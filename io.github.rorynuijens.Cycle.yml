@@ -1,0 +1,51 @@
+id: io.github.rorynuijens.Cycle
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: cycle
+
+finish-args:
+  # Wayland / X11
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU rendering (GTK4 requires this)
+  - --device=dri
+  # BLE smart trainer (bluez D-Bus)
+  - --system-talk-name=org.bluez
+  # GNOME Secret Service — required for storing API keys in the keyring
+  - --talk-name=org.freedesktop.secrets
+  # Network: Anthropic API, Intervals.icu, OpenStreetMap map tiles
+  - --share=network
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/cycle/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: libshumate
+    buildsystem: meson
+    config-opts:
+      - -Dgtk_doc=false
+      - -Dvapi=false
+      - -Dvector_renderer=false
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/libshumate/1.4/libshumate-1.4.0.tar.xz
+        sha256: 3984368e0259862b3810d1ddc86d2dadd6d372a2b32376ccf4aff7c2e48c6d30
+
+  - name: cycle
+    buildsystem: meson
+    config-opts:
+      - -Dprofile=release
+    build-options:
+      env:
+        CARGO_NET_OFFLINE: 'true'
+    sources:
+      - type: dir
+        path: .
+      - build-aux/cargo-sources.json

@@ -1,0 +1,116 @@
+# Cycle
+
+Cycle is a native Linux application for indoor cycling training. It connects to Bluetooth LE smart trainers and sensors, executes structured workouts with automatic resistance control, records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
+
+The application targets GNOME desktop environments and is distributed as a Flatpak.
+
+---
+
+## Features
+
+### Device connectivity
+
+Cycle communicates with BLE devices using standard GATT profiles:
+
+- **Smart trainers** — Fitness Machine Service (FTMS). ERG mode only: the app sends a target power and the trainer adjusts resistance automatically. Slope simulation mode is not implemented.
+- **Power meters** — Cycling Power Service (CPS). Read-only; power data is recorded but the meter cannot be commanded.
+- **Heart rate monitors** — Heart Rate Service (HRS). Supports both 8-bit and 16-bit HR measurement formats.
+
+Devices paired in a previous session are remembered and reconnected automatically on the next launch.
+
+### Workout player
+
+Structured workouts are executed segment by segment. Each segment specifies a target power as a percentage of the athlete's FTP. Ramp segments interpolate linearly between two power values. During execution the player displays elapsed and remaining time, target power in watts, live power, cadence, and heart rate from connected devices, and a colour-coded workout graph with a position cursor.
+
+Workouts can be paused and resumed. Ending a workout early saves the recorded portion as a complete session. At the end of a session the athlete is prompted to record a Rate of Perceived Exertion (RPE) on a 1–10 scale.
+
+### Workout library
+
+The library holds structured workouts across eight training categories: Recovery, Endurance, Tempo, Sweet Spot, Threshold, VO₂ Max, Anaerobic, and Custom. Workouts can be imported from `.zwo` files (Zwift XML format) or `.erg` files, scheduled to a calendar date, or deleted. There is no in-app workout editor; workouts must be created externally and imported.
+
+### Training calendar
+
+A monthly calendar view shows scheduled workouts, completed sessions, and marked time-off periods. FIT files recorded on external devices can be imported directly from the calendar. Time off can be marked for individual dates or date ranges.
+
+### Session history
+
+All sessions are stored locally in SQLite. The history view shows duration, average power, normalised power, average cadence, average heart rate, power zone distribution, kilojoules, and Training Stress Score. A route map rendered from OpenStreetMap tiles is shown when GPS data is present in the source FIT file. Sessions can be deleted individually or uploaded to Intervals.icu as FIT files.
+
+### Fitness metrics
+
+The fitness page computes and displays:
+
+- **CTL** (Chronic Training Load) — 42-day exponentially weighted average of daily TSS
+- **ATL** (Acute Training Load) — 7-day exponentially weighted average of daily TSS
+- **TSB** (Training Stress Balance) — CTL minus ATL
+- Weekly TSS totals and power zone distribution across recent sessions
+
+These metrics are derived from both locally recorded sessions and activities synced from Intervals.icu.
+
+### Intervals.icu integration
+
+Connecting an Intervals.icu account enables syncing activity history (training load, power, HR, cadence, distance), syncing wellness data (HRV, resting HR, sleep, steps, calories), uploading locally recorded sessions as FIT files, and importing structured workouts from the Intervals.icu workout library. Credentials are stored in the GNOME Secret Service keyring.
+
+### AI coaching
+
+Cycle integrates with the Anthropic Claude API to provide:
+
+- **Morning briefing** — a daily readiness assessment based on current CTL, ATL, TSB, wellness data, scheduled workouts, and upcoming time off. The briefing concludes with a recommendation to proceed, modify the planned workout, or rest.
+- **Workout recommendation** — suggests a workout from the local library given the athlete's current training load and defined goals.
+- **Retrospective analysis** — a written review of the past week or month of training, incorporating session data and wellness trends.
+- **Training program generation** — produces a multi-week training plan toward a stated goal, expressed as workout recommendations.
+
+The Anthropic API key is stored in the GNOME Secret Service keyring.
+
+---
+
+## Target audience
+
+Cycle is intended for cyclists who train indoors on a smart trainer and want a self-contained GNOME application for session execution and training load management. It is most useful to athletes who already use Intervals.icu to track training history and wellness, prefer a native Linux desktop application over a browser-based or proprietary platform, and want AI-assisted training guidance without sending personal data to a third-party coaching service.
+
+The application assumes familiarity with power-based training concepts: FTP, TSS, CTL, ATL, and power zones.
+
+---
+
+## Requirements
+
+- Linux with a GNOME desktop environment
+- Bluetooth adapter supporting Bluetooth LE (4.0 or later)
+- BlueZ accessible via D-Bus (standard on Fedora, Ubuntu, Arch, and most common distributions)
+- GNOME Secret Service daemon (gnome-keyring or equivalent) for credential storage
+- Network access for Intervals.icu sync, AI features, and map tile rendering
+
+---
+
+## Current limitations
+
+### Device connectivity
+
+- **Bluetooth LE only.** ANT+ is not supported. USB ANT+ dongles are not recognised.
+- **ERG mode only.** Slope simulation mode — adjusting resistance based on gradient — is not implemented. The app cannot command a trainer to simulate a specific incline.
+
+### Workout authoring
+
+- There is no in-app workout editor. Workouts must be imported from `.zwo` or `.erg` files, or synced from Intervals.icu.
+
+### AI integration
+
+- The Anthropic Claude API is the only supported AI provider. The API endpoint is hardcoded to `api.anthropic.com`. Despite a reference to OpenAI and compatible APIs in the setup wizard, only the Anthropic API is implemented.
+- AI features require a paid Anthropic API account. There is no offline fallback.
+- The AI has no write access to the workout schedule; recommendations are displayed as text and must be acted on manually.
+
+### External platform integrations
+
+- Intervals.icu is the only supported external training platform. There is no Strava, TrainingPeaks, Garmin Connect, or Wahoo integration.
+- FIT files from Garmin or other devices must be transferred manually and imported via the calendar or history view.
+
+### Platform
+
+- Linux only. There are no macOS or Windows builds.
+- Distributed as a Flatpak targeting the GNOME Platform runtime. Running outside a Flatpak environment requires manual dependency resolution.
+- The application has not been tested on non-GNOME desktop environments (KDE, Sway, etc.).
+
+### Data portability
+
+- Session data is stored in a local SQLite database (`~/.var/app/io.github.rorynuijens.Cycle/data/cycle/cycle.db` in the Flatpak sandbox). There is no automatic backup or cloud sync of the local database.
+- FIT export is available per session. There is no bulk export of the full session history.
