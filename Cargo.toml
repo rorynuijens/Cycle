@@ -1,0 +1,72 @@
+[package]
+name = "cycle"
+version = "0.1.0"
+edition = "2021"
+authors = ["Rory Nuijens"]
+description = "Indoor cycling training app"
+# Application crate — built via meson/flatpak, never published to crates.io.
+publish = false
+# Keep cargo's file scan out of meson/flatpak-builder artifact dirs — _build can
+# contain an unreadable host-filesystem snapshot that breaks fingerprinting
+exclude = ["_build", ".flatpak-builder", "build-aux"]
+
+[[bin]]
+name = "cycle"
+path = "src/main.rs"
+
+[dependencies]
+# --- UI ---
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
+glib = "0.22"
+gio = "0.22"
+cairo = { version = "0.22", package = "cairo-rs" }
+libshumate = { version = "0.8", features = ["v1_4"] }
+
+# --- Async runtime (BLE, background tasks) ---
+tokio = { version = "1", features = ["full"] }
+
+# --- Bluetooth BLE ---
+btleplug = "0.11"
+
+# --- Database ---
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+
+# --- Serialisation (workout files, config) ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- FIT file parsing (activity import) ---
+fitparser = "0.6"
+
+# --- Error handling ---
+anyhow = "1"
+thiserror = "1"
+
+# --- Secrets (API keys stored in GNOME Keyring / Secret Service) ---
+# sync-secret-service: synchronous D-Bus backend (GNOME Secret Service / gnome-keyring)
+# crypto-rust: pure-Rust session encryption (no libssl dependency)
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+# --- Logging --- env-filter feature required for EnvFilter
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- Time ---
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- Channels (UI <-> background thread) ---
+async-channel = "2"
+
+# --- Stream combinators (btleplug event streams) ---
+futures = "0.3"
+
+# --- HTTP client (Claude API, future integrations) ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+
+# --- GPX parsing (route simulation) ---
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+[build-dependencies]
+# Compiles data/cycle.gresource.xml into the binary at build time
+glib-build-tools = "0.22"

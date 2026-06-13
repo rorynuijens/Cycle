@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- head -->
+  <circle cx="11" cy="2.5" r="1.5" fill="currentColor"/>
+  <!-- body (torso, leaning forward) -->
+  <line x1="10" y1="4" x2="7" y2="7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- forward arm -->
+  <line x1="9" y1="5" x2="11.5" y2="7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- back arm -->
+  <line x1="9" y1="5.5" x2="6.5" y2="3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- forward leg (kick back) -->
+  <path d="M7 7.5 L9.5 10.5 L8 13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- trailing leg (swing forward) -->
+  <path d="M7 7.5 L4.5 10.5 L6.5 13.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

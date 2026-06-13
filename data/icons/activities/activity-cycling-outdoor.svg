@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- rear wheel -->
+  <circle cx="3.5" cy="11.5" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <!-- front wheel -->
+  <circle cx="12.5" cy="11.5" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <!-- frame: down tube + chain stay + seat stay -->
+  <path d="M8 5 L3.5 11.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M8 5 L10 11.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M10 11.5 L12.5 11.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- fork + top tube -->
+  <path d="M10 11.5 L11 7 L8 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- handlebar -->
+  <line x1="10.5" y1="6.5" x2="12.5" y2="6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- seat -->
+  <line x1="6.5" y1="5" x2="9" y2="5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- rider head -->
+  <circle cx="11.5" cy="4.5" r="1.5" fill="currentColor"/>
+</svg>

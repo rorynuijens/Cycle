@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Cycle
+Comment=Indoor cycling training — smart trainer control and structured workouts
+Exec=cycle
+Icon=io.github.rorynuijens.Cycle
+Type=Application
+Categories=Sports;
+Keywords=cycling;bike;trainer;workout;fitness;FTP;power;BLE;FTMS;
+StartupWMClass=cycle

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/rorynuijens/Cycle">
+    <file>thumbnails/rpe_1.png</file>
+    <file>thumbnails/rpe_2.png</file>
+    <file>thumbnails/rpe_3.png</file>
+    <file>thumbnails/rpe_4.png</file>
+    <file>thumbnails/rpe_5.png</file>
+    <file>thumbnails/rpe_6.png</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-cycling-outdoor-symbolic.svg">icons/activities/activity-cycling-outdoor.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-cycling-indoor-symbolic.svg">icons/activities/activity-cycling-indoor.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-run-symbolic.svg">icons/activities/activity-run.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-walk-symbolic.svg">icons/activities/activity-walk.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-swim-symbolic.svg">icons/activities/activity-swim.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-strength-symbolic.svg">icons/activities/activity-strength.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-generic-symbolic.svg">icons/activities/activity-generic.svg</file>
+  </gresource>
+</gresources>

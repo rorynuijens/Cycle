@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- swimmer head -->
+  <circle cx="2.5" cy="6" r="1.5" fill="currentColor"/>
+  <!-- body (horizontal, streamlined) -->
+  <line x1="4" y1="6" x2="9" y2="7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- lead arm (stretched forward) -->
+  <line x1="4.5" y1="5.5" x2="8.5" y2="4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- trailing arm (pull back) -->
+  <path d="M6 6.5 L7.5 9 L10 9.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- legs / kick -->
+  <path d="M9 7 L12 6 L14.5 7.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- water waves -->
+  <path d="M1 11 Q3 9.5 5 11 Q7 12.5 9 11 Q11 9.5 13 11 Q14.5 12 15.5 11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

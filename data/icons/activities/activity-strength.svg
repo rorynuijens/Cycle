@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- dumbbell bar -->
+  <line x1="4" y1="8" x2="12" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- left weight plates -->
+  <rect x="1" y="5.5" width="3" height="5" rx="1" fill="currentColor"/>
+  <!-- right weight plates -->
+  <rect x="12" y="5.5" width="3" height="5" rx="1" fill="currentColor"/>
+  <!-- left collar -->
+  <rect x="3.5" y="6.5" width="2" height="3" rx="0.5" fill="currentColor"/>
+  <!-- right collar -->
+  <rect x="10.5" y="6.5" width="2" height="3" rx="0.5" fill="currentColor"/>
+</svg>

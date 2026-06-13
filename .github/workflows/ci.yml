@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # fmt + clippy + test must run where the GTK4/libadwaita/libshumate dev libraries
+  # are new enough (v4_12 / v1_5 / v1_4). Ubuntu's apt ships libshumate too old, so
+  # we build inside a Fedora container — the same approach as the local toolbox.
+  test:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:42
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y \
+            gcc pkgconf-pkg-config git tar \
+            gtk4-devel libadwaita-devel libshumate-devel glib2-devel \
+            cargo rust clippy rustfmt
+
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all
+
+  # Security advisories — only needs Cargo.lock, so it runs on plain Ubuntu.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # License compliance + dependency bans + source allow-list (see deny.toml).
+  # Reads cargo metadata only — no compilation, so it runs on plain Ubuntu.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses

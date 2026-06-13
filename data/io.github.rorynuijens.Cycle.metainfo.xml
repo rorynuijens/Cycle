@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.rorynuijens.Cycle</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Cycle</name>
+  <summary>Indoor cycling training with smart trainer control</summary>
+
+  <description>
+    <p>
+      Cycle is a GNOME application for indoor cycling training. It connects to BLE
+      smart trainers via FTMS, lets you run structured ERG workouts, records sessions
+      with power, heart rate, and cadence data, and provides AI coaching advice through
+      the Claude API.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>BLE smart trainer control via FTMS (ERG mode)</li>
+      <li>Structured workout player with power zone visualisation</li>
+      <li>Session recording: power, heart rate, cadence</li>
+      <li>Training load tracking (CTL / ATL / TSB)</li>
+      <li>AI coaching suggestions powered by the Anthropic Claude API</li>
+      <li>Intervals.icu integration for activity sync</li>
+      <li>FIT file export</li>
+      <li>Post-workout self-evaluation (RPE)</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.rorynuijens.Cycle.desktop</launchable>
+
+  <url type="homepage">https://github.com/rorynuijens/cycle</url>
+  <url type="bugtracker">https://github.com/rorynuijens/cycle/issues</url>
+
+  <developer id="io.github.rorynuijens">
+    <name>Rory Nuijens</name>
+  </developer>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-05-23">
+      <description>
+        <p>Initial release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
