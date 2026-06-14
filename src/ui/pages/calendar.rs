@@ -258,74 +258,103 @@ impl CalendarPage {
 
                 month_label.set_label(&label_str);
 
-                // Show coaching banner when no upcoming scheduled workouts exist
+                // Compute the date range (sync), then run all reads on the tokio
+                // runtime and rebuild the view on the GTK main thread so navigation
+                // never blocks the GLib loop (CLAUDE.md §2.3).
                 let today_str = Local::now().format("%Y-%m-%d").to_string();
-                let upcoming = rt_handle
-                    .block_on(db::count_upcoming_scheduled(&pool, &today_str))
-                    .unwrap_or(0);
-                coaching_banner_r.set_revealed(upcoming == 0);
-
-                // Load all event types for the displayed range
                 let start_date =
                     NaiveDate::parse_from_str(&start_str, "%Y-%m-%d").unwrap_or_default();
                 let end_date = NaiveDate::parse_from_str(&end_str, "%Y-%m-%d").unwrap_or_default();
 
-                let cal_entries = rt_handle
-                    .block_on(db::load_calendar_entries_between(
-                        &pool, &start_str, &end_str,
-                    ))
-                    .unwrap_or_default();
-                let past_sessions = rt_handle
-                    .block_on(db::load_sessions_for_dates(&pool, start_date, end_date))
-                    .unwrap_or_default();
-                let icu_activities = rt_handle
-                    .block_on(db::load_intervals_activities_between(
-                        &pool, &start_str, &end_str,
-                    ))
-                    .unwrap_or_default();
-                let time_off = rt_handle
-                    .block_on(db::load_time_off_between(&pool, &start_str, &end_str))
-                    .unwrap_or_default();
+                // Per-invocation clones for the async result handler (this closure is Fn).
+                let dynamic = dynamic.clone();
+                let coaching_banner_r = coaching_banner_r.clone();
+                let current_month = Rc::clone(&current_month);
+                let current_week_start = Rc::clone(&current_week_start);
+                let pool_build = pool.clone();
+                let rt_build = rt_handle.clone();
+                let reload_holder = Rc::clone(&reload_holder);
+                let workouts = Rc::clone(&workouts);
+                let on_start_workout = Rc::clone(&on_start_workout);
+                let on_toast = Rc::clone(&on_toast);
 
-                // Merge into unified event list
-                let mut events: Vec<CalendarEvent> = Vec::new();
-                for e in cal_entries {
-                    events.push(CalendarEvent::Scheduled(e));
-                }
-                for s in past_sessions {
-                    let name = s.workout_name.clone();
-                    events.push(CalendarEvent::Session(s, name));
-                }
-                for a in icu_activities {
-                    events.push(CalendarEvent::IcuActivity(a));
-                }
-                for t in time_off {
-                    events.push(CalendarEvent::TimeOff(t));
-                }
+                let pool_load = pool.clone();
+                let start_s = start_str.clone();
+                let end_s = end_str.clone();
+                crate::ui::spawn_to_main(
+                    &rt_handle,
+                    async move {
+                        let upcoming = db::count_upcoming_scheduled(&pool_load, &today_str)
+                            .await
+                            .unwrap_or(0);
+                        let cal_entries =
+                            db::load_calendar_entries_between(&pool_load, &start_s, &end_s)
+                                .await
+                                .unwrap_or_default();
+                        let past_sessions =
+                            db::load_sessions_for_dates(&pool_load, start_date, end_date)
+                                .await
+                                .unwrap_or_default();
+                        let icu_activities =
+                            db::load_intervals_activities_between(&pool_load, &start_s, &end_s)
+                                .await
+                                .unwrap_or_default();
+                        let time_off = db::load_time_off_between(&pool_load, &start_s, &end_s)
+                            .await
+                            .unwrap_or_default();
+                        (
+                            upcoming,
+                            cal_entries,
+                            past_sessions,
+                            icu_activities,
+                            time_off,
+                        )
+                    },
+                    move |(upcoming, cal_entries, past_sessions, icu_activities, time_off)| {
+                        // Show coaching banner when no upcoming scheduled workouts exist.
+                        coaching_banner_r.set_revealed(upcoming == 0);
 
-                while let Some(child) = dynamic.first_child() {
-                    dynamic.remove(&child);
-                }
+                        // Merge into a unified event list.
+                        let mut events: Vec<CalendarEvent> = Vec::new();
+                        for e in cal_entries {
+                            events.push(CalendarEvent::Scheduled(e));
+                        }
+                        for s in past_sessions {
+                            let name = s.workout_name.clone();
+                            events.push(CalendarEvent::Session(s, name));
+                        }
+                        for a in icu_activities {
+                            events.push(CalendarEvent::IcuActivity(a));
+                        }
+                        for t in time_off {
+                            events.push(CalendarEvent::TimeOff(t));
+                        }
 
-                if is_week {
-                    let ws = *current_week_start.borrow();
-                    dynamic.append(&Self::build_week_view(
-                        ws,
-                        &events,
-                        pool.clone(),
-                        rt_handle.clone(),
-                        Rc::clone(&reload_holder),
-                        Rc::clone(&workouts),
-                        Rc::clone(&on_start_workout),
-                        ftp,
-                        weight_kg,
-                        Rc::clone(&on_toast),
-                    ));
-                } else {
-                    let (year, month) = current_month.get();
-                    dynamic.append(&Self::build_summary(&events));
-                    dynamic.append(&Self::build_month_grid(year, month, &events));
-                }
+                        while let Some(child) = dynamic.first_child() {
+                            dynamic.remove(&child);
+                        }
+
+                        if is_week {
+                            let ws = *current_week_start.borrow();
+                            dynamic.append(&Self::build_week_view(
+                                ws,
+                                &events,
+                                pool_build.clone(),
+                                rt_build.clone(),
+                                Rc::clone(&reload_holder),
+                                Rc::clone(&workouts),
+                                Rc::clone(&on_start_workout),
+                                ftp,
+                                weight_kg,
+                                Rc::clone(&on_toast),
+                            ));
+                        } else {
+                            let (year, month) = current_month.get();
+                            dynamic.append(&Self::build_summary(&events));
+                            dynamic.append(&Self::build_month_grid(year, month, &events));
+                        }
+                    },
+                );
             })
         };
 
