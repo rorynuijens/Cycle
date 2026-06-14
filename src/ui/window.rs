@@ -9,8 +9,8 @@ use sqlx::SqlitePool;
 
 use super::pages::{
     calendar::CalendarPage, coaching::CoachingPage, dashboard::DashboardPage, devices::DevicesPage,
-    fitness::FitnessPage, history::HistoryPage, library::LibraryPage, player::PlayerPage,
-    route_player::RoutePlayerPage, summary::SummaryPage,
+    fitness::FitnessPage, library::LibraryPage, player::PlayerPage, route_player::RoutePlayerPage,
+    summary::SummaryPage,
 };
 use crate::data::{
     athlete::AthleteProfile,
@@ -527,21 +527,10 @@ impl CycleGtkWindow {
         );
         let library_reload = Rc::new(library_reload);
 
-        // ── History page ──────────────────────────────────────────────────────
-        let toast_overlay_for_history = self.toast_overlay.clone();
-        let (history_page, history_reload) = HistoryPage::new(
-            pool.clone(),
-            rt_handle.clone(),
-            Rc::new(move |toast| toast_overlay_for_history.add_toast(toast)),
-            athlete.ftp_watts,
-            athlete.weight_kg,
-        );
-
         // ── Add all pages to stack ────────────────────────────────────────────
         stack.add_named(dashboard_page.widget(), Some("dashboard"));
         stack.add_named(calendar_page.widget(), Some("calendar"));
         stack.add_named(library_page.widget(), Some("library"));
-        stack.add_named(history_page.widget(), Some("history"));
         stack.add_named(devices_rc.borrow().widget(), Some("devices"));
         stack.add_named(player_rc.borrow().widget(), Some("player"));
         stack.add_named(route_player_rc.widget(), Some("route_player"));
@@ -608,7 +597,6 @@ impl CycleGtkWindow {
                 Some("dashboard") | None => "Dashboard",
                 Some("calendar") => "Calendar",
                 Some("library") => "Library",
-                Some("history") => "History",
                 Some("fitness") => "Fitness",
                 Some("coaching") => "Coaching",
                 Some("devices") => "Devices",
@@ -629,7 +617,6 @@ impl CycleGtkWindow {
                 Some("dashboard") => dashboard_reload(),
                 Some("calendar") => calendar_reload(),
                 Some("library") => library_reload(),
-                Some("history") => history_reload(),
                 Some("fitness") => fitness_reload(),
                 Some("coaching") => coaching_reload(),
                 _ => {}
