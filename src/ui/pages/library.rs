@@ -16,6 +16,17 @@ use libshumate::prelude::LocationExt;
 /// (so edit/delete callbacks can trigger a list rebuild).
 type RebuildHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
+/// Athlete fitness context used to tailor per-workout recommendations
+/// (CTL/TSB and lower-cased goal keywords). It is loaded asynchronously after
+/// the page is built — see CLAUDE.md §2.3 — so it starts neutral and the list
+/// is rebuilt once the real data arrives.
+#[derive(Default)]
+struct FitnessContext {
+    ctl: f64,
+    tsb: f64,
+    goals: Rc<Vec<String>>,
+}
+
 /// Draft segment list: `(duration_secs, power_low_pct, power_high_pct, label)`.
 type SegmentDraft = Rc<RefCell<Vec<(u32, f32, f32, String)>>>;
 
@@ -35,29 +46,12 @@ impl LibraryPage {
         ftp: u32,
         on_start_route: Rc<dyn Fn(Route)>,
     ) -> (Self, impl Fn() + 'static) {
-        // Load fitness context for per-workout recommendations
-        let session_records = rt_handle
-            .block_on(db::load_session_records(&pool))
-            .unwrap_or_default();
-        let intervals_pairs = rt_handle
-            .block_on(db::load_intervals_tss_pairs(&pool))
-            .unwrap_or_default();
-        let goal_descriptions: Rc<Vec<String>> = Rc::new(
-            rt_handle
-                .block_on(db::load_goals(&pool))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|g| g.description.to_lowercase())
-                .collect(),
-        );
-        let today = Local::now().date_naive();
-        let (ctl, atl, _) = crate::ui::pages::fitness::compute_load_metrics(
-            &session_records,
-            &intervals_pairs,
-            ftp,
-            today,
-        );
-        let tsb = ctl - atl;
+        // Per-workout recommendations need CTL/TSB and the athlete's goals, all
+        // loaded from the database. Rather than block the GLib loop while those
+        // queries run (CLAUDE.md §2.3), build the page immediately with a neutral
+        // context and rebuild the list once the data arrives (see end of `new`).
+        let fitness_ctx: Rc<RefCell<FitnessContext>> =
+            Rc::new(RefCell::new(FitnessContext::default()));
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -193,9 +187,16 @@ impl LibraryPage {
             let on_start = Rc::clone(&on_start);
             let on_toast = Rc::clone(&on_toast);
             let rebuild_holder = Rc::clone(&rebuild_holder);
-            let goal_descriptions = Rc::clone(&goal_descriptions);
+            let fitness_ctx = Rc::clone(&fitness_ctx);
 
             Rc::new(move || {
+                // Snapshot the current fitness context for this rebuild pass.
+                let ctx = fitness_ctx.borrow();
+                let ctl = ctx.ctl;
+                let tsb = ctx.tsb;
+                let goal_descriptions = Rc::clone(&ctx.goals);
+                drop(ctx);
+
                 while let Some(child) = list_container.first_child() {
                     list_container.remove(&child);
                 }
@@ -698,6 +699,46 @@ impl LibraryPage {
         root.append(&list_scroll);
 
         rebuild();
+
+        // Load CTL/TSB + goals off the main thread, then refresh recommendations.
+        {
+            let pool_load = pool.clone();
+            let fitness_ctx_load = Rc::clone(&fitness_ctx);
+            let rebuild_load = Rc::clone(&rebuild);
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move {
+                    let records = db::load_session_records(&pool_load)
+                        .await
+                        .unwrap_or_default();
+                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
+                        .await
+                        .unwrap_or_default();
+                    let goals: Vec<String> = db::load_goals(&pool_load)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| g.description.to_lowercase())
+                        .collect();
+                    (records, intervals_pairs, goals)
+                },
+                move |(records, intervals_pairs, goals)| {
+                    let today = Local::now().date_naive();
+                    let (ctl, atl, _) = crate::ui::pages::fitness::compute_load_metrics(
+                        &records,
+                        &intervals_pairs,
+                        ftp,
+                        today,
+                    );
+                    *fitness_ctx_load.borrow_mut() = FitnessContext {
+                        ctl,
+                        tsb: ctl - atl,
+                        goals: Rc::new(goals),
+                    };
+                    rebuild_load();
+                },
+            );
+        }
 
         let reload = {
             let rebuild = Rc::clone(&rebuild);
