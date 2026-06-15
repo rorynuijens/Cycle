@@ -122,139 +122,171 @@ impl DashboardPage {
 
                 let today_str = today_naive.format("%Y-%m-%d").to_string();
 
-                // Load all data needed for the summary cards
-                let today_entry = rt_handle
-                    .block_on(db::load_today_entry(&pool, &today_str))
-                    .unwrap_or(None);
+                // Load everything the summary cards need off the main thread
+                // (CLAUDE.md §2.3), then rebuild the dynamic area on arrival.
+                let pool_load = pool.clone();
+                let dynamic = dynamic.clone();
+                let on_start = Rc::clone(&on_start);
+                let on_view_fitness = Rc::clone(&on_view_fitness);
+                let pool_ob = pool.clone();
+                let rt_ob = rt_handle.clone();
 
-                let records = rt_handle
-                    .block_on(db::load_session_records(&pool))
-                    .unwrap_or_default();
-
-                let ai_workout_name = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.suggestion_workout_name"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                let ai_workout_detail = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.suggestion_workout_detail"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let ai_fitness_insight = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.fitness_insight"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let intervals_pairs = rt_handle
-                    .block_on(db::load_intervals_tss_pairs(&pool))
-                    .unwrap_or_default();
-
-                // Compute TSB for readiness + 7-day trend
-                let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today_naive);
-                let tsb = ctl - atl;
-                let week_ago = today_naive - Duration::days(7);
-                let (ctl_7d, atl_7d) = compute_ctl_atl(&records, &intervals_pairs, ftp, week_ago);
-                let tsb_7d = ctl_7d - atl_7d;
-
-                while let Some(child) = dynamic.first_child() {
-                    dynamic.remove(&child);
-                }
-
-                // ── First-run onboarding ─────────────────────────────────────
-                let first_use_done = rt_handle
-                    .block_on(db::get_setting(&pool, "first_use_complete"))
-                    .unwrap_or(None)
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-
-                if !first_use_done && records.is_empty() && today_entry.is_none() && ctl == 0.0 {
-                    let get_started_btn = gtk::Button::builder()
-                        .label("Get Started")
-                        .css_classes(["pill", "suggested-action"])
-                        .tooltip_text("Run the first-use setup wizard")
-                        .build();
-
-                    let status = adw::StatusPage::builder()
-                        .icon_name("media-playback-start-symbolic")
-                        .title("Welcome to Cycle")
-                        .description(
-                            "Set up your profile and connect your services to get \
-                             personalised training recommendations.",
+                crate::ui::spawn_to_main(
+                    &rt_handle,
+                    async move {
+                        let today_entry = db::load_today_entry(&pool_load, &today_str)
+                            .await
+                            .unwrap_or(None);
+                        let records = db::load_session_records(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let ai_workout_name =
+                            db::get_setting(&pool_load, "ai.suggestion_workout_name")
+                                .await
+                                .unwrap_or(None)
+                                .unwrap_or_default();
+                        let ai_workout_detail =
+                            db::get_setting(&pool_load, "ai.suggestion_workout_detail")
+                                .await
+                                .unwrap_or(None)
+                                .unwrap_or_default();
+                        let ai_fitness_insight = db::get_setting(&pool_load, "ai.fitness_insight")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default();
+                        let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let first_use_done = db::get_setting(&pool_load, "first_use_complete")
+                            .await
+                            .unwrap_or(None)
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        (
+                            today_entry,
+                            records,
+                            ai_workout_name,
+                            ai_workout_detail,
+                            ai_fitness_insight,
+                            intervals_pairs,
+                            first_use_done,
                         )
-                        .child(&get_started_btn)
-                        .build();
+                    },
+                    move |(
+                        today_entry,
+                        records,
+                        ai_workout_name,
+                        ai_workout_detail,
+                        ai_fitness_insight,
+                        intervals_pairs,
+                        first_use_done,
+                    )| {
+                        // Compute TSB for readiness + 7-day trend
+                        let (ctl, atl) =
+                            compute_ctl_atl(&records, &intervals_pairs, ftp, today_naive);
+                        let tsb = ctl - atl;
+                        let week_ago = today_naive - Duration::days(7);
+                        let (ctl_7d, atl_7d) =
+                            compute_ctl_atl(&records, &intervals_pairs, ftp, week_ago);
+                        let tsb_7d = ctl_7d - atl_7d;
 
-                    let pool_ob = pool.clone();
-                    let rt_ob = rt_handle.clone();
-                    let dynamic_ob = dynamic.clone();
-                    get_started_btn.connect_clicked(move |btn| {
-                        let root = btn.root().and_downcast::<gtk::Window>();
-                        let pool_w = pool_ob.clone();
-                        let rt_w = rt_ob.clone();
-                        let dynamic_w = dynamic_ob.clone();
-                        super::onboarding::show(
-                            root.as_ref(),
-                            pool_w,
-                            rt_w,
-                            Rc::new(move || {
-                                // After wizard, remove the status page so the
-                                // dashboard reloads to the normal view on next visit.
-                                while let Some(child) = dynamic_w.first_child() {
-                                    dynamic_w.remove(&child);
-                                }
-                            }),
-                        );
-                    });
+                        while let Some(child) = dynamic.first_child() {
+                            dynamic.remove(&child);
+                        }
 
-                    dynamic.append(&status);
-                    return;
-                }
+                        // ── First-run onboarding ─────────────────────────────
+                        if !first_use_done
+                            && records.is_empty()
+                            && today_entry.is_none()
+                            && ctl == 0.0
+                        {
+                            let get_started_btn = gtk::Button::builder()
+                                .label("Get Started")
+                                .css_classes(["pill", "suggested-action"])
+                                .tooltip_text("Run the first-use setup wizard")
+                                .build();
 
-                // ── TSB status banner ─────────────────────────────────────────
-                let banner = Self::build_tsb_banner(tsb);
-                let vf = Rc::clone(&on_view_fitness);
-                banner.connect_button_clicked(move |_| vf());
-                dynamic.append(&banner);
+                            let status = adw::StatusPage::builder()
+                                .icon_name("media-playback-start-symbolic")
+                                .title("Welcome to Cycle")
+                                .description(
+                                    "Set up your profile and connect your services to get \
+                                     personalised training recommendations.",
+                                )
+                                .child(&get_started_btn)
+                                .build();
 
-                // ── Today's workout + AI suggestion (consolidated) ────────────
-                dynamic.append(&Self::build_workout_card(
-                    today_entry,
-                    &ai_workout_name,
-                    &ai_workout_detail,
-                    Rc::clone(&on_start),
-                ));
+                            let dynamic_ob = dynamic.clone();
+                            get_started_btn.connect_clicked(move |btn| {
+                                let root = btn.root().and_downcast::<gtk::Window>();
+                                let pool_w = pool_ob.clone();
+                                let rt_w = rt_ob.clone();
+                                let dynamic_w = dynamic_ob.clone();
+                                super::onboarding::show(
+                                    root.as_ref(),
+                                    pool_w,
+                                    rt_w,
+                                    Rc::new(move || {
+                                        // After wizard, remove the status page so the
+                                        // dashboard reloads to the normal view next visit.
+                                        while let Some(child) = dynamic_w.first_child() {
+                                            dynamic_w.remove(&child);
+                                        }
+                                    }),
+                                );
+                            });
 
-                // ── Two-column row: Last Activity | Fitness ───────────────────
-                let last_session = records.first();
-                let cards = vec![
-                    Self::build_last_activity_card(last_session, ftp),
-                    Self::build_fitness_card(
-                        ctl,
-                        atl,
-                        tsb,
-                        ctl_7d,
-                        atl_7d,
-                        tsb_7d,
-                        &ai_fitness_insight,
-                    ),
-                ];
-                let flow = gtk::FlowBox::builder()
-                    .column_spacing(12)
-                    .row_spacing(12)
-                    .max_children_per_line(2)
-                    .min_children_per_line(1)
-                    .selection_mode(gtk::SelectionMode::None)
-                    .homogeneous(true)
-                    .build();
-                for card in &cards {
-                    flow.append(card);
-                }
-                for i in 0..cards.len() as i32 {
-                    if let Some(child) = flow.child_at_index(i) {
-                        child.set_hexpand(true);
-                    }
-                }
-                dynamic.append(&flow);
+                            dynamic.append(&status);
+                            return;
+                        }
+
+                        // ── TSB status banner ─────────────────────────────────
+                        let banner = Self::build_tsb_banner(tsb);
+                        let vf = Rc::clone(&on_view_fitness);
+                        banner.connect_button_clicked(move |_| vf());
+                        dynamic.append(&banner);
+
+                        // ── Today's workout + AI suggestion (consolidated) ────
+                        dynamic.append(&Self::build_workout_card(
+                            today_entry,
+                            &ai_workout_name,
+                            &ai_workout_detail,
+                            Rc::clone(&on_start),
+                        ));
+
+                        // ── Two-column row: Last Activity | Fitness ───────────
+                        let last_session = records.first();
+                        let cards = vec![
+                            Self::build_last_activity_card(last_session, ftp),
+                            Self::build_fitness_card(
+                                ctl,
+                                atl,
+                                tsb,
+                                ctl_7d,
+                                atl_7d,
+                                tsb_7d,
+                                &ai_fitness_insight,
+                            ),
+                        ];
+                        let flow = gtk::FlowBox::builder()
+                            .column_spacing(12)
+                            .row_spacing(12)
+                            .max_children_per_line(2)
+                            .min_children_per_line(1)
+                            .selection_mode(gtk::SelectionMode::None)
+                            .homogeneous(true)
+                            .build();
+                        for card in &cards {
+                            flow.append(card);
+                        }
+                        for i in 0..cards.len() as i32 {
+                            if let Some(child) = flow.child_at_index(i) {
+                                child.set_hexpand(true);
+                            }
+                        }
+                        dynamic.append(&flow);
+                    },
+                );
             })
         };
 
@@ -369,33 +401,6 @@ impl DashboardPage {
 
         // Shared state: name of the AI-suggested alternative workout (Modify decision)
         let pending_alt_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-
-        // Restore cached briefing if it's from today
-        let cached_text = rt_handle
-            .block_on(db::get_setting(&pool, "ai.morning_briefing_text"))
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let cached_date = rt_handle
-            .block_on(db::get_setting(&pool, "ai.morning_briefing_date"))
-            .unwrap_or(None)
-            .unwrap_or_default();
-
-        if !cached_text.is_empty() && cached_date == today_str {
-            let decision = parse_briefing_decision(&cached_text);
-            let alt = parse_alternative_workout(&cached_text);
-            *pending_alt_name.borrow_mut() = alt.clone();
-            Self::apply_briefing(
-                &text_label,
-                &action_row,
-                &content_row,
-                &decision_badge,
-                &use_workout_btn,
-                &remove_btn,
-                &cached_text,
-                &decision,
-                alt.as_deref(),
-            );
-        }
 
         // Wire up "Use this workout" (Modify) — swaps today's calendar entry and loads it
         {
@@ -792,12 +797,54 @@ impl DashboardPage {
             });
         }
 
-        // Auto-generate on first open of the day if there's no cached briefing yet
-        if cached_text.is_empty() || cached_date != today_str {
-            let btn = generate_btn.clone();
-            glib::idle_add_local_once(move || {
-                btn.emit_by_name::<()>("clicked", &[]);
-            });
+        // Load any cached briefing off the main thread (CLAUDE.md §2.3). On arrival,
+        // either restore today's cached briefing or auto-generate a fresh one.
+        {
+            let pool_cache = pool.clone();
+            let today_c = today_str.clone();
+            let text_label_c = text_label.clone();
+            let action_row_c = action_row.clone();
+            let content_row_c = content_row.clone();
+            let decision_badge_c = decision_badge.clone();
+            let use_workout_btn_c = use_workout_btn.clone();
+            let remove_btn_c = remove_btn.clone();
+            let pending_alt_c = Rc::clone(&pending_alt_name);
+            let generate_btn_c = generate_btn.clone();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move {
+                    let cached_text = db::get_setting(&pool_cache, "ai.morning_briefing_text")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    let cached_date = db::get_setting(&pool_cache, "ai.morning_briefing_date")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    (cached_text, cached_date)
+                },
+                move |(cached_text, cached_date)| {
+                    if !cached_text.is_empty() && cached_date == today_c {
+                        let decision = parse_briefing_decision(&cached_text);
+                        let alt = parse_alternative_workout(&cached_text);
+                        *pending_alt_c.borrow_mut() = alt.clone();
+                        Self::apply_briefing(
+                            &text_label_c,
+                            &action_row_c,
+                            &content_row_c,
+                            &decision_badge_c,
+                            &use_workout_btn_c,
+                            &remove_btn_c,
+                            &cached_text,
+                            &decision,
+                            alt.as_deref(),
+                        );
+                    } else {
+                        // No briefing cached for today — auto-generate one.
+                        generate_btn_c.emit_by_name::<()>("clicked", &[]);
+                    }
+                },
+            );
         }
 
         group

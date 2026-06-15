@@ -490,129 +490,162 @@ impl CoachingPage {
             let api_banner_r = api_banner.clone();
 
             Rc::new(move || {
-                // API key pre-flight check
+                // API key pre-flight check (local keyring — fast, stays synchronous)
                 let has_api_key = keystore::get_secret(keystore::KEY_ANTHROPIC)
                     .unwrap_or(None)
                     .map(|k| !k.trim().is_empty())
                     .unwrap_or(false);
                 api_banner_r.set_revealed(!has_api_key);
 
-                let ctx = rt
-                    .block_on(db::get_setting(&pool, "coaching.athlete_context"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
+                // Load coaching data off the main thread (CLAUDE.md §2.3); update the
+                // profile, goal list, and cached suggestion once it arrives. Clone the
+                // widget handles the callback needs.
+                let pool_load = pool.clone();
+                let icu_count_label = icu_count_label.clone();
+                let profile_label = profile_label.clone();
+                let goals_list = goals_list.clone();
+                let no_goals_label = no_goals_label.clone();
+                let pool_del = pool_del.clone();
+                let rt_del = rt_del.clone();
+                let reload_holder = Rc::clone(&reload_holder);
+                let response_label_r = response_label_r.clone();
+                let workout_action_frame_r = workout_action_frame_r.clone();
+                let workout_title_label_r = workout_title_label_r.clone();
+                let workout_detail_label_r = workout_detail_label_r.clone();
+                let load_now_btn_r = load_now_btn_r.clone();
+                let schedule_one_btn_r = schedule_one_btn_r.clone();
+                let suggested_workout_r = Rc::clone(&suggested_workout_r);
+                let workouts_r = Rc::clone(&workouts_r);
 
-                // Intervals.icu workout count
-                let icu_count = rt
-                    .block_on(db::count_intervals_workouts(&pool))
-                    .unwrap_or(0);
-                if icu_count > 0 {
-                    icu_count_label.set_text(&format!(
+                crate::ui::spawn_to_main(
+                    &rt,
+                    async move {
+                        let ctx = db::get_setting(&pool_load, "coaching.athlete_context")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default();
+                        let icu_count = db::count_intervals_workouts(&pool_load).await.unwrap_or(0);
+                        let goals = db::load_goals(&pool_load).await.unwrap_or_default();
+                        let cached_resp = db::get_setting(&pool_load, "ai.suggestion_response")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default();
+                        let cached_name = db::get_setting(&pool_load, "ai.suggestion_workout_name")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default();
+                        let cached_detail =
+                            db::get_setting(&pool_load, "ai.suggestion_workout_detail")
+                                .await
+                                .unwrap_or(None)
+                                .unwrap_or_default();
+                        (
+                            ctx,
+                            icu_count,
+                            goals,
+                            cached_resp,
+                            cached_name,
+                            cached_detail,
+                        )
+                    },
+                    move |(ctx, icu_count, goals, cached_resp, cached_name, cached_detail)| {
+                        if icu_count > 0 {
+                            icu_count_label.set_text(&format!(
                         "{icu_count} workouts synced from Intervals.icu — included in AI suggestions."
                     ));
-                    icu_count_label.remove_css_class("dim-label");
-                } else {
-                    icu_count_label.set_text(
+                            icu_count_label.remove_css_class("dim-label");
+                        } else {
+                            icu_count_label.set_text(
                         "No workouts synced yet. Sync your Intervals.icu library to include \
                          it in AI coaching suggestions.",
                     );
-                    icu_count_label.add_css_class("dim-label");
-                }
-                if ctx.trim().is_empty() {
-                    profile_label
-                        .set_text("No profile set — tap Edit to describe your training context.");
-                    profile_label.add_css_class("dim-label");
-                } else {
-                    profile_label.set_text(&ctx);
-                    profile_label.remove_css_class("dim-label");
-                }
-
-                let goals = rt.block_on(db::load_goals(&pool)).unwrap_or_default();
-
-                while let Some(row) = goals_list.row_at_index(0) {
-                    goals_list.remove(&row);
-                }
-
-                if goals.is_empty() {
-                    goals_list.set_visible(false);
-                    no_goals_label.set_visible(true);
-                } else {
-                    goals_list.set_visible(true);
-                    no_goals_label.set_visible(false);
-
-                    for goal in &goals {
-                        let goal_id = goal.id;
-                        let row = adw::ActionRow::builder().title(&goal.description).build();
-
-                        let del_btn = gtk::Button::builder()
-                            .icon_name("user-trash-symbolic")
-                            .css_classes(["flat", "circular"])
-                            .tooltip_text("Remove this goal")
-                            .valign(gtk::Align::Center)
-                            .build();
-
-                        let pool_d = pool_del.clone();
-                        let rt_d = rt_del.clone();
-                        let reload_d = Rc::clone(&reload_holder);
-                        del_btn.connect_clicked(move |_| {
-                            let pool_d = pool_d.clone();
-                            let reload_d = Rc::clone(&reload_d);
-                            crate::ui::spawn_to_main(
-                                &rt_d,
-                                async move { db::delete_goal(&pool_d, goal_id).await },
-                                move |res| {
-                                    if let Err(e) = res {
-                                        tracing::error!("delete_goal failed: {e}");
-                                    } else if let Some(f) = reload_d.borrow().as_ref() {
-                                        f();
-                                    }
-                                },
-                            );
-                        });
-
-                        row.add_suffix(&del_btn);
-                        goals_list.append(&row);
-                    }
-                }
-
-                // Restore cached AI suggestion if present
-                let cached_resp = rt
-                    .block_on(db::get_setting(&pool, "ai.suggestion_response"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                if !cached_resp.trim().is_empty() {
-                    response_label_r.set_markup(&to_pango(&cached_resp));
-                    response_label_r.remove_css_class("dim-label");
-
-                    let cached_name = rt
-                        .block_on(db::get_setting(&pool, "ai.suggestion_workout_name"))
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-                    let cached_detail = rt
-                        .block_on(db::get_setting(&pool, "ai.suggestion_workout_detail"))
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-
-                    if !cached_name.is_empty() {
-                        workout_title_label_r.set_label(&format!("Recommended: {}", cached_name));
-                        workout_detail_label_r.set_label(&cached_detail);
-
-                        // Restore action buttons only for built-in library workouts
-                        let is_builtin = workouts_r
-                            .iter()
-                            .find(|w| w.name.eq_ignore_ascii_case(&cached_name));
-                        if let Some(w) = is_builtin {
-                            *suggested_workout_r.borrow_mut() = Some(w.clone());
-                            load_now_btn_r.set_visible(true);
-                            schedule_one_btn_r.set_visible(true);
-                        } else {
-                            *suggested_workout_r.borrow_mut() = None;
-                            load_now_btn_r.set_visible(false);
-                            schedule_one_btn_r.set_visible(false);
+                            icu_count_label.add_css_class("dim-label");
                         }
-                        workout_action_frame_r.set_visible(true);
-                    }
-                }
+                        if ctx.trim().is_empty() {
+                            profile_label.set_text(
+                                "No profile set — tap Edit to describe your training context.",
+                            );
+                            profile_label.add_css_class("dim-label");
+                        } else {
+                            profile_label.set_text(&ctx);
+                            profile_label.remove_css_class("dim-label");
+                        }
+
+                        while let Some(row) = goals_list.row_at_index(0) {
+                            goals_list.remove(&row);
+                        }
+
+                        if goals.is_empty() {
+                            goals_list.set_visible(false);
+                            no_goals_label.set_visible(true);
+                        } else {
+                            goals_list.set_visible(true);
+                            no_goals_label.set_visible(false);
+
+                            for goal in &goals {
+                                let goal_id = goal.id;
+                                let row =
+                                    adw::ActionRow::builder().title(&goal.description).build();
+
+                                let del_btn = gtk::Button::builder()
+                                    .icon_name("user-trash-symbolic")
+                                    .css_classes(["flat", "circular"])
+                                    .tooltip_text("Remove this goal")
+                                    .valign(gtk::Align::Center)
+                                    .build();
+
+                                let pool_d = pool_del.clone();
+                                let rt_d = rt_del.clone();
+                                let reload_d = Rc::clone(&reload_holder);
+                                del_btn.connect_clicked(move |_| {
+                                    let pool_d = pool_d.clone();
+                                    let reload_d = Rc::clone(&reload_d);
+                                    crate::ui::spawn_to_main(
+                                        &rt_d,
+                                        async move { db::delete_goal(&pool_d, goal_id).await },
+                                        move |res| {
+                                            if let Err(e) = res {
+                                                tracing::error!("delete_goal failed: {e}");
+                                            } else if let Some(f) = reload_d.borrow().as_ref() {
+                                                f();
+                                            }
+                                        },
+                                    );
+                                });
+
+                                row.add_suffix(&del_btn);
+                                goals_list.append(&row);
+                            }
+                        }
+
+                        // Restore cached AI suggestion if present
+                        if !cached_resp.trim().is_empty() {
+                            response_label_r.set_markup(&to_pango(&cached_resp));
+                            response_label_r.remove_css_class("dim-label");
+
+                            if !cached_name.is_empty() {
+                                workout_title_label_r
+                                    .set_label(&format!("Recommended: {}", cached_name));
+                                workout_detail_label_r.set_label(&cached_detail);
+
+                                // Restore action buttons only for built-in library workouts
+                                let is_builtin = workouts_r
+                                    .iter()
+                                    .find(|w| w.name.eq_ignore_ascii_case(&cached_name));
+                                if let Some(w) = is_builtin {
+                                    *suggested_workout_r.borrow_mut() = Some(w.clone());
+                                    load_now_btn_r.set_visible(true);
+                                    schedule_one_btn_r.set_visible(true);
+                                } else {
+                                    *suggested_workout_r.borrow_mut() = None;
+                                    load_now_btn_r.set_visible(false);
+                                    schedule_one_btn_r.set_visible(false);
+                                }
+                                workout_action_frame_r.set_visible(true);
+                            }
+                        }
+                    },
+                );
             })
         };
 
