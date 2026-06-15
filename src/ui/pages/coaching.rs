@@ -663,85 +663,108 @@ impl CoachingPage {
                 let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
                     .unwrap_or(None)
                     .unwrap_or_default();
-                let athlete_id = rt_sl
-                    .block_on(db::get_setting(&pool_sl, "intervals.athlete_id"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
 
-                if api_key.trim().is_empty() || athlete_id.trim().is_empty() {
-                    tracing::warn!(
-                        "Intervals.icu credentials not configured — cannot sync library"
-                    );
-                    toast_sl(
-                        adw::Toast::builder()
-                            .title(
-                                "Set your Intervals.icu API key and Athlete ID in \
-                                 Preferences → Integrations",
-                            )
-                            .timeout(5)
-                            .build(),
-                    );
-                    return;
-                }
+                // Load the athlete ID off the main thread (CLAUDE.md §2.3); the
+                // credential check, spinner, and network sync follow on arrival.
+                let pool_load = pool_sl.clone();
+                let pool_net = pool_sl.clone();
+                let rt_net = rt_sl.clone();
+                let spinner_sl = spinner_sl.clone();
+                let reload_sl = Rc::clone(&reload_sl);
+                let toast_sl = Rc::clone(&toast_sl);
+                let btn = btn.clone();
 
-                btn.set_sensitive(false);
-                spinner_sl.set_visible(true);
-                spinner_sl.start();
+                crate::ui::spawn_to_main(
+                    &rt_sl,
+                    async move {
+                        db::get_setting(&pool_load, "intervals.athlete_id")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default()
+                    },
+                    move |athlete_id| {
+                        if api_key.trim().is_empty() || athlete_id.trim().is_empty() {
+                            tracing::warn!(
+                                "Intervals.icu credentials not configured — cannot sync library"
+                            );
+                            toast_sl(
+                                adw::Toast::builder()
+                                    .title(
+                                        "Set your Intervals.icu API key and Athlete ID in \
+                                         Preferences → Integrations",
+                                    )
+                                    .timeout(5)
+                                    .build(),
+                            );
+                            return;
+                        }
 
-                let pool_async = pool_sl.clone();
-                let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
-                rt_sl.spawn(async move {
-                    let result = match crate::ai::intervals::fetch_workouts(&athlete_id, &api_key)
-                        .await
-                    {
-                        Ok(workouts) => {
-                            match crate::data::db::clear_intervals_workouts(&pool_async).await {
-                                Err(e) => Err(e.to_string()),
-                                Ok(_) => {
-                                    let count = workouts.len();
-                                    for w in workouts {
-                                        if let Err(e) = crate::data::db::upsert_intervals_workout(
-                                            &pool_async,
-                                            &w.id,
-                                            &w.name,
-                                            &w.description,
-                                            w.target_duration,
-                                            w.icu_training_load,
-                                        )
-                                        .await
+                        btn.set_sensitive(false);
+                        spinner_sl.set_visible(true);
+                        spinner_sl.start();
+
+                        let pool_async = pool_net.clone();
+                        let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
+                        rt_net.spawn(async move {
+                            let result =
+                                match crate::ai::intervals::fetch_workouts(&athlete_id, &api_key)
+                                    .await
+                                {
+                                    Ok(workouts) => {
+                                        match crate::data::db::clear_intervals_workouts(&pool_async)
+                                            .await
                                         {
-                                            tracing::error!("upsert intervals workout: {e}");
+                                            Err(e) => Err(e.to_string()),
+                                            Ok(_) => {
+                                                let count = workouts.len();
+                                                for w in workouts {
+                                                    if let Err(e) =
+                                                        crate::data::db::upsert_intervals_workout(
+                                                            &pool_async,
+                                                            &w.id,
+                                                            &w.name,
+                                                            &w.description,
+                                                            w.target_duration,
+                                                            w.icu_training_load,
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::error!(
+                                                            "upsert intervals workout: {e}"
+                                                        );
+                                                    }
+                                                }
+                                                Ok(count)
+                                            }
                                         }
                                     }
-                                    Ok(count)
-                                }
-                            }
-                        }
-                        Err(e) => Err(e.to_string()),
-                    };
-                    let _ = tx.send(result).await;
-                });
+                                    Err(e) => Err(e.to_string()),
+                                };
+                            let _ = tx.send(result).await;
+                        });
 
-                let btn_c = btn.clone();
-                let spinner_c = spinner_sl.clone();
-                let reload_c = Rc::clone(&reload_sl);
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(result) = rx.recv().await {
-                        match result {
-                            Ok(_count) => {
-                                if let Some(f) = reload_c.borrow().as_ref() {
-                                    f();
+                        let btn_c = btn.clone();
+                        let spinner_c = spinner_sl.clone();
+                        let reload_c = Rc::clone(&reload_sl);
+                        glib::MainContext::default().spawn_local(async move {
+                            if let Ok(result) = rx.recv().await {
+                                match result {
+                                    Ok(_count) => {
+                                        if let Some(f) = reload_c.borrow().as_ref() {
+                                            f();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Intervals.icu library sync failed: {e}");
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Intervals.icu library sync failed: {e}");
-                            }
-                        }
-                    }
-                    spinner_c.stop();
-                    spinner_c.set_visible(false);
-                    btn_c.set_sensitive(true);
-                });
+                            spinner_c.stop();
+                            spinner_c.set_visible(false);
+                            btn_c.set_sensitive(true);
+                        });
+                    },
+                );
             });
         }
 
@@ -753,133 +776,148 @@ impl CoachingPage {
             let toast_p = Rc::clone(&toast_fn);
 
             edit_profile_btn.connect_clicked(move |btn| {
-                let current = rt_p
-                    .block_on(db::get_setting(&pool_p, "coaching.athlete_context"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
+                // Load the current context off the main thread (CLAUDE.md §2.3),
+                // then build and present the editor dialog when it arrives.
+                let pool_load = pool_p.clone();
+                let pool_save = pool_p.clone();
+                let rt_save = rt_p.clone();
+                let reload_p = Rc::clone(&reload_p);
+                let toast_p = Rc::clone(&toast_p);
+                let btn = btn.clone();
+                crate::ui::spawn_to_main(
+                    &rt_p,
+                    async move {
+                        db::get_setting(&pool_load, "coaching.athlete_context")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default()
+                    },
+                    move |current| {
+                        let content_box = gtk::Box::builder()
+                            .orientation(gtk::Orientation::Vertical)
+                            .spacing(12)
+                            .margin_top(12)
+                            .margin_bottom(24)
+                            .margin_start(24)
+                            .margin_end(24)
+                            .build();
 
-                let content_box = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(12)
-                    .margin_top(12)
-                    .margin_bottom(24)
-                    .margin_start(24)
-                    .margin_end(24)
-                    .build();
-
-                content_box.append(
-                    &gtk::Label::builder()
-                        .label(
-                            "Describe your age, lifestyle, time constraints, and training \
+                        content_box.append(
+                            &gtk::Label::builder()
+                                .label(
+                                    "Describe your age, lifestyle, time constraints, and training \
                              preferences. The AI Coach uses this in every coaching response.",
-                        )
-                        .css_classes(["dim-label"])
-                        .halign(gtk::Align::Start)
-                        .wrap(true)
-                        .build(),
-                );
+                                )
+                                .css_classes(["dim-label"])
+                                .halign(gtk::Align::Start)
+                                .wrap(true)
+                                .build(),
+                        );
 
-                let template_btn = gtk::Button::builder()
-                    .label("Use template")
-                    .css_classes(["pill"])
-                    .tooltip_text("Fill in a starter template")
-                    .halign(gtk::Align::Start)
-                    .build();
-                content_box.append(&template_btn);
+                        let template_btn = gtk::Button::builder()
+                            .label("Use template")
+                            .css_classes(["pill"])
+                            .tooltip_text("Fill in a starter template")
+                            .halign(gtk::Align::Start)
+                            .build();
+                        content_box.append(&template_btn);
 
-                let text_view = gtk::TextView::builder()
-                    .wrap_mode(gtk::WrapMode::Word)
-                    .accepts_tab(false)
-                    .hexpand(true)
-                    .build();
-                text_view.buffer().set_text(&current);
+                        let text_view = gtk::TextView::builder()
+                            .wrap_mode(gtk::WrapMode::Word)
+                            .accepts_tab(false)
+                            .hexpand(true)
+                            .build();
+                        text_view.buffer().set_text(&current);
 
-                let tv_scroll = gtk::ScrolledWindow::builder()
-                    .hscrollbar_policy(gtk::PolicyType::Never)
-                    .min_content_height(120)
-                    .hexpand(true)
-                    .build();
-                tv_scroll.set_child(Some(&text_view));
+                        let tv_scroll = gtk::ScrolledWindow::builder()
+                            .hscrollbar_policy(gtk::PolicyType::Never)
+                            .min_content_height(120)
+                            .hexpand(true)
+                            .build();
+                        tv_scroll.set_child(Some(&text_view));
 
-                let tv_frame = gtk::Box::builder()
-                    .css_classes(["card"])
-                    .orientation(gtk::Orientation::Vertical)
-                    .build();
-                tv_frame.append(&tv_scroll);
-                content_box.append(&tv_frame);
+                        let tv_frame = gtk::Box::builder()
+                            .css_classes(["card"])
+                            .orientation(gtk::Orientation::Vertical)
+                            .build();
+                        tv_frame.append(&tv_scroll);
+                        content_box.append(&tv_frame);
 
-                {
-                    let tv = text_view.clone();
-                    template_btn.connect_clicked(move |_| {
-                        tv.buffer().set_text(
-                            "I am [AGE] years old [GENDER]. [DESCRIBE YOUR LIFESTYLE AND \
+                        {
+                            let tv = text_view.clone();
+                            template_btn.connect_clicked(move |_| {
+                                tv.buffer().set_text(
+                                    "I am [AGE] years old [GENDER]. [DESCRIBE YOUR LIFESTYLE AND \
                              TIME CONSTRAINTS].\nMy training goals are: [LIST YOUR GOALS].\n\
                              I prefer workouts that are [PREFERENCES — e.g. time-efficient, \
                              varied, low-impact].\nAdditional notes: [ANYTHING ELSE].",
-                        );
-                    });
-                }
-
-                let toolbar_view = adw::ToolbarView::new();
-                let header = adw::HeaderBar::new();
-
-                let cancel_btn = gtk::Button::builder()
-                    .label("Cancel")
-                    .tooltip_text("Discard changes")
-                    .build();
-                let save_btn = gtk::Button::builder()
-                    .label("Save")
-                    .css_classes(["suggested-action"])
-                    .tooltip_text("Save athlete profile")
-                    .build();
-                header.pack_start(&cancel_btn);
-                header.pack_end(&save_btn);
-                toolbar_view.add_top_bar(&header);
-                toolbar_view.set_content(Some(&content_box));
-
-                let dialog = adw::Dialog::builder()
-                    .title("Athlete Profile")
-                    .child(&toolbar_view)
-                    .content_width(560)
-                    .build();
-
-                let dialog_cancel = dialog.clone();
-                cancel_btn.connect_clicked(move |_| {
-                    dialog_cancel.close();
-                });
-
-                let pool_d = pool_p.clone();
-                let rt_d = rt_p.clone();
-                let reload_d = Rc::clone(&reload_p);
-                let toast_d = Rc::clone(&toast_p);
-                let dialog_save = dialog.clone();
-                save_btn.connect_clicked(move |_| {
-                    let buf = text_view.buffer();
-                    let text = buf
-                        .text(&buf.start_iter(), &buf.end_iter(), false)
-                        .to_string();
-                    let trimmed = text.trim().to_string();
-                    let pool = pool_d.clone();
-                    rt_d.spawn(async move {
-                        if let Err(e) =
-                            db::set_setting(&pool, "coaching.athlete_context", &trimmed).await
-                        {
-                            tracing::error!("save coaching.athlete_context failed: {e}");
+                                );
+                            });
                         }
-                    });
-                    toast_d(
-                        adw::Toast::builder()
-                            .title("Profile saved")
-                            .timeout(3)
-                            .build(),
-                    );
-                    if let Some(f) = reload_d.borrow().as_ref() {
-                        f();
-                    }
-                    dialog_save.close();
-                });
 
-                dialog.present(Some(btn));
+                        let toolbar_view = adw::ToolbarView::new();
+                        let header = adw::HeaderBar::new();
+
+                        let cancel_btn = gtk::Button::builder()
+                            .label("Cancel")
+                            .tooltip_text("Discard changes")
+                            .build();
+                        let save_btn = gtk::Button::builder()
+                            .label("Save")
+                            .css_classes(["suggested-action"])
+                            .tooltip_text("Save athlete profile")
+                            .build();
+                        header.pack_start(&cancel_btn);
+                        header.pack_end(&save_btn);
+                        toolbar_view.add_top_bar(&header);
+                        toolbar_view.set_content(Some(&content_box));
+
+                        let dialog = adw::Dialog::builder()
+                            .title("Athlete Profile")
+                            .child(&toolbar_view)
+                            .content_width(560)
+                            .build();
+
+                        let dialog_cancel = dialog.clone();
+                        cancel_btn.connect_clicked(move |_| {
+                            dialog_cancel.close();
+                        });
+
+                        let pool_d = pool_save.clone();
+                        let rt_d = rt_save.clone();
+                        let reload_d = Rc::clone(&reload_p);
+                        let toast_d = Rc::clone(&toast_p);
+                        let dialog_save = dialog.clone();
+                        save_btn.connect_clicked(move |_| {
+                            let buf = text_view.buffer();
+                            let text = buf
+                                .text(&buf.start_iter(), &buf.end_iter(), false)
+                                .to_string();
+                            let trimmed = text.trim().to_string();
+                            let pool = pool_d.clone();
+                            rt_d.spawn(async move {
+                                if let Err(e) =
+                                    db::set_setting(&pool, "coaching.athlete_context", &trimmed)
+                                        .await
+                                {
+                                    tracing::error!("save coaching.athlete_context failed: {e}");
+                                }
+                            });
+                            toast_d(
+                                adw::Toast::builder()
+                                    .title("Profile saved")
+                                    .timeout(3)
+                                    .build(),
+                            );
+                            if let Some(f) = reload_d.borrow().as_ref() {
+                                f();
+                            }
+                            dialog_save.close();
+                        });
+
+                        dialog.present(Some(&btn));
+                    },
+                );
             });
         }
 
@@ -963,87 +1001,10 @@ impl CoachingPage {
                     }
                 };
 
-                let athlete_ctx = rt_s
-                    .block_on(db::get_setting(&pool_s, "coaching.athlete_context"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let records = rt_s
-                    .block_on(db::load_session_records(&pool_s))
-                    .unwrap_or_default();
-                let intervals_pairs = rt_s
-                    .block_on(db::load_intervals_tss_pairs(&pool_s))
-                    .unwrap_or_default();
-                let icu_activities = rt_s
-                    .block_on(db::load_intervals_activities(&pool_s))
-                    .unwrap_or_default();
-                let goals = rt_s.block_on(db::load_goals(&pool_s)).unwrap_or_default();
-                let icu_workouts = rt_s
-                    .block_on(db::load_intervals_workouts(&pool_s))
-                    .unwrap_or_default();
-                let wellness_raw = rt_s
-                    .block_on(db::load_wellness_recent(&pool_s, 7))
-                    .unwrap_or_default();
+                // Read !Send shared state on the main thread before spawning.
                 let athlete = athlete_s.borrow().clone();
                 let ftp = athlete.ftp_watts;
-
-                let today = Local::now().date_naive();
-                let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today);
-                let tsb = ctl - atl;
-
-                let four_weeks_ago = today - CDuration::weeks(4);
-                let mut recent: Vec<RecentSession> = records
-                    .iter()
-                    .filter(|r| {
-                        r.session.started_at.with_timezone(&Local).date_naive() >= four_weeks_ago
-                    })
-                    .map(|r| build_recent_session(r, ftp))
-                    .collect();
-
-                for act in icu_activities.iter().filter(|a| a.date >= four_weeks_ago) {
-                    recent.push(icu_activity_to_recent_session(act));
-                }
-                recent.sort_by(|a, b| b.date.cmp(&a.date));
-                recent.truncate(10);
-
-                let workout_opts = workouts_as_options(&workouts_s, &icu_workouts);
-
-                let wellness: Vec<WellnessSnapshot> = wellness_raw
-                    .iter()
-                    .map(|w| WellnessSnapshot {
-                        date: w.date.format("%Y-%m-%d").to_string(),
-                        hrv: w.hrv,
-                        resting_hr: w.resting_hr,
-                        sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
-                        sleep_score: w.sleep_score,
-                        steps: w.steps,
-                        calories: w.calories,
-                    })
-                    .collect();
-
-                let two_weeks_out = today + CDuration::days(14);
-                let start_str = today.format("%Y-%m-%d").to_string();
-                let end_str = two_weeks_out.format("%Y-%m-%d").to_string();
-                let time_off_dates: Vec<String> = rt_s
-                    .block_on(db::load_time_off_between(&pool_s, &start_str, &end_str))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|e| e.date.format("%Y-%m-%d").to_string())
-                    .collect();
-
-                let ctx = TrainingContext {
-                    athlete,
-                    ctl,
-                    atl,
-                    tsb,
-                    recent_sessions: recent,
-                    goals,
-                    athlete_context: athlete_ctx,
-                    workout_options: workout_opts,
-                    wellness,
-                    time_off_dates,
-                };
-                let prompt = build_prompt(&ctx);
+                let workouts_owned: Vec<Workout> = (*workouts_s).clone();
 
                 btn.set_sensitive(false);
                 spinner_s.set_visible(true);
@@ -1053,10 +1014,96 @@ impl CoachingPage {
                 action_frame_s.set_visible(false);
                 *suggested_s.borrow_mut() = None;
 
-                let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+                let (tx, rx) = async_channel::bounded::<
+                    Result<(String, Vec<db::IntervalsWorkout>), String>,
+                >(1);
+                let pool_t = pool_s.clone();
+                // All DB reads + prompt assembly + the network call run off the main
+                // thread (CLAUDE.md §2.3). icu_workouts is returned to the result
+                // handler so it can still match an Intervals.icu recommendation.
                 rt_s.spawn(async move {
+                    let athlete_ctx = db::get_setting(&pool_t, "coaching.athlete_context")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let icu_activities = db::load_intervals_activities(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let goals = db::load_goals(&pool_t).await.unwrap_or_default();
+                    let icu_workouts = db::load_intervals_workouts(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let wellness_raw = db::load_wellness_recent(&pool_t, 7)
+                        .await
+                        .unwrap_or_default();
+
+                    let today = Local::now().date_naive();
+                    let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today);
+                    let tsb = ctl - atl;
+
+                    let four_weeks_ago = today - CDuration::weeks(4);
+                    let mut recent: Vec<RecentSession> = records
+                        .iter()
+                        .filter(|r| {
+                            r.session.started_at.with_timezone(&Local).date_naive()
+                                >= four_weeks_ago
+                        })
+                        .map(|r| build_recent_session(r, ftp))
+                        .collect();
+
+                    for act in icu_activities.iter().filter(|a| a.date >= four_weeks_ago) {
+                        recent.push(icu_activity_to_recent_session(act));
+                    }
+                    recent.sort_by(|a, b| b.date.cmp(&a.date));
+                    recent.truncate(10);
+
+                    let workout_opts = workouts_as_options(&workouts_owned, &icu_workouts);
+
+                    let wellness: Vec<WellnessSnapshot> = wellness_raw
+                        .iter()
+                        .map(|w| WellnessSnapshot {
+                            date: w.date.format("%Y-%m-%d").to_string(),
+                            hrv: w.hrv,
+                            resting_hr: w.resting_hr,
+                            sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
+                            sleep_score: w.sleep_score,
+                            steps: w.steps,
+                            calories: w.calories,
+                        })
+                        .collect();
+
+                    let two_weeks_out = today + CDuration::days(14);
+                    let start_str = today.format("%Y-%m-%d").to_string();
+                    let end_str = two_weeks_out.format("%Y-%m-%d").to_string();
+                    let time_off_dates: Vec<String> =
+                        db::load_time_off_between(&pool_t, &start_str, &end_str)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|e| e.date.format("%Y-%m-%d").to_string())
+                            .collect();
+
+                    let ctx = TrainingContext {
+                        athlete,
+                        ctl,
+                        atl,
+                        tsb,
+                        recent_sessions: recent,
+                        goals,
+                        athlete_context: athlete_ctx,
+                        workout_options: workout_opts,
+                        wellness,
+                        time_off_dates,
+                    };
+                    let prompt = build_prompt(&ctx);
+
                     let result = get_suggestion(&api_key, &prompt, 1024)
                         .await
+                        .map(|text| (text, icu_workouts))
                         .map_err(|e| e.to_string());
                     let _ = tx.send(result).await;
                 });
@@ -1071,14 +1118,13 @@ impl CoachingPage {
                 let detail_c = detail_s.clone();
                 let load_btn_c = load_btn_s.clone();
                 let sched_btn_c = sched_btn_s.clone();
-                let icu_workouts_c = icu_workouts;
                 let pool_cache = pool_s.clone();
                 let rt_cache = rt_s.clone();
 
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(result) = rx.recv().await {
                         match result {
-                            Ok(text) => {
+                            Ok((text, icu_workouts_c)) => {
                                 let recommended = extract_recommended_workout(&text);
                                 let display_raw = strip_recommended_line(&text);
                                 response_c.set_markup(&to_pango(&display_raw));
@@ -1335,41 +1381,10 @@ impl CoachingPage {
                     Some((months_row_b.value() as u32) * 4)
                 };
 
-                let athlete_ctx = rt_b
-                    .block_on(db::get_setting(&pool_b, "coaching.athlete_context"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let goals = rt_b.block_on(db::load_goals(&pool_b)).unwrap_or_default();
-                let records = rt_b
-                    .block_on(db::load_session_records(&pool_b))
-                    .unwrap_or_default();
-                let intervals_pairs = rt_b
-                    .block_on(db::load_intervals_tss_pairs(&pool_b))
-                    .unwrap_or_default();
-                let icu_workouts = rt_b
-                    .block_on(db::load_intervals_workouts(&pool_b))
-                    .unwrap_or_default();
+                // Read !Send shared state on the main thread before spawning.
                 let athlete = athlete_b.borrow().clone();
                 let ftp = athlete.ftp_watts;
-                let today = Local::now().date_naive();
-
-                let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today);
-                let tsb = ctl - atl;
-
-                let workout_opts = workouts_as_options(&workouts_b, &icu_workouts);
-
-                let ctx = ProgramContext {
-                    athlete,
-                    ctl,
-                    tsb,
-                    goals,
-                    athlete_context: athlete_ctx,
-                    workout_options: workout_opts,
-                    training_days,
-                    num_weeks,
-                };
-                let prompt = build_program_prompt(&ctx);
+                let workouts_owned: Vec<Workout> = (*workouts_b).clone();
 
                 btn.set_sensitive(false);
                 build_spinner_b.set_visible(true);
@@ -1379,10 +1394,48 @@ impl CoachingPage {
                 schedule_btn_b.set_visible(false);
                 *entries_b.borrow_mut() = Vec::new();
 
-                let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+                let (tx, rx) = async_channel::bounded::<
+                    Result<(String, Vec<db::IntervalsWorkout>), String>,
+                >(1);
+                let pool_t = pool_b.clone();
+                // All DB reads + prompt assembly + the network call run off the main
+                // thread (CLAUDE.md §2.3). icu_workouts is returned to the result
+                // handler so it can format the program with Intervals.icu workouts.
                 rt_b.spawn(async move {
+                    let athlete_ctx = db::get_setting(&pool_t, "coaching.athlete_context")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    let goals = db::load_goals(&pool_t).await.unwrap_or_default();
+                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let icu_workouts = db::load_intervals_workouts(&pool_t)
+                        .await
+                        .unwrap_or_default();
+
+                    let today = Local::now().date_naive();
+                    let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today);
+                    let tsb = ctl - atl;
+
+                    let workout_opts = workouts_as_options(&workouts_owned, &icu_workouts);
+
+                    let ctx = ProgramContext {
+                        athlete,
+                        ctl,
+                        tsb,
+                        goals,
+                        athlete_context: athlete_ctx,
+                        workout_options: workout_opts,
+                        training_days,
+                        num_weeks,
+                    };
+                    let prompt = build_program_prompt(&ctx);
+
                     let result = get_suggestion(&api_key, &prompt, 2048)
                         .await
+                        .map(|text| (text, icu_workouts))
                         .map_err(|e| e.to_string());
                     let _ = tx.send(result).await;
                 });
@@ -1394,12 +1447,11 @@ impl CoachingPage {
                 let sched_btn_c = schedule_btn_b.clone();
                 let entries_c = Rc::clone(&entries_b);
                 let workouts_c = Rc::clone(&workouts_b);
-                let icu_workouts_c = icu_workouts;
 
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(result) = rx.recv().await {
                         match result {
-                            Ok(text) => {
+                            Ok((text, icu_workouts_c)) => {
                                 let entries = parse_program_response(&text);
                                 if entries.is_empty() {
                                     label_c.set_text(
