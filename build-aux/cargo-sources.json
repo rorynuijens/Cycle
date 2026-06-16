@@ -2043,6 +2043,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/libusb1-sys/libusb1-sys-0.7.0.crate",
+        "sha256": "da050ade7ac4ff1ba5379af847a10a10a8e284181e060105bf8d86960ce9ce0f",
+        "dest": "cargo/vendor/libusb1-sys-0.7.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"da050ade7ac4ff1ba5379af847a10a10a8e284181e060105bf8d86960ce9ce0f\", \"files\": {}}",
+        "dest": "cargo/vendor/libusb1-sys-0.7.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/linux-raw-sys/linux-raw-sys-0.12.1.crate",
         "sha256": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
         "dest": "cargo/vendor/linux-raw-sys-0.12.1"
@@ -2922,6 +2935,19 @@
         "type": "inline",
         "contents": "{\"package\": \"b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d\", \"files\": {}}",
         "dest": "cargo/vendor/rsa-0.9.10",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/rusb/rusb-0.9.4.crate",
+        "sha256": "ab9f9ff05b63a786553a4c02943b74b34a988448671001e9a27e2f0565cc05a4",
+        "dest": "cargo/vendor/rusb-0.9.4"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"ab9f9ff05b63a786553a4c02943b74b34a988448671001e9a27e2f0565cc05a4\", \"files\": {}}",
+        "dest": "cargo/vendor/rusb-0.9.4",
         "dest-filename": ".cargo-checksum.json"
     },
     {
