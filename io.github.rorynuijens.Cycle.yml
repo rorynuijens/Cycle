@@ -11,8 +11,9 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --share=ipc
-  # GPU rendering (GTK4 requires this)
-  - --device=dri
+  # GPU rendering (GTK4 requires this), plus raw USB for the ANT+ stick (libusb).
+  # --device=all is required for raw USB access; it supersedes --device=dri.
+  - --device=all
   # BLE smart trainer (bluez D-Bus)
   - --system-talk-name=org.bluez
   # GNOME Secret Service — required for storing API keys in the keyring
