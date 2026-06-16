@@ -505,6 +505,18 @@ impl PlayerPage {
         self.kj_total.set_label("—");
     }
 
+    /// Invoke the pause/resume toggle programmatically.
+    ///
+    /// The pause/resume button toggles based on the engine state, so the caller is
+    /// responsible for only triggering this when a state change is wanted — e.g. the
+    /// header "Resume Workout" button calls it only when the engine is paused, so it
+    /// never accidentally pauses a running workout.
+    pub fn trigger_pause_toggle(&self) {
+        if let Some(cb) = self.pause_cb.borrow().as_ref() {
+            cb();
+        }
+    }
+
     /// Start the 1 Hz GLib timer, wire the playback controls, and call `on_complete`
     /// (exactly once) when the workout finishes.
     ///

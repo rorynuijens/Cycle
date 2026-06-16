@@ -19,7 +19,7 @@ use crate::data::{
     workout::Workout,
 };
 use crate::devices::manager::{DeviceCommand, DeviceEvent};
-use crate::training::engine::WorkoutEngine;
+use crate::training::engine::{EngineState, WorkoutEngine};
 
 pub struct CycleGtkWindow {
     pub window: adw::ApplicationWindow,
@@ -681,11 +681,18 @@ impl CycleGtkWindow {
         });
 
         // Navigate to the active player when a workout is running; otherwise start one.
+        // If the workout is paused, this also resumes it — the button reads "Resume
+        // Workout" and users expect it to do exactly that.
         let workout_active_btn = Rc::clone(&workout_active);
         let stack_for_btn = stack.clone();
         let do_start_header = Rc::clone(&do_start);
+        let engine_for_btn = Rc::clone(&engine_rc);
+        let player_for_btn = Rc::clone(&player_rc);
         start_btn.connect_clicked(move |_| {
             if workout_active_btn.get() {
+                if engine_for_btn.borrow().state == EngineState::Paused {
+                    player_for_btn.borrow().trigger_pause_toggle();
+                }
                 stack_for_btn.set_visible_child_name("player");
             } else {
                 do_start_header();
