@@ -1,0 +1,11 @@
+# Grant the logged-in desktop user access to Garmin/Dynastream ANT USB sticks,
+# so Cycle can open them via libusb without root.
+#
+# Install:
+#   sudo cp data/udev/99-ant-usb.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then replug the ANT stick.
+#
+# 0fcf:1008 = ANTUSB2, 0fcf:1009 = ANTUSB-m
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1008", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1009", TAG+="uaccess"
