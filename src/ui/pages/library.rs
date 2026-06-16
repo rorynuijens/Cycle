@@ -911,8 +911,10 @@ fn show_workout_detail(
     let diff_row = adw::ActionRow::builder()
         .title("Difficulty")
         .subtitle(
+            // AdwActionRow subtitles parse Pango markup, so the literal "<" must be
+            // escaped or GTK treats "< 88%" as the start of an element.
             "Based on peak power as % of FTP — \
-             Easy < 88% · Moderate 88–110% · Hard 110–130% · Very Hard ≥ 130%",
+             Easy &lt; 88% · Moderate 88–110% · Hard 110–130% · Very Hard ≥ 130%",
         )
         .build();
     diff_row.add_suffix(

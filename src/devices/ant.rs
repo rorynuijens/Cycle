@@ -47,17 +47,28 @@ const MSG_ACKNOWLEDGED_DATA: u8 = 0x4F;
 const ANT_PLUS_NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
 
 const NETWORK_NUMBER: u8 = 0x00;
-const CHANNEL: u8 = 0x00;
 /// Bidirectional slave (receive) — lets us read broadcasts and send acknowledged control.
 const CHANNEL_TYPE_SLAVE: u8 = 0x00;
+const RF_FREQUENCY: u8 = 0x39; // 57 → 2457 MHz (ANT+)
+
+/// Channel 0 — FE-C (Fitness Equipment Control): live data + ERG control.
+const FEC_CHANNEL: u8 = 0x00;
 const FEC_DEVICE_TYPE: u8 = 0x11; // 17 = Fitness Equipment Control
-const FEC_RF_FREQUENCY: u8 = 0x39; // 57 → 2457 MHz
 const FEC_CHANNEL_PERIOD: u16 = 8192; // 4 Hz (32768 / 8192)
+
+/// Channel 1 — Bike Power: some trainers (e.g. Elite Drivo) only report cadence here,
+/// not in the FE-C trainer page, so we open a second channel just to capture it.
+const POWER_CHANNEL: u8 = 0x01;
+const POWER_DEVICE_TYPE: u8 = 0x0B; // 11 = Bike Power
+const POWER_CHANNEL_PERIOD: u16 = 8182; // ANT+ Bike Power period
 
 // FE-C data page numbers
 const PAGE_GENERAL_FE: u8 = 0x10; // 16
 const PAGE_SPECIFIC_TRAINER: u8 = 0x19; // 25
 const PAGE_TARGET_POWER: u8 = 0x31; // 49
+
+// Bike Power data page numbers
+const PAGE_POWER_ONLY: u8 = 0x10; // 16 = Standard Power-Only
 
 /// Commands sent from the device manager to the ANT thread.
 #[derive(Debug)]
@@ -143,6 +154,20 @@ fn parse_general_fe(payload: &[u8]) -> Option<LiveReadings> {
         heart_rate_bpm,
         ..Default::default()
     })
+}
+
+/// Parse cadence from an ANT+ Bike Power "Standard Power-Only" page (0x10).
+///
+/// Byte 3 is instantaneous cadence (0xFF invalid). Returns `None` for the wrong
+/// page, a short payload, or an invalid cadence.
+fn parse_bike_power_cadence(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 8 || payload[0] != PAGE_POWER_ONLY {
+        return None;
+    }
+    match payload[3] {
+        0xFF => None,
+        rpm => Some(rpm as u32),
+    }
 }
 
 // ── USB thread ───────────────────────────────────────────────────────────────
@@ -240,55 +265,53 @@ impl AntStick {
         }
     }
 
-    /// Bring up the ANT+ FE-C slave channel paired to any nearby trainer (wildcard).
-    fn open_fec_channel(&self) {
-        self.write(&encode_message(MSG_RESET_SYSTEM, &[0x00]));
-        std::thread::sleep(Duration::from_millis(600));
-        self.write(&encode_message(
-            MSG_SET_NETWORK_KEY,
-            &[
-                NETWORK_NUMBER,
-                ANT_PLUS_NETWORK_KEY[0],
-                ANT_PLUS_NETWORK_KEY[1],
-                ANT_PLUS_NETWORK_KEY[2],
-                ANT_PLUS_NETWORK_KEY[3],
-                ANT_PLUS_NETWORK_KEY[4],
-                ANT_PLUS_NETWORK_KEY[5],
-                ANT_PLUS_NETWORK_KEY[6],
-                ANT_PLUS_NETWORK_KEY[7],
-            ],
-        ));
+    /// Configure and open one ANT+ slave channel, paired by wildcard to any device
+    /// of `device_type`.
+    fn open_channel(&self, channel: u8, device_type: u8, period: u16) {
         self.write(&encode_message(
             MSG_ASSIGN_CHANNEL,
-            &[CHANNEL, CHANNEL_TYPE_SLAVE, NETWORK_NUMBER],
+            &[channel, CHANNEL_TYPE_SLAVE, NETWORK_NUMBER],
         ));
-        // Device number 0,0 = wildcard (pair with any FE-C trainer).
+        // Device number 0,0 = wildcard.
         self.write(&encode_message(
             MSG_SET_CHANNEL_ID,
-            &[CHANNEL, 0x00, 0x00, FEC_DEVICE_TYPE, 0x00],
+            &[channel, 0x00, 0x00, device_type, 0x00],
         ));
         self.write(&encode_message(
             MSG_SET_CHANNEL_RF_FREQ,
-            &[CHANNEL, FEC_RF_FREQUENCY],
+            &[channel, RF_FREQUENCY],
         ));
-        let [plsb, pmsb] = FEC_CHANNEL_PERIOD.to_le_bytes();
+        let [plsb, pmsb] = period.to_le_bytes();
         self.write(&encode_message(
             MSG_SET_CHANNEL_PERIOD,
-            &[CHANNEL, plsb, pmsb],
+            &[channel, plsb, pmsb],
         ));
-        self.write(&encode_message(MSG_OPEN_CHANNEL, &[CHANNEL]));
-        tracing::info!("ANT FE-C channel opened (searching)");
+        self.write(&encode_message(MSG_OPEN_CHANNEL, &[channel]));
     }
 
-    fn close_channel(&self) {
-        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[CHANNEL]));
+    /// Reset the stick and bring up both the FE-C control channel and the Bike Power
+    /// channel (the latter only to recover cadence on trainers that omit it from FE-C).
+    fn open_channels(&self) {
+        self.write(&encode_message(MSG_RESET_SYSTEM, &[0x00]));
+        std::thread::sleep(Duration::from_millis(600));
+        let mut key = vec![NETWORK_NUMBER];
+        key.extend_from_slice(&ANT_PLUS_NETWORK_KEY);
+        self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
+        self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
+        self.open_channel(POWER_CHANNEL, POWER_DEVICE_TYPE, POWER_CHANNEL_PERIOD);
+        tracing::info!("ANT channels opened (FE-C + Bike Power, searching)");
+    }
+
+    fn close_channels(&self) {
+        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[FEC_CHANNEL]));
+        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[POWER_CHANNEL]));
     }
 
     fn send_target_power(&self, watts: u16) {
         let clamped = watts.min(1000); // never send an unclamped ERG target — CLAUDE.md §5.1
         let page = build_target_power_page(clamped);
         let mut data = Vec::with_capacity(9);
-        data.push(CHANNEL);
+        data.push(FEC_CHANNEL);
         data.extend_from_slice(&page);
         self.write(&encode_message(MSG_ACKNOWLEDGED_DATA, &data));
         tracing::debug!("ANT ERG target: {clamped}W");
@@ -321,7 +344,11 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut stick: Option<AntStick> = None;
     let mut discovered = false;
     let mut connected = false;
+    let mut channel_open = false;
     let mut erg_enabled = true;
+    // Set once the Bike Power channel supplies cadence; thereafter FE-C cadence is
+    // ignored (some trainers report a bogus 0 there).
+    let mut got_ant_cadence = false;
     let mut buf = [0u8; 512];
 
     loop {
@@ -335,13 +362,23 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     match &stick {
                         Some(s) => {
                             discovered = false;
-                            s.open_fec_channel();
+                            s.open_channels();
+                            channel_open = true;
                         }
                         None => tracing::warn!("ANT scan requested but no stick available"),
                     }
                 }
                 Ok(AntCommand::Connect) => {
-                    if stick.is_some() {
+                    if stick.is_none() {
+                        stick = AntStick::open();
+                    }
+                    if let Some(s) = &stick {
+                        // The user may connect a saved ANT device without scanning first,
+                        // so make sure the FE-C channel is up before going live.
+                        if !channel_open {
+                            s.open_channels();
+                            channel_open = true;
+                        }
                         connected = true;
                         let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
                             address: ANT_FEC_ADDRESS.to_string(),
@@ -349,11 +386,13 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                             device_type: Some(DeviceType::FtmsTrainer),
                         });
                         tracing::info!("ANT FE-C trainer connected");
+                    } else {
+                        tracing::warn!("ANT connect requested but no stick available");
                     }
                 }
                 Ok(AntCommand::Disconnect) => {
                     if let Some(s) = &stick {
-                        s.close_channel();
+                        s.close_channels();
                     }
                     connected = false;
                     discovered = false;
@@ -376,7 +415,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                 }
                 Ok(AntCommand::Shutdown) => {
                     if let Some(s) = &stick {
-                        s.close_channel();
+                        s.close_channels();
                     }
                     tracing::info!("ANT thread stopping");
                     return;
@@ -402,10 +441,31 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             if msg_id != MSG_BROADCAST_DATA || data.len() < 9 {
                 return;
             }
-            // data[0] = channel, data[1..9] = 8-byte FE-C page.
+            // data[0] = channel number, data[1..9] = 8-byte ANT+ page.
+            let channel = data[0];
             let payload = &data[1..9];
+            tracing::debug!(
+                "ANT ch{channel} page 0x{:02x}: {:02x?}",
+                payload[0],
+                payload
+            );
 
-            // First valid trainer broadcast surfaces the device in the Devices page.
+            // Bike Power channel — used only to recover cadence on trainers that
+            // omit it from the FE-C trainer page.
+            if channel == POWER_CHANNEL {
+                if connected {
+                    if let Some(rpm) = parse_bike_power_cadence(payload) {
+                        got_ant_cadence = true;
+                        let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
+                            cadence_rpm: Some(rpm),
+                            ..Default::default()
+                        }));
+                    }
+                }
+                return;
+            }
+
+            // FE-C channel: discovery + power / speed / HR.
             if !discovered {
                 discovered = true;
                 let _ = event_tx.send_blocking(DeviceEvent::PeripheralDiscovered {
@@ -419,9 +479,13 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             if !connected {
                 return;
             }
-            if let Some(readings) =
+            if let Some(mut readings) =
                 parse_specific_trainer(payload).or_else(|| parse_general_fe(payload))
             {
+                // Once cadence arrives on the Bike Power channel, defer to it.
+                if got_ant_cadence {
+                    readings.cadence_rpm = None;
+                }
                 let _ = event_tx.send_blocking(DeviceEvent::Readings(readings));
             }
         });
@@ -482,6 +546,21 @@ mod tests {
     fn should_reject_wrong_page_for_specific_trainer() {
         assert!(parse_specific_trainer(&[0x10, 0, 0, 0, 0, 0, 0, 0]).is_none());
         assert!(parse_specific_trainer(&[0x19, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn should_parse_cadence_from_bike_power_page() {
+        // Power-only page 0x10, byte 3 = cadence 85
+        let payload = [0x10, 0x20, 0xff, 0x55, 0x00, 0x00, 0x45, 0x00];
+        assert_eq!(parse_bike_power_cadence(&payload), Some(85));
+    }
+
+    #[test]
+    fn should_treat_invalid_bike_power_cadence_as_none() {
+        let payload = [0x10, 0x20, 0xff, 0xff, 0x00, 0x00, 0x45, 0x00];
+        assert_eq!(parse_bike_power_cadence(&payload), None);
+        // wrong page
+        assert!(parse_bike_power_cadence(&[0x11, 0, 0, 0x55, 0, 0, 0, 0]).is_none());
     }
 
     #[test]

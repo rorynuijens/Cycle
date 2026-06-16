@@ -7,5 +7,7 @@
 # Then replug the ANT stick.
 #
 # 0fcf:1008 = ANTUSB2, 0fcf:1009 = ANTUSB-m
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1008", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1009", TAG+="uaccess"
+# TAG+="uaccess" grants the active-seat user access via logind ACLs; MODE="0666"
+# is a logind-independent fallback so access works even from a toolbox container.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1008", TAG+="uaccess", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1009", TAG+="uaccess", MODE="0666"
