@@ -842,6 +842,11 @@ impl CycleGtkWindow {
                     DeviceEvent::Error(e) => {
                         tracing::error!("Device error: {e}");
                     }
+                    DeviceEvent::Warning(msg) => {
+                        tracing::warn!("Device warning: {msg}");
+                        toast_overlay_for_loop
+                            .add_toast(adw::Toast::builder().title(msg).timeout(5).build());
+                    }
                 }
             }
             glib::ControlFlow::Continue

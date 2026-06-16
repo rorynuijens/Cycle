@@ -64,6 +64,8 @@ pub enum DeviceEvent {
     },
     Readings(LiveReadings),
     Error(String),
+    /// Non-fatal issue worth surfacing to the user (e.g. a trainer with no ERG control).
+    Warning(String),
 }
 
 /// Runs in a background tokio task.
@@ -240,6 +242,9 @@ impl DeviceManager {
                                     tracing::warn!(
                                         "Trainer {address} exposes no Control Point — ERG mode will not work"
                                     );
+                                    let _ = self.event_tx.send(DeviceEvent::Warning(
+                                        "Trainer connected without ERG control — resistance can't be set automatically".to_string(),
+                                    )).await;
                                 }
                                 // Subscribe to whatever data the trainer offers. Prefer Indoor
                                 // Bike Data; fall back to the Cycling Power Service for trainers
