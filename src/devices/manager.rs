@@ -124,16 +124,30 @@ impl DeviceManager {
         // Default true; overridden by SetErgMode commands from the UI.
         let mut erg_enabled = true;
 
+        // ── ANT+ trainer support ──────────────────────────────────────────────
+        // The ANT stick is driven by blocking libusb I/O, so it lives on its own
+        // std::thread and communicates over channels — readings/connection events
+        // come back on event_tx (shared with BLE), commands go out on ant_tx.
+        let (ant_tx, ant_rx) = std::sync::mpsc::channel::<crate::devices::ant::AntCommand>();
+        let ant_event_tx = self.event_tx.clone();
+        std::thread::spawn(move || crate::devices::ant::run(ant_event_tx, ant_rx));
+        // Tracks whether an ANT trainer is the active ERG target, so the BLE path
+        // doesn't log a spurious "no trainer connected" warning every second.
+        let mut ant_connected = false;
+
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
                     let Ok(cmd) = cmd else {
                         tracing::info!("Device manager stopping");
+                        let _ = ant_tx.send(crate::devices::ant::AntCommand::Shutdown);
                         break;
                     };
 
                     match cmd {
                         DeviceCommand::StartScan => {
+                            // Scan ANT+ alongside BLE (works even without a BLE adapter).
+                            let _ = ant_tx.send(crate::devices::ant::AntCommand::Scan);
                             let Some(ref adapter) = adapter else {
                                 tracing::warn!("StartScan: no BLE adapter available");
                                 continue;
@@ -170,6 +184,12 @@ impl DeviceManager {
                         }
 
                         DeviceCommand::Connect { address } => {
+                            // ANT+ devices are handled by the ANT thread, not btleplug.
+                            if address.starts_with("ant:") {
+                                let _ = ant_tx.send(crate::devices::ant::AntCommand::Connect);
+                                ant_connected = true;
+                                continue;
+                            }
                             // BlueZ removes Connect() from the D-Bus interface while a
                             // scan is active — stop scanning before attempting to connect.
                             if let Some(ref adapter) = adapter {
@@ -438,6 +458,11 @@ impl DeviceManager {
                         }
 
                         DeviceCommand::Disconnect { address } => {
+                            if address.starts_with("ant:") {
+                                let _ = ant_tx.send(crate::devices::ant::AntCommand::Disconnect);
+                                ant_connected = false;
+                                continue;
+                            }
                             if trainer_address.as_deref() == Some(address.as_str()) {
                                 if let Some(ref p) = trainer {
                                     p.disconnect().await.ok();
@@ -469,6 +494,11 @@ impl DeviceManager {
                         }
 
                         DeviceCommand::SetTargetPower { watts } => {
+                            // Forward to the ANT trainer (it applies the target only when
+                            // connected and ERG is enabled).
+                            let _ = ant_tx.send(
+                                crate::devices::ant::AntCommand::SetTargetPower(watts),
+                            );
                             if erg_enabled {
                                 if let (Some(ref p), Some(ref ch)) = (&trainer, &ctrl_char) {
                                     tracing::debug!("ERG target: {watts}W");
@@ -478,7 +508,7 @@ impl DeviceManager {
                                     {
                                         tracing::warn!("ERG write failed: {e}");
                                     }
-                                } else {
+                                } else if !ant_connected {
                                     tracing::warn!(
                                         "ERG target {watts}W dropped — no trainer/control point connected"
                                     );
@@ -488,6 +518,8 @@ impl DeviceManager {
 
                         DeviceCommand::SetErgMode(enabled) => {
                             erg_enabled = enabled;
+                            let _ = ant_tx
+                                .send(crate::devices::ant::AntCommand::SetErgMode(enabled));
                             tracing::info!("ERG mode: {}", if enabled { "on" } else { "off" });
                         }
                     }
