@@ -18,6 +18,7 @@ use std::time::Duration;
 use async_channel::Sender;
 
 use crate::data::session::LiveReadings;
+use crate::devices::ftms::compute_cadence_rpm;
 use crate::devices::manager::{DeviceEvent, DeviceType};
 use crate::devices::peripheral::Transport;
 
@@ -56,19 +57,17 @@ const FEC_CHANNEL: u8 = 0x00;
 const FEC_DEVICE_TYPE: u8 = 0x11; // 17 = Fitness Equipment Control
 const FEC_CHANNEL_PERIOD: u16 = 8192; // 4 Hz (32768 / 8192)
 
-/// Channel 1 — Bike Power: some trainers (e.g. Elite Drivo) only report cadence here,
-/// not in the FE-C trainer page, so we open a second channel just to capture it.
-const POWER_CHANNEL: u8 = 0x01;
-const POWER_DEVICE_TYPE: u8 = 0x0B; // 11 = Bike Power
-const POWER_CHANNEL_PERIOD: u16 = 8182; // ANT+ Bike Power period
+/// Channel 1 — Bike Speed & Cadence: some trainers (e.g. Elite Drivo) report a bogus
+/// cadence of 0 in both the FE-C and Bike Power pages, so we open this dedicated
+/// channel and derive cadence from its crank-revolution counter instead.
+const CADENCE_CHANNEL: u8 = 0x01;
+const SC_DEVICE_TYPE: u8 = 0x79; // 121 = Bike Speed and Cadence (combined)
+const SC_CHANNEL_PERIOD: u16 = 8086; // ANT+ combined Speed & Cadence period
 
 // FE-C data page numbers
 const PAGE_GENERAL_FE: u8 = 0x10; // 16
 const PAGE_SPECIFIC_TRAINER: u8 = 0x19; // 25
 const PAGE_TARGET_POWER: u8 = 0x31; // 49
-
-// Bike Power data page numbers
-const PAGE_POWER_ONLY: u8 = 0x10; // 16 = Standard Power-Only
 
 /// Commands sent from the device manager to the ANT thread.
 #[derive(Debug)]
@@ -156,18 +155,17 @@ fn parse_general_fe(payload: &[u8]) -> Option<LiveReadings> {
     })
 }
 
-/// Parse cadence from an ANT+ Bike Power "Standard Power-Only" page (0x10).
-///
-/// Byte 3 is instantaneous cadence (0xFF invalid). Returns `None` for the wrong
-/// page, a short payload, or an invalid cadence.
-fn parse_bike_power_cadence(payload: &[u8]) -> Option<u32> {
-    if payload.len() < 8 || payload[0] != PAGE_POWER_ONLY {
+/// Extract `(cumulative cadence revolutions, cadence event time)` from a combined
+/// ANT+ Bike Speed & Cadence page (device type 121). Cadence is bytes 0–3:
+/// event time (1/1024 s) then revolution count, both little-endian. Cadence rpm is
+/// derived from successive samples via [`compute_cadence_rpm`].
+fn parse_speed_cadence(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() < 8 {
         return None;
     }
-    match payload[3] {
-        0xFF => None,
-        rpm => Some(rpm as u32),
-    }
+    let event_time = u16::from_le_bytes([payload[0], payload[1]]);
+    let revolutions = u16::from_le_bytes([payload[2], payload[3]]);
+    Some((revolutions, event_time))
 }
 
 // ── USB thread ───────────────────────────────────────────────────────────────
@@ -298,13 +296,13 @@ impl AntStick {
         key.extend_from_slice(&ANT_PLUS_NETWORK_KEY);
         self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
         self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
-        self.open_channel(POWER_CHANNEL, POWER_DEVICE_TYPE, POWER_CHANNEL_PERIOD);
-        tracing::info!("ANT channels opened (FE-C + Bike Power, searching)");
+        self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
+        tracing::info!("ANT channels opened (FE-C + Speed/Cadence, searching)");
     }
 
     fn close_channels(&self) {
         self.write(&encode_message(MSG_CLOSE_CHANNEL, &[FEC_CHANNEL]));
-        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[POWER_CHANNEL]));
+        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[CADENCE_CHANNEL]));
     }
 
     fn send_target_power(&self, watts: u16) {
@@ -346,9 +344,11 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut connected = false;
     let mut channel_open = false;
     let mut erg_enabled = true;
-    // Set once the Bike Power channel supplies cadence; thereafter FE-C cadence is
-    // ignored (some trainers report a bogus 0 there).
+    // Set once the Speed & Cadence channel supplies cadence; thereafter FE-C cadence
+    // is ignored (some trainers report a bogus 0 there).
     let mut got_ant_cadence = false;
+    // Previous (revolutions, event_time) sample from the cadence channel.
+    let mut last_cadence_sample: Option<(u16, u16)> = None;
     let mut buf = [0u8; 512];
 
     loop {
@@ -450,16 +450,24 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                 payload
             );
 
-            // Bike Power channel — used only to recover cadence on trainers that
-            // omit it from the FE-C trainer page.
-            if channel == POWER_CHANNEL {
+            // Speed & Cadence channel — used to recover cadence on trainers that
+            // omit it from the FE-C trainer page. Cadence is derived from the change
+            // in crank revolutions between samples.
+            if channel == CADENCE_CHANNEL {
                 if connected {
-                    if let Some(rpm) = parse_bike_power_cadence(payload) {
-                        got_ant_cadence = true;
-                        let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
-                            cadence_rpm: Some(rpm),
-                            ..Default::default()
-                        }));
+                    if let Some((revs, time)) = parse_speed_cadence(payload) {
+                        if let Some((prev_revs, prev_time)) = last_cadence_sample {
+                            if let Some(rpm) = compute_cadence_rpm(prev_revs, prev_time, revs, time)
+                            {
+                                got_ant_cadence = true;
+                                let _ =
+                                    event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
+                                        cadence_rpm: Some(rpm),
+                                        ..Default::default()
+                                    }));
+                            }
+                        }
+                        last_cadence_sample = Some((revs, time));
                     }
                 }
                 return;
@@ -549,18 +557,18 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_cadence_from_bike_power_page() {
-        // Power-only page 0x10, byte 3 = cadence 85
-        let payload = [0x10, 0x20, 0xff, 0x55, 0x00, 0x00, 0x45, 0x00];
-        assert_eq!(parse_bike_power_cadence(&payload), Some(85));
+    fn should_extract_revs_and_time_from_speed_cadence_page() {
+        // cadence event time 0x0400 (LE), cadence revs 0x0064 (LE) = 100
+        let payload = [0x00, 0x04, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_speed_cadence(&payload), Some((100, 0x0400)));
     }
 
     #[test]
-    fn should_treat_invalid_bike_power_cadence_as_none() {
-        let payload = [0x10, 0x20, 0xff, 0xff, 0x00, 0x00, 0x45, 0x00];
-        assert_eq!(parse_bike_power_cadence(&payload), None);
-        // wrong page
-        assert!(parse_bike_power_cadence(&[0x11, 0, 0, 0x55, 0, 0, 0, 0]).is_none());
+    fn should_derive_60_rpm_from_one_rev_per_second() {
+        // 1 revolution in 1024 ticks (1 s) → 60 rpm, via compute_cadence_rpm
+        let (r0, t0) = parse_speed_cadence(&[0x00, 0x00, 0x63, 0x00, 0, 0, 0, 0]).unwrap();
+        let (r1, t1) = parse_speed_cadence(&[0x00, 0x04, 0x64, 0x00, 0, 0, 0, 0]).unwrap();
+        assert_eq!(compute_cadence_rpm(r0, t0, r1, t1), Some(60));
     }
 
     #[test]
