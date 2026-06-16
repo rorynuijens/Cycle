@@ -194,6 +194,14 @@ impl DeviceManager {
                             }
 
                             let chars = peripheral.characteristics();
+                            // Diagnostic: list every characteristic the device exposes so we
+                            // can see why a trainer may not bind to the FTMS branch.
+                            for c in &chars {
+                                tracing::debug!(
+                                    "  char {} (service {})",
+                                    c.uuid, c.service_uuid
+                                );
+                            }
                             let data_char = chars.iter()
                                 .find(|c| c.uuid.to_string() == INDOOR_BIKE_DATA_UUID)
                                 .cloned();
@@ -203,11 +211,19 @@ impl DeviceManager {
                             let hr_char = chars.iter()
                                 .find(|c| c.uuid.to_string() == HR_MEASUREMENT_UUID)
                                 .cloned();
+                            let power_char = chars.iter()
+                                .find(|c| c.uuid.to_string() == CYCLING_POWER_MEASUREMENT_UUID)
+                                .cloned();
 
                             let mut connected_as = DeviceType::Unknown;
 
-                            if let Some(data_ch) = data_char {
-                                // ── FTMS trainer (may also carry an integrated HR sensor) ──
+                            // A device is treated as a controllable trainer when it exposes the
+                            // FTMS Control Point or Indoor Bike Data. Some trainers report their
+                            // live data via the Cycling Power Service while staying controllable
+                            // through the FTMS Control Point, so control-point detection — not the
+                            // data characteristic — decides whether ERG is available.
+                            if found_ctrl.is_some() || data_char.is_some() {
+                                // ── FTMS trainer (may also carry HR / cycling-power data) ──
                                 if let Some(ref ch) = found_ctrl {
                                     // FTMS control sequence: take control, then move the
                                     // machine into the Started state so it honours ERG
@@ -222,11 +238,20 @@ impl DeviceManager {
                                         .ok();
                                 } else {
                                     tracing::warn!(
-                                        "FTMS trainer {address} exposes no Control Point — ERG mode will not work"
+                                        "Trainer {address} exposes no Control Point — ERG mode will not work"
                                     );
                                 }
-                                if let Err(e) = peripheral.subscribe(&data_ch).await {
-                                    tracing::error!("subscribe(indoor_bike_data) failed: {e}");
+                                // Subscribe to whatever data the trainer offers. Prefer Indoor
+                                // Bike Data; fall back to the Cycling Power Service for trainers
+                                // that only report there.
+                                if let Some(ref ch) = data_char {
+                                    if let Err(e) = peripheral.subscribe(ch).await {
+                                        tracing::error!("subscribe(indoor_bike_data) failed: {e}");
+                                    }
+                                } else if let Some(ref ch) = power_char {
+                                    if let Err(e) = peripheral.subscribe(ch).await {
+                                        tracing::error!("subscribe(cycling_power) failed: {e}");
+                                    }
                                 }
                                 // Also subscribe to HR if the trainer exposes it directly.
                                 if let Some(ref ch) = hr_char {
@@ -236,6 +261,8 @@ impl DeviceManager {
                                 let p = peripheral.clone();
                                 let event_tx = self.event_tx.clone();
                                 tokio::spawn(async move {
+                                    let mut last_revs: Option<u16> = None;
+                                    let mut last_time: Option<u16> = None;
                                     match p.notifications().await {
                                         Ok(mut stream) => {
                                             while let Some(n) = stream.next().await {
@@ -248,6 +275,25 @@ impl DeviceManager {
                                                             cadence_rpm:             data.cadence_rpm,
                                                             speed_kmh:               data.speed_kmh,
                                                             resistance_target_watts: None,
+                                                        };
+                                                        if event_tx.send(DeviceEvent::Readings(readings)).await.is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                } else if uuid == CYCLING_POWER_MEASUREMENT_UUID {
+                                                    if let Some(cpp) = parse_cycling_power_measurement(&n.value) {
+                                                        let cadence = match (last_revs, last_time, cpp.crank_revs, cpp.crank_event_time) {
+                                                            (Some(pr), Some(pt), Some(cr), Some(ct)) => {
+                                                                compute_cadence_rpm(pr, pt, cr, ct)
+                                                            }
+                                                            _ => None,
+                                                        };
+                                                        last_revs = cpp.crank_revs;
+                                                        last_time = cpp.crank_event_time;
+                                                        let readings = LiveReadings {
+                                                            power_watts: Some(cpp.power_watts.clamp(0, 3000) as u32),
+                                                            cadence_rpm: cadence,
+                                                            ..Default::default()
                                                         };
                                                         if event_tx.send(DeviceEvent::Readings(readings)).await.is_err() {
                                                             break;
@@ -276,11 +322,7 @@ impl DeviceManager {
                                 connected_as = DeviceType::FtmsTrainer;
                                 tracing::info!("FTMS trainer connected: {address}");
 
-                            } else if let Some(power_ch) = chars
-                                .iter()
-                                .find(|c| c.uuid.to_string() == CYCLING_POWER_MEASUREMENT_UUID)
-                                .cloned()
-                            {
+                            } else if let Some(power_ch) = power_char {
                                 // ── Cycling Power Service (standalone power meter) ────────
                                 if let Err(e) = peripheral.subscribe(&power_ch).await {
                                     tracing::error!("subscribe(cycling_power) failed: {e}");
