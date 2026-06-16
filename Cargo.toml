@@ -29,6 +29,10 @@ tokio = { version = "1", features = ["full"] }
 # --- Bluetooth BLE ---
 btleplug = "0.11"
 
+# --- ANT+ (USB stick, FE-C trainer control) ---
+# vendored: build the bundled libusb from source (toolbox has no system libusb-1.0-devel)
+rusb = { version = "0.9", features = ["vendored"] }
+
 # --- Database ---
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
 
