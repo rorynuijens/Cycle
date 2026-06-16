@@ -179,6 +179,15 @@ pub fn reset_command() -> Vec<u8> {
     vec![0x01]
 }
 
+/// OpCode 0x07 — Start or Resume.
+///
+/// Many FTMS trainers (e.g. Elite) sit in the *Idle* state after Request Control
+/// and silently ignore Set Target Power (0x05) until they have been moved into the
+/// *Started* state. This command performs that transition so ERG targets take effect.
+pub fn start_resume_command() -> Vec<u8> {
+    vec![0x07]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +270,23 @@ mod tests {
     fn should_handle_crank_counter_wraparound() {
         // Counter wraps from 65535 to 1 = 2 revolutions
         assert_eq!(compute_cadence_rpm(65535, 0, 1, 2048), Some(60));
+    }
+
+    // ── Control Point commands ───────────────────────────────────────────────
+
+    #[test]
+    fn should_build_request_control_command() {
+        assert_eq!(request_control_command(), vec![0x00]);
+    }
+
+    #[test]
+    fn should_build_start_resume_command() {
+        assert_eq!(start_resume_command(), vec![0x07]);
+    }
+
+    #[test]
+    fn should_build_correct_set_target_power_command() {
+        // 300 = 0x012C, little-endian
+        assert_eq!(set_target_power_command(300), vec![0x05, 0x2C, 0x01]);
     }
 }

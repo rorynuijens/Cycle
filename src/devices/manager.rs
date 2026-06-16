@@ -12,9 +12,10 @@ use futures::StreamExt;
 use crate::data::session::LiveReadings;
 use crate::devices::ftms::{
     compute_cadence_rpm, parse_cycling_power_measurement, parse_hr_measurement,
-    parse_indoor_bike_data, request_control_command, set_target_power_command, CONTROL_POINT_UUID,
-    CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID, CYCLING_POWER_SERVICE_UUID,
-    FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID, INDOOR_BIKE_DATA_UUID,
+    parse_indoor_bike_data, request_control_command, set_target_power_command,
+    start_resume_command, CONTROL_POINT_UUID, CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID,
+    CYCLING_POWER_SERVICE_UUID, FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID,
+    INDOOR_BIKE_DATA_UUID,
 };
 use crate::devices::peripheral::Transport;
 
@@ -208,10 +209,21 @@ impl DeviceManager {
                             if let Some(data_ch) = data_char {
                                 // ── FTMS trainer (may also carry an integrated HR sensor) ──
                                 if let Some(ref ch) = found_ctrl {
+                                    // FTMS control sequence: take control, then move the
+                                    // machine into the Started state so it honours ERG
+                                    // (Set Target Power) commands — see ftms.rs.
                                     peripheral
                                         .write(ch, &request_control_command(), WriteType::WithResponse)
                                         .await
                                         .ok();
+                                    peripheral
+                                        .write(ch, &start_resume_command(), WriteType::WithResponse)
+                                        .await
+                                        .ok();
+                                } else {
+                                    tracing::warn!(
+                                        "FTMS trainer {address} exposes no Control Point — ERG mode will not work"
+                                    );
                                 }
                                 if let Err(e) = peripheral.subscribe(&data_ch).await {
                                     tracing::error!("subscribe(indoor_bike_data) failed: {e}");
@@ -411,10 +423,18 @@ impl DeviceManager {
 
                         DeviceCommand::SetTargetPower { watts } => {
                             if erg_enabled {
-                                tracing::debug!("ERG target: {watts}W");
                                 if let (Some(ref p), Some(ref ch)) = (&trainer, &ctrl_char) {
+                                    tracing::debug!("ERG target: {watts}W");
                                     let cmd = set_target_power_command(watts);
-                                    p.write(ch, &cmd, WriteType::WithoutResponse).await.ok();
+                                    if let Err(e) =
+                                        p.write(ch, &cmd, WriteType::WithoutResponse).await
+                                    {
+                                        tracing::warn!("ERG write failed: {e}");
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "ERG target {watts}W dropped — no trainer/control point connected"
+                                    );
                                 }
                             }
                         }
