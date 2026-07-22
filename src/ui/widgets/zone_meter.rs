@@ -6,7 +6,8 @@ use crate::data::athlete::{power_zone_index, ZONE_COLORS};
 
 /// Zone labels indexed by `power_zone_index` — used for the accessible label
 /// and tooltip so the meter is readable without colour vision.
-const ZONE_LABELS: [&str; 7] = [
+/// Shared with the summary page's zone legend.
+pub const ZONE_LABELS: [&str; 7] = [
     "Z1 Recovery",
     "Z2 Endurance",
     "Z3 Tempo",

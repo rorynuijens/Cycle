@@ -73,6 +73,13 @@ impl WorkoutGraph {
         self.drawing_area.queue_draw();
     }
 
+    /// Replace the whole power trace at once — used when displaying a
+    /// finished session rather than a live one.
+    pub fn set_trace(&self, trace: Vec<Option<u32>>) {
+        *self.power_trace.borrow_mut() = trace;
+        self.drawing_area.queue_draw();
+    }
+
     /// Replace the displayed workout and reset the trace and playhead.
     pub fn set_workout(&self, workout: &Workout) {
         *self.workout.borrow_mut() = workout.clone();

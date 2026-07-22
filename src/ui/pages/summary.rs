@@ -3,27 +3,33 @@ use gtk::gio;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::data::athlete::{power_zone_index, ZONE_COLORS};
+use crate::data::athlete::{power_zone_index, AthleteProfile, ZONE_COLORS};
 use crate::data::session::Session;
-use crate::data::workout::Segment;
+use crate::data::workout::{Segment, Workout, WorkoutCategory};
 use crate::training::engine::WorkoutEngine;
+use crate::ui::widgets::workout_graph::WorkoutGraph;
+use crate::ui::widgets::zone_meter::ZONE_LABELS;
 
 #[derive(Clone)]
 pub struct SummaryPage {
     root: gtk::Box,
-    status: adw::StatusPage,
+    /// Hero icon — a star by default, the RPE emoticon once the rider rates.
+    rpe_image: gtk::Image,
     workout_name_label: gtk::Label,
     dur_label: gtk::Label,
+    tss_label: gtk::Label,
+    if_label: gtk::Label,
     avg_label: gtk::Label,
     np_label: gtk::Label,
-    if_label: gtk::Label,
-    tss_label: gtk::Label,
     kj_label: gtk::Label,
+    /// Holds the ride graph (profile + actual trace), rebuilt per session.
+    graph_holder: gtk::Box,
     last_session: Rc<RefCell<Option<Session>>>,
     export_banner: adw::Banner,
     zone_section: gtk::Box,
     zone_seconds: Rc<RefCell<[u32; 7]>>,
     zone_bar: gtk::DrawingArea,
+    zone_legend: gtk::Box,
     compliance_section: gtk::Box,
     compliance_group: adw::PreferencesGroup,
     /// Tracks rows added to compliance_group so they can be removed cleanly.
@@ -56,50 +62,80 @@ impl SummaryPage {
             .spacing(18)
             .build();
 
-        // ── Hero ─────────────────────────────────────────────────────────────
+        // ── Hero: the ride's name and its score ──────────────────────────────
+        let rpe_image = gtk::Image::builder()
+            .icon_name("starred-symbolic")
+            .pixel_size(48)
+            .css_classes(["accent"])
+            .build();
+        inner.append(&rpe_image);
+
+        inner.append(
+            &gtk::Label::builder()
+                .label("Workout complete")
+                .halign(gtk::Align::Center)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+
         let workout_name_label = gtk::Label::builder()
             .label("")
-            .css_classes(["dim-label", "caption"])
             .halign(gtk::Align::Center)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["title-1"])
             .build();
-
-        let status = adw::StatusPage::builder()
-            .icon_name("starred-symbolic")
-            .title("Workout Complete")
-            .build();
-        inner.append(&status);
         inner.append(&workout_name_label);
 
-        // ── Stats ─────────────────────────────────────────────────────────────
-        let stats_group = adw::PreferencesGroup::builder()
-            .title("Session Stats")
+        // Duration | TSS (the score, display class) | IF
+        let hero_grid = gtk::Grid::builder()
+            .column_spacing(12)
+            .column_homogeneous(true)
             .build();
+        let (dur_box, dur_label) = Self::metric_column("Duration", "—", &["title-1", "numeric"]);
+        let (tss_box, tss_label) = Self::metric_column("TSS", "—", &["display", "numeric"]);
+        let (if_box, if_label) = Self::metric_column("Intensity", "—", &["title-1", "numeric"]);
+        hero_grid.attach(&dur_box, 0, 0, 1, 1);
+        hero_grid.attach(&tss_box, 1, 0, 1, 1);
+        hero_grid.attach(&if_box, 2, 0, 1, 1);
+        inner.append(&hero_grid);
 
-        let make_row = |title: &str| -> (adw::ActionRow, gtk::Label) {
-            let row = adw::ActionRow::builder().title(title).build();
-            let lbl = gtk::Label::builder()
-                .label("—")
-                .css_classes(["dim-label", "numeric"])
-                .valign(gtk::Align::Center)
+        // ── The ride: workout profile with the actual power trace over it ────
+        let graph_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        inner.append(&graph_holder);
+
+        // ── Secondary totals strip ───────────────────────────────────────────
+        let totals_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(18)
+            .halign(gtk::Align::Center)
+            .build();
+        let make_total_pair = |name: &str, tooltip: &str| -> gtk::Label {
+            let pair = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .tooltip_text(tooltip)
                 .build();
-            row.add_suffix(&lbl);
-            (row, lbl)
+            pair.append(
+                &gtk::Label::builder()
+                    .label(name)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+            let value = gtk::Label::builder()
+                .label("—")
+                .css_classes(["caption", "numeric"])
+                .build();
+            pair.append(&value);
+            totals_row.append(&pair);
+            value
         };
-
-        let (r, dur_label) = make_row("Duration");
-        stats_group.add(&r);
-        let (r, avg_label) = make_row("Avg Power");
-        stats_group.add(&r);
-        let (r, np_label) = make_row("Normalised Power");
-        stats_group.add(&r);
-        let (r, if_label) = make_row("Intensity Factor");
-        stats_group.add(&r);
-        let (r, tss_label) = make_row("TSS");
-        stats_group.add(&r);
-        let (r, kj_label) = make_row("Kilojoules");
-        stats_group.add(&r);
-
-        inner.append(&stats_group);
+        let avg_label = make_total_pair("Avg", "Average power");
+        let np_label = make_total_pair("NP", "Normalised power");
+        let kj_label = make_total_pair("Energy", "Total work in kilojoules");
+        inner.append(&totals_row);
 
         // ── Zone breakdown ────────────────────────────────────────────────────
         let zone_seconds: Rc<RefCell<[u32; 7]>> = Rc::new(RefCell::new([0u32; 7]));
@@ -131,25 +167,18 @@ impl SummaryPage {
             }
         });
 
-        // Zone legend row (Z1–Z7 labels)
+        // Legend rebuilt per session: only the zones actually ridden, with
+        // their time — an evenly-spaced Z1–Z7 row under a proportional bar
+        // would mislabel the segments.
         let zone_legend = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(0)
-            .homogeneous(true)
+            .spacing(12)
+            .halign(gtk::Align::Center)
             .build();
-        for label in ["Z1", "Z2", "Z3", "Z4", "Z5", "Z6", "Z7"] {
-            zone_legend.append(
-                &gtk::Label::builder()
-                    .label(label)
-                    .css_classes(["caption", "dim-label"])
-                    .halign(gtk::Align::Center)
-                    .build(),
-            );
-        }
 
         let zone_section = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(4)
+            .spacing(6)
             .visible(false)
             .build();
         zone_section.append(
@@ -161,7 +190,6 @@ impl SummaryPage {
         );
         zone_section.append(&zone_bar);
         zone_section.append(&zone_legend);
-
         inner.append(&zone_section);
 
         // ── Interval Compliance ───────────────────────────────────────────────
@@ -189,7 +217,6 @@ impl SummaryPage {
         let export_btn = gtk::Button::builder()
             .label("Export FIT File")
             .css_classes(["flat", "pill"])
-            .halign(gtk::Align::Center)
             .tooltip_text("Export this session as a .FIT file")
             .build();
 
@@ -232,18 +259,24 @@ impl SummaryPage {
             }
         });
 
-        inner.append(&export_btn);
         inner.append(&export_banner);
 
-        // ── Done button ───────────────────────────────────────────────────────
+        // ── Actions row ───────────────────────────────────────────────────────
         let done_btn = gtk::Button::builder()
             .label("Back to Dashboard")
             .css_classes(["suggested-action", "pill"])
-            .halign(gtk::Align::Center)
             .tooltip_text("Return to the dashboard")
             .build();
         done_btn.connect_clicked(move |_| on_done());
-        inner.append(&done_btn);
+
+        let actions_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .halign(gtk::Align::Center)
+            .build();
+        actions_row.append(&export_btn);
+        actions_row.append(&done_btn);
+        inner.append(&actions_row);
 
         clamp.set_child(Some(&inner));
         scroll.set_child(Some(&clamp));
@@ -251,19 +284,21 @@ impl SummaryPage {
 
         Self {
             root,
-            status,
+            rpe_image,
             workout_name_label,
             dur_label,
+            tss_label,
+            if_label,
             avg_label,
             np_label,
-            if_label,
-            tss_label,
             kj_label,
+            graph_holder,
             last_session,
             export_banner,
             zone_section,
             zone_seconds,
             zone_bar,
+            zone_legend,
             compliance_section,
             compliance_group,
             compliance_rows: Rc::new(RefCell::new(Vec::new())),
@@ -274,15 +309,53 @@ impl SummaryPage {
         &self.root
     }
 
-    /// Show the bundled RPE emoticon icon on the status page hero.
+    /// A centred caption-over-value column, as on the player and dashboard.
+    fn metric_column(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
+        let vbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .build();
+        vbox.append(
+            &gtk::Label::builder()
+                .label(title)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+        let value_label = gtk::Label::builder()
+            .label(initial)
+            .css_classes(value_css.to_vec())
+            .build();
+        vbox.append(&value_label);
+        (vbox, value_label)
+    }
+
+    /// Small zone-coloured square for the legend.
+    fn zone_swatch(zone_idx: usize) -> gtk::DrawingArea {
+        let area = gtk::DrawingArea::builder()
+            .content_width(12)
+            .content_height(12)
+            .valign(gtk::Align::Center)
+            .build();
+        area.set_draw_func(move |_widget, cr, width, height| {
+            let (r, g, b) = ZONE_COLORS[zone_idx];
+            cr.set_source_rgba(r, g, b, 0.85);
+            cr.rectangle(0.0, 0.0, width as f64, height as f64);
+            cr.fill().ok();
+        });
+        area
+    }
+
+    /// Show the bundled RPE emoticon icon in the hero.
     pub fn show_rpe_icon(&self, rpe: u8) {
         if let Some(texture) = crate::ui::resources::rpe_texture(rpe) {
-            self.status.set_paintable(Some(&texture));
-            self.status.set_icon_name(None);
+            self.rpe_image.set_paintable(Some(&texture));
         }
     }
 
-    /// Populate stat labels, zone breakdown, and interval compliance from a completed session.
+    /// Populate stat labels, ride graph, zone breakdown, and interval
+    /// compliance from a completed session.
     pub fn update(
         &self,
         session: &Session,
@@ -292,6 +365,8 @@ impl SummaryPage {
     ) {
         *self.last_session.borrow_mut() = Some(session.clone());
         self.export_banner.set_revealed(false);
+        // Reset the hero icon — the RPE emoticon belongs to the previous ride.
+        self.rpe_image.set_icon_name(Some("starred-symbolic"));
 
         self.workout_name_label.set_label(workout_name);
 
@@ -299,29 +374,66 @@ impl SummaryPage {
         self.dur_label
             .set_label(&WorkoutEngine::format_duration(dur));
 
-        match session.average_power() {
-            Some(p) => self.avg_label.set_label(&format!("{} W", p as u32)),
-            None => self.avg_label.set_label("—"),
-        }
-
-        let np = session.normalised_power();
-        match np {
-            Some(p) => self.np_label.set_label(&format!("{} W", p as u32)),
-            None => self.np_label.set_label("—"),
-        }
-
-        match np {
-            Some(p) => self.if_label.set_label(&format!("{:.2}", p / ftp as f32)),
-            None => self.if_label.set_label("—"),
-        }
-
         match session.tss(ftp) {
             Some(t) => self.tss_label.set_label(&format!("{}", t as u32)),
             None => self.tss_label.set_label("—"),
         }
 
-        let kj = session.kilojoules();
-        self.kj_label.set_label(&format!("{:.0} kJ", kj));
+        let np = session.normalised_power();
+        match np {
+            Some(p) => self.if_label.set_label(&format!("{:.2}", p / ftp as f32)),
+            None => self.if_label.set_label("—"),
+        }
+
+        match session.average_power() {
+            Some(p) => self.avg_label.set_label(&format!("{} W", p as u32)),
+            None => self.avg_label.set_label("—"),
+        }
+        match np {
+            Some(p) => self.np_label.set_label(&format!("{} W", p as u32)),
+            None => self.np_label.set_label("—"),
+        }
+        self.kj_label
+            .set_label(&format!("{:.0} kJ", session.kilojoules()));
+
+        // ── Ride graph: the workout profile with the actual trace over it ────
+        while let Some(child) = self.graph_holder.first_child() {
+            self.graph_holder.remove(&child);
+        }
+        let total_secs: u32 = segments
+            .map(|segs| segs.iter().map(|s| s.duration_secs).sum())
+            .unwrap_or(0);
+        if let (Some(segs), true) = (segments, total_secs > 0) {
+            // Synthetic workout/athlete carry just what the graph draws:
+            // the segment profile and the FTP scale.
+            let workout = Workout {
+                id: 0,
+                name: String::new(),
+                description: String::new(),
+                duration_secs: total_secs,
+                tss: 0.0,
+                category: WorkoutCategory::Custom,
+                segments: segs.to_vec(),
+            };
+            let athlete = AthleteProfile {
+                ftp_watts: ftp.max(1),
+                ..AthleteProfile::default()
+            };
+            let graph = WorkoutGraph::new(&workout, &athlete);
+            graph.widget().set_content_height(160);
+
+            let mut trace: Vec<Option<u32>> = vec![None; total_secs as usize];
+            for dp in &session.data_points {
+                if let Some(slot) = trace.get_mut(dp.elapsed_secs as usize) {
+                    *slot = dp.power_watts;
+                }
+            }
+            graph.set_trace(trace);
+            self.graph_holder.append(graph.widget());
+            self.graph_holder.set_visible(true);
+        } else {
+            self.graph_holder.set_visible(false);
+        }
 
         // ── Zone breakdown ────────────────────────────────────────────────────
         let mut zone_secs = [0u32; 7];
@@ -335,6 +447,33 @@ impl SummaryPage {
         if has_power {
             *self.zone_seconds.borrow_mut() = zone_secs;
             self.zone_bar.queue_draw();
+
+            // Legend: only the zones actually ridden, with their time.
+            while let Some(child) = self.zone_legend.first_child() {
+                self.zone_legend.remove(&child);
+            }
+            for (i, &secs) in zone_secs.iter().enumerate() {
+                if secs == 0 {
+                    continue;
+                }
+                let pair = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(6)
+                    .tooltip_text(ZONE_LABELS[i])
+                    .build();
+                pair.append(&Self::zone_swatch(i));
+                pair.append(
+                    &gtk::Label::builder()
+                        .label(format!(
+                            "Z{} {}",
+                            i + 1,
+                            WorkoutEngine::format_duration(secs)
+                        ))
+                        .css_classes(["caption", "dim-label", "numeric"])
+                        .build(),
+                );
+                self.zone_legend.append(&pair);
+            }
         }
 
         // ── Interval compliance ───────────────────────────────────────────────
