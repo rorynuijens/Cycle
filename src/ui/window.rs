@@ -159,12 +159,16 @@ impl CycleGtkWindow {
         let engine_rc = Rc::new(RefCell::new(engine));
         let player_rc = Rc::new(RefCell::new(PlayerPage::new(&workout, &athlete)));
 
-        // ── Header start button — created here so on_complete and do_start can ref it ──
+        // ── Header resume button — created here so on_complete and do_start can ref it ──
+        // Only visible while a workout is running and the user has navigated away
+        // from the player; starting a workout always happens contextually (Today
+        // hero, Library, Calendar), never from the header.
         let workout_active = Rc::new(Cell::new(false));
         let start_btn = gtk::Button::builder()
-            .label("Start Workout")
+            .label("Resume Workout")
             .css_classes(["suggested-action"])
-            .tooltip_text("Start the selected workout")
+            .tooltip_text("Return to the workout in progress")
+            .visible(false)
             .build();
 
         // Created early so connect_visible_child_notify can reference it
@@ -206,7 +210,7 @@ impl CycleGtkWindow {
 
         let on_complete = move |session: crate::data::session::Session| {
             workout_active_complete.set(false);
-            start_btn_complete.set_label("Start Workout");
+            start_btn_complete.set_visible(false);
             // Reset timer state so the next "Start Workout" click starts fresh.
             timer_alive_complete.set(false);
             timer_started_complete.set(false);
@@ -340,7 +344,7 @@ impl CycleGtkWindow {
             });
         };
 
-        // ── Shared "start" closure — header button, dashboard card, library ──
+        // ── Shared "start" closure — dashboard card, library, calendar ──────
         let do_start: Rc<dyn Fn()> = {
             let stack = stack.clone();
             let player = Rc::clone(&player_rc);
@@ -352,7 +356,6 @@ impl CycleGtkWindow {
             Rc::new(move || {
                 stack.set_visible_child_name("player");
                 workout_active.set(true);
-                start_btn.set_label("Resume Workout");
                 if !timer_started.get() {
                     timer_started.set(true);
                     let stack_cancel = stack.clone();
@@ -364,7 +367,7 @@ impl CycleGtkWindow {
                         on_complete.clone(),
                         move || {
                             wa_cancel.set(false);
-                            sb_cancel.set_label("Start Workout");
+                            sb_cancel.set_visible(false);
                             stack_cancel.set_visible_child_name("dashboard");
                         },
                         Rc::clone(&timer_alive),
@@ -440,12 +443,17 @@ impl CycleGtkWindow {
         let on_view_fitness: Rc<dyn Fn()> = Rc::new(move || {
             stack_for_fitness_nav.set_visible_child_name("fitness");
         });
+        let stack_for_cal_nav = stack.clone();
+        let on_open_calendar: Rc<dyn Fn()> = Rc::new(move || {
+            stack_for_cal_nav.set_visible_child_name("calendar");
+        });
         let (dashboard_page, dashboard_reload) = DashboardPage::new(
             pool.clone(),
             rt_handle.clone(),
             athlete.clone(),
             Rc::clone(&on_library_start),
             on_view_fitness,
+            on_open_calendar,
         );
 
         // ── Route player page ─────────────────────────────────────────────────
@@ -585,11 +593,11 @@ impl CycleGtkWindow {
         // Reload data pages whenever they become visible (sidebar nav or
         // programmatic switches such as "Back to Dashboard" from summary).
         // Also update the content navigation page title per GNOME HIG.
-        // Also show/hide the Start Workout button: hide it on pages where it
-        // has no contextual meaning (History, Fitness, Coaching, Devices,
-        // Calendar) to avoid confusing "Start Workout" while browsing stats.
+        // Also show/hide the Resume Workout button: it only appears while a
+        // workout is running and the user is away from the player page.
         let content_nav_for_title = content_nav_page.clone();
         let start_btn_for_vis = start_btn.clone();
+        let workout_active_for_vis = Rc::clone(&workout_active);
         let back_btn_for_vis = back_btn.clone();
         stack.connect_visible_child_notify(move |s| {
             let page = s.visible_child_name();
@@ -606,10 +614,8 @@ impl CycleGtkWindow {
                 _ => "Cycle",
             };
             content_nav_for_title.set_title(title);
-            let show_start = matches!(
-                page.as_deref(),
-                Some("dashboard") | Some("library") | Some("player") | None
-            );
+            let show_start =
+                workout_active_for_vis.get() && !matches!(page.as_deref(), Some("player"));
             start_btn_for_vis.set_visible(show_start);
             let show_back = matches!(page.as_deref(), Some("summary"));
             back_btn_for_vis.set_visible(show_back);
@@ -680,23 +686,16 @@ impl CycleGtkWindow {
             stack_for_back.set_visible_child_name("dashboard");
         });
 
-        // Navigate to the active player when a workout is running; otherwise start one.
-        // If the workout is paused, this also resumes it — the button reads "Resume
-        // Workout" and users expect it to do exactly that.
-        let workout_active_btn = Rc::clone(&workout_active);
+        // Return to the active player. If the workout is paused, this also
+        // resumes it — the button reads "Resume Workout" and users expect that.
         let stack_for_btn = stack.clone();
-        let do_start_header = Rc::clone(&do_start);
         let engine_for_btn = Rc::clone(&engine_rc);
         let player_for_btn = Rc::clone(&player_rc);
         start_btn.connect_clicked(move |_| {
-            if workout_active_btn.get() {
-                if engine_for_btn.borrow().state == EngineState::Paused {
-                    player_for_btn.borrow().trigger_pause_toggle();
-                }
-                stack_for_btn.set_visible_child_name("player");
-            } else {
-                do_start_header();
+            if engine_for_btn.borrow().state == EngineState::Paused {
+                player_for_btn.borrow().trigger_pause_toggle();
             }
+            stack_for_btn.set_visible_child_name("player");
         });
 
         content_box.append(&content_header);
