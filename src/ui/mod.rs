@@ -5,6 +5,31 @@ pub mod resources;
 pub mod widgets;
 pub mod window;
 
+/// App-wide stylesheet defining the `display` typography class from the
+/// CLAUDE.md §1.5 type scale (hero numbers, e.g. live power), which libadwaita
+/// itself does not ship. Sizes are relative so the class follows the user's
+/// system font size; no colours are defined, so both themes work unchanged.
+const APP_CSS: &str = "
+.display {
+    font-size: 400%;
+    font-weight: 800;
+}
+";
+
+/// Install the app stylesheet on the default display. Call once at activate,
+/// before the main window is built.
+pub fn load_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(APP_CSS);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
 /// Run an async task on the tokio runtime and deliver its result to `on_done`
 /// back on the GTK main thread — without ever blocking the GLib loop.
 ///
