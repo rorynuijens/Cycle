@@ -85,8 +85,10 @@ impl CalendarPage {
             .vexpand(true)
             .build();
 
+        // Wider clamp than the usual ~900: a calendar grid is genuinely a
+        // wide layout, and cramped cells waste the page.
         let clamp = adw::Clamp::builder()
-            .maximum_size(960)
+            .maximum_size(1400)
             .margin_top(24)
             .margin_bottom(24)
             .margin_start(24)
@@ -133,62 +135,104 @@ impl CalendarPage {
             .tooltip_text("Jump to today")
             .build();
 
+        // Scheduling is this page's primary act — a labelled button, not an
+        // icon lost among utilities.
         let schedule_btn = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
             .tooltip_text("Schedule a workout")
-            .css_classes(["flat", "circular"])
+            .css_classes(["suggested-action"])
             .visible(!workouts.is_empty())
             .build();
+        schedule_btn.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name("list-add-symbolic")
+                .label("Schedule")
+                .build(),
+        ));
 
-        let time_off_btn = gtk::Button::builder()
-            .icon_name("weather-clear-symbolic")
-            .tooltip_text("Mark a day as time off (no cycling)")
-            .css_classes(["flat", "circular"])
+        // Rare utilities live behind one menu instead of three toolbar icons.
+        let menu_item = |icon: &str, label: &str, tooltip: &str| -> gtk::Button {
+            let btn = gtk::Button::builder()
+                .css_classes(["flat"])
+                .tooltip_text(tooltip)
+                .build();
+            btn.set_child(Some(
+                &adw::ButtonContent::builder()
+                    .icon_name(icon)
+                    .label(label)
+                    .halign(gtk::Align::Start)
+                    .build(),
+            ));
+            btn
+        };
+        let time_off_btn = menu_item(
+            "weather-clear-symbolic",
+            "Mark time off",
+            "Mark a day as time off (no cycling)",
+        );
+        let import_btn = menu_item(
+            "document-open-symbolic",
+            "Import FIT file",
+            "Import a FIT file recorded on a Garmin, Wahoo, or other device",
+        );
+        let icu_sync_btn = menu_item(
+            "view-refresh-symbolic",
+            "Sync Intervals.icu",
+            "Sync activities from Intervals.icu",
+        );
+
+        let menu_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
             .build();
-
-        let import_btn = gtk::Button::builder()
-            .icon_name("document-open-symbolic")
-            .tooltip_text("Import a FIT file recorded on a Garmin, Wahoo, or other device")
-            .css_classes(["flat", "circular"])
-            .build();
-
-        let icu_sync_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Sync activities from Intervals.icu")
-            .css_classes(["flat", "circular"])
+        menu_box.append(&time_off_btn);
+        menu_box.append(&import_btn);
+        menu_box.append(&icu_sync_btn);
+        let more_popover = gtk::Popover::builder().child(&menu_box).build();
+        for btn in [&time_off_btn, &import_btn, &icu_sync_btn] {
+            let popover = more_popover.clone();
+            btn.connect_clicked(move |_| popover.popdown());
+        }
+        let more_btn = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("More calendar actions")
+            .css_classes(["flat"])
+            .popover(&more_popover)
             .build();
 
         // Month / Week toggle — week view is the default
         let month_toggle = gtk::ToggleButton::builder()
             .label("Month")
-            .css_classes(["flat"])
             .active(false)
             .tooltip_text("Month view")
             .build();
         let week_toggle = gtk::ToggleButton::builder()
             .label("Week")
-            .css_classes(["flat"])
             .tooltip_text("Week view")
             .build();
         week_toggle.set_group(Some(&month_toggle));
         week_toggle.set_active(true);
+        let view_toggle_box = gtk::Box::builder().css_classes(["linked"]).build();
+        view_toggle_box.append(&week_toggle);
+        view_toggle_box.append(&month_toggle);
 
         nav_row.append(&prev_btn);
         nav_row.append(&month_label);
         nav_row.append(&next_btn);
         nav_row.append(&today_btn);
+        nav_row.append(&view_toggle_box);
         nav_row.append(&schedule_btn);
-        nav_row.append(&time_off_btn);
-        nav_row.append(&import_btn);
-        nav_row.append(&icu_sync_btn);
-        nav_row.append(&month_toggle);
-        nav_row.append(&week_toggle);
+        nav_row.append(&more_btn);
         inner.append(&nav_row);
 
-        // ── Dynamic area (summary + grid) — rebuilt on each reload ───────────
+        // ── Dynamic area (grid / week list) — rebuilt on each reload ─────────
         let dynamic = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
+            .vexpand(true)
             .build();
         inner.append(&dynamic);
 
@@ -350,8 +394,17 @@ impl CalendarPage {
                             ));
                         } else {
                             let (year, month) = current_month.get();
-                            dynamic.append(&Self::build_summary(&events));
-                            dynamic.append(&Self::build_month_grid(year, month, &events));
+                            dynamic.append(&Self::build_month_grid(
+                                year,
+                                month,
+                                &events,
+                                pool_build.clone(),
+                                rt_build.clone(),
+                                Rc::clone(&reload_holder),
+                                Rc::clone(&workouts),
+                                Rc::clone(&on_start_workout),
+                                ftp,
+                            ));
                         }
                     },
                 );
@@ -437,10 +490,18 @@ impl CalendarPage {
             let workouts_sb = Rc::clone(&workouts);
 
             schedule_btn.connect_clicked(move |btn| {
+                // Preselect today when viewing the current month, else the 1st.
+                let (y, m) = cm.get();
+                let today = Local::now().date_naive();
+                let preselect = if today.year() == y && today.month() == m {
+                    today
+                } else {
+                    NaiveDate::from_ymd_opt(y, m, 1).expect("valid date")
+                };
                 Self::show_schedule_dialog(
                     btn,
                     &workouts_sb,
-                    cm.get(),
+                    preselect,
                     pool.clone(),
                     rt_handle.clone(),
                     Rc::clone(&r),
@@ -588,9 +649,9 @@ impl CalendarPage {
     // ── Schedule workout dialog ───────────────────────────────────────────────
 
     fn show_schedule_dialog(
-        parent: &gtk::Button,
+        parent: &impl IsA<gtk::Widget>,
         workouts: &[Workout],
-        (year, month): (i32, u32),
+        preselect: NaiveDate,
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
         reload: Rc<dyn Fn()>,
@@ -615,7 +676,14 @@ impl CalendarPage {
             .build();
 
         let cal = gtk::Calendar::new();
-        if let Ok(dt) = glib::DateTime::from_local(year, month as i32, 1, 0, 0, 0.0) {
+        if let Ok(dt) = glib::DateTime::from_local(
+            preselect.year(),
+            preselect.month() as i32,
+            preselect.day() as i32,
+            0,
+            0,
+            0.0,
+        ) {
             cal.select_day(&dt);
         }
         content.append(&cal);
@@ -891,9 +959,13 @@ impl CalendarPage {
                 .wrap(true)
                 .build(),
         );
+        let cat_stripe = color_stripe(category_zone_rgb(&entry.category));
+        cat_stripe.set_content_height(18);
+        cat_stripe.set_valign(gtk::Align::Center);
+        title_box.append(&cat_stripe);
         let cat_label = gtk::Label::builder()
             .label(entry.category.label())
-            .css_classes(["caption", "pill", category_css_class(&entry.category)])
+            .css_classes(["caption", "dim-label"])
             .valign(gtk::Align::Center)
             .build();
         title_box.append(&cat_label);
@@ -1037,96 +1109,6 @@ impl CalendarPage {
 
     // ── Month summary cards ───────────────────────────────────────────────────
 
-    fn build_summary(events: &[CalendarEvent]) -> gtk::Box {
-        let scheduled: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                CalendarEvent::Scheduled(ce) => Some(ce),
-                _ => None,
-            })
-            .collect();
-
-        let total = scheduled.len();
-        let done = scheduled.iter().filter(|e| e.completed).count();
-        let remaining = total.saturating_sub(done);
-        let rate = (done * 100)
-            .checked_div(total)
-            .map_or_else(|| "—".to_string(), |r| format!("{}%", r));
-
-        let _next_workout = scheduled
-            .iter()
-            .filter(|e| !e.completed)
-            .min_by_key(|e| &e.scheduled_date)
-            .and_then(|e| NaiveDate::parse_from_str(&e.scheduled_date, "%Y-%m-%d").ok())
-            .map(|d| d.format("%-d %b").to_string())
-            .unwrap_or_else(|| "—".to_string());
-
-        let past_count = events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    CalendarEvent::Session(_, _) | CalendarEvent::IcuActivity(_)
-                )
-            })
-            .count();
-
-        let row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .homogeneous(true)
-            .build();
-
-        for (title, value, subtitle) in [
-            ("Scheduled", total.to_string(), "workouts this period"),
-            (
-                "Completed",
-                done.to_string(),
-                &format!("{} remaining", remaining),
-            ),
-            ("Completion Rate", rate, "of planned workouts"),
-            ("Activities", past_count.to_string(), "recorded sessions"),
-        ] {
-            let card = gtk::Box::builder()
-                .css_classes(["card"])
-                .hexpand(true)
-                .build();
-            let vbox = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(6)
-                .margin_top(12)
-                .margin_bottom(12)
-                .margin_start(12)
-                .margin_end(12)
-                .build();
-            vbox.append(
-                &gtk::Label::builder()
-                    .label(title)
-                    .halign(gtk::Align::Start)
-                    .css_classes(["caption", "dim-label"])
-                    .build(),
-            );
-            vbox.append(
-                &gtk::Label::builder()
-                    .label(&value)
-                    .halign(gtk::Align::Start)
-                    .css_classes(["title-3", "numeric"])
-                    .build(),
-            );
-            vbox.append(
-                &gtk::Label::builder()
-                    .label(subtitle)
-                    .halign(gtk::Align::Start)
-                    .css_classes(["caption", "dim-label"])
-                    .build(),
-            );
-            card.append(&vbox);
-            row.append(&card);
-        }
-
-        row
-    }
-
     // ── Week view ─────────────────────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
@@ -1269,14 +1251,64 @@ impl CalendarPage {
             }
 
             if non_time_off_events.is_empty() && time_off_entry.is_none() {
-                chip_box.append(
-                    &gtk::Label::builder()
-                        .label(if is_past { "No activity" } else { "Rest" })
-                        .css_classes(["caption", "dim-label"])
+                if is_past {
+                    chip_box.append(
+                        &gtk::Label::builder()
+                            .label("No activity")
+                            .css_classes(["caption", "dim-label"])
+                            .halign(gtk::Align::Start)
+                            .hexpand(true)
+                            .build(),
+                    );
+                } else {
+                    // An empty future day is an invitation to schedule.
+                    let rest_btn = gtk::Button::builder()
+                        .css_classes(["flat"])
                         .halign(gtk::Align::Start)
                         .hexpand(true)
-                        .build(),
-                );
+                        .tooltip_text("Schedule a workout for this day")
+                        .build();
+                    let rest_content = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(6)
+                        .build();
+                    rest_content.append(
+                        &gtk::Image::builder()
+                            .icon_name("list-add-symbolic")
+                            .css_classes(["dim-label"])
+                            .build(),
+                    );
+                    rest_content.append(
+                        &gtk::Label::builder()
+                            .label("Rest — tap to schedule")
+                            .css_classes(["caption", "dim-label"])
+                            .build(),
+                    );
+                    rest_btn.set_child(Some(&rest_content));
+
+                    let day_sched = day;
+                    let pool_rs = pool.clone();
+                    let rt_rs = rt_handle.clone();
+                    let rh_rs = Rc::clone(&reload_holder);
+                    let workouts_rs = Rc::clone(&workouts);
+                    rest_btn.connect_clicked(move |btn| {
+                        let rh_c = Rc::clone(&rh_rs);
+                        let reload_fn: Rc<dyn Fn()> = Rc::new(move || {
+                            if let Some(f) = rh_c.borrow().as_ref() {
+                                f();
+                            }
+                        });
+                        Self::show_schedule_dialog(
+                            btn,
+                            &workouts_rs,
+                            day_sched,
+                            pool_rs.clone(),
+                            rt_rs.clone(),
+                            reload_fn,
+                        );
+                    });
+                    chip_box.append(&rest_btn);
+                }
             } else {
                 for event in &non_time_off_events {
                     match event {
@@ -1288,10 +1320,7 @@ impl CalendarPage {
                                 .spacing(6)
                                 .build();
 
-                            let dot_class = category_css_class(&entry.category);
-                            let sport_icon = crate::ui::resources::sport_icon("VirtualRide", true);
-                            sport_icon.add_css_class(dot_class);
-                            entry_row.append(&sport_icon);
+                            entry_row.append(&color_stripe(category_zone_rgb(&entry.category)));
 
                             let display_name = if entry.completed {
                                 format!("✓  {}", entry.workout_name)
@@ -1350,11 +1379,11 @@ impl CalendarPage {
 
                             entry_row.append(&btn);
 
-                            // Duration badge
+                            // Load out of the tooltip and into view
                             entry_row.append(
                                 &gtk::Label::builder()
-                                    .label(format!("{dur_mins} min"))
-                                    .css_classes(["caption", "dim-label"])
+                                    .label(format!("{} min · TSS {:.0}", dur_mins, entry.tss))
+                                    .css_classes(["caption", "dim-label", "numeric"])
                                     .halign(gtk::Align::End)
                                     .build(),
                             );
@@ -1368,15 +1397,14 @@ impl CalendarPage {
                                 .spacing(6)
                                 .build();
 
-                            let sport_icon = crate::ui::resources::sport_icon("VirtualRide", true);
-                            sport_icon.add_css_class("success");
-                            entry_row.append(&sport_icon);
+                            entry_row.append(&color_stripe(None));
 
                             let display_name = workout_name
                                 .as_deref()
                                 .filter(|n| !n.is_empty())
                                 .unwrap_or("Unstructured Ride");
                             let dur_mins = session.session.duration_secs() / 60;
+                            let session_tss = session.session.tss(ftp);
 
                             let btn = gtk::Button::builder()
                                 .css_classes(["flat"])
@@ -1427,6 +1455,17 @@ impl CalendarPage {
                             });
 
                             entry_row.append(&btn);
+
+                            entry_row.append(
+                                &gtk::Label::builder()
+                                    .label(match session_tss {
+                                        Some(t) => format!("{} min · TSS {:.0}", dur_mins, t),
+                                        None => format!("{} min", dur_mins),
+                                    })
+                                    .css_classes(["caption", "dim-label", "numeric"])
+                                    .halign(gtk::Align::End)
+                                    .build(),
+                            );
 
                             // Delete button for local sessions
                             let session_id_del = session.session.id;
@@ -1479,9 +1518,11 @@ impl CalendarPage {
                                 .spacing(6)
                                 .build();
 
+                            entry_row.append(&color_stripe(None));
+                            // Sport icon kept — it distinguishes rides from runs etc.
                             let sport_icon =
                                 crate::ui::resources::sport_icon(&activity.sport_type, false);
-                            sport_icon.add_css_class("accent");
+                            sport_icon.add_css_class("dim-label");
                             entry_row.append(&sport_icon);
 
                             let display_name = if activity.name.trim().is_empty() {
@@ -1527,6 +1568,17 @@ impl CalendarPage {
                             });
 
                             entry_row.append(&btn);
+
+                            entry_row.append(
+                                &gtk::Label::builder()
+                                    .label(match activity.tss {
+                                        Some(t) => format!("{} · TSS {:.0}", dur_str, t),
+                                        None => dur_str.clone(),
+                                    })
+                                    .css_classes(["caption", "dim-label", "numeric"])
+                                    .halign(gtk::Align::End)
+                                    .build(),
+                            );
 
                             // Delete button for ICU activities
                             let icu_id_del = activity.icu_id.clone();
@@ -1610,14 +1662,28 @@ impl CalendarPage {
 
     // ── Month grid ────────────────────────────────────────────────────────────
 
-    fn build_month_grid(year: i32, month: u32, events: &[CalendarEvent]) -> gtk::Grid {
+    #[allow(clippy::too_many_arguments)]
+    fn build_month_grid(
+        year: i32,
+        month: u32,
+        events: &[CalendarEvent],
+        pool: SqlitePool,
+        rt_handle: tokio::runtime::Handle,
+        reload_holder: Rc<RefCell<Option<ReloadFn>>>,
+        workouts: Rc<Vec<Workout>>,
+        on_start_workout: Rc<dyn Fn(Workout)>,
+        ftp: u32,
+    ) -> gtk::Grid {
+        // vexpand: week rows share the viewport's spare height so cells grow
+        // with the window instead of huddling at natural size.
         let grid = gtk::Grid::builder()
             .row_spacing(6)
             .column_spacing(6)
             .column_homogeneous(true)
+            .vexpand(true)
             .build();
 
-        for (col, day) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for (col, day) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Week"]
             .iter()
             .enumerate()
         {
@@ -1634,7 +1700,7 @@ impl CalendarPage {
         }
 
         // Group events by day-of-month
-        let mut by_day: HashMap<u32, Vec<MonthCellItem>> = HashMap::new();
+        let mut by_day: HashMap<u32, Vec<&CalendarEvent>> = HashMap::new();
         for event in events {
             let day_num = match event {
                 CalendarEvent::Scheduled(e) => e.scheduled_date[8..].parse::<u32>().ok(),
@@ -1646,40 +1712,160 @@ impl CalendarPage {
                 CalendarEvent::TimeOff(t) => Some(t.date.day()),
             };
             if let Some(d) = day_num {
-                by_day
-                    .entry(d)
-                    .or_default()
-                    .push(MonthCellItem::from_event(event));
+                by_day.entry(d).or_default().push(event);
             }
         }
 
-        let today = Local::now();
-        let today_day_opt = if today.year() == year && today.month() == month {
-            Some(today.day())
-        } else {
-            None
-        };
-
+        let today = Local::now().date_naive();
         let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid date");
         let start_col = first.weekday().num_days_from_monday() as i32;
         let days_in_month = Self::days_in_month(year, month);
 
         let mut col = start_col;
         let mut row = 1i32;
+        // Per-week (grid row) totals for the gutter column.
+        let mut week_done_tss = 0.0f32;
+        let mut week_planned_tss = 0.0f32;
+        let mut week_sched = 0usize;
+        let mut week_sched_done = 0usize;
 
         for day_num in 1..=days_in_month {
-            let is_today = today_day_opt == Some(day_num);
-            let items = by_day.get(&day_num).map(Vec::as_slice).unwrap_or(&[]);
-            let cell = Self::make_day_cell(day_num, is_today, items);
+            let date = NaiveDate::from_ymd_opt(year, month, day_num).expect("valid date");
+            let is_today = date == today;
+            let day_events = by_day.get(&day_num).map(Vec::as_slice).unwrap_or(&[]);
+
+            let items: Vec<MonthCellItem> = day_events
+                .iter()
+                .map(|e| MonthCellItem::from_event(e, ftp))
+                .collect();
+            for item in &items {
+                week_done_tss += item.done_tss;
+                week_planned_tss += item.planned_tss;
+                if item.is_scheduled {
+                    week_sched += 1;
+                    if item.planned_tss == 0.0 {
+                        week_sched_done += 1;
+                    }
+                }
+            }
+
+            let cell = Self::make_day_cell(day_num, is_today, &items);
+            cell.set_vexpand(true);
+
+            // ── Cell interaction: detail for a scheduled day, schedule for an
+            // empty/future one. Past days without a plan stay inert.
+            let first_scheduled = day_events.iter().find_map(|e| match e {
+                CalendarEvent::Scheduled(entry) => Some((*entry).clone()),
+                _ => None,
+            });
+            if first_scheduled.is_some() || date >= today {
+                cell.set_tooltip_text(Some(
+                    first_scheduled
+                        .as_ref()
+                        .map(|e| e.workout_name.as_str())
+                        .unwrap_or("Schedule a workout for this day"),
+                ));
+                let gesture = gtk::GestureClick::new();
+                let pool_c = pool.clone();
+                let rt_c = rt_handle.clone();
+                let rh_c = Rc::clone(&reload_holder);
+                let workouts_c = Rc::clone(&workouts);
+                let on_start_c = Rc::clone(&on_start_workout);
+                gesture.connect_released(move |g, _, _, _| {
+                    let Some(widget) = g.widget() else { return };
+                    let rh = Rc::clone(&rh_c);
+                    let reload_fn: Rc<dyn Fn()> = Rc::new(move || {
+                        if let Some(f) = rh.borrow().as_ref() {
+                            f();
+                        }
+                    });
+                    match &first_scheduled {
+                        Some(entry) => Self::show_workout_detail_dialog(
+                            &widget,
+                            entry,
+                            pool_c.clone(),
+                            rt_c.clone(),
+                            Rc::clone(&workouts_c),
+                            Rc::clone(&on_start_c),
+                            reload_fn,
+                        ),
+                        None => Self::show_schedule_dialog(
+                            &widget,
+                            &workouts_c,
+                            date,
+                            pool_c.clone(),
+                            rt_c.clone(),
+                            reload_fn,
+                        ),
+                    }
+                });
+                cell.add_controller(gesture);
+            }
+
             grid.attach(&cell, col, row, 1, 1);
             col += 1;
-            if col >= 7 {
+            if col >= 7 || day_num == days_in_month {
+                grid.attach(
+                    &Self::week_gutter(
+                        week_done_tss,
+                        week_planned_tss,
+                        week_sched_done,
+                        week_sched,
+                    ),
+                    7,
+                    row,
+                    1,
+                    1,
+                );
+                week_done_tss = 0.0;
+                week_planned_tss = 0.0;
+                week_sched = 0;
+                week_sched_done = 0;
                 col = 0;
                 row += 1;
             }
         }
 
         grid
+    }
+
+    /// The weekly totals gutter: planned + completed TSS and how much of the
+    /// plan got done — the summary cards, condensed to where they're relevant.
+    fn week_gutter(done_tss: f32, planned_tss: f32, sched_done: usize, sched: usize) -> gtk::Box {
+        let vbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .valign(gtk::Align::Center)
+            .build();
+        let total = done_tss + planned_tss;
+        if total > 0.0 {
+            vbox.append(
+                &gtk::Label::builder()
+                    .label(format!("{:.0} TSS", total))
+                    .css_classes(["caption-heading", "numeric"])
+                    .halign(gtk::Align::Start)
+                    .build(),
+            );
+        }
+        if sched > 0 {
+            vbox.append(
+                &gtk::Label::builder()
+                    .label(format!("{}/{} done", sched_done, sched))
+                    .css_classes(["caption", "dim-label", "numeric"])
+                    .halign(gtk::Align::Start)
+                    .build(),
+            );
+        }
+        if total <= 0.0 && sched == 0 {
+            vbox.append(
+                &gtk::Label::builder()
+                    .label("—")
+                    .css_classes(["caption", "dim-label"])
+                    .halign(gtk::Align::Start)
+                    .build(),
+            );
+        }
+        vbox
     }
 
     fn make_day_cell(day_num: u32, is_today: bool, items: &[MonthCellItem]) -> gtk::Frame {
@@ -1710,28 +1896,49 @@ impl CalendarPage {
         );
 
         for (i, item) in items.iter().enumerate() {
-            if i >= 2 {
+            if i >= 3 {
                 vbox.append(
                     &gtk::Label::builder()
-                        .label(format!("+{} more", items.len() - 2))
+                        .label(format!("+{} more", items.len() - 3))
                         .halign(gtk::Align::Start)
                         .css_classes(["caption", "dim-label"])
                         .build(),
                 );
                 break;
             }
-            let chip = gtk::Label::builder()
-                .label(&item.label)
-                .halign(gtk::Align::Start)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes([item.css_class, "caption"])
-                .build();
-            if item.strikethrough {
-                let attrs = gtk::pango::AttrList::new();
-                attrs.insert(gtk::pango::AttrInt::new_strikethrough(true));
-                chip.set_attributes(Some(&attrs));
-            }
-            vbox.append(&chip);
+            vbox.append(
+                &gtk::Label::builder()
+                    .label(&item.label)
+                    .halign(gtk::Align::Start)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .css_classes(if item.dimmed {
+                        vec!["dim-label", "caption"]
+                    } else {
+                        vec!["caption"]
+                    })
+                    .build(),
+            );
+        }
+
+        // Spacer keeps the day number pinned to the top and the load bar to
+        // the bottom edge when the cell stretches with the window.
+        vbox.append(&gtk::Box::builder().vexpand(true).build());
+
+        // The signature: the day's load as a zone-coloured bar.
+        let done: f32 = items.iter().map(|i| i.done_tss).sum();
+        let planned: f32 = items.iter().map(|i| i.planned_tss).sum();
+        if done + planned > 0.0 {
+            // Dominant category = the coloured item carrying the most TSS.
+            let dominant = items
+                .iter()
+                .filter(|i| i.color.is_some())
+                .max_by(|a, b| {
+                    (a.done_tss + a.planned_tss).total_cmp(&(b.done_tss + b.planned_tss))
+                })
+                .and_then(|i| i.color);
+            let bar = load_bar(done, planned, dominant);
+            bar.set_margin_top(2);
+            vbox.append(&bar);
         }
 
         frame.set_child(Some(&vbox));
@@ -1754,12 +1961,18 @@ impl CalendarPage {
 
 struct MonthCellItem {
     label: String,
-    css_class: &'static str,
-    strikethrough: bool,
+    dimmed: bool,
+    /// TSS already banked (completed scheduled workouts, sessions, activities).
+    done_tss: f32,
+    /// TSS still ahead (scheduled and not yet completed).
+    planned_tss: f32,
+    /// Category zone colour — only scheduled workouts carry one.
+    color: Option<(f64, f64, f64)>,
+    is_scheduled: bool,
 }
 
 impl MonthCellItem {
-    fn from_event(event: &CalendarEvent) -> Self {
+    fn from_event(event: &CalendarEvent, ftp: u32) -> Self {
         match event {
             CalendarEvent::Scheduled(e) => MonthCellItem {
                 label: if e.completed {
@@ -1767,17 +1980,23 @@ impl MonthCellItem {
                 } else {
                     e.workout_name.clone()
                 },
-                css_class: if e.completed { "dim-label" } else { "body" },
-                strikethrough: false,
+                dimmed: e.completed,
+                done_tss: if e.completed { e.tss } else { 0.0 },
+                planned_tss: if e.completed { 0.0 } else { e.tss },
+                color: category_zone_rgb(&e.category),
+                is_scheduled: true,
             },
-            CalendarEvent::Session(_s, name) => MonthCellItem {
+            CalendarEvent::Session(s, name) => MonthCellItem {
                 label: name
                     .as_deref()
                     .filter(|n| !n.is_empty())
                     .unwrap_or("Ride")
                     .to_string(),
-                css_class: "dim-label",
-                strikethrough: false,
+                dimmed: true,
+                done_tss: s.session.tss(ftp).unwrap_or(0.0),
+                planned_tss: 0.0,
+                color: None,
+                is_scheduled: false,
             },
             CalendarEvent::IcuActivity(a) => MonthCellItem {
                 label: if a.name.trim().is_empty() {
@@ -1785,31 +2004,95 @@ impl MonthCellItem {
                 } else {
                     a.name.clone()
                 },
-                css_class: "dim-label",
-                strikethrough: false,
+                dimmed: true,
+                done_tss: a.tss.unwrap_or(0.0),
+                planned_tss: 0.0,
+                color: None,
+                is_scheduled: false,
             },
             CalendarEvent::TimeOff(_) => MonthCellItem {
                 label: "Time off".to_string(),
-                css_class: "dim-label",
-                strikethrough: false,
+                dimmed: true,
+                done_tss: 0.0,
+                planned_tss: 0.0,
+                color: None,
+                is_scheduled: false,
             },
         }
     }
 }
 
-// ── Category → CSS class ──────────────────────────────────────────────────────
+// ── Category → zone colour ────────────────────────────────────────────────────
 
-fn category_css_class(cat: &WorkoutCategory) -> &'static str {
+/// Map a workout category to the zone colour of its dominant intensity.
+/// Zone RGB via Cairo is the app's one expressive colour (CLAUDE.md §1.6);
+/// this replaces the earlier misuse of success/warning/error classes, where
+/// a VO₂Max day rendered in error-red. `None` = no category (drawn as a
+/// neutral foreground-tinted stripe).
+fn category_zone_rgb(cat: &WorkoutCategory) -> Option<(f64, f64, f64)> {
+    use crate::data::athlete::ZONE_COLORS;
     match cat {
-        WorkoutCategory::Recovery => "success",
-        WorkoutCategory::Endurance => "accent",
-        WorkoutCategory::Tempo => "accent",
-        WorkoutCategory::SweetSpot => "warning",
-        WorkoutCategory::Threshold => "warning",
-        WorkoutCategory::Vo2Max => "error",
-        WorkoutCategory::Anaerobic => "error",
-        WorkoutCategory::Custom => "dim-label",
+        WorkoutCategory::Recovery => Some(ZONE_COLORS[0]),
+        WorkoutCategory::Endurance => Some(ZONE_COLORS[1]),
+        WorkoutCategory::Tempo => Some(ZONE_COLORS[2]),
+        WorkoutCategory::SweetSpot => Some(ZONE_COLORS[2]),
+        WorkoutCategory::Threshold => Some(ZONE_COLORS[3]),
+        WorkoutCategory::Vo2Max => Some(ZONE_COLORS[4]),
+        WorkoutCategory::Anaerobic => Some(ZONE_COLORS[5]),
+        WorkoutCategory::Custom => None,
     }
+}
+
+/// Slim vertical colour stripe marking an event row's intensity category.
+fn color_stripe(rgb: Option<(f64, f64, f64)>) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().content_width(6).build();
+    area.set_draw_func(move |widget, cr, width, height| {
+        let (r, g, b, a) = match rgb {
+            Some((r, g, b)) => (r, g, b, 1.0),
+            None => {
+                let fg = widget.color();
+                (fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.3)
+            }
+        };
+        cr.set_source_rgba(r, g, b, a);
+        cr.rectangle(0.0, 0.0, width as f64, height as f64);
+        cr.fill().ok();
+    });
+    area
+}
+
+/// A day's training load as a slim bar: width ∝ TSS (150 TSS = full width),
+/// completed load drawn solid, still-planned load dimmed, coloured by the
+/// day's dominant category.
+fn load_bar(done_tss: f32, planned_tss: f32, rgb: Option<(f64, f64, f64)>) -> gtk::DrawingArea {
+    const FULL_SCALE_TSS: f64 = 150.0;
+    let area = gtk::DrawingArea::builder()
+        .content_height(6)
+        .hexpand(true)
+        .build();
+    area.set_draw_func(move |widget, cr, width, height| {
+        let total = (done_tss + planned_tss) as f64;
+        if total <= 0.0 {
+            return;
+        }
+        let w = width as f64;
+        let h = height as f64;
+        let (r, g, b) = rgb.unwrap_or_else(|| {
+            let fg = widget.color();
+            (fg.red() as f64, fg.green() as f64, fg.blue() as f64)
+        });
+        let bar_w = (total / FULL_SCALE_TSS).min(1.0) * w;
+        let done_w = bar_w * (done_tss as f64 / total);
+        // Completed load: solid
+        cr.set_source_rgba(r, g, b, 1.0);
+        cr.rectangle(0.0, 0.0, done_w, h);
+        cr.fill().ok();
+        // Planned load: dimmed continuation
+        cr.set_source_rgba(r, g, b, 0.35);
+        cr.rectangle(done_w, 0.0, bar_w - done_w, h);
+        cr.fill().ok();
+    });
+    area
 }
 
 // ── Build time-off context string for AI prompts ──────────────────────────────
