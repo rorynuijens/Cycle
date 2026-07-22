@@ -37,8 +37,9 @@ impl WorkoutGraph {
         let ph = Rc::clone(&playhead);
         let tr = Rc::clone(&power_trace);
 
-        drawing_area.set_draw_func(move |_widget, cr, width, height| {
+        drawing_area.set_draw_func(move |widget, cr, width, height| {
             Self::draw(
+                widget,
                 cr,
                 width,
                 height,
@@ -80,7 +81,9 @@ impl WorkoutGraph {
         self.drawing_area.queue_draw();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw(
+        widget: &gtk::DrawingArea,
         cr: &gtk::cairo::Context,
         width: i32,
         height: i32,
@@ -91,6 +94,10 @@ impl WorkoutGraph {
     ) {
         let w = width as f64;
         let h = height as f64;
+        // Theme foreground colour — keeps the overlay lines legible in both
+        // light and dark themes without hardcoding a colour (CLAUDE.md §1.6).
+        let fg = widget.color();
+        let (fg_r, fg_g, fg_b) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
         let total_secs = workout.duration_secs as f64;
         // Scale: 125% FTP fills the graph vertically
         let max_watts = athlete.ftp_watts as f64 * 1.25;
@@ -134,7 +141,7 @@ impl WorkoutGraph {
 
         // ── FTP reference line (dashed) ──────────────────────────────────────
         let ftp_y = h - (athlete.ftp_watts as f64 / max_watts) * h;
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
+        cr.set_source_rgba(fg_r, fg_g, fg_b, 0.25);
         cr.set_line_width(1.0);
         cr.set_dash(&[4.0, 4.0], 0.0);
         cr.move_to(0.0, ftp_y);
@@ -145,7 +152,7 @@ impl WorkoutGraph {
         // ── Live power trace (fill + stroke) ────────────────────────────────
         if !power_trace.is_empty() {
             // Semi-transparent fill under the trace
-            cr.set_source_rgba(0.47, 0.68, 0.93, 0.18);
+            cr.set_source_rgba(fg_r, fg_g, fg_b, 0.10);
             let mut last_x = 0.0f64;
             let mut started = false;
             for (i, &watts) in power_trace.iter().enumerate() {
@@ -169,7 +176,7 @@ impl WorkoutGraph {
             }
 
             // Solid stroke over the fill
-            cr.set_source_rgba(0.47, 0.68, 0.93, 0.90);
+            cr.set_source_rgba(fg_r, fg_g, fg_b, 0.85);
             cr.set_line_width(1.5);
             let mut first = true;
             for (i, &watts) in power_trace.iter().enumerate() {
@@ -190,7 +197,7 @@ impl WorkoutGraph {
         // ── Playhead ─────────────────────────────────────────────────────────
         if playhead_secs > 0 {
             let ph_x = (playhead_secs as f64 / total_secs) * w;
-            cr.set_source_rgba(0.47, 0.68, 0.93, 1.0);
+            cr.set_source_rgba(fg_r, fg_g, fg_b, 0.9);
             cr.set_line_width(2.0);
             cr.move_to(ph_x, 0.0);
             cr.line_to(ph_x, h);

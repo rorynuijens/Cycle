@@ -14,6 +14,7 @@ use crate::data::{
 };
 use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
+use crate::ui::widgets::zone_meter::ZoneMeter;
 
 pub struct PlayerPage {
     root: gtk::Box,
@@ -26,10 +27,10 @@ pub struct PlayerPage {
     interval_label: gtk::Label,
     workout_progress: gtk::ProgressBar,
     segment_progress: gtk::ProgressBar,
-    /// Shown while the workout is running — hides during countdown.
-    /// Compact interval info row shown while the workout is active (above the scroll).
-    interval_revealer: gtk::Revealer,
-    interval_info_label: gtk::Label,
+    /// Caption above the interval countdown — shows "Interval N" while running.
+    interval_caption: gtk::Label,
+    /// Live power-zone ribbon under the hero power number.
+    zone_meter: ZoneMeter,
     /// Shown during the pre-start countdown — hides once the engine starts.
     countdown_banner: adw::Banner,
     /// Horizontal pill row listing connected BLE devices.
@@ -87,46 +88,16 @@ impl PlayerPage {
 
         root.append(&countdown_banner);
 
-        // ── Interval info row (shown while workout is running) ────────────────
-        // adw::Banner is for dismissible alerts; persistent live state uses a plain row.
-        let interval_info_label = gtk::Label::builder()
-            .label("")
-            .css_classes(["caption", "numeric"])
-            .hexpand(true)
-            .halign(gtk::Align::Start)
-            .build();
-        let interval_info_row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(18)
-            .margin_end(18)
-            .build();
-        interval_info_row.append(&interval_info_label);
-        let rev_inner = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .build();
-        rev_inner.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        rev_inner.append(&interval_info_row);
-        let interval_revealer = gtk::Revealer::builder()
-            .transition_type(gtk::RevealerTransitionType::SlideDown)
-            .transition_duration(150)
-            .reveal_child(false)
-            .child(&rev_inner)
-            .build();
-        root.append(&interval_revealer);
-
-        let scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .build();
-
+        // ── Cockpit layout ───────────────────────────────────────────────────
+        // Everything the rider needs mid-effort is visible at once — no scroll.
+        // The graph absorbs spare height so the page fills any window size.
         let clamp = adw::Clamp::builder()
             .maximum_size(900)
-            .margin_top(20)
+            .margin_top(18)
             .margin_bottom(24)
             .margin_start(24)
             .margin_end(24)
+            .vexpand(true)
             .build();
 
         let inner = gtk::Box::builder()
@@ -134,11 +105,25 @@ impl PlayerPage {
             .spacing(18)
             .build();
 
-        // ── Connected device chips ────────────────────────────────────────────
+        // ── Header row: workout name + connected device chips ────────────────
+        let header_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+        let workout_name_label = gtk::Label::builder()
+            .label(&workout.name)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["title-3"])
+            .build();
+        header_row.append(&workout_name_label);
+
         let devices_section = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+            .spacing(6)
             .visible(false)
+            .halign(gtk::Align::End)
             .build();
         devices_section.append(
             &gtk::Label::builder()
@@ -151,18 +136,76 @@ impl PlayerPage {
             .spacing(6)
             .build();
         devices_section.append(&devices_flow);
-        inner.append(&devices_section);
+        header_row.append(&devices_section);
+        inner.append(&header_row);
 
-        // ── Workout name ─────────────────────────────────────────────────────
-        let workout_name_label = gtk::Label::builder()
-            .label(&workout.name)
-            .halign(gtk::Align::Start)
-            .css_classes(["title-3"])
+        // ── Hero row: target | live power | interval countdown ───────────────
+        // Power is the page's reason to exist — it gets the `display` class
+        // (CLAUDE.md §1.5) and the centre column; the machine-set target and
+        // the interval countdown flank it.
+        let hero_grid = gtk::Grid::builder()
+            .column_spacing(12)
+            .column_homogeneous(true)
             .build();
-        inner.append(&workout_name_label);
 
-        // ── Workout power profile graph ──────────────────────────────────────
+        let (target_box, target_label) =
+            Self::metric_column("Target", "— W", &["title-1", "numeric", "accent"]);
+        hero_grid.attach(&target_box, 0, 0, 1, 1);
+
+        let (power_box, power_label) = Self::metric_column("Power", "— W", &["display", "numeric"]);
+        hero_grid.attach(&power_box, 1, 0, 1, 1);
+
+        let interval_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .build();
+        let interval_caption = gtk::Label::builder()
+            .label("Interval")
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let interval_label = gtk::Label::builder()
+            .label("—")
+            .css_classes(["title-1", "numeric"])
+            .build();
+        let segment_progress = gtk::ProgressBar::builder().fraction(0.0).build();
+        segment_progress.add_css_class("accent");
+        interval_box.append(&interval_caption);
+        interval_box.append(&interval_label);
+        interval_box.append(&segment_progress);
+        hero_grid.attach(&interval_box, 2, 0, 1, 1);
+        inner.append(&hero_grid);
+
+        // ── Zone ribbon: where the current effort sits across Z1–Z7 ─────────
+        let zone_meter = ZoneMeter::new(athlete.ftp_watts);
+        inner.append(zone_meter.widget());
+
+        // ── Secondary metrics: HR · cadence · elapsed · remaining ────────────
+        let secondary_grid = gtk::Grid::builder()
+            .column_spacing(12)
+            .column_homogeneous(true)
+            .build();
+        let (hr_box, hr_label) =
+            Self::metric_column("Heart Rate", "— bpm", &["title-2", "numeric"]);
+        let (cadence_box, cadence_label) =
+            Self::metric_column("Cadence", "— rpm", &["title-2", "numeric"]);
+        let (elapsed_box, elapsed_label) =
+            Self::metric_column("Elapsed", "0:00", &["title-2", "numeric"]);
+        let (remaining_box, remaining_label) = Self::metric_column(
+            "Remaining",
+            &WorkoutEngine::format_duration(workout.duration_secs),
+            &["title-2", "numeric"],
+        );
+        secondary_grid.attach(&hr_box, 0, 0, 1, 1);
+        secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
+        secondary_grid.attach(&elapsed_box, 2, 0, 1, 1);
+        secondary_grid.attach(&remaining_box, 3, 0, 1, 1);
+        inner.append(&secondary_grid);
+
+        // ── Workout power profile graph (absorbs spare height) ───────────────
         let graph = WorkoutGraph::new(workout, athlete);
+        graph.widget().set_vexpand(true);
         inner.append(graph.widget());
 
         // ── Whole-workout progress bar ───────────────────────────────────────
@@ -173,111 +216,43 @@ impl PlayerPage {
         workout_progress.add_css_class("accent");
         inner.append(&workout_progress);
 
-        let time_row = gtk::Box::builder()
+        // ── Session totals strip ─────────────────────────────────────────────
+        // Live running totals in one glanceable line; the full breakdown
+        // belongs to the post-ride summary page.
+        let totals_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .build();
-        let elapsed_label = gtk::Label::builder()
-            .label("0:00")
-            .css_classes(["dim-label", "caption", "numeric"])
-            .build();
-        let remaining_label = gtk::Label::builder()
-            .label(WorkoutEngine::format_duration(workout.duration_secs))
-            .css_classes(["dim-label", "caption", "numeric"])
-            .halign(gtk::Align::End)
-            .hexpand(true)
-            .build();
-        time_row.append(&elapsed_label);
-        time_row.append(&remaining_label);
-        inner.append(&time_row);
-
-        // ── 2×2 live metric grid ─────────────────────────────────────────────
-        let metrics_grid = gtk::Grid::builder()
-            .row_spacing(12)
-            .column_spacing(12)
-            .column_homogeneous(true)
+            .spacing(18)
+            .halign(gtk::Align::Center)
             .build();
 
-        let (power_frame, power_label) = Self::metric_card("Power", "— W", &["accent"]);
-        let (hr_frame, hr_label) = Self::metric_card("Heart Rate", "— bpm", &[]);
-        let (cadence_frame, cadence_label) = Self::metric_card("Cadence", "— rpm", &[]);
-        let (target_frame, target_label) = Self::metric_card("Target", "— W", &["accent"]);
-
-        metrics_grid.attach(&power_frame, 0, 0, 1, 1);
-        metrics_grid.attach(&hr_frame, 1, 0, 1, 1);
-        metrics_grid.attach(&cadence_frame, 0, 1, 1, 1);
-        metrics_grid.attach(&target_frame, 1, 1, 1, 1);
-        inner.append(&metrics_grid);
-
-        // ── Interval countdown ───────────────────────────────────────────────
-        let interval_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .build();
-
-        interval_box.append(
-            &gtk::Label::builder()
-                .label("Current Interval")
-                .css_classes(["title-4"])
-                .halign(gtk::Align::Start)
-                .build(),
-        );
-
-        let interval_label = gtk::Label::builder()
-            .label("—")
-            .css_classes(["title-2", "accent", "numeric"])
-            .halign(gtk::Align::Start)
-            .build();
-
-        let segment_progress = gtk::ProgressBar::builder().fraction(0.0).build();
-        segment_progress.add_css_class("accent");
-
-        interval_box.append(&interval_label);
-        interval_box.append(&segment_progress);
-        inner.append(&interval_box);
-
-        // ── Session totals ───────────────────────────────────────────────────
-        let totals_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .build();
-
-        totals_box.append(
-            &gtk::Label::builder()
-                .label("Session Totals")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-
-        let totals_list = gtk::ListBox::builder()
-            .css_classes(["boxed-list"])
-            .selection_mode(gtk::SelectionMode::None)
-            .build();
-
-        let make_total_row = |title: &str| -> (adw::ActionRow, gtk::Label) {
-            let row = adw::ActionRow::builder().title(title).build();
-            let lbl = gtk::Label::builder()
-                .label("—")
-                .css_classes(["dim-label", "numeric"])
-                .valign(gtk::Align::Center)
+        let make_total_pair = |name: &str, tooltip: Option<&str>| -> gtk::Label {
+            let pair = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
                 .build();
-            row.add_suffix(&lbl);
-            (row, lbl)
+            let name_lbl = gtk::Label::builder()
+                .label(name)
+                .css_classes(["caption", "dim-label"])
+                .build();
+            let value_lbl = gtk::Label::builder()
+                .label("—")
+                .css_classes(["caption", "numeric"])
+                .build();
+            if let Some(tip) = tooltip {
+                pair.set_tooltip_text(Some(tip));
+            }
+            pair.append(&name_lbl);
+            pair.append(&value_lbl);
+            totals_row.append(&pair);
+            value_lbl
         };
 
-        let (r, avg_power_total) = make_total_row("Avg Power");
-        totals_list.append(&r);
-        let (r, np_total) = make_total_row("Normalised Power");
-        totals_list.append(&r);
-        let (r, if_total) = make_total_row("Intensity Factor");
-        totals_list.append(&r);
-        let (r, tss_total) = make_total_row("TSS");
-        totals_list.append(&r);
-        let (r, kj_total) = make_total_row("Kilojoules");
-        totals_list.append(&r);
-
-        totals_box.append(&totals_list);
-        inner.append(&totals_box);
+        let avg_power_total = make_total_pair("Avg", Some("Average power"));
+        let np_total = make_total_pair("NP", Some("Normalised power"));
+        let if_total = make_total_pair("IF", Some("Intensity factor"));
+        let tss_total = make_total_pair("TSS", Some("Training stress score"));
+        let kj_total = make_total_pair("Energy", Some("Total work in kilojoules"));
+        inner.append(&totals_row);
 
         // ── Playback controls ────────────────────────────────────────────────
         // Cancel/Pause/Skip at leading edge; hexpand spacer pushes End Workout to
@@ -319,8 +294,7 @@ impl PlayerPage {
         inner.append(&controls);
 
         clamp.set_child(Some(&inner));
-        scroll.set_child(Some(&clamp));
-        root.append(&scroll);
+        root.append(&clamp);
 
         // ── Wire buttons once through replaceable callbacks ───────────────────
         // Each start_timer call replaces the callbacks; the buttons are never
@@ -374,8 +348,8 @@ impl PlayerPage {
             interval_label,
             workout_progress,
             segment_progress,
-            interval_revealer,
-            interval_info_label,
+            interval_caption,
+            zone_meter,
             countdown_banner,
             devices_section,
             devices_flow,
@@ -486,8 +460,8 @@ impl PlayerPage {
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
         self.power_countdown.set(0);
-        self.interval_revealer.set_reveal_child(false);
         self.graph.set_workout(workout);
+        self.zone_meter.set_power(None);
         self.elapsed_label.set_label("0:00");
         self.remaining_label
             .set_label(&WorkoutEngine::format_duration(workout.duration_secs));
@@ -498,6 +472,7 @@ impl PlayerPage {
         self.cadence_label.set_label("— rpm");
         self.target_label.set_label("— W");
         self.interval_label.set_label("—");
+        self.interval_caption.set_label("Interval");
         self.avg_power_total.set_label("—");
         self.np_total.set_label("—");
         self.if_total.set_label("—");
@@ -715,15 +690,14 @@ impl PlayerPage {
         ));
         self.target_label
             .set_label(&format!("{} W", snap.target_power_watts));
+        self.zone_meter.set_power(snap.readings.power_watts);
 
         self.elapsed_label
             .set_label(&WorkoutEngine::format_duration(snap.elapsed_secs));
         self.remaining_label
             .set_label(&WorkoutEngine::format_duration(snap.remaining_secs));
-        self.interval_label.set_label(&format!(
-            "{} remaining",
-            WorkoutEngine::format_duration(snap.segment_remaining_secs)
-        ));
+        self.interval_label
+            .set_label(&WorkoutEngine::format_duration(snap.segment_remaining_secs));
 
         let total = snap.elapsed_secs + snap.remaining_secs;
         if total > 0 {
@@ -736,15 +710,13 @@ impl PlayerPage {
                 .set_fraction(snap.segment_elapsed_secs as f64 / seg_total as f64);
         }
 
-        // Interval info row: visible while the workout is active.
+        // Interval caption: numbered while the workout is active.
         let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
-        self.interval_revealer.set_reveal_child(is_active);
         if is_active {
-            self.interval_info_label.set_label(&format!(
-                "Interval {} — {} remaining",
-                snap.segment_index + 1,
-                WorkoutEngine::format_duration(snap.segment_remaining_secs),
-            ));
+            self.interval_caption
+                .set_label(&format!("Interval {}", snap.segment_index + 1));
+        } else {
+            self.interval_caption.set_label("Interval");
         }
 
         // Countdown banner and cancel button: visible only while engine is still Idle.
@@ -753,8 +725,9 @@ impl PlayerPage {
         self.cancel_btn.set_visible(is_idle);
     }
 
-    /// Update the live session totals panel from the current in-progress session.
+    /// Update the live session totals strip from the current in-progress session.
     pub fn update_session_totals(&self, session: &Session, ftp: u32) {
+        self.zone_meter.set_ftp(ftp);
         match session.average_power() {
             Some(p) => self.avg_power_total.set_label(&format!("{} W", p as u32)),
             None => self.avg_power_total.set_label("—"),
@@ -776,43 +749,28 @@ impl PlayerPage {
         self.kj_total.set_label(&format!("{:.0} kJ", kj));
     }
 
-    fn metric_card(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
-        let card = gtk::Box::builder()
-            .css_classes(["card"])
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-
+    /// A centred caption-over-value column for the cockpit metric rows.
+    fn metric_column(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
         let vbox = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
-            .margin_top(18)
-            .margin_bottom(18)
-            .margin_start(18)
-            .margin_end(18)
-            .valign(gtk::Align::Center)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
             .build();
 
         vbox.append(
             &gtk::Label::builder()
                 .label(title)
                 .css_classes(["caption", "dim-label"])
-                .halign(gtk::Align::Start)
                 .build(),
         );
 
-        let mut classes = vec!["title-1", "numeric"];
-        classes.extend_from_slice(value_css);
-
         let value_label = gtk::Label::builder()
             .label(initial)
-            .css_classes(classes)
-            .halign(gtk::Align::Start)
+            .css_classes(value_css.to_vec())
             .build();
 
         vbox.append(&value_label);
-        card.append(&vbox);
-
-        (card, value_label)
+        (vbox, value_label)
     }
 }
