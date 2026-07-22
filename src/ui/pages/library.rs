@@ -6,10 +6,13 @@ use std::rc::Rc;
 
 use sqlx::SqlitePool;
 
+use crate::data::athlete::AthleteProfile;
 use crate::data::db;
 use crate::data::import::{parse_erg, parse_zwo};
 use crate::data::route::Route;
 use crate::data::workout::{Workout, WorkoutCategory};
+use crate::ui::widgets::workout_graph::WorkoutGraph;
+use crate::ui::widgets::zone_color::{category_zone_rgb, zone_swatch};
 use libshumate::prelude::LocationExt;
 
 /// Self-referential rebuild-callback holder — lets a closure reference itself
@@ -70,59 +73,94 @@ impl LibraryPage {
         search_bar.connect_entry(&search_entry);
         root.append(&search_bar);
 
-        // ── Toolbar row: Import button (right-aligned) ───────────────────────
+        // ── Toolbar row: search · [spacer] · New Workout · more menu ─────────
         let toolbar_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
             .margin_start(18)
             .margin_end(18)
             .build();
 
-        let gpx_btn = gtk::Button::builder()
-            .label("Load GPX Route")
-            .icon_name("map-symbolic")
+        // Visible entry point for search — Ctrl+F works too, but a hidden
+        // shortcut shouldn't be the only way in.
+        let search_toggle = gtk::ToggleButton::builder()
+            .icon_name("system-search-symbolic")
             .css_classes(["flat"])
-            .tooltip_text("Load a GPX file to preview the route and elevation profile")
-            .halign(gtk::Align::End)
+            .tooltip_text("Search workouts (Ctrl+F)")
+            .build();
+        search_bar
+            .bind_property("search-mode-enabled", &search_toggle, "active")
+            .bidirectional()
+            .sync_create()
             .build();
 
-        let import_btn = gtk::Button::builder()
-            .label("Import ZWO / ERG")
-            .css_classes(["flat"])
-            .tooltip_text("Import a ZWO, ERG, or MRC workout file")
-            .halign(gtk::Align::End)
-            .build();
-
+        // Creating a workout is this page's primary act.
         let new_workout_btn = gtk::Button::builder()
-            .label("New Workout")
-            .icon_name("list-add-symbolic")
-            .css_classes(["flat"])
+            .css_classes(["suggested-action"])
             .tooltip_text("Create a new custom workout")
-            .halign(gtk::Align::End)
+            .build();
+        new_workout_btn.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name("list-add-symbolic")
+                .label("New Workout")
+                .build(),
+        ));
+
+        // Rare imports live behind one menu, as on the Calendar.
+        let menu_item = |icon: &str, label: &str, tooltip: &str| -> gtk::Button {
+            let btn = gtk::Button::builder()
+                .css_classes(["flat"])
+                .tooltip_text(tooltip)
+                .build();
+            btn.set_child(Some(
+                &adw::ButtonContent::builder()
+                    .icon_name(icon)
+                    .label(label)
+                    .halign(gtk::Align::Start)
+                    .build(),
+            ));
+            btn
+        };
+        let import_btn = menu_item(
+            "document-open-symbolic",
+            "Import ZWO / ERG",
+            "Import a ZWO, ERG, or MRC workout file",
+        );
+        let gpx_btn = menu_item(
+            "map-symbolic",
+            "Load GPX route",
+            "Load a GPX file to preview the route and elevation profile",
+        );
+        let menu_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        menu_box.append(&import_btn);
+        menu_box.append(&gpx_btn);
+        let more_popover = gtk::Popover::builder().child(&menu_box).build();
+        for btn in [&import_btn, &gpx_btn] {
+            let popover = more_popover.clone();
+            btn.connect_clicked(move |_| popover.popdown());
+        }
+        let more_btn = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Import workouts and routes")
+            .css_classes(["flat"])
+            .popover(&more_popover)
             .build();
 
+        toolbar_row.append(&search_toggle);
         toolbar_row.append(&gtk::Label::builder().hexpand(true).build());
         toolbar_row.append(&new_workout_btn);
-        toolbar_row.append(&gpx_btn);
-        toolbar_row.append(&import_btn);
+        toolbar_row.append(&more_btn);
         root.append(&toolbar_row);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-        // ── Help banner ───────────────────────────────────────────────────────
-        let help_banner = adw::Banner::builder()
-            .title(
-                "Click any workout to view its power profile, then start or schedule it \
-                 from the detail view.",
-            )
-            .button_label("Got it")
-            .revealed(true)
-            .build();
-        {
-            let banner = help_banner.clone();
-            help_banner.connect_button_clicked(move |_| banner.set_revealed(false));
-        }
-        root.append(&help_banner);
 
         // ── Category filter chips ────────────────────────────────────────────
         let filter_scroll = gtk::ScrolledWindow::builder()
@@ -137,13 +175,6 @@ impl LibraryPage {
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .build();
-
-        filter_box.append(
-            &gtk::Label::builder()
-                .label("Filter:")
-                .css_classes(["dim-label"])
-                .build(),
-        );
 
         // ── Dynamic list container ───────────────────────────────────────────
         let list_scroll = gtk::ScrolledWindow::builder()
@@ -172,6 +203,9 @@ impl LibraryPage {
             Rc::new(RefCell::new(HashSet::new()));
         let search_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let workouts_rc: Rc<RefCell<Vec<Workout>>> = Rc::new(RefCell::new(workouts));
+        // Chip references for the empty state's "Clear Filters" action —
+        // filled when the chips are built below.
+        let filter_chips: Rc<RefCell<Vec<gtk::ToggleButton>>> = Rc::new(RefCell::new(Vec::new()));
 
         // ── Rebuild closure — clears and repopulates list_container ──────────
         // rebuild_holder lets the closure reference itself (for edit/delete callbacks).
@@ -188,6 +222,8 @@ impl LibraryPage {
             let on_toast = Rc::clone(&on_toast);
             let rebuild_holder = Rc::clone(&rebuild_holder);
             let fitness_ctx = Rc::clone(&fitness_ctx);
+            let filter_chips = Rc::clone(&filter_chips);
+            let search_entry = search_entry.clone();
 
             Rc::new(move || {
                 // Snapshot the current fitness context for this rebuild pass.
@@ -239,13 +275,22 @@ impl LibraryPage {
 
                     any_visible = true;
 
-                    list_container.append(
+                    // Category heading with its zone-colour swatch.
+                    let heading_row = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(6)
+                        .build();
+                    if let Some(rgb) = category_zone_rgb(cat) {
+                        heading_row.append(&zone_swatch(rgb));
+                    }
+                    heading_row.append(
                         &gtk::Label::builder()
                             .label(cat.label())
                             .halign(gtk::Align::Start)
                             .css_classes(["title-4"])
                             .build(),
                     );
+                    list_container.append(&heading_row);
 
                     let group = adw::PreferencesGroup::new();
 
@@ -259,20 +304,22 @@ impl LibraryPage {
                             .iter()
                             .map(|s| s.power_high_pct.max(s.power_low_pct))
                             .fold(0.0f32, f32::max);
-                        let (difficulty, diff_class) = if peak_pct >= 130.0 {
-                            ("Very Hard", "error")
+                        let difficulty = if peak_pct >= 130.0 {
+                            "Very Hard"
                         } else if peak_pct >= 110.0 || tss > 100 {
-                            ("Hard", "warning")
+                            "Hard"
                         } else if peak_pct >= 88.0 || tss > 50 {
-                            ("Moderate", "accent")
+                            "Moderate"
                         } else {
-                            ("Easy", "success")
+                            "Easy"
                         };
+                        // Category is already the section heading — the meta
+                        // line carries difficulty instead.
                         let meta = format!(
                             "{} min · TSS {} · {}",
                             workout.duration_secs / 60,
                             tss,
-                            workout.category.label()
+                            difficulty
                         );
                         let subtitle = if workout.description.trim().is_empty() {
                             meta
@@ -286,12 +333,18 @@ impl LibraryPage {
                             .activatable(true)
                             .build();
 
-                        let diff_badge = gtk::Label::builder()
-                            .label(difficulty)
-                            .css_classes(["caption", "pill", diff_class])
-                            .valign(gtk::Align::Center)
-                            .build();
-                        row.add_prefix(&diff_badge);
+                        // The workout's own shape is its best label: a mini
+                        // zone-coloured profile, same motif as player/summary.
+                        let thumb_athlete = AthleteProfile {
+                            ftp_watts: ftp.max(1),
+                            ..AthleteProfile::default()
+                        };
+                        let thumb = WorkoutGraph::new(workout, &thumb_athlete);
+                        thumb.widget().set_content_width(84);
+                        thumb.widget().set_content_height(42);
+                        thumb.widget().set_hexpand(false);
+                        thumb.widget().set_valign(gtk::Align::Center);
+                        row.add_prefix(thumb.widget());
 
                         let (is_rec, _, _) =
                             workout_fitness_context(workout, ctl, tsb, &goal_descriptions);
@@ -431,11 +484,27 @@ impl LibraryPage {
                 }
 
                 if !any_visible {
+                    // The empty state offers the way out of it.
+                    let clear_btn = gtk::Button::builder()
+                        .label("Clear Filters")
+                        .css_classes(["pill"])
+                        .halign(gtk::Align::Center)
+                        .tooltip_text("Show all workouts again")
+                        .build();
+                    let chips_c = Rc::clone(&filter_chips);
+                    let search_entry_c = search_entry.clone();
+                    clear_btn.connect_clicked(move |_| {
+                        for chip in chips_c.borrow().iter() {
+                            chip.set_active(false);
+                        }
+                        search_entry_c.set_text("");
+                    });
                     list_container.append(
                         &adw::StatusPage::builder()
                             .icon_name("folder-open-symbolic")
                             .title("No Workouts")
-                            .description("No workouts match your current filters.")
+                            .description("No workouts match your search or filters.")
+                            .child(&clear_btn)
                             .build(),
                     );
                 }
@@ -662,28 +731,12 @@ impl LibraryPage {
                 rebuild_clone();
             });
 
+            filter_chips.borrow_mut().push(chip.clone());
             filter_box.append(&chip);
         }
 
         filter_scroll.set_child(Some(&filter_box));
         root.append(&filter_scroll);
-
-        // ── Difficulty legend ─────────────────────────────────────────────────
-        root.append(
-            &gtk::Label::builder()
-                .label(
-                    "Difficulty is based on the peak power target in any segment as a \
-                     percentage of your FTP — Easy < 88 % · Moderate 88–110 % · \
-                     Hard 110–130 % · Very Hard ≥ 130 %",
-                )
-                .wrap(true)
-                .xalign(0.0)
-                .css_classes(["caption", "dim-label"])
-                .margin_start(18)
-                .margin_end(18)
-                .margin_top(6)
-                .build(),
-        );
 
         // Ctrl+F reveals the search bar; key events on root propagate into it
         search_bar.set_key_capture_widget(Some(&root));
