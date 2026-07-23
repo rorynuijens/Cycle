@@ -9,8 +9,8 @@ use sqlx::SqlitePool;
 
 use super::pages::{
     calendar::CalendarPage, coaching::CoachingPage, dashboard::DashboardPage, devices::DevicesPage,
-    fitness::FitnessPage, history::HistoryPage, library::LibraryPage, player::PlayerPage,
-    route_player::RoutePlayerPage, summary::SummaryPage,
+    fitness::FitnessPage, library::LibraryPage, player::PlayerPage, route_player::RoutePlayerPage,
+    summary::SummaryPage,
 };
 use crate::data::{
     athlete::AthleteProfile,
@@ -18,8 +18,8 @@ use crate::data::{
     route::Route,
     workout::Workout,
 };
-use crate::devices::manager::{DeviceCommand, DeviceEvent};
-use crate::training::engine::WorkoutEngine;
+use crate::devices::manager::{DeviceCommand, DeviceEvent, DeviceType};
+use crate::training::engine::{EngineState, WorkoutEngine};
 
 pub struct CycleGtkWindow {
     pub window: adw::ApplicationWindow,
@@ -124,23 +124,11 @@ impl CycleGtkWindow {
 
         let stack = adw::ViewStack::new();
 
-        // ── Resolve icon names early (needed by library page) ─────────────────
-        let calendar_icon = Self::resolve_icon(&[
-            "x-office-calendar-symbolic",
-            "org.gnome.Calendar-symbolic",
-            "month-symbolic",
-        ]);
-        let fitness_icon = Self::resolve_icon(&[
-            "org.gnome.Charts-symbolic",
-            "chart-line-symbolic",
-            "utilities-system-monitor-symbolic",
-            "preferences-system-symbolic",
-        ]);
-        let coaching_icon = Self::resolve_icon(&[
-            "brain-augmented-symbolic",
-            "chat-message-new-symbolic",
-            "system-search-symbolic",
-        ]);
+        // ── Nav icons — bundled in the app gresource, so they always resolve
+        // (see data/icons/symbolic/README.md) ─────────────────────────────────
+        let calendar_icon = "calendar-symbolic";
+        let fitness_icon = "graph-symbolic";
+        let coaching_icon = "brain-augmented-symbolic";
 
         // ── Non-library pages ─────────────────────────────────────────────────
         let devices_rc = Rc::new(RefCell::new(DevicesPage::new(
@@ -159,12 +147,16 @@ impl CycleGtkWindow {
         let engine_rc = Rc::new(RefCell::new(engine));
         let player_rc = Rc::new(RefCell::new(PlayerPage::new(&workout, &athlete)));
 
-        // ── Header start button — created here so on_complete and do_start can ref it ──
+        // ── Header resume button — created here so on_complete and do_start can ref it ──
+        // Only visible while a workout is running and the user has navigated away
+        // from the player; starting a workout always happens contextually (Today
+        // hero, Library, Calendar), never from the header.
         let workout_active = Rc::new(Cell::new(false));
         let start_btn = gtk::Button::builder()
-            .label("Start Workout")
+            .label("Resume Workout")
             .css_classes(["suggested-action"])
-            .tooltip_text("Start the selected workout")
+            .tooltip_text("Return to the workout in progress")
+            .visible(false)
             .build();
 
         // Created early so connect_visible_child_notify can reference it
@@ -206,7 +198,7 @@ impl CycleGtkWindow {
 
         let on_complete = move |session: crate::data::session::Session| {
             workout_active_complete.set(false);
-            start_btn_complete.set_label("Start Workout");
+            start_btn_complete.set_visible(false);
             // Reset timer state so the next "Start Workout" click starts fresh.
             timer_alive_complete.set(false);
             timer_started_complete.set(false);
@@ -340,7 +332,7 @@ impl CycleGtkWindow {
             });
         };
 
-        // ── Shared "start" closure — header button, dashboard card, library ──
+        // ── Shared "start" closure — dashboard card, library, calendar ──────
         let do_start: Rc<dyn Fn()> = {
             let stack = stack.clone();
             let player = Rc::clone(&player_rc);
@@ -352,7 +344,6 @@ impl CycleGtkWindow {
             Rc::new(move || {
                 stack.set_visible_child_name("player");
                 workout_active.set(true);
-                start_btn.set_label("Resume Workout");
                 if !timer_started.get() {
                     timer_started.set(true);
                     let stack_cancel = stack.clone();
@@ -364,7 +355,7 @@ impl CycleGtkWindow {
                         on_complete.clone(),
                         move || {
                             wa_cancel.set(false);
-                            sb_cancel.set_label("Start Workout");
+                            sb_cancel.set_visible(false);
                             stack_cancel.set_visible_child_name("dashboard");
                         },
                         Rc::clone(&timer_alive),
@@ -440,12 +431,17 @@ impl CycleGtkWindow {
         let on_view_fitness: Rc<dyn Fn()> = Rc::new(move || {
             stack_for_fitness_nav.set_visible_child_name("fitness");
         });
+        let stack_for_cal_nav = stack.clone();
+        let on_open_calendar: Rc<dyn Fn()> = Rc::new(move || {
+            stack_for_cal_nav.set_visible_child_name("calendar");
+        });
         let (dashboard_page, dashboard_reload) = DashboardPage::new(
             pool.clone(),
             rt_handle.clone(),
             athlete.clone(),
             Rc::clone(&on_library_start),
             on_view_fitness,
+            on_open_calendar,
         );
 
         // ── Route player page ─────────────────────────────────────────────────
@@ -460,6 +456,11 @@ impl CycleGtkWindow {
         let route_timer_alive = Rc::new(Cell::new(false));
         let route_timer_started = Rc::new(Cell::new(false));
 
+        // True while a controllable trainer (BLE FTMS or ANT+ FE-C) is connected.
+        // The route player checks this each tick to pick SIM vs ERG emulation.
+        let sim_capable = Rc::new(Cell::new(false));
+        let trainer_addr: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
         // on_start_route: called from the library when the user clicks "Ride this Route"
         let on_start_route: Rc<dyn Fn(Route)> = {
             let route_player = Rc::clone(&route_player_rc);
@@ -470,6 +471,7 @@ impl CycleGtkWindow {
             let toast_route = self.toast_overlay.clone();
             let timer_alive = Rc::clone(&route_timer_alive);
             let timer_started = Rc::clone(&route_timer_started);
+            let sim_capable = Rc::clone(&sim_capable);
             let mass_kg = athlete.weight_kg;
             Rc::new(move |route: Route| {
                 timer_alive.set(false);
@@ -488,6 +490,7 @@ impl CycleGtkWindow {
                         route,
                         mass_kg,
                         cmd_tx.clone(),
+                        Rc::clone(&sim_capable),
                         move |session| {
                             stack_done.set_visible_child_name("dashboard");
                             let pool_save = pool_c.clone();
@@ -527,21 +530,10 @@ impl CycleGtkWindow {
         );
         let library_reload = Rc::new(library_reload);
 
-        // ── History page ──────────────────────────────────────────────────────
-        let toast_overlay_for_history = self.toast_overlay.clone();
-        let (history_page, history_reload) = HistoryPage::new(
-            pool.clone(),
-            rt_handle.clone(),
-            Rc::new(move |toast| toast_overlay_for_history.add_toast(toast)),
-            athlete.ftp_watts,
-            athlete.weight_kg,
-        );
-
         // ── Add all pages to stack ────────────────────────────────────────────
         stack.add_named(dashboard_page.widget(), Some("dashboard"));
         stack.add_named(calendar_page.widget(), Some("calendar"));
         stack.add_named(library_page.widget(), Some("library"));
-        stack.add_named(history_page.widget(), Some("history"));
         stack.add_named(devices_rc.borrow().widget(), Some("devices"));
         stack.add_named(player_rc.borrow().widget(), Some("player"));
         stack.add_named(route_player_rc.widget(), Some("route_player"));
@@ -596,11 +588,11 @@ impl CycleGtkWindow {
         // Reload data pages whenever they become visible (sidebar nav or
         // programmatic switches such as "Back to Dashboard" from summary).
         // Also update the content navigation page title per GNOME HIG.
-        // Also show/hide the Start Workout button: hide it on pages where it
-        // has no contextual meaning (History, Fitness, Coaching, Devices,
-        // Calendar) to avoid confusing "Start Workout" while browsing stats.
+        // Also show/hide the Resume Workout button: it only appears while a
+        // workout is running and the user is away from the player page.
         let content_nav_for_title = content_nav_page.clone();
         let start_btn_for_vis = start_btn.clone();
+        let workout_active_for_vis = Rc::clone(&workout_active);
         let back_btn_for_vis = back_btn.clone();
         stack.connect_visible_child_notify(move |s| {
             let page = s.visible_child_name();
@@ -608,7 +600,6 @@ impl CycleGtkWindow {
                 Some("dashboard") | None => "Dashboard",
                 Some("calendar") => "Calendar",
                 Some("library") => "Library",
-                Some("history") => "History",
                 Some("fitness") => "Fitness",
                 Some("coaching") => "Coaching",
                 Some("devices") => "Devices",
@@ -618,10 +609,8 @@ impl CycleGtkWindow {
                 _ => "Cycle",
             };
             content_nav_for_title.set_title(title);
-            let show_start = matches!(
-                page.as_deref(),
-                Some("dashboard") | Some("library") | Some("player") | None
-            );
+            let show_start =
+                workout_active_for_vis.get() && !matches!(page.as_deref(), Some("player"));
             start_btn_for_vis.set_visible(show_start);
             let show_back = matches!(page.as_deref(), Some("summary"));
             back_btn_for_vis.set_visible(show_back);
@@ -629,7 +618,6 @@ impl CycleGtkWindow {
                 Some("dashboard") => dashboard_reload(),
                 Some("calendar") => calendar_reload(),
                 Some("library") => library_reload(),
-                Some("history") => history_reload(),
                 Some("fitness") => fitness_reload(),
                 Some("coaching") => coaching_reload(),
                 _ => {}
@@ -693,16 +681,16 @@ impl CycleGtkWindow {
             stack_for_back.set_visible_child_name("dashboard");
         });
 
-        // Navigate to the active player when a workout is running; otherwise start one.
-        let workout_active_btn = Rc::clone(&workout_active);
+        // Return to the active player. If the workout is paused, this also
+        // resumes it — the button reads "Resume Workout" and users expect that.
         let stack_for_btn = stack.clone();
-        let do_start_header = Rc::clone(&do_start);
+        let engine_for_btn = Rc::clone(&engine_rc);
+        let player_for_btn = Rc::clone(&player_rc);
         start_btn.connect_clicked(move |_| {
-            if workout_active_btn.get() {
-                stack_for_btn.set_visible_child_name("player");
-            } else {
-                do_start_header();
+            if engine_for_btn.borrow().state == EngineState::Paused {
+                player_for_btn.borrow().trigger_pause_toggle();
             }
+            stack_for_btn.set_visible_child_name("player");
         });
 
         content_box.append(&content_header);
@@ -815,10 +803,11 @@ impl CycleGtkWindow {
                         name,
                         rssi,
                         transport,
+                        kind,
                     } => {
                         devices_for_loop
                             .borrow_mut()
-                            .on_discovered(address, name, rssi, transport);
+                            .on_discovered(address, name, rssi, transport, kind);
                     }
                     DeviceEvent::ConnectionChanged {
                         address,
@@ -831,6 +820,16 @@ impl CycleGtkWindow {
                             connected,
                             device_type,
                         );
+                        // Track whether a controllable trainer is available for SIM mode.
+                        if connected && device_type == Some(DeviceType::FtmsTrainer) {
+                            *trainer_addr.borrow_mut() = Some(address.clone());
+                            sim_capable.set(true);
+                        } else if !connected
+                            && trainer_addr.borrow().as_deref() == Some(address.as_str())
+                        {
+                            *trainer_addr.borrow_mut() = None;
+                            sim_capable.set(false);
+                        }
                         if connected {
                             player_for_loop
                                 .borrow()
@@ -847,6 +846,11 @@ impl CycleGtkWindow {
                     }
                     DeviceEvent::Error(e) => {
                         tracing::error!("Device error: {e}");
+                    }
+                    DeviceEvent::Warning(msg) => {
+                        tracing::warn!("Device warning: {msg}");
+                        toast_overlay_for_loop
+                            .add_toast(adw::Toast::builder().title(msg).timeout(5).build());
                     }
                 }
             }
@@ -882,17 +886,5 @@ impl CycleGtkWindow {
             .child(&row_box)
             .name(page_name)
             .build()
-    }
-
-    fn resolve_icon(candidates: &[&'static str]) -> &'static str {
-        if let Some(display) = gtk::gdk::Display::default() {
-            let theme = gtk::IconTheme::for_display(&display);
-            for candidate in candidates {
-                if theme.has_icon(candidate) {
-                    return candidate;
-                }
-            }
-        }
-        candidates.last().copied().unwrap_or("image-missing")
     }
 }

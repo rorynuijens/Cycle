@@ -3,6 +3,12 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+// Physics model constants shared by `power_at` and `speed_from_power`.
+const G: f32 = 9.81; // gravitational acceleration m/s²
+const RHO: f32 = 1.22; // air density kg/m³
+const CRR: f32 = 0.004; // rolling resistance coefficient
+const CDA: f32 = 0.32; // combined drag area m²
+
 /// A single point on a GPX route.
 #[derive(Debug, Clone)]
 pub struct RoutePoint {
@@ -43,16 +49,46 @@ impl Route {
     /// Uses a simplified road-cycling physics model:
     ///   P = (F_gravity + F_rolling + F_aero) × v
     pub fn power_at(speed_ms: f32, gradient: f32, mass_kg: f32) -> f32 {
-        const G: f32 = 9.81;
-        const RHO: f32 = 1.22; // air density kg/m³
-        const CRR: f32 = 0.004; // rolling resistance coefficient
-        const CDA: f32 = 0.32; // combined drag area m²
-
         let f_gravity = mass_kg * G * gradient;
         let f_rolling = mass_kg * G * CRR;
         let f_aero = 0.5 * RHO * CDA * speed_ms * speed_ms;
         let power = (f_gravity + f_rolling + f_aero) * speed_ms;
         power.max(0.0)
+    }
+
+    /// Speed (m/s) sustained at `power_watts` on the given `gradient` — the inverse
+    /// of [`Route::power_at`], used by SIM mode to derive virtual speed from the
+    /// rider's actual power.
+    ///
+    /// Solves `P = (a + b·v²)·v` with `a = m·G·(gradient + Crr)` (which is negative
+    /// on descents) and `b = ½·ρ·CdA`. On a descent at low power the cubic has
+    /// multiple roots; the physical solution is the largest one, so bisection
+    /// starts at the curve's stationary point where it is guaranteed monotonic.
+    /// Zero power downhill therefore yields the coasting terminal speed.
+    pub fn speed_from_power(power_watts: f32, gradient: f32, mass_kg: f32) -> f32 {
+        let a = mass_kg * G * (gradient + CRR);
+        let b = 0.5 * RHO * CDA;
+        let f = |v: f32| (a + b * v * v) * v - power_watts;
+
+        // Below the stationary point the curve can decrease; above it, it only rises.
+        let mut lo = if a < 0.0 {
+            (-a / (3.0 * b)).sqrt()
+        } else {
+            0.0
+        };
+        if f(lo) >= 0.0 {
+            return lo; // already at/above the requested power at the minimum speed
+        }
+        let mut hi = 40.0; // 144 km/h — beyond any indoor-realistic speed
+        for _ in 0..40 {
+            let mid = (lo + hi) / 2.0;
+            if f(mid) < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) / 2.0
     }
 
     /// Build a per-second workout segment list for the route driven at constant FTP percentage.
@@ -257,6 +293,49 @@ mod tests {
         let flat = Route::power_at(10.0, 0.0, 80.0);
         let climb = Route::power_at(10.0, 0.08, 80.0);
         assert!(climb > flat, "climbing should require more power than flat");
+    }
+
+    // ── speed_from_power (SIM mode virtual speed) ────────────────────────────
+
+    #[test]
+    fn should_ride_around_34_kmh_at_200w_on_the_flat() {
+        let v = Route::speed_from_power(200.0, 0.0, 75.0);
+        assert!((9.0..10.0).contains(&v), "got {v} m/s");
+    }
+
+    #[test]
+    fn should_slow_to_a_crawl_at_200w_on_8_percent() {
+        let v = Route::speed_from_power(200.0, 0.08, 75.0);
+        assert!((2.8..3.5).contains(&v), "got {v} m/s");
+    }
+
+    #[test]
+    fn should_coast_downhill_at_zero_power() {
+        // −5%: terminal coasting speed, well above zero
+        let v = Route::speed_from_power(0.0, -0.05, 75.0);
+        assert!((12.0..15.0).contains(&v), "got {v} m/s");
+    }
+
+    #[test]
+    fn should_stand_still_at_zero_power_on_the_flat() {
+        let v = Route::speed_from_power(0.0, 0.0, 75.0);
+        assert!(v < 0.2, "got {v} m/s");
+    }
+
+    #[test]
+    fn speed_from_power_inverts_power_at() {
+        for &(watts, grade) in &[(150.0, 0.0), (250.0, 0.05), (100.0, -0.02)] {
+            let v = Route::speed_from_power(watts, grade, 78.0);
+            let p = Route::power_at(v, grade, 78.0);
+            assert!((p - watts).abs() < 1.0, "P({v})={p}, expected {watts}");
+        }
+    }
+
+    #[test]
+    fn more_power_means_more_speed() {
+        let slow = Route::speed_from_power(150.0, 0.04, 75.0);
+        let fast = Route::speed_from_power(300.0, 0.04, 75.0);
+        assert!(fast > slow);
     }
 
     #[test]

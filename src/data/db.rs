@@ -27,6 +27,8 @@ pub struct SavedDevice {
     pub display_name: String,
     pub transport: String,
     pub erg_enabled: bool,
+    /// Device role as stored by `DeviceType::as_db_str` ("trainer", "hr", …).
+    pub device_type: String,
 }
 
 /// Open (or create) the SQLite database at the XDG data path and run migrations.
@@ -146,6 +148,11 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
 
     // Additive columns added after initial release — safe to ignore if they already exist.
     sqlx::query("ALTER TABLE saved_devices ADD COLUMN erg_enabled INTEGER NOT NULL DEFAULT 1")
+        .execute(pool)
+        .await
+        .ok();
+
+    sqlx::query("ALTER TABLE saved_devices ADD COLUMN device_type TEXT NOT NULL DEFAULT 'unknown'")
         .execute(pool)
         .await
         .ok();
@@ -416,7 +423,7 @@ pub async fn save_session_rpe(pool: &SqlitePool, session_id: i64, rpe: u8) -> Re
 
 pub async fn load_saved_devices(pool: &SqlitePool) -> Result<Vec<SavedDevice>> {
     let rows = sqlx::query(
-        "SELECT address, display_name, transport, erg_enabled
+        "SELECT address, display_name, transport, erg_enabled, device_type
          FROM saved_devices ORDER BY last_seen DESC",
     )
     .fetch_all(pool)
@@ -428,6 +435,7 @@ pub async fn load_saved_devices(pool: &SqlitePool) -> Result<Vec<SavedDevice>> {
             display_name: r.get("display_name"),
             transport: r.get("transport"),
             erg_enabled: r.get::<i64, _>("erg_enabled") != 0,
+            device_type: r.get("device_type"),
         })
         .collect())
 }
@@ -442,21 +450,26 @@ pub async fn set_device_erg_enabled(pool: &SqlitePool, address: &str, enabled: b
     Ok(())
 }
 
-/// Upsert a connected device. An existing custom `display_name` is preserved on conflict.
+/// Upsert a connected device. An existing custom `display_name` is preserved on conflict;
+/// the device type is refreshed since connect-time detection is the most reliable source.
 pub async fn save_device(
     pool: &SqlitePool,
     address: &str,
     display_name: &str,
     transport: &str,
+    device_type: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO saved_devices (address, display_name, transport, last_seen)
-         VALUES (?, ?, ?, datetime('now'))
-         ON CONFLICT(address) DO UPDATE SET last_seen = excluded.last_seen",
+        "INSERT INTO saved_devices (address, display_name, transport, device_type, last_seen)
+         VALUES (?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(address) DO UPDATE SET
+             last_seen = excluded.last_seen,
+             device_type = excluded.device_type",
     )
     .bind(address)
     .bind(display_name)
     .bind(transport)
+    .bind(device_type)
     .execute(pool)
     .await?;
     Ok(())

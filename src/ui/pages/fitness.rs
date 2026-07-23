@@ -30,14 +30,6 @@ const PACE_LABELS: [&str; 8] = [
 
 type PmcPoint = (NaiveDate, f64, f64, f64);
 
-const HR_ZONE_COLORS: [(f64, f64, f64); 5] = [
-    (0.34, 0.89, 0.53), // Z1 Easy
-    (0.47, 0.68, 0.93), // Z2 Aerobic
-    (0.97, 0.89, 0.36), // Z3 Tempo
-    (1.00, 0.48, 0.39), // Z4 Threshold
-    (0.84, 0.20, 0.20), // Z5 Max
-];
-
 fn hr_zone_index(bpm: u32, max_hr: u32) -> usize {
     if max_hr == 0 {
         return 0;
@@ -205,25 +197,7 @@ fn compute_pmc_series(
     series
 }
 
-fn ctl_status_text(ctl: f64) -> &'static str {
-    match ctl as u32 {
-        0..=15 => "Building your aerobic base",
-        16..=30 => "Moderate aerobic base",
-        31..=50 => "Good aerobic fitness",
-        51..=70 => "Strong fitness level",
-        _ => "Very high fitness",
-    }
-}
-
-fn atl_status_text(atl: f64) -> &'static str {
-    match atl as u32 {
-        0..=15 => "Low recent load — well rested",
-        16..=30 => "Moderate recent load",
-        31..=50 => "High recent load",
-        _ => "Very high load — monitor recovery",
-    }
-}
-
+/// Plain-language reading of the TSB value — the hero's headline phrase.
 fn tsb_status_text(tsb: f64) -> &'static str {
     if tsb > 25.0 {
         "Very fresh — consider adding volume"
@@ -236,32 +210,6 @@ fn tsb_status_text(tsb: f64) -> &'static str {
     } else {
         "High fatigue — prioritise rest"
     }
-}
-
-fn form_summary_text(ctl: f64, tsb: f64) -> String {
-    let fitness_phrase = if ctl < 16.0 {
-        "building your aerobic base"
-    } else if ctl < 31.0 {
-        "developing a moderate aerobic base"
-    } else if ctl < 51.0 {
-        "maintaining a solid aerobic base"
-    } else {
-        "maintaining a strong fitness level"
-    };
-
-    let form_phrase = if tsb > 25.0 {
-        "and feeling very fresh — you could increase training volume"
-    } else if tsb > 5.0 {
-        "and in good form — ideal for quality sessions"
-    } else if tsb > -10.0 {
-        "while carrying normal training fatigue"
-    } else if tsb > -30.0 {
-        "while accumulating fatigue — an easier day or two would help"
-    } else {
-        "while significantly fatigued — rest is the priority"
-    };
-
-    format!("You are {} {}.", fitness_phrase, form_phrase)
 }
 
 pub struct FitnessPage {
@@ -294,8 +242,11 @@ impl FitnessPage {
             .vexpand(true)
             .build();
 
+        // Chart-dominated page — wider clamp than the standard 900 (same
+        // justification as the calendar) so the PMC and curves get usable
+        // horizontal resolution.
         let clamp = adw::Clamp::builder()
-            .maximum_size(900)
+            .maximum_size(1200)
             .margin_top(24)
             .margin_bottom(24)
             .margin_start(24)
@@ -307,94 +258,58 @@ impl FitnessPage {
             .spacing(18)
             .build();
 
-        // ── AI Coach card — top of page, first thing the user sees ───────────
-        let ai_card = gtk::Box::builder()
-            .css_classes(["card"])
+        // ── Form hero ─────────────────────────────────────────────────────────
+        // TSB is the page's headline — the one number that says what you can
+        // absorb today. CTL/ATL are the supporting pair, and the PMC below
+        // shows how you got here.
+        let hero = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .build();
-
-        let ai_header = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
-            .margin_top(12)
-            .margin_bottom(6)
-            .margin_start(12)
-            .margin_end(12)
             .build();
-        ai_header.append(
-            &gtk::Image::builder()
-                .icon_name("chat-message-new-symbolic")
-                .css_classes(["dim-label"])
-                .build(),
-        );
-        ai_header.append(
+        hero.append(
             &gtk::Label::builder()
-                .label("AI Coach")
-                .css_classes(["heading"])
+                .label("Form")
                 .halign(gtk::Align::Start)
-                .hexpand(true)
+                .css_classes(["caption-heading", "dim-label"])
+                .tooltip_text(
+                    "Form (TSB) is fitness (CTL) minus fatigue (ATL) — exponential moving \
+                     averages of your daily training stress. Positive means fresh, negative \
+                     means you are carrying fatigue.",
+                )
                 .build(),
         );
-        let analyse_spinner = gtk::Spinner::new();
-        analyse_spinner.set_visible(false);
-        ai_header.append(&analyse_spinner);
 
-        let analyse_btn = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .css_classes(["flat", "circular"])
-            .tooltip_text("Refresh AI fitness analysis")
+        let hero_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(18)
+            .build();
+        let tsb_label = gtk::Label::builder()
+            .label("—")
+            .css_classes(["display", "numeric"])
+            .halign(gtk::Align::Start)
+            .build();
+        hero_row.append(&tsb_label);
+
+        let hero_text = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
             .valign(gtk::Align::Center)
             .build();
-        ai_header.append(&analyse_btn);
-        ai_card.append(&ai_header);
-        ai_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-        // Container that holds either structured sections or a single fallback label
-        let ai_content = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(0)
-            .build();
-
-        let analyse_label = gtk::Label::builder()
-            .label(
-                "Select the refresh button above to get an AI-powered interpretation \
-                 of your training metrics, recovery signals, and wellness data.",
-            )
-            .css_classes(["dim-label"])
+        let form_phrase = gtk::Label::builder()
+            .label("Complete a workout to start tracking form")
+            .css_classes(["title-3"])
             .halign(gtk::Align::Start)
-            .valign(gtk::Align::Start)
             .wrap(true)
-            .selectable(true)
-            .xalign(0.0)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
             .build();
-        ai_content.append(&analyse_label);
-        ai_card.append(&ai_content);
-        inner.append(&ai_card);
-
-        // ── Training Load ─────────────────────────────────────────────────────
-        inner.append(
-            &gtk::Label::builder()
-                .label("Training Load")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        inner.append(
-            &gtk::Label::builder()
-                .label(
-                    "CTL (fitness), ATL (fatigue), and TSB (form) are exponential moving \
-                     averages of your daily training stress. Together they describe where you \
-                     are in your fitness-fatigue cycle.",
-                )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
-                .build(),
-        );
+        let ctl_atl_pair = gtk::Label::builder()
+            .label("")
+            .css_classes(["caption", "dim-label"])
+            .halign(gtk::Align::Start)
+            .build();
+        hero_text.append(&form_phrase);
+        hero_text.append(&ctl_atl_pair);
+        hero_row.append(&hero_text);
+        hero.append(&hero_row);
 
         let icu_indicator = gtk::Label::builder()
             .label("")
@@ -402,41 +317,18 @@ impl FitnessPage {
             .halign(gtk::Align::Start)
             .visible(false)
             .build();
-        inner.append(&icu_indicator);
-
-        let metrics_row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .homogeneous(true)
-            .build();
-
-        let (ctl_frame, ctl_label, ctl_status) =
-            Self::make_metric_card("CTL", "Chronic Training Load");
-        let (atl_frame, atl_label, atl_status) =
-            Self::make_metric_card("ATL", "Acute Training Load");
-        let (tsb_frame, tsb_label, tsb_status) =
-            Self::make_metric_card("TSB", "Training Stress Balance");
-        metrics_row.append(&ctl_frame);
-        metrics_row.append(&atl_frame);
-        metrics_row.append(&tsb_frame);
-        inner.append(&metrics_row);
-
-        let form_summary = gtk::Label::builder()
-            .label("")
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .css_classes(["dim-label"])
-            .visible(false)
-            .build();
-        inner.append(&form_summary);
 
         // ── Performance Management Chart ──────────────────────────────────────
         // (date, ctl, atl, tsb) series for the past 90 days
         let pmc_data: Rc<RefCell<Vec<PmcPoint>>> = Rc::new(RefCell::new(Vec::new()));
 
+        // The "accent" style class makes widget.color() resolve to the GNOME
+        // accent colour (no accent API in libadwaita 1.5); the neutral fg for
+        // supporting strokes comes from the parent widget instead.
         let pmc_chart = gtk::DrawingArea::builder()
             .content_height(170)
             .hexpand(true)
+            .css_classes(["accent"])
             .accessible_role(gtk::AccessibleRole::Img)
             .build();
         pmc_chart.update_property(&[gtk::accessible::Property::Label(
@@ -445,11 +337,22 @@ impl FitnessPage {
 
         {
             let pd = Rc::clone(&pmc_data);
-            pmc_chart.set_draw_func(move |_w, cr, width, height| {
+            pmc_chart.set_draw_func(move |widget, cr, width, height| {
                 let data = pd.borrow();
                 if data.len() < 2 {
                     return;
                 }
+                // Theme-aware: the headline CTL series draws in the GNOME
+                // accent colour (widget carries the "accent" class), while
+                // supporting strokes use the parent's neutral foreground.
+                let accent = widget.color();
+                let (ar, ag, ab) = (
+                    accent.red() as f64,
+                    accent.green() as f64,
+                    accent.blue() as f64,
+                );
+                let fg = widget.parent().map(|p| p.color()).unwrap_or(accent);
+                let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
                 let w = width as f64;
                 let h = height as f64;
                 let n = data.len();
@@ -477,13 +380,13 @@ impl FitnessPage {
 
                 // Zero line (thin, dimmed)
                 let zero_y = y_at(0.0);
-                cr.set_source_rgba(0.5, 0.5, 0.5, 0.25);
+                cr.set_source_rgba(fr, fgr, fb, 0.25);
                 cr.set_line_width(1.0);
                 cr.move_to(0.0, zero_y);
                 cr.line_to(w, zero_y);
                 cr.stroke().ok();
 
-                // TSB fill: green above zero, warm red below zero
+                // TSB as a soft fill against the zero line — no third line needed
                 {
                     cr.new_path();
                     cr.move_to(x_at(0), zero_y);
@@ -492,22 +395,16 @@ impl FitnessPage {
                     }
                     cr.line_to(x_at(n - 1), zero_y);
                     cr.close_path();
-                    cr.set_source_rgba(0.30, 0.75, 0.55, 0.20);
+                    cr.set_source_rgba(fr, fgr, fb, 0.08);
                     cr.fill().ok();
                 }
 
-                // Draw a single series as a line — field_idx: 1=CTL, 2=ATL, 3=TSB
-                let draw_series = |field_idx: usize, r: f64, g: f64, b: f64| {
+                // Draw a single series as a line — field_idx: 1=CTL, 2=ATL
+                let draw_series = |field_idx: usize| {
                     let vals: Vec<f64> = data
                         .iter()
-                        .map(|&(_, c, a, s)| match field_idx {
-                            1 => c,
-                            2 => a,
-                            _ => s,
-                        })
+                        .map(|&(_, c, a, _)| if field_idx == 1 { c } else { a })
                         .collect();
-                    cr.set_source_rgba(r, g, b, 0.90);
-                    cr.set_line_width(2.0);
                     cr.move_to(x_at(0), y_at(vals[0]));
                     for (i, &v) in vals.iter().enumerate().skip(1) {
                         cr.line_to(x_at(i), y_at(v));
@@ -515,15 +412,26 @@ impl FitnessPage {
                     cr.stroke().ok();
                 };
 
-                // ATL (amber) — draw first so CTL renders on top
-                draw_series(2, 1.0, 0.70, 0.20);
-                // CTL (blue)
-                draw_series(1, 0.47, 0.68, 0.93);
-                // TSB (teal)
-                draw_series(3, 0.30, 0.80, 0.65);
+                // ATL: thin dashed — draw first so CTL renders on top
+                cr.set_source_rgba(fr, fgr, fb, 0.45);
+                cr.set_line_width(1.5);
+                cr.set_dash(&[4.0, 3.0], 0.0);
+                draw_series(2);
+                cr.set_dash(&[], 0.0);
+
+                // CTL: the bold headline series, in the accent colour
+                cr.set_source_rgba(ar, ag, ab, 0.90);
+                cr.set_line_width(2.5);
+                draw_series(1);
+
+                // Mark today on the CTL line
+                if let Some(&(_, ctl_last, _, _)) = data.last() {
+                    cr.arc(x_at(n - 1), y_at(ctl_last), 3.5, 0.0, std::f64::consts::TAU);
+                    cr.fill().ok();
+                }
 
                 // X-axis: draw a tick and short month label at the 1st of each month
-                cr.set_source_rgba(0.5, 0.5, 0.5, 0.55);
+                cr.set_source_rgba(fr, fgr, fb, 0.55);
                 cr.set_font_size(10.0);
                 let axis_y = h - pad_b + 4.0;
                 let label_y = h - 4.0;
@@ -542,14 +450,16 @@ impl FitnessPage {
             });
         }
 
+        // Legend mirrors the drawing: CTL is genuinely accent-coloured, the
+        // rest are neutral line styles.
         let pmc_legend = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(18)
             .build();
         for (label, css) in [
-            ("● CTL (fitness)", "accent"),
-            ("● ATL (fatigue)", "warning"),
-            ("● TSB (form)", "success"),
+            ("━ Fitness (CTL)", "accent"),
+            ("╌ Fatigue (ATL)", "dim-label"),
+            ("▒ Form (TSB)", "dim-label"),
         ] {
             pmc_legend.append(
                 &gtk::Label::builder()
@@ -564,26 +474,11 @@ impl FitnessPage {
             .spacing(6)
             .visible(false)
             .build();
-        pmc_section.append(
-            &gtk::Label::builder()
-                .label("Performance Management Chart")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        pmc_section.append(
-            &gtk::Label::builder()
-                .label(
-                    "90-day history of fitness (CTL), fatigue (ATL), and form (TSB = CTL − ATL).",
-                )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
-                .build(),
-        );
         pmc_section.append(&pmc_chart);
         pmc_section.append(&pmc_legend);
-        inner.append(&pmc_section);
+        pmc_section.append(&icu_indicator);
+        hero.append(&pmc_section);
+        inner.append(&hero);
 
         // ── Wellness ──────────────────────────────────────────────────────────
         inner.append(
@@ -591,17 +486,10 @@ impl FitnessPage {
                 .label("Wellness")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
-                .build(),
-        );
-        inner.append(
-            &gtk::Label::builder()
-                .label(
+                .tooltip_text(
                     "HRV, resting heart rate, sleep, and activity data synced from \
-                     Intervals.icu. Use Preferences → Intervals.icu to sync.",
+                     Intervals.icu (Preferences → Intervals.icu)",
                 )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
                 .build(),
         );
 
@@ -658,32 +546,33 @@ impl FitnessPage {
         inner.append(&wellness_no_data);
         inner.append(&wellness_flow);
 
-        // ── Weekly TSS ────────────────────────────────────────────────────────
-        inner.append(
+        // ── Load history (weekly TSS bars + volume strip) ─────────────────────
+        // Built here, appended to `inner` after the zones/bests sections so the
+        // page reads: form → wellness → zones → bests → load → coach.
+        let load_section = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        load_section.append(
             &gtk::Label::builder()
-                .label("Weekly Training Stress")
+                .label("Load History")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
-                .build(),
-        );
-        inner.append(
-            &gtk::Label::builder()
-                .label(
-                    "TSS (Training Stress Score) quantifies each session's overall load — \
-                     higher bars mean harder weeks. A sustainable build is roughly 5–10% \
-                     per week.",
+                .tooltip_text(
+                    "Training Stress Score per week for the past 6 weeks — higher bars \
+                     mean harder weeks. A sustainable build is roughly 5–10% per week.",
                 )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
                 .build(),
         );
 
         let tss_week_data: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(vec![0.0; 6]));
 
+        // "accent" class → widget.color() resolves to the GNOME accent colour
+        // (see the PMC chart note)
         let tss_chart = gtk::DrawingArea::builder()
             .content_height(120)
             .hexpand(true)
+            .css_classes(["accent"])
             .accessible_role(gtk::AccessibleRole::Img)
             .build();
         tss_chart.update_property(&[gtk::accessible::Property::Label(
@@ -691,9 +580,11 @@ impl FitnessPage {
         )]);
 
         let tss_data_ref = Rc::clone(&tss_week_data);
-        tss_chart.set_draw_func(move |_widget, cr, width, height| {
+        tss_chart.set_draw_func(move |widget, cr, width, height| {
             let weeks = tss_data_ref.borrow();
             let max_tss = weeks.iter().copied().fold(0.0f32, f32::max);
+            let fg = widget.color();
+            let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
             let w = width as f64;
             let h = height as f64;
             let n = weeks.len() as f64;
@@ -702,20 +593,20 @@ impl FitnessPage {
 
             for (i, &tss) in weeks.iter().enumerate() {
                 let x = i as f64 * (bar_w + gap);
-                cr.set_source_rgba(0.47, 0.68, 0.93, 0.15);
+                cr.set_source_rgba(fr, fgr, fb, 0.10);
                 cr.rectangle(x, 0.0, bar_w, h);
                 cr.fill().ok();
 
                 if max_tss > 0.0 && tss > 0.0 {
                     let bar_h = (tss as f64 / max_tss as f64 * h).max(2.0);
-                    cr.set_source_rgba(0.47, 0.68, 0.93, 0.85);
+                    cr.set_source_rgba(fr, fgr, fb, 0.65);
                     cr.rectangle(x, h - bar_h, bar_w, bar_h);
                     cr.fill().ok();
                 }
             }
         });
 
-        inner.append(&tss_chart);
+        load_section.append(&tss_chart);
 
         let week_label_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -747,8 +638,8 @@ impl FitnessPage {
             tss_value_row.append(&vlbl);
             tss_value_labels.push(vlbl);
         }
-        inner.append(&week_label_row);
-        inner.append(&tss_value_row);
+        load_section.append(&week_label_row);
+        load_section.append(&tss_value_row);
 
         // ── Power Curve ───────────────────────────────────────────────────────
         const CURVE_DURATIONS: [usize; 10] = [5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600];
@@ -770,12 +661,16 @@ impl FitnessPage {
         )]);
 
         let curve_data_draw = Rc::clone(&curve_data);
-        curve_chart.set_draw_func(move |_w, cr, width, height| {
+        let ftp_for_curve = Rc::clone(&ftp);
+        curve_chart.set_draw_func(move |widget, cr, width, height| {
             let data = curve_data_draw.borrow();
             let max_w = data.iter().map(|&(a, _)| a).max().unwrap_or(0);
             if max_w == 0 {
                 return;
             }
+            let ftp_val = ftp_for_curve.get();
+            let fg = widget.color();
+            let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
             let w = width as f64;
             let h = height as f64;
             let n = data.len();
@@ -792,29 +687,7 @@ impl FitnessPage {
                 }
             };
 
-            // Draw all-time curve (accent yellow)
-            let at_pts: Vec<(f64, f64)> = data
-                .iter()
-                .enumerate()
-                .filter(|(_, &(a, _))| a > 0)
-                .map(|(i, &(a, _))| (x_at(i), y_at(a)))
-                .collect();
-            if at_pts.len() >= 2 {
-                cr.set_source_rgba(0.97, 0.78, 0.26, 0.85);
-                cr.set_line_width(2.0);
-                cr.move_to(at_pts[0].0, at_pts[0].1);
-                for &(x, y) in &at_pts[1..] {
-                    cr.line_to(x, y);
-                }
-                cr.stroke().ok();
-                for &(x, y) in &at_pts {
-                    cr.set_source_rgba(0.97, 0.78, 0.26, 1.0);
-                    cr.arc(x, y, 3.5, 0.0, std::f64::consts::TAU);
-                    cr.fill().ok();
-                }
-            }
-
-            // Draw 30-day curve (accent blue)
+            // 30-day curve first (dimmed fg), so the all-time zone dots sit on top
             let mo_pts: Vec<(f64, f64)> = data
                 .iter()
                 .enumerate()
@@ -822,16 +695,42 @@ impl FitnessPage {
                 .map(|(i, &(_, m))| (x_at(i), y_at(m)))
                 .collect();
             if mo_pts.len() >= 2 {
-                cr.set_source_rgba(0.47, 0.68, 0.93, 0.85);
-                cr.set_line_width(2.0);
+                cr.set_source_rgba(fr, fgr, fb, 0.40);
+                cr.set_line_width(1.5);
                 cr.move_to(mo_pts[0].0, mo_pts[0].1);
                 for &(x, y) in &mo_pts[1..] {
                     cr.line_to(x, y);
                 }
                 cr.stroke().ok();
                 for &(x, y) in &mo_pts {
-                    cr.set_source_rgba(0.47, 0.68, 0.93, 1.0);
-                    cr.arc(x, y, 3.5, 0.0, std::f64::consts::TAU);
+                    cr.arc(x, y, 2.5, 0.0, std::f64::consts::TAU);
+                    cr.fill().ok();
+                }
+            }
+
+            // All-time curve: a quiet fg line carrying dots coloured by the
+            // power zone each best falls in — the sprint end glows anaerobic
+            // red, the hour end sits at threshold. Zone RGB is the app's only
+            // sanctioned expressive colour (CLAUDE.md §1.6).
+            let at_pts: Vec<(usize, f64, f64)> = data
+                .iter()
+                .enumerate()
+                .filter(|(_, &(a, _))| a > 0)
+                .map(|(i, &(a, _))| (i, x_at(i), y_at(a)))
+                .collect();
+            if at_pts.len() >= 2 {
+                cr.set_source_rgba(fr, fgr, fb, 0.30);
+                cr.set_line_width(1.5);
+                cr.move_to(at_pts[0].1, at_pts[0].2);
+                for &(_, x, y) in &at_pts[1..] {
+                    cr.line_to(x, y);
+                }
+                cr.stroke().ok();
+                for &(i, x, y) in &at_pts {
+                    let watts = data[i].0;
+                    let (zr, zg, zb) = ZONE_COLORS[power_zone_index(watts, ftp_val)];
+                    cr.set_source_rgba(zr, zg, zb, 1.0);
+                    cr.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
                     cr.fill().ok();
                 }
             }
@@ -871,21 +770,11 @@ impl FitnessPage {
         }
 
         // Legend
-        let curve_legend = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(18)
+        let curve_legend = gtk::Label::builder()
+            .label("Dots coloured by power zone · dimmed line = last 30 days")
+            .css_classes(["caption", "dim-label"])
+            .halign(gtk::Align::Start)
             .build();
-        curve_legend.append(
-            &gtk::Label::builder()
-                .label("● All time")
-                .css_classes(["caption"])
-                .build(),
-        );
-        let curve_legend_month = gtk::Label::builder()
-            .label("● Last 30 days")
-            .css_classes(["caption", "accent"])
-            .build();
-        curve_legend.append(&curve_legend_month);
 
         let curve_section = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -894,27 +783,19 @@ impl FitnessPage {
             .build();
         curve_section.append(
             &gtk::Label::builder()
-                .label("Power Curve")
+                .label("Peak power")
                 .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        curve_section.append(
-            &gtk::Label::builder()
-                .label(
-                    "Peak average power for each duration across all recorded sessions. \
-                     Yellow = all-time best · Blue = last 30 days.",
+                .css_classes(["caption-heading", "dim-label"])
+                .tooltip_text(
+                    "Best average power for each duration across all recorded sessions, \
+                     coloured by the power zone it falls in at your current FTP",
                 )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
                 .build(),
         );
         curve_section.append(&curve_chart);
         curve_section.append(&curve_x_row);
         curve_section.append(&curve_w_row);
         curve_section.append(&curve_legend);
-        inner.append(&curve_section);
 
         // ── Pace Curve (running) ──────────────────────────────────────────────
         let pace_data: Rc<RefCell<Vec<(u32, u32)>>> =
@@ -930,7 +811,9 @@ impl FitnessPage {
         )]);
         {
             let pd = Rc::clone(&pace_data);
-            pace_chart.set_draw_func(move |_w, cr, width, height| {
+            pace_chart.set_draw_func(move |widget, cr, width, height| {
+                let fg = widget.color();
+                let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
                 let data = pd.borrow();
                 // Scale from both curves so neither goes out of range.
                 let min_p = data
@@ -961,31 +844,23 @@ impl FitnessPage {
                     4.0 + ratio * (usable_h - 4.0)
                 };
 
-                let draw_curve = |pts: &[(f64, f64)], r: f64, g: f64, b: f64| {
+                // Theme-aware: solid fg = all-time, dimmed fg = last 30 days
+                let draw_curve = |pts: &[(f64, f64)], alpha: f64, radius: f64| {
                     if pts.len() < 2 {
                         return;
                     }
-                    cr.set_source_rgba(r, g, b, 0.85);
+                    cr.set_source_rgba(fr, fgr, fb, alpha);
                     cr.set_line_width(2.0);
                     cr.move_to(pts[0].0, pts[0].1);
                     for &(x, y) in &pts[1..] {
                         cr.line_to(x, y);
                     }
                     cr.stroke().ok();
-                    cr.set_source_rgba(r, g, b, 1.0);
                     for &(x, y) in pts {
-                        cr.arc(x, y, 3.5, 0.0, std::f64::consts::TAU);
+                        cr.arc(x, y, radius, 0.0, std::f64::consts::TAU);
                         cr.fill().ok();
                     }
                 };
-
-                let at_pts: Vec<(f64, f64)> = data
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &(a, _))| a > 0)
-                    .map(|(i, &(a, _))| (x_at(i), y_at(a)))
-                    .collect();
-                draw_curve(&at_pts, 0.97, 0.78, 0.26);
 
                 let mo_pts: Vec<(f64, f64)> = data
                     .iter()
@@ -993,7 +868,15 @@ impl FitnessPage {
                     .filter(|(_, &(_, m))| m > 0)
                     .map(|(i, &(_, m))| (x_at(i), y_at(m)))
                     .collect();
-                draw_curve(&mo_pts, 0.47, 0.68, 0.93);
+                draw_curve(&mo_pts, 0.40, 2.5);
+
+                let at_pts: Vec<(f64, f64)> = data
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &(a, _))| a > 0)
+                    .map(|(i, &(a, _))| (x_at(i), y_at(a)))
+                    .collect();
+                draw_curve(&at_pts, 0.85, 3.5);
             });
         }
 
@@ -1028,22 +911,11 @@ impl FitnessPage {
             pace_val_labels.push(lbl);
         }
 
-        let pace_legend = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(18)
+        let pace_legend = gtk::Label::builder()
+            .label("Solid = all time · dimmed = last 30 days")
+            .css_classes(["caption", "dim-label"])
+            .halign(gtk::Align::Start)
             .build();
-        pace_legend.append(
-            &gtk::Label::builder()
-                .label("● All time")
-                .css_classes(["caption"])
-                .build(),
-        );
-        pace_legend.append(
-            &gtk::Label::builder()
-                .label("● Last 30 days")
-                .css_classes(["caption", "accent"])
-                .build(),
-        );
 
         let pace_section = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -1052,72 +924,56 @@ impl FitnessPage {
             .build();
         pace_section.append(
             &gtk::Label::builder()
-                .label("Pace Curve")
+                .label("Running pace")
                 .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        pace_section.append(
-            &gtk::Label::builder()
-                .label(
-                    "Best pace for each distance across all synced running activities. \
-                     Yellow = all-time best · Blue = last 30 days.",
-                )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
+                .css_classes(["caption-heading", "dim-label"])
+                .tooltip_text("Best pace for each distance across all synced running activities")
                 .build(),
         );
         pace_section.append(&pace_chart);
         pace_section.append(&pace_x_row);
         pace_section.append(&pace_val_row);
         pace_section.append(&pace_legend);
-        inner.append(&pace_section);
 
-        // ── Volume ────────────────────────────────────────────────────────────
+        // ── Volume strip (inside Load History) ────────────────────────────────
         let volume_section = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .visible(false)
-            .build();
-
-        volume_section.append(
-            &gtk::Label::builder()
-                .label("Volume")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        volume_section.append(
-            &gtk::Label::builder()
-                .label(
-                    "Kilojoules measure total mechanical work done — a more accurate proxy \
-                     for training load than time alone.",
-                )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
-                .build(),
-        );
-
-        let volume_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .homogeneous(true)
+            .spacing(24)
+            .margin_top(6)
+            .visible(false)
+            .tooltip_text(
+                "Kilojoules measure total mechanical work done — a more accurate proxy \
+                 for training load than time alone",
+            )
             .build();
-
-        let (wkj_frame, week_kj_label, _) = Self::make_metric_card("Week · kJ", "Kilojoules");
-        let (whrs_frame, week_hrs_label, _) =
-            Self::make_metric_card("Week · hours", "Training time");
-        let (mkj_frame, month_kj_label, _) = Self::make_metric_card("This month", "Kilojoules");
-        let (tot_frame, total_sessions_label, _) =
-            Self::make_metric_card("Total", "Sessions recorded");
-        volume_row.append(&wkj_frame);
-        volume_row.append(&whrs_frame);
-        volume_row.append(&mkj_frame);
-        volume_row.append(&tot_frame);
-        volume_section.append(&volume_row);
-        inner.append(&volume_section);
+        let make_stat = |caption: &str| -> (gtk::Box, gtk::Label) {
+            let col = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            col.append(
+                &gtk::Label::builder()
+                    .label(caption)
+                    .halign(gtk::Align::Start)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+            let value = gtk::Label::builder()
+                .label("—")
+                .halign(gtk::Align::Start)
+                .css_classes(["title-4", "numeric"])
+                .build();
+            col.append(&value);
+            (col, value)
+        };
+        let (wkj_col, week_kj_label) = make_stat("This week");
+        let (whrs_col, week_hrs_label) = make_stat("Time this week");
+        let (mkj_col, month_kj_label) = make_stat("This month");
+        let (tot_col, total_sessions_label) = make_stat("Sessions");
+        volume_section.append(&wkj_col);
+        volume_section.append(&whrs_col);
+        volume_section.append(&mkj_col);
+        volume_section.append(&tot_col);
+        load_section.append(&volume_section);
 
         // ── Zone Distribution ─────────────────────────────────────────────────
         let zone_seconds: Rc<RefCell<[u32; 7]>> = Rc::new(RefCell::new([0u32; 7]));
@@ -1176,25 +1032,18 @@ impl FitnessPage {
             .build();
         zone_section.append(
             &gtk::Label::builder()
-                .label("Zone Distribution (All Time)")
+                .label("Power")
                 .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        zone_section.append(
-            &gtk::Label::builder()
-                .label(
-                    "Time spent in each power zone. Endurance athletes typically aim for \
-                     70–80 % in Z1–Z2 (polarised) or Z2–Z3 (pyramidal).",
+                .css_classes(["caption-heading", "dim-label"])
+                .tooltip_text(
+                    "Time spent in each power zone, all recorded sessions. Endurance \
+                     athletes typically aim for 70–80% in Z1–Z2 (polarised) or Z2–Z3 \
+                     (pyramidal)",
                 )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
                 .build(),
         );
         zone_section.append(&zone_bar);
         zone_section.append(&zone_legend);
-        inner.append(&zone_section);
 
         // ── Heart Rate Zones ──────────────────────────────────────────────────
         let hr_zone_seconds: Rc<RefCell<[u32; 5]>> = Rc::new(RefCell::new([0u32; 5]));
@@ -1223,7 +1072,9 @@ impl FitnessPage {
                         continue;
                     }
                     let seg_w = (secs as f64 / total as f64) * w;
-                    let (r, g, b) = HR_ZONE_COLORS[i];
+                    // HR zones share the power-zone ramp (Z1–Z5) — one palette
+                    // across the whole app, per the zone-colour design language.
+                    let (r, g, b) = ZONE_COLORS[i];
                     cr.set_source_rgba(r, g, b, 0.85);
                     cr.rectangle(x, 0.0, seg_w, h);
                     cr.fill().ok();
@@ -1260,55 +1111,199 @@ impl FitnessPage {
             .build();
         hr_zone_section.append(
             &gtk::Label::builder()
-                .label("Heart Rate Zones (In-App Sessions)")
+                .label("Heart rate")
                 .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
-        hr_zone_section.append(
-            &gtk::Label::builder()
-                .label(
-                    "Time in each HR zone based on your recorded max HR. \
-                     Computed from in-app sessions only.",
+                .css_classes(["caption-heading", "dim-label"])
+                .tooltip_text(
+                    "Time in each HR zone based on your recorded max HR — in-app \
+                     sessions only",
                 )
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .wrap(true)
                 .build(),
         );
         hr_zone_section.append(&hr_zone_bar);
         hr_zone_section.append(&hr_zone_legend);
-        inner.append(&hr_zone_section);
 
-        // ── Retrospective Analysis ────────────────────────────────────────────
-        inner.append(
+        // ── Section wrappers and page order ───────────────────────────────────
+        let zones_section = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .visible(false)
+            .build();
+        zones_section.append(
             &gtk::Label::builder()
-                .label("Training Retrospective")
+                .label("Where the Time Goes")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),
         );
-        inner.append(
+        zones_section.append(&zone_section);
+        zones_section.append(&hr_zone_section);
+        inner.append(&zones_section);
+
+        let bests_section = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .visible(false)
+            .build();
+        bests_section.append(
             &gtk::Label::builder()
-                .label(
-                    "AI chain-of-thought analysis of strain, recovery patterns, and \
-                     performance trends over the past week or month.",
-                )
-                .css_classes(["dim-label"])
+                .label("Bests")
                 .halign(gtk::Align::Start)
-                .wrap(true)
+                .css_classes(["heading"])
                 .build(),
         );
+        bests_section.append(&curve_section);
+        bests_section.append(&pace_section);
+        inner.append(&bests_section);
 
-        // Weekly retrospective card
-        let (weekly_card, weekly_content, weekly_label, weekly_spinner, weekly_btn) =
-            build_retro_card("Weekly Retrospective", "Analyse the past 7 days");
-        inner.append(&weekly_card);
+        inner.append(&load_section);
 
-        // Monthly retrospective card
-        let (monthly_card, monthly_content, monthly_label, monthly_spinner, monthly_btn) =
-            build_retro_card("Monthly Retrospective", "Analyse the past 30 days");
-        inner.append(&monthly_card);
+        // ── Coach — one card for all AI output ────────────────────────────────
+        // Fitness analysis on top, retrospectives below behind a Week|Month
+        // switcher (same linked-toggle pattern as the calendar).
+        let coach_card = gtk::Box::builder()
+            .css_classes(["card"])
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+
+        let ai_header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(12)
+            .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        ai_header.append(
+            &gtk::Image::builder()
+                .icon_name("chat-message-new-symbolic")
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        ai_header.append(
+            &gtk::Label::builder()
+                .label("Coach")
+                .css_classes(["heading"])
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .tooltip_text(
+                    "AI interpretation of your training metrics, recovery signals, \
+                     and wellness data",
+                )
+                .build(),
+        );
+        let analyse_spinner = gtk::Spinner::new();
+        analyse_spinner.set_visible(false);
+        ai_header.append(&analyse_spinner);
+
+        let analyse_btn = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .css_classes(["flat", "circular"])
+            .tooltip_text("Refresh AI fitness analysis")
+            .valign(gtk::Align::Center)
+            .build();
+        ai_header.append(&analyse_btn);
+        coach_card.append(&ai_header);
+        coach_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        // Container that holds either structured sections or a single fallback label
+        let ai_content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(0)
+            .build();
+
+        let analyse_label = gtk::Label::builder()
+            .label(
+                "Select the refresh button above to get an AI-powered interpretation \
+                 of your training metrics, recovery signals, and wellness data.",
+            )
+            .css_classes(["dim-label"])
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .wrap(true)
+            .selectable(true)
+            .xalign(0.0)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        ai_content.append(&analyse_label);
+        coach_card.append(&ai_content);
+        coach_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let retro_header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        retro_header.append(
+            &gtk::Label::builder()
+                .label("Retrospective")
+                .css_classes(["heading"])
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .tooltip_text(
+                    "AI analysis of strain, recovery patterns, and performance trends \
+                     over the selected period",
+                )
+                .build(),
+        );
+        let retro_spinner = gtk::Spinner::new();
+        retro_spinner.set_visible(false);
+        retro_header.append(&retro_spinner);
+
+        let week_toggle = gtk::ToggleButton::builder()
+            .label("Week")
+            .active(true)
+            .build();
+        let month_toggle = gtk::ToggleButton::builder().label("Month").build();
+        month_toggle.set_group(Some(&week_toggle));
+        let toggle_box = gtk::Box::builder()
+            .css_classes(["linked"])
+            .valign(gtk::Align::Center)
+            .build();
+        toggle_box.append(&week_toggle);
+        toggle_box.append(&month_toggle);
+        retro_header.append(&toggle_box);
+
+        let generate_btn = gtk::Button::builder()
+            .label("Generate")
+            .css_classes(["pill"])
+            .tooltip_text("Generate an AI retrospective for the selected period")
+            .valign(gtk::Align::Center)
+            .build();
+        retro_header.append(&generate_btn);
+        coach_card.append(&retro_header);
+
+        let (weekly_content, weekly_label) = build_retro_content("past 7 days");
+        let (monthly_content, monthly_label) = build_retro_content("past 30 days");
+
+        let retro_stack = gtk::Stack::builder()
+            .vhomogeneous(false)
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        retro_stack.add_named(&weekly_content, Some("week"));
+        retro_stack.add_named(&monthly_content, Some("month"));
+        coach_card.append(&retro_stack);
+        {
+            let stack = retro_stack.clone();
+            week_toggle.connect_toggled(move |t| {
+                if t.is_active() {
+                    stack.set_visible_child_name("week");
+                }
+            });
+            let stack = retro_stack.clone();
+            month_toggle.connect_toggled(move |t| {
+                if t.is_active() {
+                    stack.set_visible_child_name("month");
+                }
+            });
+        }
+        inner.append(&coach_card);
 
         clamp.set_child(Some(&inner));
         scroll.set_child(Some(&clamp));
@@ -1342,329 +1337,424 @@ impl FitnessPage {
             let volume_section_r = volume_section.clone();
             let api_banner_r = api_banner.clone();
             Rc::new(move || {
-                // API key pre-flight check
+                // API key pre-flight check (local keyring — fast, stays synchronous)
                 let has_api_key = keystore::get_secret(keystore::KEY_ANTHROPIC)
                     .unwrap_or(None)
                     .map(|k| !k.trim().is_empty())
                     .unwrap_or(false);
                 api_banner_r.set_revealed(!has_api_key);
 
-                let records = rt_handle
-                    .block_on(db::load_session_records(&pool))
-                    .unwrap_or_default();
-                let intervals_pairs = rt_handle
-                    .block_on(db::load_intervals_tss_pairs(&pool))
-                    .unwrap_or_default();
-                let icu_activities = rt_handle
-                    .block_on(db::load_intervals_activities(&pool))
-                    .unwrap_or_default();
-                let wellness = rt_handle
-                    .block_on(db::load_wellness_recent(&pool, 14))
-                    .unwrap_or_default();
+                // Load every data source off the main thread (CLAUDE.md §2.3), then
+                // update the charts and cards once the data arrives. Clone the widget
+                // handles the callback needs (cheap refcount bumps).
+                let pool_load = pool.clone();
+                let icu_indicator_r = icu_indicator_r.clone();
+                let ftp = Rc::clone(&ftp);
+                let pmc_data_r = Rc::clone(&pmc_data_r);
+                let pmc_section_r = pmc_section_r.clone();
+                let pmc_chart_r = pmc_chart_r.clone();
+                let tsb_label = tsb_label.clone();
+                let form_phrase = form_phrase.clone();
+                let ctl_atl_pair = ctl_atl_pair.clone();
+                let zones_section_r = zones_section.clone();
+                let bests_section_r = bests_section.clone();
+                let wellness_no_data = wellness_no_data.clone();
+                let wellness_flow = wellness_flow.clone();
+                let hrv_value = hrv_value.clone();
+                let hrv_trend = hrv_trend.clone();
+                let hrv_data = Rc::clone(&hrv_data);
+                let hrv_chart = hrv_chart.clone();
+                let rhr_value = rhr_value.clone();
+                let rhr_trend = rhr_trend.clone();
+                let rhr_data = Rc::clone(&rhr_data);
+                let rhr_chart = rhr_chart.clone();
+                let sleep_value = sleep_value.clone();
+                let sleep_trend = sleep_trend.clone();
+                let sleep_data = Rc::clone(&sleep_data);
+                let sleep_chart = sleep_chart.clone();
+                let score_value = score_value.clone();
+                let score_trend = score_trend.clone();
+                let score_data = Rc::clone(&score_data);
+                let score_chart = score_chart.clone();
+                let steps_value = steps_value.clone();
+                let steps_trend = steps_trend.clone();
+                let steps_data = Rc::clone(&steps_data);
+                let steps_chart = steps_chart.clone();
+                let cal_value = cal_value.clone();
+                let cal_trend = cal_trend.clone();
+                let cal_data = Rc::clone(&cal_data);
+                let cal_chart = cal_chart.clone();
+                let volume_section_r = volume_section_r.clone();
+                let week_kj_label = week_kj_label.clone();
+                let week_hrs_label = week_hrs_label.clone();
+                let month_kj_label = month_kj_label.clone();
+                let total_sessions_label = total_sessions_label.clone();
+                let week_header_labels = week_header_labels.clone();
+                let tss_value_labels = tss_value_labels.clone();
+                let tss_week_data = Rc::clone(&tss_week_data);
+                let tss_chart = tss_chart.clone();
+                let zone_seconds = Rc::clone(&zone_seconds);
+                let zone_bar = zone_bar.clone();
+                let zone_section = zone_section.clone();
+                let curve_data_r = Rc::clone(&curve_data_r);
+                let curve_section_r = curve_section_r.clone();
+                let curve_chart_r = curve_chart_r.clone();
+                let curve_w_labels_r = curve_w_labels_r.clone();
+                let pace_data_r = Rc::clone(&pace_data_r);
+                let pace_section_r = pace_section_r.clone();
+                let pace_chart_r = pace_chart_r.clone();
+                let pace_val_labels_r = pace_val_labels_r.clone();
+                let hr_zone_seconds_r = Rc::clone(&hr_zone_seconds_r);
+                let hr_zone_bar_r = hr_zone_bar_r.clone();
+                let hr_zone_section_r = hr_zone_section_r.clone();
+                let athlete_r = Rc::clone(&athlete_r);
+                let ai_content_r = ai_content_r.clone();
+                let analyse_label_r = analyse_label_r.clone();
 
-                if !icu_activities.is_empty() {
-                    icu_indicator_r.set_label(&format!(
-                        "Includes {} activities synced from Intervals.icu",
-                        icu_activities.len()
-                    ));
-                    icu_indicator_r.set_visible(true);
-                } else {
-                    icu_indicator_r.set_visible(false);
-                }
-
-                let ftp_val = ftp.get();
-                let today = Local::now().date_naive();
-
-                let (ctl, atl, _) =
-                    compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
-                let tsb = ctl - atl;
-
-                // PMC 90-day series
-                let pmc_series = compute_pmc_series(&records, &intervals_pairs, ftp_val, today);
-                let has_pmc = pmc_series.len() >= 2;
-                pmc_section_r.set_visible(has_pmc);
-                if has_pmc {
-                    *pmc_data_r.borrow_mut() = pmc_series;
-                    pmc_chart_r.queue_draw();
-                }
-
-                ctl_label.set_label(&format!("{:.0}", ctl));
-                atl_label.set_label(&format!("{:.0}", atl));
-                tsb_label.set_label(&format!("{:+.0}", tsb));
-
-                // Per-card status descriptions
-                ctl_status.set_label(ctl_status_text(ctl));
-                ctl_status.set_visible(ctl > 0.5);
-                atl_status.set_label(atl_status_text(atl));
-                atl_status.set_visible(atl > 0.5);
-                tsb_status.set_label(tsb_status_text(tsb));
-                tsb_status.set_visible(ctl > 0.5 || atl > 0.5);
-
-                // TSB value colour
-                tsb_label.remove_css_class("success");
-                tsb_label.remove_css_class("warning");
-                if tsb > 5.0 {
-                    tsb_label.add_css_class("success");
-                } else if tsb < -10.0 {
-                    tsb_label.add_css_class("warning");
-                }
-
-                // Plain-language form summary sentence
-                if ctl > 0.5 || atl > 0.5 {
-                    form_summary.set_label(&form_summary_text(ctl, tsb));
-                    form_summary.set_visible(true);
-                } else {
-                    form_summary.set_visible(false);
-                }
-
-                // ── Wellness cards ────────────────────────────────────────────
-                let has_wellness = wellness.iter().any(|w| {
-                    w.hrv.is_some()
-                        || w.resting_hr.is_some()
-                        || w.sleep_secs.is_some()
-                        || w.steps.is_some()
-                        || w.calories.is_some()
-                });
-                wellness_no_data.set_visible(!has_wellness);
-                wellness_flow.set_visible(has_wellness);
-
-                if has_wellness {
-                    let hrv_series = build_14day_series(&wellness, today, |e| e.hrv);
-                    let rhr_series =
-                        build_14day_series(&wellness, today, |e| e.resting_hr.map(|v| v as f32));
-                    let sleep_series = build_14day_series(&wellness, today, |e| {
-                        e.sleep_secs.map(|s| s as f32 / 3600.0)
-                    });
-                    let score_series =
-                        build_14day_series(&wellness, today, |e| e.sleep_score.map(|v| v as f32));
-                    let steps_series =
-                        build_14day_series(&wellness, today, |e| e.steps.map(|v| v as f32));
-                    let cal_series =
-                        build_14day_series(&wellness, today, |e| e.calories.map(|v| v as f32));
-
-                    update_wellness_card(
-                        &hrv_value,
-                        &hrv_trend,
-                        &hrv_data,
-                        &hrv_chart,
-                        &hrv_series,
-                        "{:.0}",
-                        true,
-                    );
-                    update_wellness_card(
-                        &rhr_value,
-                        &rhr_trend,
-                        &rhr_data,
-                        &rhr_chart,
-                        &rhr_series,
-                        "{:.0}",
-                        false,
-                    );
-                    update_wellness_card(
-                        &sleep_value,
-                        &sleep_trend,
-                        &sleep_data,
-                        &sleep_chart,
-                        &sleep_series,
-                        "{:.1}",
-                        true,
-                    );
-                    update_wellness_card(
-                        &score_value,
-                        &score_trend,
-                        &score_data,
-                        &score_chart,
-                        &score_series,
-                        "{:.0}",
-                        true,
-                    );
-                    update_wellness_card(
-                        &steps_value,
-                        &steps_trend,
-                        &steps_data,
-                        &steps_chart,
-                        &steps_series,
-                        "{:.0}",
-                        true,
-                    );
-                    update_wellness_card(
-                        &cal_value,
-                        &cal_trend,
-                        &cal_data,
-                        &cal_chart,
-                        &cal_series,
-                        "{:.0}",
-                        true,
-                    );
-                }
-
-                // Volume
-                let week_start =
-                    today - Duration::days(today.weekday().num_days_from_monday() as i64);
-                let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                    .expect("day 1 of any calendar month is always valid");
-
-                let mut wk_kj = 0.0f32;
-                let mut wk_secs = 0u64;
-                let mut mo_kj = 0.0f32;
-
-                for record in &records {
-                    let date = record.session.started_at.with_timezone(&Local).date_naive();
-                    let kj = record.session.kilojoules();
-                    let dur = record.session.duration_secs();
-                    if date >= week_start {
-                        wk_kj += kj;
-                        wk_secs += dur;
-                    }
-                    if date >= month_start {
-                        mo_kj += kj;
-                    }
-                }
-                for act in &icu_activities {
-                    let kj = act
-                        .average_watts
-                        .and_then(|w| act.duration_secs.map(|d| w as f32 * d as f32 / 1000.0))
-                        .unwrap_or(0.0);
-                    let dur = act.duration_secs.unwrap_or(0) as u64;
-                    if act.date >= week_start {
-                        wk_kj += kj;
-                        wk_secs += dur;
-                    }
-                    if act.date >= month_start {
-                        mo_kj += kj;
-                    }
-                }
-
-                let has_sessions = !records.is_empty() || !icu_activities.is_empty();
-                volume_section_r.set_visible(has_sessions);
-                week_kj_label.set_label(&format!("{:.0} kJ", wk_kj));
-                week_hrs_label.set_label(&format!("{:.1} h", wk_secs as f32 / 3600.0));
-                month_kj_label.set_label(&format!("{:.0} kJ", mo_kj));
-                total_sessions_label.set_label(&(records.len() + icu_activities.len()).to_string());
-
-                // Weekly TSS chart (last 6 weeks, oldest → newest)
-                let mut week_tss: Vec<(String, f32)> = Vec::with_capacity(6);
-                for i in (0..6i64).rev() {
-                    let ws = week_start - Duration::weeks(i);
-                    let we = ws + Duration::days(6);
-                    let tss_sessions: f32 = records
-                        .iter()
-                        .filter(|r| {
-                            let d = r.session.started_at.with_timezone(&Local).date_naive();
-                            d >= ws && d <= we
-                        })
-                        .filter_map(|r| r.session.tss(ftp_val))
-                        .sum();
-                    let tss_icu: f32 = intervals_pairs
-                        .iter()
-                        .filter(|(d, _)| *d >= ws && *d <= we)
-                        .map(|(_, t)| *t)
-                        .sum();
-                    let tss = tss_sessions + tss_icu;
-                    let iso_week = ws.iso_week().week();
-                    week_tss.push((format!("W{iso_week}"), tss));
-                }
-
-                for (i, (label_text, tss_val)) in week_tss.iter().enumerate() {
-                    week_header_labels[i].set_label(label_text);
-                    if *tss_val > 0.0 {
-                        tss_value_labels[i].set_label(&format!("{:.0}", tss_val));
-                    } else {
-                        tss_value_labels[i].set_label("—");
-                    }
-                }
-                *tss_week_data.borrow_mut() = week_tss.iter().map(|(_, t)| *t).collect();
-                tss_chart.queue_draw();
-
-                // Zone distribution
-                let mut zone_secs = [0u32; 7];
-                for record in &records {
-                    for dp in &record.session.data_points {
-                        if let Some(watts) = dp.power_watts {
-                            zone_secs[power_zone_index(watts, ftp_val)] += 1;
-                        }
-                    }
-                }
-                let has_power = zone_secs.iter().any(|&s| s > 0);
-                zone_section.set_visible(has_power);
-                if has_power {
-                    *zone_seconds.borrow_mut() = zone_secs;
-                    zone_bar.queue_draw();
-                }
-
-                // Power curve
-                let cutoff_30d = today - Duration::days(30);
-                let mut all_time_peaks = vec![0u32; CURVE_DURATIONS.len()];
-                let mut month_peaks = vec![0u32; CURVE_DURATIONS.len()];
-                for record in &records {
-                    let date = record.session.started_at.with_timezone(&Local).date_naive();
-                    let is_recent = date >= cutoff_30d;
-                    for (i, &dur) in CURVE_DURATIONS.iter().enumerate() {
-                        if let Some(peak) = record.session.peak_power_for_duration(dur) {
-                            if peak > all_time_peaks[i] {
-                                all_time_peaks[i] = peak;
-                            }
-                            if is_recent && peak > month_peaks[i] {
-                                month_peaks[i] = peak;
-                            }
-                        }
-                    }
-                }
-                let has_curve = all_time_peaks.iter().any(|&p| p > 0);
-                curve_section_r.set_visible(has_curve);
-                if has_curve {
-                    *curve_data_r.borrow_mut() = all_time_peaks
-                        .iter()
-                        .zip(month_peaks.iter())
-                        .map(|(&a, &m)| (a, m))
-                        .collect();
-                    for (lbl, &peak) in curve_w_labels_r.iter().zip(all_time_peaks.iter()) {
-                        if peak > 0 {
-                            lbl.set_label(&format!("{}W", peak));
+                crate::ui::spawn_to_main(
+                    &rt_handle,
+                    async move {
+                        let records = db::load_session_records(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let icu_activities = db::load_intervals_activities(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let wellness = db::load_wellness_recent(&pool_load, 14)
+                            .await
+                            .unwrap_or_default();
+                        let run_streams = db::load_run_activity_streams(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let cached_insight = db::get_setting(&pool_load, "ai.fitness_insight")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default();
+                        (
+                            records,
+                            intervals_pairs,
+                            icu_activities,
+                            wellness,
+                            run_streams,
+                            cached_insight,
+                        )
+                    },
+                    move |(
+                        records,
+                        intervals_pairs,
+                        icu_activities,
+                        wellness,
+                        run_streams,
+                        cached_insight,
+                    )| {
+                        if !icu_activities.is_empty() {
+                            icu_indicator_r.set_label(&format!(
+                                "Includes {} activities synced from Intervals.icu",
+                                icu_activities.len()
+                            ));
+                            icu_indicator_r.set_visible(true);
                         } else {
-                            lbl.set_label("—");
+                            icu_indicator_r.set_visible(false);
                         }
-                    }
-                    curve_chart_r.queue_draw();
-                }
 
-                // Pace curve (running activities with cached streams)
-                let run_streams = rt_handle
-                    .block_on(db::load_run_activity_streams(&pool))
-                    .unwrap_or_default();
-                let pace_curve = compute_pace_curve(&run_streams, cutoff_30d);
-                let has_pace = pace_curve.iter().any(|&(a, _)| a > 0);
-                pace_section_r.set_visible(has_pace);
-                if has_pace {
-                    for (lbl, &(all_p, _)) in pace_val_labels_r.iter().zip(pace_curve.iter()) {
-                        if all_p > 0 {
-                            lbl.set_label(&format!("{}/km", format_pace_display(all_p)));
+                        let ftp_val = ftp.get();
+                        let today = Local::now().date_naive();
+
+                        let (ctl, atl, _) =
+                            compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
+                        let tsb = ctl - atl;
+
+                        // PMC 90-day series
+                        let pmc_series =
+                            compute_pmc_series(&records, &intervals_pairs, ftp_val, today);
+                        let has_pmc = pmc_series.len() >= 2;
+                        pmc_section_r.set_visible(has_pmc);
+                        if has_pmc {
+                            *pmc_data_r.borrow_mut() = pmc_series;
+                            pmc_chart_r.queue_draw();
+                        }
+
+                        // Form hero
+                        let has_load = ctl > 0.5 || atl > 0.5;
+                        if has_load {
+                            tsb_label.set_label(&format!("{:+.0}", tsb));
+                            form_phrase.set_label(tsb_status_text(tsb));
+                            ctl_atl_pair
+                                .set_label(&format!("Fitness {:.0} · Fatigue {:.0}", ctl, atl));
                         } else {
-                            lbl.set_label("—");
+                            tsb_label.set_label("—");
+                            form_phrase.set_label("Complete a workout to start tracking form");
+                            ctl_atl_pair.set_label("");
                         }
-                    }
-                    *pace_data_r.borrow_mut() = pace_curve;
-                    pace_chart_r.queue_draw();
-                }
 
-                // Heart rate zones (local sessions)
-                let max_hr = athlete_r.borrow().max_hr;
-                let hr_zones = compute_hr_zones(&records, max_hr);
-                let has_hr = hr_zones.iter().any(|&s| s > 0);
-                hr_zone_section_r.set_visible(has_hr);
-                if has_hr {
-                    *hr_zone_seconds_r.borrow_mut() = hr_zones;
-                    hr_zone_bar_r.queue_draw();
-                }
+                        // TSB value colour — genuinely semantic: fresh is good,
+                        // deep fatigue warrants attention
+                        tsb_label.remove_css_class("success");
+                        tsb_label.remove_css_class("warning");
+                        if has_load && tsb > 5.0 {
+                            tsb_label.add_css_class("success");
+                        } else if has_load && tsb < -10.0 {
+                            tsb_label.add_css_class("warning");
+                        }
 
-                // Restore cached AI fitness insight if present
-                let cached_insight = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.fitness_insight"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                if !cached_insight.trim().is_empty() {
-                    populate_ai_content(&ai_content_r, &analyse_label_r, &cached_insight);
-                }
+                        // ── Wellness cards ────────────────────────────────────────────
+                        let has_wellness = wellness.iter().any(|w| {
+                            w.hrv.is_some()
+                                || w.resting_hr.is_some()
+                                || w.sleep_secs.is_some()
+                                || w.steps.is_some()
+                                || w.calories.is_some()
+                        });
+                        wellness_no_data.set_visible(!has_wellness);
+                        wellness_flow.set_visible(has_wellness);
+
+                        if has_wellness {
+                            let hrv_series = build_14day_series(&wellness, today, |e| e.hrv);
+                            let rhr_series = build_14day_series(&wellness, today, |e| {
+                                e.resting_hr.map(|v| v as f32)
+                            });
+                            let sleep_series = build_14day_series(&wellness, today, |e| {
+                                e.sleep_secs.map(|s| s as f32 / 3600.0)
+                            });
+                            let score_series = build_14day_series(&wellness, today, |e| {
+                                e.sleep_score.map(|v| v as f32)
+                            });
+                            let steps_series =
+                                build_14day_series(&wellness, today, |e| e.steps.map(|v| v as f32));
+                            let cal_series = build_14day_series(&wellness, today, |e| {
+                                e.calories.map(|v| v as f32)
+                            });
+
+                            update_wellness_card(
+                                &hrv_value,
+                                &hrv_trend,
+                                &hrv_data,
+                                &hrv_chart,
+                                &hrv_series,
+                                "{:.0}",
+                                true,
+                            );
+                            update_wellness_card(
+                                &rhr_value,
+                                &rhr_trend,
+                                &rhr_data,
+                                &rhr_chart,
+                                &rhr_series,
+                                "{:.0}",
+                                false,
+                            );
+                            update_wellness_card(
+                                &sleep_value,
+                                &sleep_trend,
+                                &sleep_data,
+                                &sleep_chart,
+                                &sleep_series,
+                                "{:.1}",
+                                true,
+                            );
+                            update_wellness_card(
+                                &score_value,
+                                &score_trend,
+                                &score_data,
+                                &score_chart,
+                                &score_series,
+                                "{:.0}",
+                                true,
+                            );
+                            update_wellness_card(
+                                &steps_value,
+                                &steps_trend,
+                                &steps_data,
+                                &steps_chart,
+                                &steps_series,
+                                "{:.0}",
+                                true,
+                            );
+                            update_wellness_card(
+                                &cal_value,
+                                &cal_trend,
+                                &cal_data,
+                                &cal_chart,
+                                &cal_series,
+                                "{:.0}",
+                                true,
+                            );
+                        }
+
+                        // Volume
+                        let week_start =
+                            today - Duration::days(today.weekday().num_days_from_monday() as i64);
+                        let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+                            .expect("day 1 of any calendar month is always valid");
+
+                        let mut wk_kj = 0.0f32;
+                        let mut wk_secs = 0u64;
+                        let mut mo_kj = 0.0f32;
+
+                        for record in &records {
+                            let date = record.session.started_at.with_timezone(&Local).date_naive();
+                            let kj = record.session.kilojoules();
+                            let dur = record.session.duration_secs();
+                            if date >= week_start {
+                                wk_kj += kj;
+                                wk_secs += dur;
+                            }
+                            if date >= month_start {
+                                mo_kj += kj;
+                            }
+                        }
+                        for act in &icu_activities {
+                            let kj = act
+                                .average_watts
+                                .and_then(|w| {
+                                    act.duration_secs.map(|d| w as f32 * d as f32 / 1000.0)
+                                })
+                                .unwrap_or(0.0);
+                            let dur = act.duration_secs.unwrap_or(0) as u64;
+                            if act.date >= week_start {
+                                wk_kj += kj;
+                                wk_secs += dur;
+                            }
+                            if act.date >= month_start {
+                                mo_kj += kj;
+                            }
+                        }
+
+                        let has_sessions = !records.is_empty() || !icu_activities.is_empty();
+                        volume_section_r.set_visible(has_sessions);
+                        week_kj_label.set_label(&format!("{:.0} kJ", wk_kj));
+                        week_hrs_label.set_label(&format!("{:.1} h", wk_secs as f32 / 3600.0));
+                        month_kj_label.set_label(&format!("{:.0} kJ", mo_kj));
+                        total_sessions_label
+                            .set_label(&(records.len() + icu_activities.len()).to_string());
+
+                        // Weekly TSS chart (last 6 weeks, oldest → newest)
+                        let mut week_tss: Vec<(String, f32)> = Vec::with_capacity(6);
+                        for i in (0..6i64).rev() {
+                            let ws = week_start - Duration::weeks(i);
+                            let we = ws + Duration::days(6);
+                            let tss_sessions: f32 = records
+                                .iter()
+                                .filter(|r| {
+                                    let d = r.session.started_at.with_timezone(&Local).date_naive();
+                                    d >= ws && d <= we
+                                })
+                                .filter_map(|r| r.session.tss(ftp_val))
+                                .sum();
+                            let tss_icu: f32 = intervals_pairs
+                                .iter()
+                                .filter(|(d, _)| *d >= ws && *d <= we)
+                                .map(|(_, t)| *t)
+                                .sum();
+                            let tss = tss_sessions + tss_icu;
+                            let iso_week = ws.iso_week().week();
+                            week_tss.push((format!("W{iso_week}"), tss));
+                        }
+
+                        for (i, (label_text, tss_val)) in week_tss.iter().enumerate() {
+                            week_header_labels[i].set_label(label_text);
+                            if *tss_val > 0.0 {
+                                tss_value_labels[i].set_label(&format!("{:.0}", tss_val));
+                            } else {
+                                tss_value_labels[i].set_label("—");
+                            }
+                        }
+                        *tss_week_data.borrow_mut() = week_tss.iter().map(|(_, t)| *t).collect();
+                        tss_chart.queue_draw();
+
+                        // Zone distribution
+                        let mut zone_secs = [0u32; 7];
+                        for record in &records {
+                            for dp in &record.session.data_points {
+                                if let Some(watts) = dp.power_watts {
+                                    zone_secs[power_zone_index(watts, ftp_val)] += 1;
+                                }
+                            }
+                        }
+                        let has_power = zone_secs.iter().any(|&s| s > 0);
+                        zone_section.set_visible(has_power);
+                        if has_power {
+                            *zone_seconds.borrow_mut() = zone_secs;
+                            zone_bar.queue_draw();
+                        }
+
+                        // Power curve
+                        let cutoff_30d = today - Duration::days(30);
+                        let mut all_time_peaks = vec![0u32; CURVE_DURATIONS.len()];
+                        let mut month_peaks = vec![0u32; CURVE_DURATIONS.len()];
+                        for record in &records {
+                            let date = record.session.started_at.with_timezone(&Local).date_naive();
+                            let is_recent = date >= cutoff_30d;
+                            for (i, &dur) in CURVE_DURATIONS.iter().enumerate() {
+                                if let Some(peak) = record.session.peak_power_for_duration(dur) {
+                                    if peak > all_time_peaks[i] {
+                                        all_time_peaks[i] = peak;
+                                    }
+                                    if is_recent && peak > month_peaks[i] {
+                                        month_peaks[i] = peak;
+                                    }
+                                }
+                            }
+                        }
+                        let has_curve = all_time_peaks.iter().any(|&p| p > 0);
+                        curve_section_r.set_visible(has_curve);
+                        if has_curve {
+                            *curve_data_r.borrow_mut() = all_time_peaks
+                                .iter()
+                                .zip(month_peaks.iter())
+                                .map(|(&a, &m)| (a, m))
+                                .collect();
+                            for (lbl, &peak) in curve_w_labels_r.iter().zip(all_time_peaks.iter()) {
+                                if peak > 0 {
+                                    lbl.set_label(&format!("{}W", peak));
+                                } else {
+                                    lbl.set_label("—");
+                                }
+                            }
+                            curve_chart_r.queue_draw();
+                        }
+
+                        // Pace curve (running activities with cached streams)
+                        let pace_curve = compute_pace_curve(&run_streams, cutoff_30d);
+                        let has_pace = pace_curve.iter().any(|&(a, _)| a > 0);
+                        pace_section_r.set_visible(has_pace);
+                        if has_pace {
+                            for (lbl, &(all_p, _)) in
+                                pace_val_labels_r.iter().zip(pace_curve.iter())
+                            {
+                                if all_p > 0 {
+                                    lbl.set_label(&format!("{}/km", format_pace_display(all_p)));
+                                } else {
+                                    lbl.set_label("—");
+                                }
+                            }
+                            *pace_data_r.borrow_mut() = pace_curve;
+                            pace_chart_r.queue_draw();
+                        }
+
+                        // Heart rate zones (local sessions)
+                        let max_hr = athlete_r.borrow().max_hr;
+                        let hr_zones = compute_hr_zones(&records, max_hr);
+                        let has_hr = hr_zones.iter().any(|&s| s > 0);
+                        hr_zone_section_r.set_visible(has_hr);
+                        if has_hr {
+                            *hr_zone_seconds_r.borrow_mut() = hr_zones;
+                            hr_zone_bar_r.queue_draw();
+                        }
+
+                        // Section wrappers show when any of their children have data
+                        zones_section_r.set_visible(has_power || has_hr);
+                        bests_section_r.set_visible(has_curve || has_pace);
+
+                        // Restore cached AI fitness insight if present
+                        if !cached_insight.trim().is_empty() {
+                            populate_ai_content(&ai_content_r, &analyse_label_r, &cached_insight);
+                        }
+                    },
+                );
             })
         };
 
@@ -1692,57 +1782,10 @@ impl FitnessPage {
                     }
                 };
 
-                let records = rt_a
-                    .block_on(db::load_session_records(&pool_a))
-                    .unwrap_or_default();
-                let intervals_pairs = rt_a
-                    .block_on(db::load_intervals_tss_pairs(&pool_a))
-                    .unwrap_or_default();
-                let icu_count = rt_a
-                    .block_on(db::count_intervals_activities(&pool_a))
-                    .unwrap_or(0) as usize;
-                let wellness_raw = rt_a
-                    .block_on(db::load_wellness_recent(&pool_a, 7))
-                    .unwrap_or_default();
+                // Read the !Send shared state on the main thread before spawning.
                 let ftp_val = ftp_a.get();
-                let today = Local::now().date_naive();
-                let (ctl, atl, ctl_4wk_ago) =
-                    compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
-                let tsb = ctl - atl;
-
                 let week_tss = tss_week_a.borrow().clone();
                 let athlete = athlete_a.borrow().clone();
-
-                let athlete_context = rt_a
-                    .block_on(db::get_setting(&pool_a, "coaching.athlete_context"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let wellness: Vec<WellnessSnapshot> = wellness_raw
-                    .iter()
-                    .map(|w| WellnessSnapshot {
-                        date: w.date.format("%Y-%m-%d").to_string(),
-                        hrv: w.hrv,
-                        resting_hr: w.resting_hr,
-                        sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
-                        sleep_score: w.sleep_score,
-                        steps: w.steps,
-                        calories: w.calories,
-                    })
-                    .collect();
-
-                let ctx = FitnessContext {
-                    athlete,
-                    ctl,
-                    atl,
-                    tsb,
-                    ctl_4wk_ago,
-                    week_tss,
-                    total_sessions: records.len() + icu_count,
-                    athlete_context,
-                    wellness,
-                };
-                let prompt = build_fitness_prompt(&ctx);
 
                 let btn_c = btn.clone();
                 btn.set_sensitive(false);
@@ -1752,7 +1795,55 @@ impl FitnessPage {
                 label_a.remove_css_class("dim-label");
 
                 let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+                let pool_t = pool_a.clone();
+                // All DB reads + prompt assembly + the network call run off the main
+                // thread, so the click never blocks the GLib loop (CLAUDE.md §2.3).
                 rt_a.spawn(async move {
+                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let icu_count =
+                        db::count_intervals_activities(&pool_t).await.unwrap_or(0) as usize;
+                    let wellness_raw = db::load_wellness_recent(&pool_t, 7)
+                        .await
+                        .unwrap_or_default();
+                    let athlete_context = db::get_setting(&pool_t, "coaching.athlete_context")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+
+                    let today = Local::now().date_naive();
+                    let (ctl, atl, ctl_4wk_ago) =
+                        compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
+                    let tsb = ctl - atl;
+
+                    let wellness: Vec<WellnessSnapshot> = wellness_raw
+                        .iter()
+                        .map(|w| WellnessSnapshot {
+                            date: w.date.format("%Y-%m-%d").to_string(),
+                            hrv: w.hrv,
+                            resting_hr: w.resting_hr,
+                            sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
+                            sleep_score: w.sleep_score,
+                            steps: w.steps,
+                            calories: w.calories,
+                        })
+                        .collect();
+
+                    let ctx = FitnessContext {
+                        athlete,
+                        ctl,
+                        atl,
+                        tsb,
+                        ctl_4wk_ago,
+                        week_tss,
+                        total_sessions: records.len() + icu_count,
+                        athlete_context,
+                        wellness,
+                    };
+                    let prompt = build_fitness_prompt(&ctx);
+
                     let result = get_suggestion(&api_key, &prompt, 1024)
                         .await
                         .map_err(|e| e.to_string());
@@ -1791,46 +1882,47 @@ impl FitnessPage {
             });
         }
 
-        // ── Retrospective Generate buttons ────────────────────────────────────
-        for (period, btn, content, label, spinner, cache_key) in [
-            (
-                RetroPeriod::Weekly,
-                &weekly_btn,
-                &weekly_content,
-                &weekly_label,
-                &weekly_spinner,
-                "ai.weekly_retrospective",
-            ),
-            (
-                RetroPeriod::Monthly,
-                &monthly_btn,
-                &monthly_content,
-                &monthly_label,
-                &monthly_spinner,
-                "ai.monthly_retrospective",
-            ),
+        // ── Retrospectives: cached restore + shared Generate button ───────────
+        for (content, label, cache_key) in [
+            (&weekly_content, &weekly_label, "ai.weekly_retrospective"),
+            (&monthly_content, &monthly_label, "ai.monthly_retrospective"),
         ] {
-            // Restore cached retrospective
-            {
-                let cached = rt_handle
-                    .block_on(db::get_setting(&pool, cache_key))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                if !cached.is_empty() {
-                    populate_ai_content(content, label, &cached);
-                }
-            }
+            // Restore cached retrospective (loaded off the main thread — CLAUDE.md §2.3)
+            let pool_load = pool.clone();
+            let cache_key_load = cache_key.to_string();
+            let content_c = content.clone();
+            let label_c = label.clone();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move {
+                    db::get_setting(&pool_load, &cache_key_load)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default()
+                },
+                move |cached| {
+                    if !cached.is_empty() {
+                        populate_ai_content(&content_c, &label_c, &cached);
+                    }
+                },
+            );
+        }
 
+        // One Generate button serves both periods; dispatch on the active toggle.
+        let run_retro: Rc<dyn Fn(RetroPeriod)> = {
             let pool_r = pool.clone();
             let rt_r = rt_handle.clone();
             let athlete_r = Rc::clone(&athlete);
             let ftp_r = Rc::clone(&ftp);
-            let content_r = content.clone();
-            let label_r = label.clone();
-            let spinner_r = spinner.clone();
-            let cache_key_s = cache_key.to_string();
-
-            btn.connect_clicked(move |btn| {
+            let weekly = (weekly_content.clone(), weekly_label.clone());
+            let monthly = (monthly_content.clone(), monthly_label.clone());
+            let spinner_r = retro_spinner.clone();
+            let generate_btn = generate_btn.clone();
+            Rc::new(move |period: RetroPeriod| {
+                let (content_r, label_r, cache_key_s) = match period {
+                    RetroPeriod::Weekly => (&weekly.0, &weekly.1, "ai.weekly_retrospective"),
+                    RetroPeriod::Monthly => (&monthly.0, &monthly.1, "ai.monthly_retrospective"),
+                };
                 let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
                     Ok(Some(k)) if !k.trim().is_empty() => k,
                     _ => {
@@ -1861,107 +1953,11 @@ impl FitnessPage {
                     .and_utc()
                     .to_rfc3339();
 
-                let records = rt_r
-                    .block_on(db::load_sessions_between(&pool_r, &start_utc, &end_utc))
-                    .unwrap_or_default();
-                let icu_acts = rt_r
-                    .block_on(db::load_intervals_activities(&pool_r))
-                    .unwrap_or_default();
-                let intervals_all = rt_r
-                    .block_on(db::load_intervals_tss_pairs(&pool_r))
-                    .unwrap_or_default();
-                let wellness_raw = rt_r
-                    .block_on(db::load_wellness_between(
-                        &pool_r,
-                        &start_date.format("%Y-%m-%d").to_string(),
-                        &today.format("%Y-%m-%d").to_string(),
-                    ))
-                    .unwrap_or_default();
-                let all_records = rt_r
-                    .block_on(db::load_session_records(&pool_r))
-                    .unwrap_or_default();
-                let athlete_context = rt_r
-                    .block_on(db::get_setting(&pool_r, "coaching.athlete_context"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
+                // Read !Send shared state on the main thread before spawning.
                 let ftp_val = ftp_r.get();
-                let (ctl_end, atl_end, _) =
-                    compute_load_metrics(&all_records, &intervals_all, ftp_val, today);
-                let ctl_start_date = today - Duration::days(period_days);
-                let (ctl_start, _, _) =
-                    compute_load_metrics(&all_records, &intervals_all, ftp_val, ctl_start_date);
-                let tsb_end = ctl_end - atl_end;
+                let athlete = athlete_r.borrow().clone();
 
-                let mut sessions: Vec<RetroSession> = Vec::new();
-                for r in &records {
-                    let date = r.session.started_at.with_timezone(&Local).date_naive();
-                    sessions.push(RetroSession {
-                        date: date.format("%Y-%m-%d").to_string(),
-                        name: r.workout_name.clone(),
-                        sport_type: "Cycling".to_string(),
-                        duration_mins: r.session.duration_secs() as u32 / 60,
-                        avg_power: r.session.average_power().map(|p| p as u32),
-                        tss: r.session.tss(ftp_val),
-                        kj: r.session.kilojoules(),
-                    });
-                }
-                for act in &icu_acts {
-                    if act.date >= start_date && act.date <= today {
-                        let sport = normalize_sport_type(&act.sport_type);
-                        let is_cycling = sport == "Cycling";
-                        sessions.push(RetroSession {
-                            date: act.date.format("%Y-%m-%d").to_string(),
-                            name: if act.name.is_empty() {
-                                None
-                            } else {
-                                Some(act.name.clone())
-                            },
-                            sport_type: sport,
-                            duration_mins: act.duration_secs.unwrap_or(0) / 60,
-                            avg_power: if is_cycling { act.average_watts } else { None },
-                            tss: act.tss,
-                            kj: if is_cycling {
-                                act.average_watts
-                                    .and_then(|w| {
-                                        act.duration_secs.map(|d| w as f32 * d as f32 / 1000.0)
-                                    })
-                                    .unwrap_or(0.0)
-                            } else {
-                                0.0
-                            },
-                        });
-                    }
-                }
-                sessions.sort_by_key(|s| s.date.clone());
-
-                let wellness: Vec<WellnessSnapshot> = wellness_raw
-                    .iter()
-                    .map(|w| WellnessSnapshot {
-                        date: w.date.format("%Y-%m-%d").to_string(),
-                        hrv: w.hrv,
-                        resting_hr: w.resting_hr,
-                        sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
-                        sleep_score: w.sleep_score,
-                        steps: w.steps,
-                        calories: w.calories,
-                    })
-                    .collect();
-
-                let ctx = RetrospectiveContext {
-                    athlete: athlete_r.borrow().clone(),
-                    period,
-                    sessions,
-                    wellness,
-                    ctl_start,
-                    ctl_end,
-                    atl_end,
-                    tsb_end,
-                    athlete_context,
-                };
-                let prompt = build_retrospective_prompt(&ctx);
-
-                btn.set_sensitive(false);
+                generate_btn.set_sensitive(false);
                 spinner_r.set_visible(true);
                 spinner_r.start();
                 label_r.set_text(&format!(
@@ -1971,7 +1967,107 @@ impl FitnessPage {
                 label_r.remove_css_class("dim-label");
 
                 let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+                let pool_t = pool_r.clone();
+                // All DB reads + prompt assembly + the network call run off the main
+                // thread, so the click never blocks the GLib loop (CLAUDE.md §2.3).
                 rt_r.spawn(async move {
+                    let records = db::load_sessions_between(&pool_t, &start_utc, &end_utc)
+                        .await
+                        .unwrap_or_default();
+                    let icu_acts = db::load_intervals_activities(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let intervals_all = db::load_intervals_tss_pairs(&pool_t)
+                        .await
+                        .unwrap_or_default();
+                    let wellness_raw = db::load_wellness_between(
+                        &pool_t,
+                        &start_date.format("%Y-%m-%d").to_string(),
+                        &today.format("%Y-%m-%d").to_string(),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    let all_records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let athlete_context = db::get_setting(&pool_t, "coaching.athlete_context")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+
+                    let (ctl_end, atl_end, _) =
+                        compute_load_metrics(&all_records, &intervals_all, ftp_val, today);
+                    let ctl_start_date = today - Duration::days(period_days);
+                    let (ctl_start, _, _) =
+                        compute_load_metrics(&all_records, &intervals_all, ftp_val, ctl_start_date);
+                    let tsb_end = ctl_end - atl_end;
+
+                    let mut sessions: Vec<RetroSession> = Vec::new();
+                    for r in &records {
+                        let date = r.session.started_at.with_timezone(&Local).date_naive();
+                        sessions.push(RetroSession {
+                            date: date.format("%Y-%m-%d").to_string(),
+                            name: r.workout_name.clone(),
+                            sport_type: "Cycling".to_string(),
+                            duration_mins: r.session.duration_secs() as u32 / 60,
+                            avg_power: r.session.average_power().map(|p| p as u32),
+                            tss: r.session.tss(ftp_val),
+                            kj: r.session.kilojoules(),
+                        });
+                    }
+                    for act in &icu_acts {
+                        if act.date >= start_date && act.date <= today {
+                            let sport = normalize_sport_type(&act.sport_type);
+                            let is_cycling = sport == "Cycling";
+                            sessions.push(RetroSession {
+                                date: act.date.format("%Y-%m-%d").to_string(),
+                                name: if act.name.is_empty() {
+                                    None
+                                } else {
+                                    Some(act.name.clone())
+                                },
+                                sport_type: sport,
+                                duration_mins: act.duration_secs.unwrap_or(0) / 60,
+                                avg_power: if is_cycling { act.average_watts } else { None },
+                                tss: act.tss,
+                                kj: if is_cycling {
+                                    act.average_watts
+                                        .and_then(|w| {
+                                            act.duration_secs.map(|d| w as f32 * d as f32 / 1000.0)
+                                        })
+                                        .unwrap_or(0.0)
+                                } else {
+                                    0.0
+                                },
+                            });
+                        }
+                    }
+                    sessions.sort_by_key(|s| s.date.clone());
+
+                    let wellness: Vec<WellnessSnapshot> = wellness_raw
+                        .iter()
+                        .map(|w| WellnessSnapshot {
+                            date: w.date.format("%Y-%m-%d").to_string(),
+                            hrv: w.hrv,
+                            resting_hr: w.resting_hr,
+                            sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
+                            sleep_score: w.sleep_score,
+                            steps: w.steps,
+                            calories: w.calories,
+                        })
+                        .collect();
+
+                    let ctx = RetrospectiveContext {
+                        athlete,
+                        period,
+                        sessions,
+                        wellness,
+                        ctl_start,
+                        ctl_end,
+                        atl_end,
+                        tsb_end,
+                        athlete_context,
+                    };
+                    let prompt = build_retrospective_prompt(&ctx);
+
                     let r = get_suggestion(&api_key, &prompt, 1500)
                         .await
                         .map_err(|e| e.to_string());
@@ -1981,10 +2077,10 @@ impl FitnessPage {
                 let label_c = label_r.clone();
                 let content_c = content_r.clone();
                 let spinner_c = spinner_r.clone();
-                let btn_c = btn.clone();
+                let btn_c = generate_btn.clone();
                 let pool_c = pool_r.clone();
                 let rt_c = rt_r.clone();
-                let key_c = cache_key_s.clone();
+                let key_c = cache_key_s.to_string();
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(result) = rx.recv().await {
                         match result {
@@ -2007,6 +2103,18 @@ impl FitnessPage {
                     spinner_c.set_visible(false);
                     btn_c.set_sensitive(true);
                 });
+            })
+        };
+        {
+            let run_retro = Rc::clone(&run_retro);
+            let month_toggle = month_toggle.clone();
+            generate_btn.connect_clicked(move |_| {
+                let period = if month_toggle.is_active() {
+                    RetroPeriod::Monthly
+                } else {
+                    RetroPeriod::Weekly
+                };
+                run_retro(period);
             });
         }
 
@@ -2017,56 +2125,6 @@ impl FitnessPage {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
-    }
-
-    fn make_metric_card(title: &str, subtitle: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
-        let card = gtk::Box::builder()
-            .css_classes(["card"])
-            .hexpand(true)
-            .build();
-
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(4)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
-            .build();
-
-        vbox.append(
-            &gtk::Label::builder()
-                .label(title)
-                .halign(gtk::Align::Start)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
-
-        let value = gtk::Label::builder()
-            .label("—")
-            .halign(gtk::Align::Start)
-            .css_classes(["title-2", "numeric"])
-            .build();
-        vbox.append(&value);
-
-        vbox.append(
-            &gtk::Label::builder()
-                .label(subtitle)
-                .halign(gtk::Align::Start)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
-
-        let status = gtk::Label::builder()
-            .label("")
-            .halign(gtk::Align::Start)
-            .css_classes(["caption"])
-            .visible(false)
-            .build();
-        vbox.append(&status);
-
-        card.append(&vbox);
-        (card, value, status)
     }
 }
 
@@ -2205,14 +2263,18 @@ impl FitnessPage {
             );
         }
 
-        // Sparkline
+        // Sparkline — "accent" class makes widget.color() resolve to the
+        // GNOME accent colour (see the PMC chart note)
         let data: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(vec![]));
         let chart = gtk::DrawingArea::builder()
             .content_height(42)
             .hexpand(true)
+            .css_classes(["accent"])
             .build();
         let data_ref = Rc::clone(&data);
-        chart.set_draw_func(move |_w, cr, width, height| {
+        chart.set_draw_func(move |widget, cr, width, height| {
+            let fg = widget.color();
+            let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
             let vals = data_ref.borrow();
             let points: Vec<(usize, f32)> = vals
                 .iter()
@@ -2234,7 +2296,7 @@ impl FitnessPage {
             let py = |v: f32| h - pad - ((v - min_v) as f64 / range as f64) * (h - pad * 2.0);
 
             // Fill under line
-            cr.set_source_rgba(0.47, 0.68, 0.93, 0.12);
+            cr.set_source_rgba(fr, fgr, fb, 0.10);
             let (fi, fv) = points[0];
             cr.move_to(px(fi), h);
             cr.line_to(px(fi), py(fv));
@@ -2247,7 +2309,7 @@ impl FitnessPage {
             cr.fill().ok();
 
             // Line
-            cr.set_source_rgba(0.47, 0.68, 0.93, 0.85);
+            cr.set_source_rgba(fr, fgr, fb, 0.80);
             cr.set_line_width(2.0);
             cr.move_to(px(fi), py(fv));
             for &(i, v) in &points[1..] {
@@ -2257,7 +2319,7 @@ impl FitnessPage {
 
             // Dot at latest point
             let (ldi, ldv) = *points.last().expect("len >= 2");
-            cr.set_source_rgba(0.47, 0.68, 0.93, 1.0);
+            cr.set_source_rgba(fr, fgr, fb, 1.0);
             cr.arc(px(ldi), py(ldv), 3.5, 0.0, std::f64::consts::TAU);
             cr.fill().ok();
         });
@@ -2383,57 +2445,18 @@ fn parse_ai_sections(text: &str) -> Vec<(String, String)> {
     sections
 }
 
-/// Build a retrospective analysis card.
-/// Returns `(card, ai_content_box, fallback_label, spinner, generate_btn)`.
-fn build_retro_card(
-    title: &str,
-    btn_label: &str,
-) -> (gtk::Box, gtk::Box, gtk::Label, gtk::Spinner, gtk::Button) {
-    let card = gtk::Box::builder()
-        .css_classes(["card"])
-        .orientation(gtk::Orientation::Vertical)
-        .build();
-
-    let header = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(10)
-        .margin_bottom(6)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-
-    header.append(
-        &gtk::Label::builder()
-            .label(title)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .css_classes(["heading"])
-            .build(),
-    );
-
-    let spinner = gtk::Spinner::new();
-    spinner.set_visible(false);
-    header.append(&spinner);
-
-    let btn = gtk::Button::builder()
-        .label(btn_label)
-        .css_classes(["pill"])
-        .tooltip_text("Generate AI retrospective analysis")
-        .valign(gtk::Align::Center)
-        .build();
-    header.append(&btn);
-
-    card.append(&header);
-    card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
+/// Build one retrospective period's content area for the Coach card stack.
+/// Returns `(content_box, fallback_label)`.
+fn build_retro_content(period_desc: &str) -> (gtk::Box, gtk::Label) {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(0)
         .build();
 
     let label = gtk::Label::builder()
-        .label("Select the button above to generate a retrospective analysis.")
+        .label(format!(
+            "Select Generate for an AI retrospective of the {period_desc}."
+        ))
         .css_classes(["dim-label"])
         .halign(gtk::Align::Start)
         .wrap(true)
@@ -2445,7 +2468,5 @@ fn build_retro_card(
         .margin_end(12)
         .build();
     content.append(&label);
-    card.append(&content);
-
-    (card, content, label, spinner, btn)
+    (content, label)
 }

@@ -1,6 +1,6 @@
 # Cycle
 
-Cycle is a native Linux application for indoor cycling training. It connects to Bluetooth LE smart trainers and sensors, executes structured workouts with automatic resistance control, records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
+Cycle is a native GNOME application for indoor cycling training, built in Rust with GTK4 and libadwaita. It connects to smart trainers and sensors over Bluetooth LE and ANT+, executes structured workouts with automatic resistance control (ERG), records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
 
 The application targets GNOME desktop environments and is distributed as a Flatpak.
 
@@ -12,9 +12,12 @@ The application targets GNOME desktop environments and is distributed as a Flatp
 
 Cycle communicates with BLE devices using standard GATT profiles:
 
-- **Smart trainers** — Fitness Machine Service (FTMS). ERG mode only: the app sends a target power and the trainer adjusts resistance automatically. Slope simulation mode is not implemented.
+- **Smart trainers** — Fitness Machine Service (FTMS). ERG mode for structured workouts (the app sends a target power and the trainer adjusts resistance automatically) and SIM mode for route rides (the app sends the road gradient and the trainer sets resistance to match).
 - **Power meters** — Cycling Power Service (CPS). Read-only; power data is recorded but the meter cannot be commanded.
 - **Heart rate monitors** — Heart Rate Service (HRS). Supports both 8-bit and 16-bit HR measurement formats.
+- **Cadence sensors** — Cycling Speed and Cadence Service (CSC), crank revolution data.
+
+Trainers that expose no usable BLE interface are supported over **ANT+**: with a USB ANT+ stick, Cycle drives FE-C trainers with full ERG and SIM control plus power and speed readings.
 
 Devices paired in a previous session are remembered and reconnected automatically on the next launch.
 
@@ -24,9 +27,13 @@ Structured workouts are executed segment by segment. Each segment specifies a ta
 
 Workouts can be paused and resumed. Ending a workout early saves the recorded portion as a complete session. At the end of a session the athlete is prompted to record a Rate of Perceived Exertion (RPE) on a 1–10 scale.
 
+### Route rides (SIM mode)
+
+GPX routes can be ridden in simulation mode: the trainer's resistance follows the route's gradient, and the rider's measured power is converted to a virtual speed through a road-cycling physics model — ease off on a climb and the climb takes longer. The route player shows live gradient, virtual speed, position on the elevation profile, and distance remaining. Without a controllable trainer, route rides fall back to ERG emulation: power targets computed from the gradient at a fixed assumed speed.
+
 ### Workout library
 
-The library holds structured workouts across eight training categories: Recovery, Endurance, Tempo, Sweet Spot, Threshold, VO₂ Max, Anaerobic, and Custom. Workouts can be imported from `.zwo` files (Zwift XML format) or `.erg` files, scheduled to a calendar date, or deleted. There is no in-app workout editor; workouts must be created externally and imported.
+The library holds structured workouts across eight training categories: Recovery, Endurance, Tempo, Sweet Spot, Threshold, VO₂ Max, Anaerobic, and Custom. A built-in workout creator edits workouts segment by segment — steady blocks and ramps with FTP-percentage targets, reorderable by drag and drop — and existing workouts can be opened in the same editor. Workouts can also be imported from `.zwo` files (Zwift XML format) or `.erg` files, scheduled to a calendar date, or deleted. GPX files can be loaded to preview a route's elevation profile and ride it in the route player.
 
 ### Training calendar
 
@@ -76,6 +83,7 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 - Linux with a GNOME desktop environment
 - Bluetooth adapter supporting Bluetooth LE (4.0 or later)
+- Optional: a USB ANT+ stick for ANT+ FE-C trainers
 - BlueZ accessible via D-Bus (standard on Fedora, Ubuntu, Arch, and most common distributions)
 - GNOME Secret Service daemon (gnome-keyring or equivalent) for credential storage
 - Network access for Intervals.icu sync, AI features, and map tile rendering
@@ -86,12 +94,11 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 ### Device connectivity
 
-- **Bluetooth LE only.** ANT+ is not supported. USB ANT+ dongles are not recognised.
-- **ERG mode only.** Slope simulation mode — adjusting resistance based on gradient — is not implemented. The app cannot command a trainer to simulate a specific incline.
+- **ANT+ covers FE-C trainers only.** ANT+ heart rate straps and cadence sensors are not supported; use their BLE mode instead. Running the ANT+ stick outside Flatpak may require a udev rule granting USB access.
 
-### Workout authoring
+### Simulation
 
-- There is no in-app workout editor. Workouts must be imported from `.zwo` or `.erg` files, or synced from Intervals.icu.
+- The SIM physics model is simplified: fixed air density, rolling resistance, and drag area, with no wind, drafting, or surface changes. Rider weight comes from the athlete profile.
 
 ### AI integration
 

@@ -73,6 +73,26 @@ pub fn show(
     hr_group.add(&resting_hr_row);
     athlete_page.add(&hr_group);
 
+    // ── Coaching context (moved here from the Coaching page) ──────────────
+    let coaching_group = adw::PreferencesGroup::builder()
+        .title("Coaching")
+        .description("Context the AI Coach reads with every request.")
+        .build();
+
+    let context_row = adw::ActionRow::builder()
+        .title("Training Context")
+        .subtitle("Loading…")
+        .use_markup(false)
+        .activatable(true)
+        .tooltip_text(
+            "Describe your age, lifestyle, time constraints, and training preferences — \
+             the more detail, the more personalised the coaching",
+        )
+        .build();
+    context_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    coaching_group.add(&context_row);
+    athlete_page.add(&coaching_group);
+
     // ── Danger Zone — widgets built here, signal wired after on_saved is wrapped ──
     let danger_group = adw::PreferencesGroup::builder()
         .title("Danger Zone")
@@ -296,7 +316,7 @@ pub fn show(
     // ── Page 3: Integrations ──────────────────────────────────────────────
     let integrations_page = adw::PreferencesPage::builder()
         .title("Integrations")
-        .icon_name("emblem-shared-symbolic")
+        .icon_name("share-symbolic")
         .build();
 
     // ── Intervals.icu ─────────────────────────────────────────────────────
@@ -410,6 +430,25 @@ pub fn show(
     sync_action_row.add_suffix(&sync_now_btn);
     icu_group.add(&sync_action_row);
 
+    // Workout library sync (moved here from the Coaching page) — the AI Coach
+    // offers synced workouts alongside the built-in library in suggestions
+    let lib_row = adw::ActionRow::builder()
+        .title("Workout Library")
+        .subtitle("Loading…")
+        .build();
+    let lib_spinner = gtk::Spinner::new();
+    lib_spinner.set_visible(false);
+    lib_spinner.set_valign(gtk::Align::Center);
+    let lib_sync_btn = gtk::Button::builder()
+        .label("Sync Library")
+        .css_classes(["pill"])
+        .tooltip_text("Download your Intervals.icu workout library for AI suggestions")
+        .valign(gtk::Align::Center)
+        .build();
+    lib_row.add_suffix(&lib_spinner);
+    lib_row.add_suffix(&lib_sync_btn);
+    icu_group.add(&lib_row);
+
     integrations_page.add(&icu_group);
 
     // ── AI Coaching ───────────────────────────────────────────────────────
@@ -486,6 +525,155 @@ pub fn show(
                     tracing::error!("save intervals.athlete_id failed: {e}");
                 }
             });
+        });
+    }
+
+    // ── Coaching: training context preview + editor ───────────────────────
+    {
+        // Populate the preview subtitle off the main thread (CLAUDE.md §2.3)
+        let row_c = context_row.clone();
+        let pool_c = pool.clone();
+        crate::ui::spawn_to_main(
+            &rt_handle,
+            async move {
+                db::get_setting(&pool_c, "coaching.athlete_context")
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_default()
+            },
+            move |ctx| row_c.set_subtitle(&context_preview(&ctx)),
+        );
+
+        let pool_e = pool.clone();
+        let rt_e = rt_handle.clone();
+        let win_e = win.clone();
+        context_row.connect_activated(move |row| {
+            show_context_editor(&win_e, pool_e.clone(), rt_e.clone(), row.clone());
+        });
+    }
+
+    // ── Intervals.icu workout library: count + sync ───────────────────────
+    {
+        let row_l = lib_row.clone();
+        let pool_l = pool.clone();
+        crate::ui::spawn_to_main(
+            &rt_handle,
+            async move { db::count_intervals_workouts(&pool_l).await.unwrap_or(0) },
+            move |count| row_l.set_subtitle(&library_subtitle(count)),
+        );
+
+        let pool_sl = pool.clone();
+        let rt_sl = rt_handle.clone();
+        let spinner_sl = lib_spinner.clone();
+        let row_sl = lib_row.clone();
+        let win_sl = win.clone();
+        lib_sync_btn.connect_clicked(move |btn| {
+            let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
+                .unwrap_or(None)
+                .unwrap_or_default();
+
+            // Load the athlete ID off the main thread (CLAUDE.md §2.3); the
+            // credential check, spinner, and network sync follow on arrival.
+            let pool_load = pool_sl.clone();
+            let pool_net = pool_sl.clone();
+            let rt_net = rt_sl.clone();
+            let spinner_sl = spinner_sl.clone();
+            let row_sl = row_sl.clone();
+            let win_sl = win_sl.clone();
+            let btn = btn.clone();
+
+            crate::ui::spawn_to_main(
+                &rt_sl,
+                async move {
+                    db::get_setting(&pool_load, "intervals.athlete_id")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default()
+                },
+                move |athlete_id| {
+                    if api_key.trim().is_empty() || athlete_id.trim().is_empty() {
+                        win_sl.add_toast(
+                            adw::Toast::builder()
+                                .title("Set your Intervals.icu API key and Athlete ID above first")
+                                .timeout(5)
+                                .build(),
+                        );
+                        return;
+                    }
+
+                    btn.set_sensitive(false);
+                    spinner_sl.set_visible(true);
+                    spinner_sl.start();
+
+                    let pool_async = pool_net.clone();
+                    let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
+                    rt_net.spawn(async move {
+                        let result =
+                            match crate::ai::intervals::fetch_workouts(&athlete_id, &api_key).await
+                            {
+                                Ok(workouts) => {
+                                    match db::clear_intervals_workouts(&pool_async).await {
+                                        Err(e) => Err(e.to_string()),
+                                        Ok(_) => {
+                                            let count = workouts.len();
+                                            for w in workouts {
+                                                if let Err(e) = db::upsert_intervals_workout(
+                                                    &pool_async,
+                                                    &w.id,
+                                                    &w.name,
+                                                    &w.description,
+                                                    w.target_duration,
+                                                    w.icu_training_load,
+                                                )
+                                                .await
+                                                {
+                                                    tracing::error!(
+                                                        "upsert intervals workout: {e}"
+                                                    );
+                                                }
+                                            }
+                                            Ok(count)
+                                        }
+                                    }
+                                }
+                                Err(e) => Err(e.to_string()),
+                            };
+                        let _ = tx.send(result).await;
+                    });
+
+                    let btn_c = btn.clone();
+                    let spinner_c = spinner_sl.clone();
+                    let row_c = row_sl.clone();
+                    let win_c = win_sl.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Ok(result) = rx.recv().await {
+                            match result {
+                                Ok(count) => {
+                                    row_c.set_subtitle(&library_subtitle(count as i64));
+                                    win_c.add_toast(
+                                        adw::Toast::builder()
+                                            .title("Workout library synced")
+                                            .timeout(3)
+                                            .build(),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("Intervals.icu library sync failed: {e}");
+                                    win_c.add_toast(
+                                        adw::Toast::builder()
+                                            .title("Library sync failed — check your credentials")
+                                            .timeout(5)
+                                            .build(),
+                                    );
+                                }
+                            }
+                        }
+                        spinner_c.stop();
+                        spinner_c.set_visible(false);
+                        btn_c.set_sensitive(true);
+                    });
+                },
+            );
         });
     }
 
@@ -843,4 +1031,169 @@ fn key_subtitle(key: &str) -> String {
     } else {
         "Not configured".to_string()
     }
+}
+
+/// First line of the training context, truncated, for the preferences row subtitle.
+fn context_preview(ctx: &str) -> String {
+    let first = ctx.trim().lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return "Not set — the AI Coach gives better advice with context".to_string();
+    }
+    let truncated: String = first.chars().take(72).collect();
+    if truncated.len() < first.len() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// Subtitle for the Intervals.icu workout library row.
+fn library_subtitle(count: i64) -> String {
+    if count > 0 {
+        format!("{count} workouts synced — offered to the AI Coach in suggestions")
+    } else {
+        "Not synced yet — sync to include your library in AI suggestions".to_string()
+    }
+}
+
+/// Present the training-context editor dialog (moved here from the Coaching page).
+/// Saves to `coaching.athlete_context` and refreshes `preview_row`'s subtitle.
+fn show_context_editor(
+    win: &adw::PreferencesWindow,
+    pool: SqlitePool,
+    rt_handle: tokio::runtime::Handle,
+    preview_row: adw::ActionRow,
+) {
+    let win = win.clone();
+    let pool_load = pool.clone();
+    let rt_save = rt_handle.clone();
+    // Load the current context off the main thread (CLAUDE.md §2.3), then
+    // build and present the editor dialog when it arrives.
+    crate::ui::spawn_to_main(
+        &rt_handle,
+        async move {
+            db::get_setting(&pool_load, "coaching.athlete_context")
+                .await
+                .unwrap_or(None)
+                .unwrap_or_default()
+        },
+        move |current| {
+            let content_box = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .margin_top(12)
+                .margin_bottom(24)
+                .margin_start(24)
+                .margin_end(24)
+                .build();
+
+            content_box.append(
+                &gtk::Label::builder()
+                    .label(
+                        "Describe your age, lifestyle, time constraints, and training \
+                         preferences. The AI Coach uses this in every coaching response.",
+                    )
+                    .css_classes(["dim-label"])
+                    .halign(gtk::Align::Start)
+                    .wrap(true)
+                    .build(),
+            );
+
+            let template_btn = gtk::Button::builder()
+                .label("Use template")
+                .css_classes(["pill"])
+                .tooltip_text("Fill in a starter template")
+                .halign(gtk::Align::Start)
+                .build();
+            content_box.append(&template_btn);
+
+            let text_view = gtk::TextView::builder()
+                .wrap_mode(gtk::WrapMode::Word)
+                .accepts_tab(false)
+                .hexpand(true)
+                .build();
+            text_view.buffer().set_text(&current);
+
+            let tv_scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .min_content_height(120)
+                .hexpand(true)
+                .build();
+            tv_scroll.set_child(Some(&text_view));
+
+            let tv_frame = gtk::Box::builder()
+                .css_classes(["card"])
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            tv_frame.append(&tv_scroll);
+            content_box.append(&tv_frame);
+
+            {
+                let tv = text_view.clone();
+                template_btn.connect_clicked(move |_| {
+                    tv.buffer().set_text(
+                        "I am [AGE] years old [GENDER]. [DESCRIBE YOUR LIFESTYLE AND \
+                         TIME CONSTRAINTS].\nMy training goals are: [LIST YOUR GOALS].\n\
+                         I prefer workouts that are [PREFERENCES — e.g. time-efficient, \
+                         varied, low-impact].\nAdditional notes: [ANYTHING ELSE].",
+                    );
+                });
+            }
+
+            let toolbar_view = adw::ToolbarView::new();
+            let header = adw::HeaderBar::new();
+
+            let cancel_btn = gtk::Button::builder()
+                .label("Cancel")
+                .tooltip_text("Discard changes")
+                .build();
+            let save_btn = gtk::Button::builder()
+                .label("Save")
+                .css_classes(["suggested-action"])
+                .tooltip_text("Save training context")
+                .build();
+            header.pack_start(&cancel_btn);
+            header.pack_end(&save_btn);
+            toolbar_view.add_top_bar(&header);
+            toolbar_view.set_content(Some(&content_box));
+
+            let dialog = adw::Dialog::builder()
+                .title("Training Context")
+                .child(&toolbar_view)
+                .content_width(560)
+                .build();
+
+            let dialog_cancel = dialog.clone();
+            cancel_btn.connect_clicked(move |_| {
+                dialog_cancel.close();
+            });
+
+            let dialog_save = dialog.clone();
+            let win_save = win.clone();
+            save_btn.connect_clicked(move |_| {
+                let buf = text_view.buffer();
+                let text = buf
+                    .text(&buf.start_iter(), &buf.end_iter(), false)
+                    .to_string();
+                let trimmed = text.trim().to_string();
+                let pool = pool.clone();
+                let ctx = trimmed.clone();
+                rt_save.spawn(async move {
+                    if let Err(e) = db::set_setting(&pool, "coaching.athlete_context", &ctx).await {
+                        tracing::error!("save coaching.athlete_context failed: {e}");
+                    }
+                });
+                preview_row.set_subtitle(&context_preview(&trimmed));
+                win_save.add_toast(
+                    adw::Toast::builder()
+                        .title("Training context saved")
+                        .timeout(3)
+                        .build(),
+                );
+                dialog_save.close();
+            });
+
+            dialog.present(Some(&win));
+        },
+    );
 }

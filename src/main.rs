@@ -104,6 +104,8 @@ fn main() -> glib::ExitCode {
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::IconTheme::for_display(&display).add_search_path("data/icons");
         }
+        // App stylesheet (defines the `display` typography class — CLAUDE.md §1.5).
+        ui::load_css();
 
         let window = CycleGtkWindow::new(
             app,

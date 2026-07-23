@@ -17,6 +17,7 @@ pub const CYCLING_POWER_MEASUREMENT_UUID: &str = "00002a63-0000-1000-8000-00805f
 /// Cycling Speed and Cadence Service (CSC) — BLE GATT profile for cadence/speed sensors.
 #[allow(dead_code)]
 pub const CSC_SERVICE_UUID: &str = "00001816-0000-1000-8000-00805f9b34fb";
+pub const CSC_MEASUREMENT_UUID: &str = "00002a5b-0000-1000-8000-00805f9b34fb";
 
 /// Parse a Heart Rate Measurement GATT notification (Bluetooth Assigned Numbers §3.104).
 /// Supports both uint8 (bit 0 = 0) and uint16 (bit 0 = 1) heart rate formats.
@@ -141,6 +142,43 @@ pub fn parse_cycling_power_measurement(data: &[u8]) -> Option<CyclingPowerData> 
     Some(result)
 }
 
+/// Parsed fields from a CSC Measurement GATT notification (BT Spec §3.55).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CscData {
+    /// Cumulative crank revolutions (uint16, wraps at 65535).
+    pub crank_revs: Option<u16>,
+    /// Timestamp of the last crank event (uint16, units: 1/1024 s, wraps at 65535).
+    pub crank_event_time: Option<u16>,
+}
+
+/// Parse raw bytes from a CSC Measurement GATT notification.
+///
+/// Flags (uint8): bit 0 = Wheel Revolution Data present (6 bytes, skipped —
+/// speed needs a wheel circumference we don't know, and the trainer already
+/// reports speed), bit 1 = Crank Revolution Data present (4 bytes).
+/// Crank event time uses the same 1/1024 s units as the Cycling Power Service,
+/// so [`compute_cadence_rpm`] works for both.
+pub fn parse_csc_measurement(data: &[u8]) -> Option<CscData> {
+    if data.is_empty() {
+        return None;
+    }
+    let flags = data[0];
+    let mut result = CscData::default();
+    let mut offset = 1usize;
+
+    // Bit 0: Wheel Revolution Data (uint32 cumulative revs + uint16 event time)
+    if flags & 0x01 != 0 {
+        offset += 6;
+    }
+    // Bit 1: Crank Revolution Data (uint16 cumulative revs + uint16 event time)
+    if flags & 0x02 != 0 && offset + 4 <= data.len() {
+        result.crank_revs = Some(u16::from_le_bytes([data[offset], data[offset + 1]]));
+        result.crank_event_time = Some(u16::from_le_bytes([data[offset + 2], data[offset + 3]]));
+    }
+
+    Some(result)
+}
+
 /// Compute cadence in RPM from two successive Crank Revolution Data samples.
 ///
 /// Both counters are uint16 and wrap; wrapping subtraction handles rollover.
@@ -177,6 +215,28 @@ pub fn request_control_command() -> Vec<u8> {
 #[allow(dead_code)]
 pub fn reset_command() -> Vec<u8> {
     vec![0x01]
+}
+
+/// OpCode 0x11 — Set Indoor Bike Simulation Parameters (SIM mode).
+///
+/// Field layout: wind speed (sint16, 0.001 m/s), grade (sint16, 0.01 %),
+/// rolling resistance coefficient (uint8, 0.0001), wind resistance
+/// coefficient (uint8, 0.01 kg/m). Wind is fixed at zero; Crr/CdA match the
+/// virtual-speed physics model in `data::route` (0.004 / ~0.51 kg/m).
+/// Grade is clamped to ±20 % — never trust raw route data (CLAUDE.md §5.1).
+pub fn set_simulation_command(grade_percent: f32) -> Vec<u8> {
+    let grade = (grade_percent.clamp(-20.0, 20.0) * 100.0).round() as i16;
+    let g = grade.to_le_bytes();
+    vec![0x11, 0x00, 0x00, g[0], g[1], 40, 51]
+}
+
+/// OpCode 0x07 — Start or Resume.
+///
+/// Many FTMS trainers (e.g. Elite) sit in the *Idle* state after Request Control
+/// and silently ignore Set Target Power (0x05) until they have been moved into the
+/// *Started* state. This command performs that transition so ERG targets take effect.
+pub fn start_resume_command() -> Vec<u8> {
+    vec![0x07]
 }
 
 #[cfg(test)]
@@ -261,5 +321,101 @@ mod tests {
     fn should_handle_crank_counter_wraparound() {
         // Counter wraps from 65535 to 1 = 2 revolutions
         assert_eq!(compute_cadence_rpm(65535, 0, 1, 2048), Some(60));
+    }
+
+    // ── CSC Measurement ──────────────────────────────────────────────────────
+
+    #[test]
+    fn should_parse_crank_data_from_csc_packet() {
+        // Flags = 0x02 (crank data only)
+        // Crank revs = 100 (0x0064 LE), Event time = 2048 (0x0800 LE)
+        let data = &[0x02, 0x64, 0x00, 0x00, 0x08];
+        let result = parse_csc_measurement(data).unwrap();
+        assert_eq!(result.crank_revs, Some(100));
+        assert_eq!(result.crank_event_time, Some(0x0800));
+    }
+
+    #[test]
+    fn should_skip_wheel_data_to_reach_crank_data_in_csc_packet() {
+        // Flags = 0x03 (wheel + crank data)
+        // Wheel: revs = 5000 (uint32 LE), event time = 1024 — 6 bytes, skipped
+        // Crank: revs = 200 (0x00C8 LE), event time = 4096 (0x1000 LE)
+        let data = &[
+            0x03, 0x88, 0x13, 0x00, 0x00, 0x00, 0x04, 0xC8, 0x00, 0x00, 0x10,
+        ];
+        let result = parse_csc_measurement(data).unwrap();
+        assert_eq!(result.crank_revs, Some(200));
+        assert_eq!(result.crank_event_time, Some(0x1000));
+    }
+
+    #[test]
+    fn should_return_no_crank_data_for_wheel_only_csc_packet() {
+        // Flags = 0x01 (wheel data only)
+        let data = &[0x01, 0x88, 0x13, 0x00, 0x00, 0x00, 0x04];
+        let result = parse_csc_measurement(data).unwrap();
+        assert_eq!(result.crank_revs, None);
+        assert_eq!(result.crank_event_time, None);
+    }
+
+    #[test]
+    fn should_return_none_for_empty_csc_packet() {
+        assert!(parse_csc_measurement(&[]).is_none());
+    }
+
+    #[test]
+    fn should_ignore_truncated_crank_data_in_csc_packet() {
+        // Flags claim crank data but only 2 of 4 bytes present
+        let result = parse_csc_measurement(&[0x02, 0x64, 0x00]).unwrap();
+        assert_eq!(result.crank_revs, None);
+    }
+
+    // ── Control Point commands ───────────────────────────────────────────────
+
+    #[test]
+    fn should_build_request_control_command() {
+        assert_eq!(request_control_command(), vec![0x00]);
+    }
+
+    #[test]
+    fn should_build_start_resume_command() {
+        assert_eq!(start_resume_command(), vec![0x07]);
+    }
+
+    #[test]
+    fn should_build_correct_set_target_power_command() {
+        // 300 = 0x012C, little-endian
+        assert_eq!(set_target_power_command(300), vec![0x05, 0x2C, 0x01]);
+    }
+
+    #[test]
+    fn should_build_simulation_command_for_positive_grade() {
+        // 6% → 600 (0x0258 LE); wind 0; Crr 40; Cw 51
+        assert_eq!(
+            set_simulation_command(6.0),
+            vec![0x11, 0x00, 0x00, 0x58, 0x02, 40, 51]
+        );
+    }
+
+    #[test]
+    fn should_build_simulation_command_for_descent() {
+        // −5% → −500 as i16 LE = 0x0C 0xFE
+        assert_eq!(
+            set_simulation_command(-5.0),
+            vec![0x11, 0x00, 0x00, 0x0C, 0xFE, 40, 51]
+        );
+    }
+
+    #[test]
+    fn should_clamp_simulation_grade_to_plus_minus_20_percent() {
+        // 45% clamps to 20% → 2000 (0x07D0 LE)
+        assert_eq!(
+            set_simulation_command(45.0),
+            vec![0x11, 0x00, 0x00, 0xD0, 0x07, 40, 51]
+        );
+        // −45% clamps to −20% → −2000 as i16 LE = 0x30 0xF8
+        assert_eq!(
+            set_simulation_command(-45.0),
+            vec![0x11, 0x00, 0x00, 0x30, 0xF8, 40, 51]
+        );
     }
 }

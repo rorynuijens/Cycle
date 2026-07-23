@@ -1,8 +1,18 @@
+//! Devices page — organised around the question "am I ready to ride?".
+//!
+//! A hero "Your Setup" strip shows the three sensor roles (trainer, heart
+//! rate, cadence) and fills in as devices connect. Saved devices live in one
+//! stable "My Devices" list whose rows only change status text — rows never
+//! jump between groups. Per-device actions (rename, ERG, forget) live in a
+//! detail dialog so list rows stay simple. All copy is plain language: no MAC
+//! addresses or dBm outside the detail dialog.
+
 use adw::prelude::*;
 use async_channel::Sender;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 
@@ -10,35 +20,64 @@ use crate::data::db::{self, SavedDevice};
 use crate::devices::manager::{DeviceCommand, DeviceType};
 use crate::devices::peripheral::Transport;
 
-#[derive(Clone, Copy, PartialEq)]
-enum DeviceLocation {
-    Known,
-    Nearby,
-    Connected,
-}
+/// How long a scan runs before giving up and telling the user nothing was found.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(25);
+
+const ADD_DESC_IDLE: &str = "Power on your device, then scan to find it";
+const ADD_DESC_SCANNING: &str = "Searching — make sure the device is on and awake";
+const ADD_DESC_NOTHING_FOUND: &str =
+    "Nothing found. Check the device is on and awake, then scan again.";
 
 struct DeviceEntry {
-    ble_name: String,
     display_name: String,
     rssi: Option<i16>,
     transport: Transport,
-    location: DeviceLocation,
-    row: adw::ActionRow,
+    kind: DeviceType,
+    saved: bool,
+    connected: bool,
+    /// A connect request is in flight — suppresses duplicate auto-connects.
+    connecting: bool,
+    /// Discovered at least once this session, so the manager can connect to it.
+    seen: bool,
     erg_enabled: bool,
+    row: adw::ActionRow,
+    /// Status label on saved rows ("Connected" / "Searching…" / "Not connected").
+    status_label: Option<gtk::Label>,
+}
+
+/// Widgets of one role card in the "Your Setup" strip.
+struct SetupSlot {
+    icon: gtk::Image,
+    name_label: gtk::Label,
+    status_label: gtk::Label,
+}
+
+struct SlotSet {
+    trainer: SetupSlot,
+    heart_rate: SetupSlot,
+    cadence: SetupSlot,
+}
+
+/// Everything page closures need, cloneable so each callback can own a copy.
+#[derive(Clone)]
+struct PageCtx {
+    cmd_tx: Sender<DeviceCommand>,
+    pool: SqlitePool,
+    rt: tokio::runtime::Handle,
+    entries: Rc<RefCell<HashMap<String, DeviceEntry>>>,
+    slots: Rc<SlotSet>,
+    my_devices_group: adw::PreferencesGroup,
+    add_group: adw::PreferencesGroup,
+    scan_btn: gtk::Button,
+    scan_spinner: gtk::Spinner,
+    scanning: Rc<Cell<bool>>,
+    scan_generation: Rc<Cell<u32>>,
+    auto_reconnect: Rc<Cell<bool>>,
 }
 
 pub struct DevicesPage {
     root: gtk::Box,
-    cmd_tx: Sender<DeviceCommand>,
-    pool: SqlitePool,
-    rt_handle: tokio::runtime::Handle,
-    known_group: adw::PreferencesGroup,
-    connected_group: adw::PreferencesGroup,
-    nearby_group: adw::PreferencesGroup,
-    scan_btn: gtk::Button,
-    scan_spinner: gtk::Spinner,
-    entries: Rc<RefCell<HashMap<String, DeviceEntry>>>,
-    auto_reconnect: Rc<Cell<bool>>,
+    ctx: PageCtx,
 }
 
 impl DevicesPage {
@@ -52,28 +91,25 @@ impl DevicesPage {
             .orientation(gtk::Orientation::Vertical)
             .build();
 
-        let scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .build();
-
         let prefs_page = adw::PreferencesPage::new();
 
-        // ── Previously Connected ─────────────────────────────────────────────
-        let known_group = adw::PreferencesGroup::builder()
-            .title("Previously Connected")
+        // ── "Your Setup" hero strip ──────────────────────────────────────────
+        let (strip_box, slots) = make_setup_strip();
+        let strip_group = adw::PreferencesGroup::builder().title("Your Setup").build();
+        strip_group.add(&strip_box);
+        prefs_page.add(&strip_group);
+
+        // ── My Devices ───────────────────────────────────────────────────────
+        let my_devices_group = adw::PreferencesGroup::builder()
+            .title("My Devices")
             .visible(!saved_devices.is_empty())
             .build();
-        prefs_page.add(&known_group);
+        prefs_page.add(&my_devices_group);
 
-        // ── Connected ────────────────────────────────────────────────────────
-        let connected_group = adw::PreferencesGroup::builder().title("Connected").build();
-        prefs_page.add(&connected_group);
-
-        // ── Nearby ───────────────────────────────────────────────────────────
-        let nearby_group = adw::PreferencesGroup::builder()
-            .title("Nearby")
-            .description("Tap Connect to connect a device")
+        // ── Add a Device ─────────────────────────────────────────────────────
+        let add_group = adw::PreferencesGroup::builder()
+            .title("Add a Device")
+            .description(ADD_DESC_IDLE)
             .build();
 
         let scan_controls = gtk::Box::builder()
@@ -85,19 +121,19 @@ impl DevicesPage {
         let scan_btn = gtk::Button::builder()
             .label("Scan")
             .css_classes(["pill"])
-            .tooltip_text("Scan for nearby Bluetooth devices")
+            .tooltip_text("Scan for nearby devices")
             .build();
         scan_controls.append(&scan_spinner);
         scan_controls.append(&scan_btn);
-        nearby_group.set_header_suffix(Some(&scan_controls));
-        prefs_page.add(&nearby_group);
+        add_group.set_header_suffix(Some(&scan_controls));
+        prefs_page.add(&add_group);
 
         // ── Settings ─────────────────────────────────────────────────────────
         let auto_reconnect = Rc::new(Cell::new(true));
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
         let auto_switch = adw::SwitchRow::builder()
-            .title("Auto-reconnect to saved devices")
-            .subtitle("Connect automatically when a saved device is detected during a scan")
+            .title("Reconnect automatically")
+            .subtitle("Connect to saved devices as soon as a scan finds them")
             .active(true)
             .build();
         let auto_reconnect_switch = Rc::clone(&auto_reconnect);
@@ -107,73 +143,72 @@ impl DevicesPage {
         settings_group.add(&auto_switch);
         prefs_page.add(&settings_group);
 
-        scroll.set_child(Some(&prefs_page));
-        root.append(&scroll);
+        prefs_page.set_vexpand(true);
+        root.append(&prefs_page);
 
-        let cmd_tx_clone = cmd_tx.clone();
-        let spinner_clone = scan_spinner.clone();
-        let btn_clone = scan_btn.clone();
-        scan_btn.connect_clicked(move |_| {
-            let _ = cmd_tx_clone.try_send(DeviceCommand::StartScan);
-            spinner_clone.set_visible(true);
-            spinner_clone.start();
-            btn_clone.set_sensitive(false);
-            btn_clone.set_label("Scanning…");
-        });
+        let ctx = PageCtx {
+            cmd_tx,
+            pool,
+            rt: rt_handle,
+            entries: Rc::new(RefCell::new(HashMap::new())),
+            slots: Rc::new(slots),
+            my_devices_group,
+            add_group,
+            scan_btn: scan_btn.clone(),
+            scan_spinner,
+            scanning: Rc::new(Cell::new(false)),
+            scan_generation: Rc::new(Cell::new(0)),
+            auto_reconnect,
+        };
 
-        // Auto-start a scan on launch when saved devices exist so they reconnect
-        // without the user having to navigate to the Devices page first.
-        if !saved_devices.is_empty() {
-            let _ = cmd_tx.try_send(DeviceCommand::StartScan);
-            scan_spinner.set_visible(true);
-            scan_spinner.start();
-            scan_btn.set_sensitive(false);
-            scan_btn.set_label("Scanning…");
-        }
+        let ctx_scan = ctx.clone();
+        scan_btn.connect_clicked(move |_| begin_scan(&ctx_scan));
 
-        let entries: Rc<RefCell<HashMap<String, DeviceEntry>>> =
-            Rc::new(RefCell::new(HashMap::new()));
-
-        // Populate known group from saved devices
+        // Populate saved devices.
         for saved in &saved_devices {
             let transport = Transport::from_db_str(&saved.transport);
-            let row = Self::make_known_row(
+            let mut kind = DeviceType::from_db_str(&saved.device_type);
+            // Rows saved before the device_type column existed: an ANT+ device
+            // can only be an FE-C trainer, so classify it without a reconnect.
+            if kind == DeviceType::Unknown && transport == Transport::AntPlus {
+                kind = DeviceType::FtmsTrainer;
+            }
+            let (row, status_label) = make_saved_row(
+                &ctx,
                 &saved.address,
                 &saved.display_name,
+                kind,
                 transport,
-                pool.clone(),
-                rt_handle.clone(),
-                Rc::clone(&entries),
-                known_group.clone(),
+                RowStatus::Idle,
             );
-            known_group.add(&row);
-            entries.borrow_mut().insert(
+            ctx.my_devices_group.add(&row);
+            ctx.entries.borrow_mut().insert(
                 saved.address.clone(),
                 DeviceEntry {
-                    ble_name: saved.display_name.clone(),
                     display_name: saved.display_name.clone(),
                     rssi: None,
                     transport,
-                    location: DeviceLocation::Known,
-                    row,
+                    kind,
+                    saved: true,
+                    connected: false,
+                    connecting: false,
+                    seen: false,
                     erg_enabled: saved.erg_enabled,
+                    row,
+                    status_label: Some(status_label),
                 },
             );
         }
 
-        Self {
-            root,
-            cmd_tx,
-            pool,
-            rt_handle,
-            known_group,
-            connected_group,
-            nearby_group,
-            scan_btn,
-            scan_spinner,
-            entries,
-            auto_reconnect,
+        refresh_strip(&ctx);
+
+        // Auto-start a scan on launch when saved devices exist so they reconnect
+        // without the user having to navigate to the Devices page first.
+        if !saved_devices.is_empty() {
+            begin_scan(&ctx);
         }
+
+        Self { root, ctx }
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -186,87 +221,53 @@ impl DevicesPage {
         name: String,
         rssi: Option<i16>,
         transport: Transport,
+        kind: DeviceType,
     ) {
-        let existing_location = {
-            let mut entries = self.entries.borrow_mut();
+        let mut auto_connect = false;
+        {
+            let mut entries = self.ctx.entries.borrow_mut();
             if let Some(entry) = entries.get_mut(&address) {
-                match entry.location {
-                    DeviceLocation::Known => {
-                        entry.ble_name = name.clone();
-                        entry.rssi = rssi;
-                        entry.transport = transport;
-                        Some(DeviceLocation::Known)
+                entry.rssi = rssi;
+                entry.transport = transport;
+                entry.seen = true;
+                if entry.kind == DeviceType::Unknown && kind != DeviceType::Unknown {
+                    entry.kind = kind;
+                }
+                if entry.saved {
+                    if !entry.connected && !entry.connecting && self.ctx.auto_reconnect.get() {
+                        entry.connecting = true;
+                        auto_connect = true;
                     }
-                    DeviceLocation::Nearby => {
-                        entry.rssi = rssi;
-                        entry
-                            .row
-                            .set_subtitle(&Self::nearby_subtitle(&address, rssi));
-                        return;
-                    }
-                    DeviceLocation::Connected => return,
+                } else {
+                    entry
+                        .row
+                        .set_subtitle(&add_row_subtitle(entry.kind, transport, rssi));
                 }
             } else {
-                None
-            }
-        };
-
-        match existing_location {
-            Some(DeviceLocation::Known) => {
-                // Promote from Known → Nearby
-                let (old_row, display_name) = {
-                    let entries = self.entries.borrow();
-                    let entry = entries
-                        .get(&address)
-                        .expect("invariant: address present — checked via existing_location above");
-                    (entry.row.clone(), entry.display_name.clone())
-                };
-                self.known_group.remove(&old_row);
-
-                let new_row = self.make_nearby_row(&address, &display_name, transport, rssi);
-                self.nearby_group.add(&new_row);
-
-                {
-                    let mut entries = self.entries.borrow_mut();
-                    let entry = entries.get_mut(&address).expect(
-                        "invariant: address present — same map, no removal between borrows",
-                    );
-                    entry.row = new_row;
-                    entry.location = DeviceLocation::Nearby;
-                    let has_known = entries
-                        .values()
-                        .any(|e| e.location == DeviceLocation::Known);
-                    self.known_group.set_visible(has_known);
-                }
-
-                if self.auto_reconnect.get() {
-                    let _ = self.cmd_tx.try_send(DeviceCommand::StopScan);
-                    self.scan_spinner.stop();
-                    self.scan_spinner.set_visible(false);
-                    self.scan_btn.set_sensitive(true);
-                    self.scan_btn.set_label("Scan");
-                    let _ = self.cmd_tx.try_send(DeviceCommand::Connect {
-                        address: address.clone(),
-                    });
-                }
-            }
-            None => {
-                let row = self.make_nearby_row(&address, &name, transport, rssi);
-                self.nearby_group.add(&row);
-                self.entries.borrow_mut().insert(
+                let row = make_add_row(&self.ctx, &address, &name, kind, transport, rssi);
+                self.ctx.add_group.add(&row);
+                entries.insert(
                     address.clone(),
                     DeviceEntry {
-                        ble_name: name.clone(),
                         display_name: name,
                         rssi,
                         transport,
-                        location: DeviceLocation::Nearby,
-                        row,
+                        kind,
+                        saved: false,
+                        connected: false,
+                        connecting: false,
+                        seen: true,
                         erg_enabled: true,
+                        row,
+                        status_label: None,
                     },
                 );
             }
-            _ => {}
+        }
+
+        if auto_connect {
+            set_saved_status(&self.ctx, &address, RowStatus::Connecting);
+            let _ = self.ctx.cmd_tx.try_send(DeviceCommand::Connect { address });
         }
     }
 
@@ -276,436 +277,706 @@ impl DevicesPage {
         connected: bool,
         device_type: Option<DeviceType>,
     ) {
-        let target = if connected {
-            DeviceLocation::Connected
-        } else {
-            DeviceLocation::Nearby
-        };
-
-        let data = {
-            let mut entries = self.entries.borrow_mut();
+        let newly_saved = {
+            let mut entries = self.ctx.entries.borrow_mut();
             let Some(entry) = entries.get_mut(&address) else {
+                // Already forgotten (e.g. disconnect event after Forget) — nothing to update.
                 return;
             };
-            if entry.location == target {
-                return;
+            entry.connecting = false;
+            entry.connected = connected;
+            if let Some(t) = device_type {
+                if t != DeviceType::Unknown {
+                    entry.kind = t;
+                }
             }
-            let old_row = entry.row.clone();
-            let old_location = entry.location;
-            let display_name = entry.display_name.clone();
-            let transport = entry.transport;
-            let rssi = entry.rssi;
-            let erg = entry.erg_enabled;
-            entry.location = target;
-            (old_row, old_location, display_name, transport, rssi, erg)
-        };
-        let (old_row, old_location, display_name, transport, rssi, erg_initial) = data;
-
-        let is_trainer = device_type == Some(DeviceType::FtmsTrainer);
-        let new_row = if connected {
-            self.make_connected_row(&address, &display_name, transport, is_trainer, erg_initial)
-        } else {
-            self.make_nearby_row(&address, &display_name, transport, rssi)
+            let newly_saved = connected && !entry.saved;
+            if newly_saved {
+                entry.saved = true;
+                self.ctx.add_group.remove(&entry.row);
+            }
+            newly_saved
         };
 
-        if let Some(entry) = self.entries.borrow_mut().get_mut(&address) {
-            entry.row = new_row.clone();
+        // Rebuild the saved row so icon, subtitle, and status reflect the new state.
+        rebuild_saved_row(&self.ctx, &address);
+        if newly_saved {
+            self.ctx.my_devices_group.set_visible(true);
         }
-
-        match old_location {
-            DeviceLocation::Known => self.known_group.remove(&old_row),
-            DeviceLocation::Nearby => self.nearby_group.remove(&old_row),
-            DeviceLocation::Connected => self.connected_group.remove(&old_row),
-        }
+        refresh_strip(&self.ctx);
 
         if connected {
-            self.connected_group.add(&new_row);
-            self.scan_spinner.stop();
-            self.scan_spinner.set_visible(false);
-            self.scan_btn.set_sensitive(true);
-            self.scan_btn.set_label("Scan");
+            let (display_name, transport, kind, erg_enabled) = {
+                let entries = self.ctx.entries.borrow();
+                let e = &entries[&address];
+                (e.display_name.clone(), e.transport, e.kind, e.erg_enabled)
+            };
 
-            let pool = self.pool.clone();
+            let pool = self.ctx.pool.clone();
             let addr = address.clone();
-            let transport_str = transport.as_db_str().to_string();
-            self.rt_handle.spawn(async move {
-                if let Err(e) = db::save_device(&pool, &addr, &display_name, &transport_str).await {
+            self.ctx.rt.spawn(async move {
+                if let Err(e) = db::save_device(
+                    &pool,
+                    &addr,
+                    &display_name,
+                    transport.as_db_str(),
+                    kind.as_db_str(),
+                )
+                .await
+                {
                     tracing::error!("save_device failed: {e}");
                 }
             });
 
-            // Sync the persisted ERG preference to the manager for FTMS trainers.
-            if is_trainer {
-                let _ = self.cmd_tx.try_send(DeviceCommand::SetErgMode(erg_initial));
+            // Sync the persisted ERG preference to the manager for trainers.
+            if kind == DeviceType::FtmsTrainer {
+                let _ = self
+                    .ctx
+                    .cmd_tx
+                    .try_send(DeviceCommand::SetErgMode(erg_enabled));
             }
-        } else {
-            self.nearby_group.add(&new_row);
+
+            // Keep searching while other saved devices are still missing (the
+            // manager stops the BLE scan to connect, so it must be restarted);
+            // once everything saved is connected, stop.
+            if self.ctx.scanning.get() {
+                if has_missing_saved(&self.ctx) {
+                    let _ = self.ctx.cmd_tx.try_send(DeviceCommand::StartScan);
+                } else {
+                    let _ = self.ctx.cmd_tx.try_send(DeviceCommand::StopScan);
+                    finish_scan(&self.ctx);
+                }
+            }
         }
     }
 
     /// Return the human-readable display name for a device address, falling back to the address.
     pub fn display_name_for(&self, address: &str) -> String {
-        self.entries
+        self.ctx
+            .entries
             .borrow()
             .get(address)
             .map(|e| e.display_name.clone())
             .unwrap_or_else(|| address.to_string())
     }
+}
 
-    // ── Row constructors ─────────────────────────────────────────────────────
+// ── Setup strip ──────────────────────────────────────────────────────────────
 
-    fn make_known_row(
-        address: &str,
-        display_name: &str,
-        transport: Transport,
-        pool: SqlitePool,
-        rt_handle: tokio::runtime::Handle,
-        entries: Rc<RefCell<HashMap<String, DeviceEntry>>>,
-        known_group: adw::PreferencesGroup,
-    ) -> adw::ActionRow {
-        let row = adw::ActionRow::builder()
-            .title(display_name)
-            .subtitle(address)
-            .build();
-        row.add_prefix(&Self::transport_badge(transport));
+fn make_setup_strip() -> (gtk::Box, SlotSet) {
+    let strip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .homogeneous(true)
+        .build();
 
-        let forget_btn = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Forget this device")
-            .css_classes(["flat", "circular"])
-            .valign(gtk::Align::Center)
-            .build();
+    let trainer = make_slot_card(&strip, DeviceType::FtmsTrainer.icon_name(), "Trainer");
+    let heart_rate = make_slot_card(
+        &strip,
+        DeviceType::HeartRateMonitor.icon_name(),
+        "Heart rate",
+    );
+    let cadence = make_slot_card(&strip, DeviceType::CadenceSensor.icon_name(), "Cadence");
 
-        let addr = address.to_string();
-        let row_clone = row.clone();
-        forget_btn.connect_clicked(move |btn| {
-            let dialog = adw::AlertDialog::builder()
-                .heading("Forget Device?")
-                .body("This device will be removed from your saved devices.")
-                .build();
-            dialog.add_response("cancel", "_Cancel");
-            dialog.add_response("forget", "_Forget");
-            dialog.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
-            dialog.set_close_response("cancel");
+    (
+        strip,
+        SlotSet {
+            trainer,
+            heart_rate,
+            cadence,
+        },
+    )
+}
 
-            let addr = addr.clone();
-            let entries = Rc::clone(&entries);
-            let group = known_group.clone();
-            let pool = pool.clone();
-            let rt = rt_handle.clone();
-            let rw = row_clone.clone();
+fn make_slot_card(strip: &gtk::Box, icon_name: &str, role: &str) -> SetupSlot {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .css_classes(["card"])
+        .build();
 
-            dialog.connect_response(None, move |_, resp| {
-                if resp != "forget" {
-                    return;
-                }
-                entries.borrow_mut().remove(&addr);
-                group.remove(&rw);
-                let has_known = entries
-                    .borrow()
-                    .values()
-                    .any(|e| e.location == DeviceLocation::Known);
-                group.set_visible(has_known);
-                let pool = pool.clone();
-                let a = addr.clone();
-                rt.spawn(async move {
-                    if let Err(e) = db::delete_device(&pool, &a).await {
-                        tracing::error!("delete_device failed: {e}");
-                    }
-                });
-            });
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let icon = gtk::Image::builder()
+        .icon_name(icon_name)
+        .css_classes(["dim-label"])
+        .build();
+    let role_label = gtk::Label::builder()
+        .label(role)
+        .css_classes(["caption-heading", "dim-label"])
+        .xalign(0.0)
+        .build();
+    header.append(&icon);
+    header.append(&role_label);
+    card.append(&header);
 
-            dialog.present(Some(btn));
-        });
-        row.add_suffix(&forget_btn);
+    let name_label = gtk::Label::builder()
+        .label("—")
+        .css_classes(["heading"])
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    card.append(&name_label);
 
-        row
+    let status_label = gtk::Label::builder()
+        .label("—")
+        .css_classes(["caption", "dim-label"])
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_bottom(12)
+        .build();
+    card.append(&status_label);
+
+    strip.append(&card);
+    SetupSlot {
+        icon,
+        name_label,
+        status_label,
     }
+}
 
-    fn make_nearby_row(
-        &self,
-        address: &str,
-        display_name: &str,
-        transport: Transport,
-        rssi: Option<i16>,
-    ) -> adw::ActionRow {
-        let row = adw::ActionRow::builder()
-            .title(display_name)
-            .subtitle(Self::nearby_subtitle(address, rssi))
-            .build();
+/// Recompute all three role cards from the current entries.
+fn refresh_strip(ctx: &PageCtx) {
+    let entries = ctx.entries.borrow();
+    let scanning = ctx.scanning.get();
 
-        row.add_prefix(&Self::transport_badge(transport));
+    let slot_views: [(&SetupSlot, &[DeviceType], &str); 3] = [
+        (
+            &ctx.slots.trainer,
+            &[DeviceType::FtmsTrainer, DeviceType::CyclingPowerMeter],
+            "No trainer yet",
+        ),
+        (
+            &ctx.slots.heart_rate,
+            &[DeviceType::HeartRateMonitor],
+            "No monitor yet",
+        ),
+        (
+            &ctx.slots.cadence,
+            &[DeviceType::CadenceSensor],
+            "No sensor yet",
+        ),
+    ];
 
-        let connect_btn = gtk::Button::builder()
-            .label("Connect")
-            .css_classes(["pill"])
-            .valign(gtk::Align::Center)
-            .tooltip_text("Connect to this device")
-            .build();
+    for (slot, kinds, empty_name) in slot_views {
+        let connected = entries
+            .values()
+            .find(|e| e.saved && e.connected && kinds.contains(&e.kind));
+        let saved = entries
+            .values()
+            .find(|e| e.saved && kinds.contains(&e.kind));
 
-        let addr = address.to_string();
-        let cmd_tx = self.cmd_tx.clone();
-        let scan_btn = self.scan_btn.clone();
-        let scan_spinner = self.scan_spinner.clone();
-        connect_btn.connect_clicked(move |btn| {
-            let _ = cmd_tx.try_send(DeviceCommand::StopScan);
-            scan_spinner.stop();
-            scan_spinner.set_visible(false);
-            scan_btn.set_sensitive(true);
-            scan_btn.set_label("Scan");
-            btn.set_sensitive(false);
-            let _ = cmd_tx.try_send(DeviceCommand::Connect {
-                address: addr.clone(),
-            });
-        });
-
-        row.add_suffix(&connect_btn);
-        row
-    }
-
-    fn make_connected_row(
-        &self,
-        address: &str,
-        display_name: &str,
-        transport: Transport,
-        show_erg: bool,
-        erg_initial: bool,
-    ) -> adw::ActionRow {
-        let row = adw::ActionRow::builder()
-            .title(display_name)
-            .subtitle("Connected")
-            .build();
-
-        row.add_prefix(&Self::transport_badge(transport));
-        row.add_prefix(
-            &gtk::Image::builder()
-                .icon_name("object-select-symbolic")
-                .css_classes(["success"])
-                .valign(gtk::Align::Center)
-                .build(),
-        );
-
-        // ERG toggle (FTMS trainers only)
-        if show_erg {
-            let erg_sep = gtk::Separator::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .margin_top(8)
-                .margin_bottom(8)
-                .build();
-            let erg_label = gtk::Label::builder()
-                .label("ERG")
-                .css_classes(["caption", "dim-label"])
-                .valign(gtk::Align::Center)
-                .build();
-            let erg_switch = gtk::Switch::builder()
-                .active(erg_initial)
-                .valign(gtk::Align::Center)
-                .tooltip_text(
-                    "When on, the trainer automatically adjusts resistance to match target power",
-                )
-                .build();
-
-            let cmd_tx_erg = self.cmd_tx.clone();
-            let pool_erg = self.pool.clone();
-            let rt_erg = self.rt_handle.clone();
-            let addr_erg = address.to_string();
-            let entries_erg = Rc::clone(&self.entries);
-            erg_switch.connect_active_notify(move |sw| {
-                let enabled = sw.is_active();
-                if let Some(e) = entries_erg.borrow_mut().get_mut(&addr_erg) {
-                    e.erg_enabled = enabled;
-                }
-                let _ = cmd_tx_erg.try_send(DeviceCommand::SetErgMode(enabled));
-                let pool = pool_erg.clone();
-                let a = addr_erg.clone();
-                rt_erg.spawn(async move {
-                    if let Err(e) = db::set_device_erg_enabled(&pool, &a, enabled).await {
-                        tracing::error!("set_device_erg_enabled failed: {e}");
-                    }
-                });
-            });
-
-            row.add_suffix(&erg_sep);
-            row.add_suffix(&erg_label);
-            row.add_suffix(&erg_switch);
+        match (connected, saved) {
+            (Some(e), _) => set_slot(slot, &e.display_name, "Connected", true),
+            (None, Some(e)) => {
+                let status = if scanning {
+                    "Searching…"
+                } else {
+                    "Not connected"
+                };
+                set_slot(slot, &e.display_name, status, false);
+            }
+            (None, None) => set_slot(slot, empty_name, "Scan to add one", false),
         }
+    }
+}
 
-        // Rename button
-        let rename_btn = gtk::Button::builder()
-            .icon_name("document-edit-symbolic")
-            .tooltip_text("Rename this device")
-            .css_classes(["flat", "circular"])
+fn set_slot(slot: &SetupSlot, name: &str, status: &str, connected: bool) {
+    slot.name_label.set_label(name);
+    slot.status_label.set_label(status);
+    if connected {
+        slot.icon.set_css_classes(&["success"]);
+        slot.status_label.set_css_classes(&["caption", "success"]);
+    } else {
+        slot.icon.set_css_classes(&["dim-label"]);
+        slot.status_label.set_css_classes(&["caption", "dim-label"]);
+    }
+}
+
+// ── Scanning ─────────────────────────────────────────────────────────────────
+
+fn begin_scan(ctx: &PageCtx) {
+    if ctx.scanning.get() {
+        return;
+    }
+    ctx.scanning.set(true);
+    let generation = ctx.scan_generation.get().wrapping_add(1);
+    ctx.scan_generation.set(generation);
+
+    let _ = ctx.cmd_tx.try_send(DeviceCommand::StartScan);
+    ctx.scan_spinner.set_visible(true);
+    ctx.scan_spinner.start();
+    ctx.scan_btn.set_sensitive(false);
+    ctx.scan_btn.set_label("Scanning…");
+    ctx.add_group.set_description(Some(ADD_DESC_SCANNING));
+    update_saved_statuses(ctx);
+    refresh_strip(ctx);
+
+    // Give up after a while so a fruitless scan ends with guidance, not silence.
+    let ctx_timeout = ctx.clone();
+    glib::timeout_add_local_once(SCAN_TIMEOUT, move || {
+        if !ctx_timeout.scanning.get() || ctx_timeout.scan_generation.get() != generation {
+            return; // scan already ended, or a newer scan is running
+        }
+        let _ = ctx_timeout.cmd_tx.try_send(DeviceCommand::StopScan);
+        finish_scan(&ctx_timeout);
+        let found_any_new = ctx_timeout.entries.borrow().values().any(|e| !e.saved);
+        if !found_any_new {
+            ctx_timeout
+                .add_group
+                .set_description(Some(ADD_DESC_NOTHING_FOUND));
+        }
+    });
+}
+
+fn finish_scan(ctx: &PageCtx) {
+    ctx.scanning.set(false);
+    ctx.scan_spinner.stop();
+    ctx.scan_spinner.set_visible(false);
+    ctx.scan_btn.set_sensitive(true);
+    ctx.scan_btn.set_label("Scan");
+    ctx.add_group.set_description(Some(ADD_DESC_IDLE));
+    update_saved_statuses(ctx);
+    refresh_strip(ctx);
+}
+
+fn has_missing_saved(ctx: &PageCtx) -> bool {
+    ctx.entries
+        .borrow()
+        .values()
+        .any(|e| e.saved && !e.connected)
+}
+
+/// Refresh status text on every saved-but-not-connected row.
+fn update_saved_statuses(ctx: &PageCtx) {
+    let scanning = ctx.scanning.get();
+    let entries = ctx.entries.borrow();
+    for entry in entries.values() {
+        if !entry.saved || entry.connected {
+            continue;
+        }
+        let status = if entry.connecting {
+            RowStatus::Connecting
+        } else if scanning {
+            RowStatus::Searching
+        } else {
+            RowStatus::Idle
+        };
+        if let Some(label) = &entry.status_label {
+            apply_status(label, status);
+        }
+    }
+}
+
+// ── Row construction ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum RowStatus {
+    Connected,
+    Connecting,
+    Searching,
+    Idle,
+}
+
+fn apply_status(label: &gtk::Label, status: RowStatus) {
+    let (text, classes): (&str, &[&str]) = match status {
+        RowStatus::Connected => ("Connected", &["caption", "success"]),
+        RowStatus::Connecting => ("Connecting…", &["caption", "dim-label"]),
+        RowStatus::Searching => ("Searching…", &["caption", "dim-label"]),
+        RowStatus::Idle => ("Not connected", &["caption", "dim-label"]),
+    };
+    label.set_label(text);
+    label.set_css_classes(classes);
+}
+
+fn make_saved_row(
+    ctx: &PageCtx,
+    address: &str,
+    display_name: &str,
+    kind: DeviceType,
+    transport: Transport,
+    status: RowStatus,
+) -> (adw::ActionRow, gtk::Label) {
+    let row = adw::ActionRow::builder()
+        .title(display_name)
+        .subtitle(format!("{} · {}", kind.label(), transport.label()))
+        .activatable(true)
+        .tooltip_text("Open device details")
+        .build();
+
+    row.add_prefix(
+        &gtk::Image::builder()
+            .icon_name(kind.icon_name())
+            .css_classes(["dim-label"])
             .valign(gtk::Align::Center)
-            .build();
+            .build(),
+    );
 
-        let addr_rename = address.to_string();
-        let entries_rc = Rc::clone(&self.entries);
-        let pool_rename = self.pool.clone();
-        let rt_rename = self.rt_handle.clone();
-        let row_clone = row.clone();
-        rename_btn.connect_clicked(move |btn| {
-            let current_name = entries_rc
-                .borrow()
-                .get(&addr_rename)
-                .map(|e| e.display_name.clone())
-                .unwrap_or_default();
-            Self::show_rename_dialog(
-                btn,
-                &addr_rename,
-                &current_name,
-                Rc::clone(&entries_rc),
-                pool_rename.clone(),
-                rt_rename.clone(),
-                row_clone.clone(),
-            );
+    let status_label = gtk::Label::builder().valign(gtk::Align::Center).build();
+    apply_status(&status_label, status);
+    row.add_suffix(&status_label);
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("go-next-symbolic")
+            .css_classes(["dim-label"])
+            .valign(gtk::Align::Center)
+            .build(),
+    );
+
+    let ctx_dialog = ctx.clone();
+    let addr = address.to_string();
+    row.connect_activated(move |row| {
+        open_device_dialog(&ctx_dialog, &addr, row);
+    });
+
+    (row, status_label)
+}
+
+/// Tear down and re-add a saved device's row so it reflects the entry's state.
+fn rebuild_saved_row(ctx: &PageCtx, address: &str) {
+    let Some((old_row, display_name, kind, transport, status)) = ({
+        let entries = ctx.entries.borrow();
+        entries.get(address).map(|e| {
+            let status = if e.connected {
+                RowStatus::Connected
+            } else if e.connecting {
+                RowStatus::Connecting
+            } else if ctx.scanning.get() {
+                RowStatus::Searching
+            } else {
+                RowStatus::Idle
+            };
+            (
+                e.row.clone(),
+                e.display_name.clone(),
+                e.kind,
+                e.transport,
+                status,
+            )
+        })
+    }) else {
+        return;
+    };
+
+    let (new_row, status_label) =
+        make_saved_row(ctx, address, &display_name, kind, transport, status);
+    ctx.my_devices_group.remove(&old_row);
+    ctx.my_devices_group.add(&new_row);
+
+    if let Some(entry) = ctx.entries.borrow_mut().get_mut(address) {
+        entry.row = new_row;
+        entry.status_label = Some(status_label);
+    }
+}
+
+fn add_row_subtitle(kind: DeviceType, transport: Transport, rssi: Option<i16>) -> String {
+    match signal_text(rssi) {
+        Some(signal) => format!("{} · {} · {}", kind.label(), transport.label(), signal),
+        None => format!("{} · {}", kind.label(), transport.label()),
+    }
+}
+
+fn make_add_row(
+    ctx: &PageCtx,
+    address: &str,
+    name: &str,
+    kind: DeviceType,
+    transport: Transport,
+    rssi: Option<i16>,
+) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(name)
+        .subtitle(add_row_subtitle(kind, transport, rssi))
+        .build();
+
+    row.add_prefix(
+        &gtk::Image::builder()
+            .icon_name(kind.icon_name())
+            .css_classes(["dim-label"])
+            .valign(gtk::Align::Center)
+            .build(),
+    );
+
+    let add_btn = gtk::Button::builder()
+        .label("Add")
+        .css_classes(["pill", "suggested-action"])
+        .valign(gtk::Align::Center)
+        .tooltip_text("Connect and save this device")
+        .build();
+
+    let addr = address.to_string();
+    let ctx_add = ctx.clone();
+    add_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        btn.set_label("Connecting…");
+        if let Some(e) = ctx_add.entries.borrow_mut().get_mut(&addr) {
+            e.connecting = true;
+        }
+        let _ = ctx_add.cmd_tx.try_send(DeviceCommand::Connect {
+            address: addr.clone(),
         });
-        row.add_suffix(&rename_btn);
+    });
 
-        // Forget button
-        let forget_btn = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Forget this device")
-            .css_classes(["flat", "circular"])
-            .valign(gtk::Align::Center)
+    row.add_suffix(&add_btn);
+    row
+}
+
+// ── Device detail dialog ─────────────────────────────────────────────────────
+
+fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widget>) {
+    // Snapshot the entry — the dialog shows state as of opening.
+    let Some((display_name, kind, transport, rssi, connected, seen, erg_enabled)) = ({
+        let entries = ctx.entries.borrow();
+        entries.get(address).map(|e| {
+            (
+                e.display_name.clone(),
+                e.kind,
+                e.transport,
+                e.rssi,
+                e.connected,
+                e.seen,
+                e.erg_enabled,
+            )
+        })
+    }) else {
+        return;
+    };
+
+    let dialog = adw::Dialog::builder()
+        .title(&display_name)
+        .content_width(420)
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_top(12)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+
+    // ── Name + trainer options ───────────────────────────────────────────────
+    let options_group = adw::PreferencesGroup::new();
+
+    let name_row = adw::EntryRow::builder()
+        .title("Name")
+        .text(&display_name)
+        .show_apply_button(true)
+        .build();
+    let ctx_rename = ctx.clone();
+    let addr_rename = address.to_string();
+    name_row.connect_apply(move |row| {
+        let new_name = row.text().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        if let Some(e) = ctx_rename.entries.borrow_mut().get_mut(&addr_rename) {
+            e.display_name = new_name.clone();
+            e.row.set_title(&new_name);
+        }
+        refresh_strip(&ctx_rename);
+        let pool = ctx_rename.pool.clone();
+        let addr = addr_rename.clone();
+        ctx_rename.rt.spawn(async move {
+            if let Err(e) = db::rename_device(&pool, &addr, &new_name).await {
+                tracing::error!("rename_device failed: {e}");
+            }
+        });
+    });
+    options_group.add(&name_row);
+
+    if kind == DeviceType::FtmsTrainer {
+        let erg_row = adw::SwitchRow::builder()
+            .title("Automatic resistance (ERG)")
+            .subtitle("The trainer adjusts itself to match each interval's target power")
+            .active(erg_enabled)
             .build();
-
-        let addr_forget = address.to_string();
-        let entries_forget = Rc::clone(&self.entries);
-        let connected_group = self.connected_group.clone();
-        let pool_forget = self.pool.clone();
-        let rt_forget = self.rt_handle.clone();
-        let cmd_forget = self.cmd_tx.clone();
-        let row_forget = row.clone();
-
-        forget_btn.connect_clicked(move |btn| {
-            let dialog = adw::AlertDialog::builder()
-                .heading("Forget Device?")
-                .body("This device will be removed from your saved devices.")
-                .build();
-            dialog.add_response("cancel", "_Cancel");
-            dialog.add_response("forget", "_Forget");
-            dialog.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
-            dialog.set_close_response("cancel");
-
-            let addr = addr_forget.clone();
-            let entries = Rc::clone(&entries_forget);
-            let grp = connected_group.clone();
-            let pool = pool_forget.clone();
-            let rt = rt_forget.clone();
-            let cmd = cmd_forget.clone();
-            let rw = row_forget.clone();
-
-            dialog.connect_response(None, move |_, resp| {
-                if resp != "forget" {
-                    return;
+        let ctx_erg = ctx.clone();
+        let addr_erg = address.to_string();
+        erg_row.connect_active_notify(move |sw| {
+            let enabled = sw.is_active();
+            if let Some(e) = ctx_erg.entries.borrow_mut().get_mut(&addr_erg) {
+                e.erg_enabled = enabled;
+            }
+            let _ = ctx_erg.cmd_tx.try_send(DeviceCommand::SetErgMode(enabled));
+            let pool = ctx_erg.pool.clone();
+            let addr = addr_erg.clone();
+            ctx_erg.rt.spawn(async move {
+                if let Err(e) = db::set_device_erg_enabled(&pool, &addr, enabled).await {
+                    tracing::error!("set_device_erg_enabled failed: {e}");
                 }
-                entries.borrow_mut().remove(&addr);
-                grp.remove(&rw);
-                // Sending Disconnect: on_connection_changed will be a no-op since
-                // the entry was already removed from the map.
-                let _ = cmd.try_send(DeviceCommand::Disconnect {
-                    address: addr.clone(),
-                });
-                let pool = pool.clone();
-                let a = addr.clone();
-                rt.spawn(async move {
-                    if let Err(e) = db::delete_device(&pool, &a).await {
-                        tracing::error!("delete_device failed: {e}");
-                    }
-                });
             });
-
-            dialog.present(Some(btn));
         });
-        row.add_suffix(&forget_btn);
+        options_group.add(&erg_row);
+    }
+    content.append(&options_group);
 
-        // Disconnect button
+    // ── Details ──────────────────────────────────────────────────────────────
+    let details_group = adw::PreferencesGroup::builder().title("Details").build();
+    details_group.add(&property_row("Type", kind.label()));
+    details_group.add(&property_row("Connection", transport.label()));
+    if let Some(signal) = signal_text(rssi) {
+        details_group.add(&property_row("Signal", signal));
+    }
+    details_group.add(&property_row("Address", address));
+    content.append(&details_group);
+
+    // ── Actions ──────────────────────────────────────────────────────────────
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(6)
+        .build();
+
+    if connected {
         let disconnect_btn = gtk::Button::builder()
             .label("Disconnect")
-            .css_classes(["destructive-action", "pill"])
-            .valign(gtk::Align::Center)
-            .tooltip_text("Disconnect this device")
+            .css_classes(["pill"])
+            .tooltip_text("Disconnect this device but keep it saved")
             .build();
-
-        let addr = address.to_string();
-        let cmd_tx = self.cmd_tx.clone();
+        let ctx_disc = ctx.clone();
+        let addr_disc = address.to_string();
+        let dialog_disc = dialog.clone();
         disconnect_btn.connect_clicked(move |_| {
-            let _ = cmd_tx.try_send(DeviceCommand::Disconnect {
-                address: addr.clone(),
+            let _ = ctx_disc.cmd_tx.try_send(DeviceCommand::Disconnect {
+                address: addr_disc.clone(),
             });
+            dialog_disc.close();
         });
-        row.add_suffix(&disconnect_btn);
-
-        row
-    }
-
-    fn show_rename_dialog(
-        parent: &gtk::Button,
-        address: &str,
-        current_name: &str,
-        entries: Rc<RefCell<HashMap<String, DeviceEntry>>>,
-        pool: SqlitePool,
-        rt_handle: tokio::runtime::Handle,
-        row: adw::ActionRow,
-    ) {
-        let dialog = adw::AlertDialog::builder()
-            .heading("Rename Device")
-            .body("Enter a custom name for this device.")
+        actions.append(&disconnect_btn);
+    } else if seen {
+        let connect_btn = gtk::Button::builder()
+            .label("Connect")
+            .css_classes(["pill", "suggested-action"])
+            .tooltip_text("Connect to this device")
             .build();
-
-        dialog.add_response("cancel", "_Cancel");
-        dialog.add_response("rename", "_Rename");
-        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("rename"));
-        dialog.set_close_response("cancel");
-
-        let entry = gtk::Entry::builder()
-            .text(current_name)
-            .activates_default(true)
-            .build();
-        dialog.set_extra_child(Some(&entry));
-
-        let address = address.to_string();
-        let entry_widget = entry.clone();
-        dialog.connect_response(None, move |_d, response| {
-            if response != "rename" {
-                return;
+        let ctx_conn = ctx.clone();
+        let addr_conn = address.to_string();
+        let dialog_conn = dialog.clone();
+        connect_btn.connect_clicked(move |_| {
+            if let Some(e) = ctx_conn.entries.borrow_mut().get_mut(&addr_conn) {
+                e.connecting = true;
             }
-            let new_name = entry_widget.text().to_string();
-            if new_name.is_empty() {
-                return;
-            }
-            row.set_title(&new_name);
-            if let Some(e) = entries.borrow_mut().get_mut(&address) {
-                e.display_name = new_name.clone();
-            }
-            let pool = pool.clone();
-            let addr = address.clone();
-            rt_handle.spawn(async move {
-                if let Err(e) = db::rename_device(&pool, &addr, &new_name).await {
-                    tracing::error!("rename_device failed: {e}");
-                }
+            set_saved_status(&ctx_conn, &addr_conn, RowStatus::Connecting);
+            let _ = ctx_conn.cmd_tx.try_send(DeviceCommand::Connect {
+                address: addr_conn.clone(),
             });
+            dialog_conn.close();
         });
-
-        dialog.present(Some(parent));
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
-    fn transport_badge(transport: Transport) -> gtk::Image {
-        let img = gtk::Image::builder()
-            .icon_name(transport.icon_name())
-            .valign(gtk::Align::Center)
+        actions.append(&connect_btn);
+    } else {
+        // Never discovered this session — the manager can't connect to it yet.
+        let hint = gtk::Label::builder()
+            .label("Turn the device on and scan to connect")
+            .css_classes(["caption", "dim-label"])
             .build();
-        img.add_css_class("dim-label");
-        img
+        actions.append(&hint);
     }
 
-    fn nearby_subtitle(address: &str, rssi: Option<i16>) -> String {
-        match rssi {
-            Some(r) => format!("{address} · {r} dBm"),
-            None => address.to_string(),
+    let forget_btn = gtk::Button::builder()
+        .label("Forget This Device…")
+        .css_classes(["pill", "destructive-action"])
+        .tooltip_text("Remove this device from your saved devices")
+        .build();
+    let ctx_forget = ctx.clone();
+    let addr_forget = address.to_string();
+    let dialog_forget = dialog.clone();
+    forget_btn.connect_clicked(move |_| {
+        confirm_forget(&ctx_forget, &addr_forget, &dialog_forget);
+    });
+    actions.append(&forget_btn);
+    content.append(&actions);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(parent));
+}
+
+/// Read-only "Title: value" row for the detail dialog.
+fn property_row(title: &str, value: &str) -> adw::ActionRow {
+    adw::ActionRow::builder()
+        .title(title)
+        .subtitle(value)
+        .css_classes(["property"])
+        .subtitle_selectable(true)
+        .build()
+}
+
+fn confirm_forget(ctx: &PageCtx, address: &str, device_dialog: &adw::Dialog) {
+    let confirm = adw::AlertDialog::builder()
+        .heading("Forget Device?")
+        .body("This device will be removed from your saved devices. You can add it again with a scan.")
+        .build();
+    confirm.add_response("cancel", "_Cancel");
+    confirm.add_response("forget", "_Forget");
+    confirm.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
+    confirm.set_close_response("cancel");
+
+    let ctx = ctx.clone();
+    let address = address.to_string();
+    let dialog_to_close = device_dialog.clone();
+    confirm.connect_response(None, move |_, resp| {
+        if resp != "forget" {
+            return;
         }
+        let removed = ctx.entries.borrow_mut().remove(&address);
+        if let Some(entry) = removed {
+            if entry.saved {
+                ctx.my_devices_group.remove(&entry.row);
+            } else {
+                ctx.add_group.remove(&entry.row);
+            }
+            if entry.connected {
+                // on_connection_changed will be a no-op: the entry is gone.
+                let _ = ctx.cmd_tx.try_send(DeviceCommand::Disconnect {
+                    address: address.clone(),
+                });
+            }
+        }
+        let any_saved = ctx.entries.borrow().values().any(|e| e.saved);
+        ctx.my_devices_group.set_visible(any_saved);
+        refresh_strip(&ctx);
+
+        let pool = ctx.pool.clone();
+        let addr = address.clone();
+        ctx.rt.spawn(async move {
+            if let Err(e) = db::delete_device(&pool, &addr).await {
+                tracing::error!("delete_device failed: {e}");
+            }
+        });
+        dialog_to_close.close();
+    });
+
+    confirm.present(Some(device_dialog));
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn set_saved_status(ctx: &PageCtx, address: &str, status: RowStatus) {
+    let entries = ctx.entries.borrow();
+    if let Some(label) = entries.get(address).and_then(|e| e.status_label.as_ref()) {
+        apply_status(label, status);
     }
+}
+
+/// Signal strength in words — thresholds match `PeripheralInfo::signal_bars`.
+fn signal_text(rssi: Option<i16>) -> Option<&'static str> {
+    Some(match rssi? {
+        r if r >= -55 => "Excellent signal",
+        r if r >= -67 => "Good signal",
+        r if r >= -80 => "Fair signal",
+        _ => "Weak signal",
+    })
 }

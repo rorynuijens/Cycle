@@ -20,6 +20,7 @@ use crate::data::{
     workout::Workout,
 };
 use crate::ui::markdown::{strip_markdown, to_pango};
+use crate::ui::widgets::workout_graph::WorkoutGraph;
 
 type ReloadHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
@@ -35,6 +36,7 @@ impl DashboardPage {
         athlete: AthleteProfile,
         on_start: Rc<dyn Fn(Workout)>,
         on_view_fitness: Rc<dyn Fn()>,
+        on_open_calendar: Rc<dyn Fn()>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -58,33 +60,51 @@ impl DashboardPage {
             .spacing(18)
             .build();
 
+        // ── Header: greeting and date share one baseline ─────────────────────
+        let header_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+
         let greeting_label = gtk::Label::builder()
             .label("")
             .halign(gtk::Align::Start)
+            .hexpand(true)
+            .valign(gtk::Align::Baseline)
             .css_classes(["title-1"])
             .build();
 
         let subtitle_label = gtk::Label::builder()
             .label("")
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Baseline)
             .css_classes(["dim-label"])
             .build();
 
-        inner.append(&greeting_label);
-        inner.append(&subtitle_label);
+        header_row.append(&greeting_label);
+        header_row.append(&subtitle_label);
+        inner.append(&header_row);
 
-        // ── Morning Briefing card (static — not rebuilt on each reload) ──────
+        // ── Today hero (rebuilt on each reload) ──────────────────────────────
+        // The page's job is "what do I ride today?" — so today's workout,
+        // drawn in its zone colours, comes before everything else.
+        let dynamic_top = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build();
+        inner.append(&dynamic_top);
+
+        // ── Coach briefing card (static — not rebuilt on each reload) ────────
         let reload_holder: ReloadHolder = Rc::new(RefCell::new(None));
         let briefing_card = Self::build_briefing_card(
             pool.clone(),
             rt_handle.clone(),
             athlete.clone(),
             Rc::clone(&reload_holder),
-            Rc::clone(&on_start),
         );
         inner.append(&briefing_card);
 
-        // Dynamic area rebuilt on each reload
+        // ── Form + recent activity (rebuilt on each reload) ──────────────────
         let dynamic = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
@@ -98,23 +118,27 @@ impl DashboardPage {
         let reload: Rc<dyn Fn()> = {
             let greeting_label = greeting_label.clone();
             let subtitle_label = subtitle_label.clone();
+            let dynamic_top = dynamic_top.clone();
             let dynamic = dynamic.clone();
+            let briefing_card = briefing_card.clone();
             let pool = pool.clone();
             let rt_handle = rt_handle.clone();
-            let ftp = athlete.ftp_watts;
-            let athlete_name = athlete.name.clone();
+            let athlete = athlete.clone();
             let on_start = Rc::clone(&on_start);
             let on_view_fitness = Rc::clone(&on_view_fitness);
+            let on_open_calendar = Rc::clone(&on_open_calendar);
+            let reload_holder = Rc::clone(&reload_holder);
 
             Rc::new(move || {
                 let now = Local::now();
+                let ftp = athlete.ftp_watts;
 
                 let salutation = match now.hour() {
                     5..=11 => "Good morning",
                     12..=17 => "Good afternoon",
                     _ => "Good evening",
                 };
-                greeting_label.set_label(&format!("{}, {}!", salutation, athlete_name));
+                greeting_label.set_label(&format!("{}, {}", salutation, athlete.name));
 
                 let today_naive = now.date_naive();
                 let weekday = today_naive.format("%A, %-d %B %Y").to_string();
@@ -122,139 +146,176 @@ impl DashboardPage {
 
                 let today_str = today_naive.format("%Y-%m-%d").to_string();
 
-                // Load all data needed for the summary cards
-                let today_entry = rt_handle
-                    .block_on(db::load_today_entry(&pool, &today_str))
-                    .unwrap_or(None);
+                // Load everything the summary cards need off the main thread
+                // (CLAUDE.md §2.3), then rebuild the dynamic areas on arrival.
+                let pool_load = pool.clone();
+                let dynamic_top = dynamic_top.clone();
+                let dynamic = dynamic.clone();
+                let briefing_card = briefing_card.clone();
+                let athlete_cb = athlete.clone();
+                let on_start = Rc::clone(&on_start);
+                let on_view_fitness = Rc::clone(&on_view_fitness);
+                let on_open_calendar = Rc::clone(&on_open_calendar);
+                let reload_holder = Rc::clone(&reload_holder);
+                let today_for_card = today_str.clone();
+                let pool_ob = pool.clone();
+                let rt_ob = rt_handle.clone();
 
-                let records = rt_handle
-                    .block_on(db::load_session_records(&pool))
-                    .unwrap_or_default();
-
-                let ai_workout_name = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.suggestion_workout_name"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-                let ai_workout_detail = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.suggestion_workout_detail"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let ai_fitness_insight = rt_handle
-                    .block_on(db::get_setting(&pool, "ai.fitness_insight"))
-                    .unwrap_or(None)
-                    .unwrap_or_default();
-
-                let intervals_pairs = rt_handle
-                    .block_on(db::load_intervals_tss_pairs(&pool))
-                    .unwrap_or_default();
-
-                // Compute TSB for readiness + 7-day trend
-                let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today_naive);
-                let tsb = ctl - atl;
-                let week_ago = today_naive - Duration::days(7);
-                let (ctl_7d, atl_7d) = compute_ctl_atl(&records, &intervals_pairs, ftp, week_ago);
-                let tsb_7d = ctl_7d - atl_7d;
-
-                while let Some(child) = dynamic.first_child() {
-                    dynamic.remove(&child);
-                }
-
-                // ── First-run onboarding ─────────────────────────────────────
-                let first_use_done = rt_handle
-                    .block_on(db::get_setting(&pool, "first_use_complete"))
-                    .unwrap_or(None)
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-
-                if !first_use_done && records.is_empty() && today_entry.is_none() && ctl == 0.0 {
-                    let get_started_btn = gtk::Button::builder()
-                        .label("Get Started")
-                        .css_classes(["pill", "suggested-action"])
-                        .tooltip_text("Run the first-use setup wizard")
-                        .build();
-
-                    let status = adw::StatusPage::builder()
-                        .icon_name("media-playback-start-symbolic")
-                        .title("Welcome to Cycle")
-                        .description(
-                            "Set up your profile and connect your services to get \
-                             personalised training recommendations.",
+                crate::ui::spawn_to_main(
+                    &rt_handle,
+                    async move {
+                        let today_entry = db::load_today_entry(&pool_load, &today_str)
+                            .await
+                            .unwrap_or(None);
+                        let records = db::load_session_records(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let ai_workout_name =
+                            db::get_setting(&pool_load, "ai.suggestion_workout_name")
+                                .await
+                                .unwrap_or(None)
+                                .unwrap_or_default();
+                        // The suggestion only matters on an empty day — with a
+                        // workout scheduled, the plan wins and the suggestion hides.
+                        let suggested_workout =
+                            if today_entry.is_none() && !ai_workout_name.trim().is_empty() {
+                                db::load_workouts(&pool_load)
+                                    .await
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    // Case-insensitive — the AI may return different casing
+                                    .find(|w| w.name.eq_ignore_ascii_case(ai_workout_name.trim()))
+                            } else {
+                                None
+                            };
+                        let ai_workout_detail =
+                            db::get_setting(&pool_load, "ai.suggestion_workout_detail")
+                                .await
+                                .unwrap_or(None)
+                                .unwrap_or_default();
+                        let ai_fitness_insight = db::get_setting(&pool_load, "ai.fitness_insight")
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default();
+                        let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
+                            .await
+                            .unwrap_or_default();
+                        let first_use_done = db::get_setting(&pool_load, "first_use_complete")
+                            .await
+                            .unwrap_or(None)
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        (
+                            today_entry,
+                            records,
+                            suggested_workout,
+                            ai_workout_detail,
+                            ai_fitness_insight,
+                            intervals_pairs,
+                            first_use_done,
                         )
-                        .child(&get_started_btn)
-                        .build();
+                    },
+                    move |(
+                        today_entry,
+                        records,
+                        suggested_workout,
+                        ai_workout_detail,
+                        ai_fitness_insight,
+                        intervals_pairs,
+                        first_use_done,
+                    )| {
+                        // Compute TSB for readiness + 7-day trend
+                        let (ctl, atl) =
+                            compute_ctl_atl(&records, &intervals_pairs, ftp, today_naive);
+                        let tsb = ctl - atl;
+                        let week_ago = today_naive - Duration::days(7);
+                        let (ctl_7d, atl_7d) =
+                            compute_ctl_atl(&records, &intervals_pairs, ftp, week_ago);
 
-                    let pool_ob = pool.clone();
-                    let rt_ob = rt_handle.clone();
-                    let dynamic_ob = dynamic.clone();
-                    get_started_btn.connect_clicked(move |btn| {
-                        let root = btn.root().and_downcast::<gtk::Window>();
-                        let pool_w = pool_ob.clone();
-                        let rt_w = rt_ob.clone();
-                        let dynamic_w = dynamic_ob.clone();
-                        super::onboarding::show(
-                            root.as_ref(),
-                            pool_w,
-                            rt_w,
-                            Rc::new(move || {
-                                // After wizard, remove the status page so the
-                                // dashboard reloads to the normal view on next visit.
-                                while let Some(child) = dynamic_w.first_child() {
-                                    dynamic_w.remove(&child);
-                                }
-                            }),
-                        );
-                    });
+                        while let Some(child) = dynamic_top.first_child() {
+                            dynamic_top.remove(&child);
+                        }
+                        while let Some(child) = dynamic.first_child() {
+                            dynamic.remove(&child);
+                        }
 
-                    dynamic.append(&status);
-                    return;
-                }
+                        // ── First-run onboarding ─────────────────────────────
+                        if !first_use_done
+                            && records.is_empty()
+                            && today_entry.is_none()
+                            && ctl == 0.0
+                        {
+                            briefing_card.set_visible(false);
+                            let get_started_btn = gtk::Button::builder()
+                                .label("Get Started")
+                                .css_classes(["pill", "suggested-action"])
+                                .tooltip_text("Run the first-use setup wizard")
+                                .build();
 
-                // ── TSB status banner ─────────────────────────────────────────
-                let banner = Self::build_tsb_banner(tsb);
-                let vf = Rc::clone(&on_view_fitness);
-                banner.connect_button_clicked(move |_| vf());
-                dynamic.append(&banner);
+                            let status = adw::StatusPage::builder()
+                                .icon_name("media-playback-start-symbolic")
+                                .title("Welcome to Cycle")
+                                .description(
+                                    "Set up your profile and connect your services to get \
+                                     personalised training recommendations.",
+                                )
+                                .child(&get_started_btn)
+                                .build();
 
-                // ── Today's workout + AI suggestion (consolidated) ────────────
-                dynamic.append(&Self::build_workout_card(
-                    today_entry,
-                    &ai_workout_name,
-                    &ai_workout_detail,
-                    Rc::clone(&on_start),
-                ));
+                            let dynamic_ob = dynamic_top.clone();
+                            get_started_btn.connect_clicked(move |btn| {
+                                let root = btn.root().and_downcast::<gtk::Window>();
+                                let pool_w = pool_ob.clone();
+                                let rt_w = rt_ob.clone();
+                                let dynamic_w = dynamic_ob.clone();
+                                super::onboarding::show(
+                                    root.as_ref(),
+                                    pool_w,
+                                    rt_w,
+                                    Rc::new(move || {
+                                        // After wizard, remove the status page so the
+                                        // dashboard reloads to the normal view next visit.
+                                        while let Some(child) = dynamic_w.first_child() {
+                                            dynamic_w.remove(&child);
+                                        }
+                                    }),
+                                );
+                            });
 
-                // ── Two-column row: Last Activity | Fitness ───────────────────
-                let last_session = records.first();
-                let cards = vec![
-                    Self::build_last_activity_card(last_session, ftp),
-                    Self::build_fitness_card(
-                        ctl,
-                        atl,
-                        tsb,
-                        ctl_7d,
-                        atl_7d,
-                        tsb_7d,
-                        &ai_fitness_insight,
-                    ),
-                ];
-                let flow = gtk::FlowBox::builder()
-                    .column_spacing(12)
-                    .row_spacing(12)
-                    .max_children_per_line(2)
-                    .min_children_per_line(1)
-                    .selection_mode(gtk::SelectionMode::None)
-                    .homogeneous(true)
-                    .build();
-                for card in &cards {
-                    flow.append(card);
-                }
-                for i in 0..cards.len() as i32 {
-                    if let Some(child) = flow.child_at_index(i) {
-                        child.set_hexpand(true);
-                    }
-                }
-                dynamic.append(&flow);
+                            dynamic_top.append(&status);
+                            return;
+                        }
+                        briefing_card.set_visible(true);
+
+                        // ── Today hero: the workout you're about to ride ──────
+                        dynamic_top.append(&Self::build_workout_card(
+                            today_entry,
+                            suggested_workout,
+                            &ai_workout_detail,
+                            Rc::clone(&on_start),
+                            &athlete_cb,
+                            Rc::clone(&on_open_calendar),
+                            pool_ob.clone(),
+                            rt_ob.clone(),
+                            Rc::clone(&reload_holder),
+                            today_for_card.clone(),
+                        ));
+
+                        // ── Form + last activity list ─────────────────────────
+                        dynamic.append(&Self::build_status_list(
+                            ctl,
+                            atl,
+                            tsb,
+                            ctl_7d,
+                            atl_7d,
+                            &ai_fitness_insight,
+                            records.first(),
+                            ftp,
+                            Rc::clone(&on_view_fitness),
+                            Rc::clone(&on_open_calendar),
+                        ));
+                    },
+                );
             })
         };
 
@@ -273,18 +334,10 @@ impl DashboardPage {
         rt_handle: tokio::runtime::Handle,
         athlete: AthleteProfile,
         reload_holder: ReloadHolder,
-        on_start: Rc<dyn Fn(Workout)>,
     ) -> adw::PreferencesGroup {
         let today_str = Local::now().date_naive().format("%Y-%m-%d").to_string();
 
-        let group = adw::PreferencesGroup::builder()
-            .title("Morning Briefing")
-            .description(
-                "Reviews your planned workout against today's readiness (HRV, sleep, TSB). \
-                 May suggest a different workout than the Coaching tab when today's fatigue \
-                 or wellness warrants it.",
-            )
-            .build();
+        let group = adw::PreferencesGroup::builder().title("Coach").build();
 
         // ── Briefing text label ───────────────────────────────────────────────
         let text_label = gtk::Label::builder()
@@ -311,13 +364,13 @@ impl DashboardPage {
             .build();
         action_row.add_suffix(&decision_badge);
 
-        // Modify: "Use this workout" button (hidden unless decision is Modify)
+        // Modify: "Replace" button (hidden unless decision is Modify)
         let use_workout_btn = gtk::Button::builder()
-            .label("Use this workout")
-            .css_classes(["pill", "suggested-action"])
+            .label("Replace")
+            .css_classes(["pill"])
             .valign(gtk::Align::Center)
             .visible(false)
-            .tooltip_text("Replace today's scheduled workout with the AI suggestion")
+            .tooltip_text("Replace today's planned workout with the suggested workout")
             .build();
         action_row.add_suffix(&use_workout_btn);
 
@@ -330,8 +383,6 @@ impl DashboardPage {
             .tooltip_text("Remove today's workout — take a rest day as recommended")
             .build();
         action_row.add_suffix(&remove_btn);
-
-        group.add(&action_row);
 
         // ── Text label as a fake row (inlined via Box) ────────────────────────
         let text_box = gtk::Box::builder()
@@ -346,65 +397,42 @@ impl DashboardPage {
         // Wrap text_box in an ActionRow for consistent styling
         let content_row = adw::ActionRow::builder().visible(false).build();
         content_row.set_child(Some(&text_box));
-        group.add(&content_row);
 
         // ── Spinner + Generate button ─────────────────────────────────────────
         let generate_row = adw::ActionRow::builder()
-            .title("AI Coach Briefing")
-            .subtitle("Reviews readiness and today's planned workout, may suggest alternatives")
+            .title("Morning briefing")
+            .subtitle("Checks today's readiness against your plan")
             .build();
 
         let spinner = gtk::Spinner::builder().visible(false).build();
         generate_row.add_prefix(&spinner);
 
+        // Plain pill — the Today hero keeps the page's single primary action.
         let generate_btn = gtk::Button::builder()
             .label("Generate")
-            .css_classes(["pill", "suggested-action"])
+            .css_classes(["pill"])
             .valign(gtk::Align::Center)
             .tooltip_text("Ask the AI coach for today's briefing")
             .build();
         generate_row.add_suffix(&generate_btn);
         generate_row.set_activatable_widget(Some(&generate_btn));
+
+        // Generate on top, then the decision, then the full briefing text.
         group.add(&generate_row);
+        group.add(&action_row);
+        group.add(&content_row);
 
         // Shared state: name of the AI-suggested alternative workout (Modify decision)
         let pending_alt_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-        // Restore cached briefing if it's from today
-        let cached_text = rt_handle
-            .block_on(db::get_setting(&pool, "ai.morning_briefing_text"))
-            .unwrap_or(None)
-            .unwrap_or_default();
-        let cached_date = rt_handle
-            .block_on(db::get_setting(&pool, "ai.morning_briefing_date"))
-            .unwrap_or(None)
-            .unwrap_or_default();
-
-        if !cached_text.is_empty() && cached_date == today_str {
-            let decision = parse_briefing_decision(&cached_text);
-            let alt = parse_alternative_workout(&cached_text);
-            *pending_alt_name.borrow_mut() = alt.clone();
-            Self::apply_briefing(
-                &text_label,
-                &action_row,
-                &content_row,
-                &decision_badge,
-                &use_workout_btn,
-                &remove_btn,
-                &cached_text,
-                &decision,
-                alt.as_deref(),
-            );
-        }
-
-        // Wire up "Use this workout" (Modify) — swaps today's calendar entry and loads it
+        // Wire up "Replace" (Modify) — swaps today's calendar entry for the
+        // suggested alternative; the Today hero then offers Start on it.
         {
             let pool_u = pool.clone();
             let rt_u = rt_handle.clone();
             let rh = Rc::clone(&reload_holder);
             let alt_name = Rc::clone(&pending_alt_name);
             let today = today_str.clone();
-            let on_start_u = Rc::clone(&on_start);
             use_workout_btn.connect_clicked(move |btn| {
                 let name = match alt_name.borrow().clone() {
                     Some(n) if !n.is_empty() => n,
@@ -412,7 +440,6 @@ impl DashboardPage {
                 };
                 let pool_u = pool_u.clone();
                 let rh = Rc::clone(&rh);
-                let on_start_u = Rc::clone(&on_start_u);
                 let today = today.clone();
                 let btn = btn.clone();
                 crate::ui::spawn_to_main(
@@ -448,9 +475,8 @@ impl DashboardPage {
                         Some(alt)
                     },
                     move |result| {
-                        if let Some(alt) = result {
+                        if result.is_some() {
                             btn.set_visible(false);
-                            on_start_u(alt);
                             if let Some(reload) = rh.borrow().as_ref() {
                                 reload();
                             }
@@ -543,9 +569,9 @@ impl DashboardPage {
                 text_label_g.set_visible(true);
                 content_row_g.set_visible(true);
 
-                // Channel carries (briefing_text, planned_name_for_align).
+                // Channel carries (briefing_text, planned_name_for_align, has_planned).
                 let (tx, rx) =
-                    async_channel::bounded::<Result<(String, Option<String>), String>>(1);
+                    async_channel::bounded::<Result<(String, Option<String>, bool), String>>(1);
 
                 let pool_t = pool_g.clone();
                 let athlete_t = athlete_g.clone();
@@ -621,6 +647,9 @@ impl DashboardPage {
                     let today_entry = db::load_today_entry(&pool_t, &today_t)
                         .await
                         .unwrap_or(None);
+                    // Whether a workout is actually on today's calendar — the
+                    // decision copy must not say "as planned" when nothing is.
+                    let has_planned = today_entry.is_some();
                     let records = db::load_session_records(&pool_t).await.unwrap_or_default();
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
                         .await
@@ -716,7 +745,7 @@ impl DashboardPage {
 
                     let r = get_suggestion(&api_key, &prompt, 1200)
                         .await
-                        .map(|text| (text, planned_name_for_align))
+                        .map(|text| (text, planned_name_for_align, has_planned))
                         .map_err(|e| e.to_string());
                     let _ = tx.send(r).await;
                 });
@@ -736,7 +765,7 @@ impl DashboardPage {
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(result) = rx.recv().await {
                         match result {
-                            Ok((text, planned_name_for_align)) => {
+                            Ok((text, planned_name_for_align, has_planned)) => {
                                 let decision = parse_briefing_decision(&text);
                                 let alt = parse_alternative_workout(&text);
                                 *alt_name_c.borrow_mut() = alt.clone();
@@ -750,6 +779,7 @@ impl DashboardPage {
                                     &text,
                                     &decision,
                                     alt.as_deref(),
+                                    has_planned,
                                 );
                                 // Align the coaching suggestion with the briefing decision
                                 let suggest_name = match &decision {
@@ -792,12 +822,60 @@ impl DashboardPage {
             });
         }
 
-        // Auto-generate on first open of the day if there's no cached briefing yet
-        if cached_text.is_empty() || cached_date != today_str {
-            let btn = generate_btn.clone();
-            glib::idle_add_local_once(move || {
-                btn.emit_by_name::<()>("clicked", &[]);
-            });
+        // Load any cached briefing off the main thread (CLAUDE.md §2.3). On arrival,
+        // either restore today's cached briefing or auto-generate a fresh one.
+        {
+            let pool_cache = pool.clone();
+            let today_c = today_str.clone();
+            let today_q = today_str.clone();
+            let text_label_c = text_label.clone();
+            let action_row_c = action_row.clone();
+            let content_row_c = content_row.clone();
+            let decision_badge_c = decision_badge.clone();
+            let use_workout_btn_c = use_workout_btn.clone();
+            let remove_btn_c = remove_btn.clone();
+            let pending_alt_c = Rc::clone(&pending_alt_name);
+            let generate_btn_c = generate_btn.clone();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move {
+                    let cached_text = db::get_setting(&pool_cache, "ai.morning_briefing_text")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    let cached_date = db::get_setting(&pool_cache, "ai.morning_briefing_date")
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    let has_planned = db::load_today_entry(&pool_cache, &today_q)
+                        .await
+                        .unwrap_or(None)
+                        .is_some();
+                    (cached_text, cached_date, has_planned)
+                },
+                move |(cached_text, cached_date, has_planned)| {
+                    if !cached_text.is_empty() && cached_date == today_c {
+                        let decision = parse_briefing_decision(&cached_text);
+                        let alt = parse_alternative_workout(&cached_text);
+                        *pending_alt_c.borrow_mut() = alt.clone();
+                        Self::apply_briefing(
+                            &text_label_c,
+                            &action_row_c,
+                            &content_row_c,
+                            &decision_badge_c,
+                            &use_workout_btn_c,
+                            &remove_btn_c,
+                            &cached_text,
+                            &decision,
+                            alt.as_deref(),
+                            has_planned,
+                        );
+                    } else {
+                        // No briefing cached for today — auto-generate one.
+                        generate_btn_c.emit_by_name::<()>("clicked", &[]);
+                    }
+                },
+            );
         }
 
         group
@@ -814,6 +892,7 @@ impl DashboardPage {
         text: &str,
         decision: &BriefingDecision,
         alt_workout: Option<&str>,
+        has_planned: bool,
     ) {
         // Strip DECISION: and ALTERNATIVE_WORKOUT: lines from displayed text
         let cleaned: String = text
@@ -834,10 +913,14 @@ impl DashboardPage {
 
         match decision {
             BriefingDecision::Proceed => {
-                action_row.set_title("Recommendation: Proceed");
-                action_row.set_subtitle(
-                    "Today's readiness supports the planned workout — go ahead as scheduled.",
-                );
+                // "As planned" only makes sense when something is on the calendar.
+                if has_planned {
+                    action_row.set_title("Proceed as planned");
+                    action_row.set_subtitle("Your readiness supports today's workout.");
+                } else {
+                    action_row.set_title("Ready to train");
+                    action_row.set_subtitle("Your readiness supports training today.");
+                }
                 decision_badge.set_label("Proceed");
                 decision_badge.set_css_classes(&["pill", "caption", "success"]);
                 use_workout_btn.set_visible(false);
@@ -850,77 +933,39 @@ impl DashboardPage {
                     "Modify".to_string()
                 };
                 action_row.set_title(&label);
-                action_row.set_subtitle(
-                    "Today's fatigue or wellness data suggests a lower-intensity alternative \
-                     than the Coaching tab's general recommendation.",
-                );
+                action_row.set_subtitle("Your readiness suggests an easier alternative today.");
                 decision_badge.set_label("Modify");
                 decision_badge.set_css_classes(&["pill", "caption", "warning"]);
                 use_workout_btn.set_visible(alt_workout.is_some());
                 remove_btn.set_visible(false);
             }
             BriefingDecision::Rest => {
-                action_row.set_title("Recommendation: Rest");
-                action_row.set_subtitle(
-                    "Today's fatigue or wellness indicators suggest rest takes priority over \
-                     any training, including the Coaching tab's suggestion.",
-                );
+                action_row.set_title("Rest today");
+                action_row.set_subtitle("Recovery takes priority over training today.");
                 decision_badge.set_label("Rest");
                 decision_badge.set_css_classes(&["pill", "caption", "error"]);
                 use_workout_btn.set_visible(false);
-                remove_btn.set_visible(true);
+                // Nothing to remove when nothing is scheduled.
+                remove_btn.set_visible(has_planned);
             }
         }
     }
 
-    fn build_tsb_banner(tsb: f64) -> adw::Banner {
-        let (message, css) = if tsb > 5.0 {
-            (
-                format!("Good form today — ready to train hard (TSB {:+.0})", tsb),
-                "success",
-            )
-        } else if tsb > -10.0 {
-            (
-                format!(
-                    "Normal training fatigue — moderate effort recommended (TSB {:+.0})",
-                    tsb
-                ),
-                "",
-            )
-        } else if tsb > -20.0 {
-            (
-                format!(
-                    "Elevated fatigue — consider an easier session today (TSB {:+.0})",
-                    tsb
-                ),
-                "warning",
-            )
-        } else {
-            (
-                format!(
-                    "Very fatigued — rest is the priority today (TSB {:+.0})",
-                    tsb
-                ),
-                "error",
-            )
-        };
-
-        let banner = adw::Banner::builder()
-            .title(&message)
-            .button_label("View Fitness")
-            .revealed(true)
-            .build();
-        if !css.is_empty() {
-            banner.add_css_class(css);
-        }
-        banner
-    }
-
+    /// The Today hero — exactly one of three states:
+    /// a scheduled workout (Start), the AI suggestion standing in for an
+    /// empty day (Schedule / Start), or a rest day linking to the Calendar.
+    #[allow(clippy::too_many_arguments)]
     fn build_workout_card(
         entry: Option<db::TodayEntry>,
-        ai_name: &str,
+        suggested: Option<Workout>,
         ai_detail: &str,
         on_start: Rc<dyn Fn(Workout)>,
+        athlete: &AthleteProfile,
+        on_open_calendar: Rc<dyn Fn()>,
+        pool: SqlitePool,
+        rt_handle: tokio::runtime::Handle,
+        reload_holder: ReloadHolder,
+        today_str: String,
     ) -> gtk::Box {
         let outer = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -935,53 +980,39 @@ impl DashboardPage {
                 .build(),
         );
 
-        let list = gtk::ListBox::builder()
-            .css_classes(["boxed-list"])
-            .selection_mode(gtk::SelectionMode::None)
-            .build();
-
-        match entry {
-            None => {
-                let row = adw::ActionRow::builder()
-                    .title("Rest Day")
-                    .subtitle("No workout scheduled — open Calendar to plan ahead")
-                    .build();
-                row.add_suffix(
-                    &gtk::Image::builder()
-                        .icon_name("weather-clear-night-symbolic")
-                        .build(),
-                );
-                list.append(&row);
-            }
-            Some(entry) => {
+        match (entry, suggested) {
+            // ── Scheduled workout ────────────────────────────────────────────
+            (Some(entry), _) => {
                 let subtitle = if entry.workout.description.trim().is_empty() {
-                    format!(
-                        "{} min · TSS {} · {}",
-                        entry.workout.duration_secs / 60,
-                        entry.workout.tss as u32,
-                        entry.workout.category.label()
-                    )
+                    Self::workout_meta(&entry.workout)
                 } else {
                     format!(
-                        "{} min · TSS {} · {} — {}",
-                        entry.workout.duration_secs / 60,
-                        entry.workout.tss as u32,
-                        entry.workout.category.label(),
+                        "{} — {}",
+                        Self::workout_meta(&entry.workout),
                         entry.workout.description.trim()
                     )
                 };
-                let row = adw::ActionRow::builder()
-                    .title(&entry.workout.name)
-                    .subtitle(&subtitle)
-                    .build();
+                let (card, action_area) = Self::hero_card(&entry.workout, athlete, &subtitle);
 
                 if entry.completed {
-                    row.add_suffix(
+                    let done = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(6)
+                        .valign(gtk::Align::Center)
+                        .build();
+                    done.append(
                         &gtk::Image::builder()
                             .icon_name("object-select-symbolic")
                             .css_classes(["success"])
                             .build(),
                     );
+                    done.append(
+                        &gtk::Label::builder()
+                            .label("Completed")
+                            .css_classes(["success", "caption-heading"])
+                            .build(),
+                    );
+                    action_area.append(&done);
                 } else {
                     let start_btn = gtk::Button::builder()
                         .label("Start")
@@ -991,57 +1022,276 @@ impl DashboardPage {
                         .build();
                     let w = entry.workout.clone();
                     start_btn.connect_clicked(move |_| on_start(w.clone()));
-                    row.set_activatable_widget(Some(&start_btn));
-                    row.add_suffix(&start_btn);
+                    action_area.append(&start_btn);
                 }
+
+                outer.append(&card);
+            }
+            // ── Nothing scheduled — the AI suggestion becomes the hero ───────
+            (None, Some(workout)) => {
+                let subtitle = if ai_detail.is_empty() {
+                    Self::workout_meta(&workout)
+                } else {
+                    format!("{} — {}", Self::workout_meta(&workout), ai_detail)
+                };
+                let (card, action_area) = Self::hero_card(&workout, athlete, &subtitle);
+
+                // Schedule: put the suggestion on today's calendar, then reload
+                // so this card becomes the scheduled hero.
+                let schedule_btn = gtk::Button::builder()
+                    .label("Schedule")
+                    .css_classes(["pill"])
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Add this workout to today's calendar")
+                    .build();
+                {
+                    let pool = pool.clone();
+                    let workout_id = workout.id;
+                    schedule_btn.connect_clicked(move |_| {
+                        let pool = pool.clone();
+                        let today = today_str.clone();
+                        let rh = Rc::clone(&reload_holder);
+                        crate::ui::spawn_to_main(
+                            &rt_handle,
+                            async move {
+                                if let Err(e) =
+                                    db::schedule_workout(&pool, workout_id, &today).await
+                                {
+                                    tracing::error!("schedule suggested workout: {e}");
+                                }
+                            },
+                            move |()| {
+                                if let Some(reload) = rh.borrow().as_ref() {
+                                    reload();
+                                }
+                            },
+                        );
+                    });
+                }
+                action_area.append(&schedule_btn);
+
+                // Start: the day's primary action when nothing else is planned.
+                let start_btn = gtk::Button::builder()
+                    .label("Start")
+                    .css_classes(["suggested-action", "pill"])
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Start the suggested workout now")
+                    .build();
+                start_btn.connect_clicked(move |_| on_start(workout.clone()));
+                action_area.append(&start_btn);
+
+                outer.append(&card);
+            }
+            // ── Rest day ─────────────────────────────────────────────────────
+            (None, None) => {
+                let list = gtk::ListBox::builder()
+                    .css_classes(["boxed-list"])
+                    .selection_mode(gtk::SelectionMode::None)
+                    .build();
+                // The row performs the action its copy names: click → Calendar.
+                let row = adw::ActionRow::builder()
+                    .title("Rest Day")
+                    .subtitle("No workout scheduled — plan one in Calendar")
+                    .activatable(true)
+                    .tooltip_text("Open Calendar to plan a workout")
+                    .build();
+                row.add_prefix(
+                    &gtk::Image::builder()
+                        .icon_name("weather-clear-night-symbolic")
+                        .css_classes(["dim-label"])
+                        .build(),
+                );
+                row.add_suffix(
+                    &gtk::Image::builder()
+                        .icon_name("go-next-symbolic")
+                        .css_classes(["dim-label"])
+                        .build(),
+                );
+                row.connect_activated(move |_| on_open_calendar());
                 list.append(&row);
+                outer.append(&list);
             }
         }
 
-        // AI suggestion as a secondary row — visually separated with a badge
-        if !ai_name.is_empty() {
-            let ai_row = adw::ActionRow::builder()
-                .title(ai_name)
-                .subtitle(if ai_detail.is_empty() {
-                    "AI suggested workout — open Coaching for details"
-                } else {
-                    ai_detail
-                })
-                .build();
-            // Icon distinguishes AI row from scheduled workout row
-            ai_row.add_prefix(
-                &gtk::Image::builder()
-                    .icon_name("chat-message-new-symbolic")
-                    .css_classes(["accent"])
-                    .build(),
-            );
-            // "Suggested" badge makes the source explicit at a glance
-            let badge = gtk::Label::builder()
-                .label("Suggested")
-                .css_classes(["pill", "caption", "accent"])
-                .valign(gtk::Align::Center)
-                .build();
-            ai_row.add_suffix(&badge);
-            list.append(&ai_row);
-        }
-
-        outer.append(&list);
         outer
     }
 
-    fn build_last_activity_card(record: Option<&db::SessionRecord>, ftp: u32) -> gtk::Box {
-        match record {
-            None => Self::summary_card(
-                "Last Activity",
-                "No sessions recorded yet",
-                "Complete a workout to see it here",
-                "document-open-recent-symbolic",
+    /// Meta line shared by hero cards: duration · TSS · category.
+    fn workout_meta(w: &Workout) -> String {
+        format!(
+            "{} min · TSS {} · {}",
+            w.duration_secs / 60,
+            w.tss as u32,
+            w.category.label()
+        )
+    }
+
+    /// Card with the workout's zone-coloured profile, name, and subtitle.
+    /// Returns `(card, action_area)` — the caller appends its own buttons.
+    fn hero_card(
+        workout: &Workout,
+        athlete: &AthleteProfile,
+        subtitle: &str,
+    ) -> (gtk::Box, gtk::Box) {
+        let card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["card"])
+            .build();
+
+        let graph = WorkoutGraph::new(workout, athlete);
+        graph.widget().set_content_height(72);
+        graph.widget().set_margin_top(12);
+        graph.widget().set_margin_start(12);
+        graph.widget().set_margin_end(12);
+        card.append(graph.widget());
+
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+
+        let text_col = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .hexpand(true)
+            .build();
+        text_col.append(
+            &gtk::Label::builder()
+                .label(&workout.name)
+                .halign(gtk::Align::Start)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["title-2"])
+                .build(),
+        );
+        text_col.append(
+            &gtk::Label::builder()
+                .label(subtitle)
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+        row.append(&text_col);
+        card.append(&row);
+
+        (card, row)
+    }
+
+    /// One quiet list holding form (readiness + CTL/ATL/TSB) and the most
+    /// recent activity — replaces the old banner + two-card row.
+    #[allow(clippy::too_many_arguments)]
+    fn build_status_list(
+        ctl: f64,
+        atl: f64,
+        tsb: f64,
+        ctl_7d: f64,
+        atl_7d: f64,
+        insight: &str,
+        record: Option<&db::SessionRecord>,
+        ftp: u32,
+        on_view_fitness: Rc<dyn Fn()>,
+        on_open_calendar: Rc<dyn Fn()>,
+    ) -> gtk::ListBox {
+        let list = gtk::ListBox::builder()
+            .css_classes(["boxed-list"])
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+
+        // ── Form row: readiness in plain words, numbers as quiet pills ───────
+        let message = if tsb > 5.0 {
+            "Fresh — ready to train hard"
+        } else if tsb > -10.0 {
+            "Normal training fatigue — moderate effort is fine"
+        } else if tsb > -20.0 {
+            "Elevated fatigue — consider an easier session"
+        } else {
+            "Very fatigued — rest is the priority"
+        };
+
+        let form_row = adw::ActionRow::builder()
+            .title(message)
+            .activatable(true)
+            .tooltip_text("Open Fitness for the full picture")
+            // AI text may contain markup-significant characters (& etc.)
+            .use_markup(false)
+            .build();
+        let preview = Self::insight_preview(insight);
+        if !preview.is_empty() {
+            form_row.set_subtitle(&preview);
+        }
+
+        let trend_arrow = |current: f64, prev: f64| -> &'static str {
+            if current > prev + 1.0 {
+                "↑"
+            } else if current < prev - 1.0 {
+                "↓"
+            } else {
+                "→"
+            }
+        };
+
+        // CTL and ATL only — the readiness message above already expresses
+        // their balance (TSB), so a third number would say nothing new.
+        for (label, value, trend, tip) in [
+            (
+                "CTL",
+                format!("{:.0}", ctl),
+                trend_arrow(ctl, ctl_7d),
+                "Chronic Training Load — 42-day fitness average. Higher means more aerobic base built up.",
             ),
+            (
+                "ATL",
+                format!("{:.0}", atl),
+                trend_arrow(atl, atl_7d),
+                "Acute Training Load — 7-day fatigue average. Spikes after hard weeks.",
+            ),
+        ] {
+            let pair = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .tooltip_text(tip)
+                .valign(gtk::Align::Center)
+                .build();
+            pair.append(
+                &gtk::Label::builder()
+                    .label(label)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+            pair.append(
+                &gtk::Label::builder()
+                    .label(format!("{value}{trend}"))
+                    .css_classes(["caption-heading", "numeric"])
+                    .build(),
+            );
+            form_row.add_suffix(&pair);
+        }
+
+        form_row.add_suffix(
+            &gtk::Image::builder()
+                .icon_name("go-next-symbolic")
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        form_row.connect_activated(move |_| on_view_fitness());
+        list.append(&form_row);
+
+        // ── Last activity row ────────────────────────────────────────────────
+        let last_row = match record {
+            None => adw::ActionRow::builder()
+                .title("No sessions recorded yet")
+                .subtitle("Complete a workout to see it here")
+                .build(),
+            // Workout names are user/AI-supplied — markup disabled below.
             Some(r) => {
                 let local_dt = r.session.started_at.with_timezone(&Local);
                 let title = r.workout_name.as_deref().unwrap_or("Free Ride");
-                let dur = r.session.duration_secs() as u32;
-                let mins = dur / 60;
+                let mins = r.session.duration_secs() as u32 / 60;
                 let power_str = match r.session.normalised_power() {
                     Some(np) => format!("{} W NP", np as u32),
                     None => match r.session.average_power() {
@@ -1059,217 +1309,60 @@ impl DashboardPage {
                 } else {
                     format!("{} min · {}{}", mins, power_str, tss_str)
                 };
-                let subtitle = format!("{} — {}", local_dt.format("%-d %b"), detail);
-                Self::summary_card(
-                    "Last Activity",
-                    title,
-                    &subtitle,
-                    "document-open-recent-symbolic",
-                )
-            }
-        }
-    }
-
-    fn build_fitness_card(
-        ctl: f64,
-        atl: f64,
-        tsb: f64,
-        ctl_7d: f64,
-        atl_7d: f64,
-        tsb_7d: f64,
-        insight: &str,
-    ) -> gtk::Box {
-        let frame = gtk::Box::builder()
-            .css_classes(["card"])
-            .hexpand(true)
-            .build();
-
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(12)
-            .margin_end(12)
-            .build();
-
-        vbox.append(
-            &gtk::Label::builder()
-                .label("Fitness")
-                .halign(gtk::Align::Start)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
-
-        let trend_arrow = |current: f64, prev: f64| -> &'static str {
-            if current > prev + 1.0 {
-                "↑"
-            } else if current < prev - 1.0 {
-                "↓"
-            } else {
-                "→"
+                adw::ActionRow::builder()
+                    .title(title)
+                    .use_markup(false)
+                    .subtitle(format!("{} — {}", local_dt.format("%-d %b"), detail))
+                    .build()
             }
         };
-
-        // CTL / ATL / TSB pill row
-        let metrics_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .build();
-
-        for (label, value, trend, class, tip) in [
-            (
-                "CTL",
-                format!("{:.0}", ctl),
-                trend_arrow(ctl, ctl_7d),
-                "",
-                "Chronic Training Load — 42-day fitness average. Higher means more aerobic base built up.",
-            ),
-            (
-                "ATL",
-                format!("{:.0}", atl),
-                trend_arrow(atl, atl_7d),
-                "",
-                "Acute Training Load — 7-day fatigue average. Spikes after hard weeks.",
-            ),
-            (
-                "TSB",
-                format!("{:+.0}", tsb),
-                trend_arrow(tsb, tsb_7d),
-                if tsb > 5.0 {
-                    "success"
-                } else if tsb < -10.0 {
-                    "warning"
-                } else {
-                    ""
-                },
-                "Training Stress Balance (CTL − ATL). Positive = fresh and ready; negative = accumulated fatigue.",
-            ),
-        ] {
-            let pair = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(4)
-                .tooltip_text(tip)
-                .build();
-            pair.append(
-                &gtk::Label::builder()
-                    .label(label)
-                    .css_classes(["caption", "dim-label"])
+        last_row.add_prefix(
+            &gtk::Image::builder()
+                .icon_name("document-open-recent-symbolic")
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        // Past sessions live in the Calendar — the row takes you to them.
+        if record.is_some() {
+            last_row.set_activatable(true);
+            last_row.set_tooltip_text(Some("Open Calendar to review past sessions"));
+            last_row.add_suffix(
+                &gtk::Image::builder()
+                    .icon_name("go-next-symbolic")
+                    .css_classes(["dim-label"])
                     .build(),
             );
-            let val_label = gtk::Label::builder()
-                .label(format!("{value}{trend}"))
-                .css_classes(["caption-heading", "numeric"])
-                .build();
-            if !class.is_empty() {
-                val_label.add_css_class(class);
-            }
-            pair.append(&val_label);
-            metrics_box.append(&pair);
+            last_row.connect_activated(move |_| on_open_calendar());
         }
-        vbox.append(&metrics_box);
+        list.append(&last_row);
 
-        // First sentence of AI insight (if any) — strip markdown for plain preview
-        if !insight.is_empty() {
-            let plain = strip_markdown(insight);
-            let first_sentence = plain
-                .split(['.', '\n'])
-                .find(|s| !s.trim().is_empty())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let preview = if first_sentence.chars().count() > 120 {
-                let cut = first_sentence
-                    .char_indices()
-                    .nth(120)
-                    .map(|(i, _)| i)
-                    .unwrap_or(first_sentence.len());
-                format!("{}…", &first_sentence[..cut])
-            } else if first_sentence.is_empty() {
-                String::new()
-            } else {
-                format!("{}.", first_sentence)
-            };
-            if !preview.is_empty() {
-                vbox.append(
-                    &gtk::Label::builder()
-                        .label(&preview)
-                        .css_classes(["caption", "dim-label"])
-                        .halign(gtk::Align::Start)
-                        .wrap(true)
-                        .xalign(0.0)
-                        .build(),
-                );
-            }
-        }
-
-        frame.append(&vbox);
-        frame
+        list
     }
 
-    /// Generic summary card with icon, title, value, and subtitle.
-    fn summary_card(section: &str, title: &str, subtitle: &str, icon: &str) -> gtk::Box {
-        let frame = gtk::Box::builder()
-            .css_classes(["card"])
-            .hexpand(true)
-            .build();
-
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(14)
-            .margin_end(14)
-            .build();
-
-        vbox.append(
-            &gtk::Label::builder()
-                .label(section)
-                .halign(gtk::Align::Start)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
-
-        let title_row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .build();
-
-        if !icon.is_empty() {
-            let icon_widget = gtk::Image::builder()
-                .icon_name(icon)
-                .icon_size(gtk::IconSize::Normal)
-                .build();
-            title_row.append(&icon_widget);
+    /// First sentence of the AI fitness insight, markdown stripped, ≤120 chars.
+    fn insight_preview(insight: &str) -> String {
+        if insight.is_empty() {
+            return String::new();
         }
-
-        title_row.append(
-            &gtk::Label::builder()
-                .label(title)
-                .halign(gtk::Align::Start)
-                .hexpand(true)
-                .css_classes(["heading"])
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build(),
-        );
-        vbox.append(&title_row);
-
-        if !subtitle.is_empty() {
-            vbox.append(
-                &gtk::Label::builder()
-                    .label(subtitle)
-                    .halign(gtk::Align::Start)
-                    .css_classes(["caption", "dim-label"])
-                    .wrap(true)
-                    .xalign(0.0)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .build(),
-            );
+        let plain = strip_markdown(insight);
+        let first_sentence = plain
+            .split(['.', '\n'])
+            .find(|s| !s.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if first_sentence.is_empty() {
+            String::new()
+        } else if first_sentence.chars().count() > 120 {
+            let cut = first_sentence
+                .char_indices()
+                .nth(120)
+                .map(|(i, _)| i)
+                .unwrap_or(first_sentence.len());
+            format!("{}…", &first_sentence[..cut])
+        } else {
+            format!("{}.", first_sentence)
         }
-
-        frame.append(&vbox);
-        frame
     }
 }
 
