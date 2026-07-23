@@ -48,8 +48,12 @@ impl WorkoutEngine {
         athlete: AthleteProfile,
         device_cmd_tx: Sender<DeviceCommand>,
     ) -> Self {
+        let mut session = Session::new(Some(workout.id));
+        // Stamp the FTP the ride is executed at — FTP detection needs it to
+        // interpret targets after the profile FTP changes.
+        session.ftp_watts = Some(athlete.ftp_watts);
         Self {
-            session: Session::new(Some(workout.id)),
+            session,
             workout,
             athlete,
             state: EngineState::Idle,
@@ -112,6 +116,7 @@ impl WorkoutEngine {
         let workout_id = Some(workout.id);
         self.workout = workout;
         self.session = Session::new(workout_id);
+        self.session.ftp_watts = Some(self.athlete.ftp_watts);
         self.state = EngineState::Idle;
         self.start_instant = None;
         self.pause_offset = Duration::ZERO;
@@ -139,13 +144,16 @@ impl WorkoutEngine {
             self.stop();
         }
 
-        let (target_watts, seg_remaining) = if let Some(seg) = self.workout.segments.get(seg_idx) {
-            let target = seg.target_power_at(seg_elapsed, self.athlete.ftp_watts);
-            let remaining = seg.duration_secs.saturating_sub(seg_elapsed);
-            (target, remaining)
-        } else {
-            (0, 0)
-        };
+        // `planned_target` is None once past the last segment — recorded data
+        // points distinguish "no target" from "target of 0 W" for FTP detection.
+        let (target_watts, seg_remaining, planned_target) =
+            if let Some(seg) = self.workout.segments.get(seg_idx) {
+                let target = seg.target_power_at(seg_elapsed, self.athlete.ftp_watts);
+                let remaining = seg.duration_secs.saturating_sub(seg_elapsed);
+                (target, remaining, Some(target))
+            } else {
+                (0, 0, None)
+            };
 
         if self.state == EngineState::Running && target_watts > 0 {
             let tx = self.device_cmd_tx.clone();
@@ -170,6 +178,7 @@ impl WorkoutEngine {
             self.session.data_points.push(DataPoint {
                 elapsed_secs: elapsed,
                 power_watts: readings.power_watts,
+                target_watts: planned_target,
                 heart_rate_bpm: readings.heart_rate_bpm,
                 cadence_rpm: readings.cadence_rpm,
                 speed_kmh: readings.speed_kmh,
