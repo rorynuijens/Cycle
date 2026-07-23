@@ -390,6 +390,7 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
                     data_points.push(DataPoint {
                         elapsed_secs: elapsed,
                         power_watts: power,
+                        target_watts: None,
                         heart_rate_bpm: hr,
                         cadence_rpm: cad,
                         speed_kmh,
@@ -429,6 +430,8 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
         ended_at: session_end,
         data_points,
         rpe: None,
+        // Imported rides were not executed against app targets.
+        ftp_watts: None,
     })
 }
 

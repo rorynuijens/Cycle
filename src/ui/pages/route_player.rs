@@ -445,6 +445,7 @@ impl RoutePlayerPage {
             session.borrow_mut().data_points.push(DataPoint {
                 elapsed_secs: elapsed,
                 power_watts: readings.power_watts,
+                target_watts: None,
                 heart_rate_bpm: readings.heart_rate_bpm,
                 cadence_rpm: readings.cadence_rpm,
                 speed_kmh: Some(speed_ms * 3.6),

@@ -14,6 +14,10 @@ pub struct Session {
     /// Rate of Perceived Exertion (1–10), recorded after the session ends.
     #[serde(default)]
     pub rpe: Option<u8>,
+    /// The athlete's FTP at ride time — required by FTP detection to interpret
+    /// compliance and zones after the profile FTP changes (docs/ftp-detection.md).
+    #[serde(default)]
+    pub ftp_watts: Option<u32>,
 }
 
 impl Session {
@@ -25,6 +29,7 @@ impl Session {
             ended_at: None,
             data_points: Vec::new(),
             rpe: None,
+            ftp_watts: None,
         }
     }
 
@@ -107,6 +112,11 @@ impl Session {
 pub struct DataPoint {
     pub elapsed_secs: u32,
     pub power_watts: Option<u32>,
+    /// The workout target in force at this second (`None` outside structured
+    /// workouts, e.g. route rides and imported files). Recorded for FTP
+    /// detection — see docs/ftp-detection.md.
+    #[serde(default)]
+    pub target_watts: Option<u32>,
     pub heart_rate_bpm: Option<u32>,
     pub cadence_rpm: Option<u32>,
     pub speed_kmh: Option<f32>,
@@ -221,6 +231,7 @@ mod tests {
         DataPoint {
             elapsed_secs: elapsed,
             power_watts: power,
+            target_watts: None,
             heart_rate_bpm: None,
             cadence_rpm: None,
             speed_kmh: None,

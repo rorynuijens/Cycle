@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use gtk::glib;
 use sqlx::SqlitePool;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::data::{athlete::AthleteProfile, db, keystore};
@@ -166,7 +166,38 @@ pub fn show(
     }
     {
         let a = Rc::clone(&apply);
-        ftp_row.connect_value_notify(move |_| a());
+        // Log manual FTP changes to ftp_history for FTP detection
+        // (docs/ftp-detection.md) — debounced so spinner clicks produce one
+        // entry with the final value, not one per notch.
+        let log_generation = Rc::new(Cell::new(0u32));
+        let last_logged_ftp = Rc::new(Cell::new(athlete.ftp_watts));
+        let pool_log = pool.clone();
+        let rt_log = rt_handle.clone();
+        ftp_row.connect_value_notify(move |row| {
+            a();
+            let generation = log_generation.get().wrapping_add(1);
+            log_generation.set(generation);
+            let row = row.clone();
+            let log_generation = Rc::clone(&log_generation);
+            let last_logged_ftp = Rc::clone(&last_logged_ftp);
+            let pool = pool_log.clone();
+            let rt = rt_log.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+                if log_generation.get() != generation {
+                    return; // superseded by a newer change
+                }
+                let ftp = row.value() as u32;
+                if ftp == last_logged_ftp.get() {
+                    return;
+                }
+                last_logged_ftp.set(ftp);
+                rt.spawn(async move {
+                    if let Err(e) = db::log_ftp_change(&pool, ftp, "manual", "").await {
+                        tracing::error!("log_ftp_change failed: {e}");
+                    }
+                });
+            });
+        });
     }
     {
         let a = Rc::clone(&apply);

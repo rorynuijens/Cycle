@@ -108,6 +108,14 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
             value TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS ftp_history (
+            id        INTEGER PRIMARY KEY,
+            date      TEXT    NOT NULL,
+            ftp_watts INTEGER NOT NULL,
+            source    TEXT    NOT NULL DEFAULT 'manual',
+            note      TEXT    NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS athlete_goals (
             id          INTEGER PRIMARY KEY,
             description TEXT NOT NULL,
@@ -158,6 +166,11 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .ok();
 
     sqlx::query("ALTER TABLE sessions ADD COLUMN rpe INTEGER")
+        .execute(pool)
+        .await
+        .ok();
+
+    sqlx::query("ALTER TABLE sessions ADD COLUMN ftp_watts INTEGER")
         .execute(pool)
         .await
         .ok();
@@ -397,16 +410,59 @@ pub async fn save_session(pool: &SqlitePool, session: &Session) -> Result<i64> {
     let ended_at = session.ended_at.map(|t| t.to_rfc3339());
 
     let result = sqlx::query(
-        "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json)
-         VALUES (?, ?, ?, ?)",
+        "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json, ftp_watts)
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(session.workout_id)
     .bind(&started_at)
     .bind(&ended_at)
     .bind(&data_points_json)
+    .bind(session.ftp_watts.map(|v| v as i64))
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+// ── FTP history ───────────────────────────────────────────────────────────────
+// Audit trail of FTP changes; consumed by FTP detection (docs/ftp-detection.md)
+// for cooldown logic and the "Last updated" subtitle in Preferences.
+
+/// Record an FTP change. `source` is one of "manual", "suggestion", "ramp_test".
+pub async fn log_ftp_change(
+    pool: &SqlitePool,
+    ftp_watts: u32,
+    source: &str,
+    note: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ftp_history (date, ftp_watts, source, note)
+         VALUES (datetime('now'), ?, ?, ?)",
+    )
+    .bind(ftp_watts as i64)
+    .bind(source)
+    .bind(note)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Most recent FTP history entry as `(date, ftp_watts, source)`, if any.
+// TODO(ftp-detect): used by the phase-2 check-in card for cooldown decisions.
+#[allow(dead_code)]
+pub async fn latest_ftp_entry(pool: &SqlitePool) -> Result<Option<(String, u32, String)>> {
+    let row = sqlx::query(
+        "SELECT date, ftp_watts, source FROM ftp_history
+         ORDER BY date DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get::<String, _>("date"),
+            r.get::<i64, _>("ftp_watts") as u32,
+            r.get::<String, _>("source"),
+        )
+    }))
 }
 
 /// Update the RPE score on an already-saved session.
@@ -753,7 +809,7 @@ pub async fn session_exists_at(pool: &SqlitePool, started_at: &DateTime<Utc>) ->
 pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord>> {
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
-                s.uploaded_to_icu, s.rpe, w.name AS workout_name
+                s.uploaded_to_icu, s.rpe, s.ftp_watts, w.name AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
          ORDER BY s.started_at DESC",
@@ -784,6 +840,7 @@ pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord
                 ended_at,
                 data_points,
                 rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
+                ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -1263,7 +1320,7 @@ pub async fn load_sessions_between(
 ) -> Result<Vec<SessionRecord>> {
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
-                s.uploaded_to_icu, s.rpe, w.name AS workout_name
+                s.uploaded_to_icu, s.rpe, s.ftp_watts, w.name AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
          WHERE s.started_at >= ? AND s.started_at <= ?
@@ -1294,6 +1351,7 @@ pub async fn load_sessions_between(
                 ended_at,
                 data_points,
                 rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
+                ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -1716,6 +1774,7 @@ mod tests {
         session.data_points.push(DataPoint {
             elapsed_secs: 0,
             power_watts: Some(210),
+            target_watts: None,
             heart_rate_bpm: Some(150),
             cadence_rpm: Some(90),
             speed_kmh: Some(32.0),
@@ -1734,6 +1793,59 @@ mod tests {
         let points: Vec<DataPoint> = serde_json::from_str(&json).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].power_watts, Some(210));
+    }
+
+    #[tokio::test]
+    async fn save_session_persists_target_and_ftp() {
+        let pool = test_pool().await;
+        let mut session = Session::new(None);
+        session.ftp_watts = Some(250);
+        session.data_points.push(DataPoint {
+            elapsed_secs: 0,
+            power_watts: Some(228),
+            target_watts: Some(230),
+            heart_rate_bpm: None,
+            cadence_rpm: None,
+            speed_kmh: None,
+            lat: None,
+            lng: None,
+        });
+        let id = save_session(&pool, &session).await.unwrap();
+
+        let row = sqlx::query("SELECT ftp_watts, data_points_json FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<i64>, _>("ftp_watts"), Some(250));
+        let points: Vec<DataPoint> =
+            serde_json::from_str(row.get::<&str, _>("data_points_json")).unwrap();
+        assert_eq!(points[0].target_watts, Some(230));
+    }
+
+    #[tokio::test]
+    async fn old_data_points_without_target_deserialise_as_none() {
+        // JSON recorded before the target_watts field existed must still load.
+        let json = r#"[{"elapsed_secs":0,"power_watts":200,"heart_rate_bpm":null,
+                        "cadence_rpm":null,"speed_kmh":null}]"#;
+        let points: Vec<DataPoint> = serde_json::from_str(json).unwrap();
+        assert_eq!(points[0].power_watts, Some(200));
+        assert_eq!(points[0].target_watts, None);
+    }
+
+    #[tokio::test]
+    async fn ftp_history_logs_and_returns_latest() {
+        let pool = test_pool().await;
+        assert!(latest_ftp_entry(&pool).await.unwrap().is_none());
+
+        log_ftp_change(&pool, 250, "manual", "").await.unwrap();
+        log_ftp_change(&pool, 260, "suggestion", "check-in 2026-07")
+            .await
+            .unwrap();
+
+        let (_date, ftp, source) = latest_ftp_entry(&pool).await.unwrap().unwrap();
+        assert_eq!(ftp, 260);
+        assert_eq!(source, "suggestion");
     }
 
     #[tokio::test]
