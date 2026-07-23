@@ -68,6 +68,7 @@ const SC_CHANNEL_PERIOD: u16 = 8086; // ANT+ combined Speed & Cadence period
 const PAGE_GENERAL_FE: u8 = 0x10; // 16
 const PAGE_SPECIFIC_TRAINER: u8 = 0x19; // 25
 const PAGE_TARGET_POWER: u8 = 0x31; // 49
+const PAGE_TRACK_RESISTANCE: u8 = 0x33; // 51
 
 /// Commands sent from the device manager to the ANT thread.
 #[derive(Debug)]
@@ -76,6 +77,8 @@ pub enum AntCommand {
     Connect,
     Disconnect,
     SetTargetPower(u16),
+    /// SIM mode: set the simulated road gradient in percent.
+    SetTrackResistance(f32),
     SetErgMode(bool),
     Shutdown,
 }
@@ -105,6 +108,19 @@ fn build_target_power_page(watts: u16) -> [u8; 8] {
     let quarter_watts = watts.saturating_mul(4);
     let [lsb, msb] = quarter_watts.to_le_bytes();
     [PAGE_TARGET_POWER, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, lsb, msb]
+}
+
+/// Build the FE-C Data Page 51 (Track Resistance) payload for SIM mode.
+///
+/// Grade is a little-endian u16 in 0.01 % units with a −200 % offset
+/// (so 0 % ⇒ 20000 = 0x4E20). The final byte is the rolling resistance
+/// coefficient in 5×10⁻⁵ units — 80 ⇒ 0.004, matching the virtual-speed
+/// physics model. Grade is clamped to ±20 % — never trust raw route data
+/// (CLAUDE.md §5.1).
+fn build_track_resistance_page(grade_percent: f32) -> [u8; 8] {
+    let raw = ((grade_percent.clamp(-20.0, 20.0) + 200.0) * 100.0).round() as u16;
+    let [lsb, msb] = raw.to_le_bytes();
+    [PAGE_TRACK_RESISTANCE, 0xFF, 0xFF, 0xFF, 0xFF, lsb, msb, 80]
 }
 
 /// Parse an 8-byte FE-C Specific Trainer Data page (0x19) into readings.
@@ -314,6 +330,15 @@ impl AntStick {
         self.write(&encode_message(MSG_ACKNOWLEDGED_DATA, &data));
         tracing::debug!("ANT ERG target: {clamped}W");
     }
+
+    fn send_track_resistance(&self, grade_percent: f32) {
+        let page = build_track_resistance_page(grade_percent);
+        let mut data = Vec::with_capacity(9);
+        data.push(FEC_CHANNEL);
+        data.extend_from_slice(&page);
+        self.write(&encode_message(MSG_ACKNOWLEDGED_DATA, &data));
+        tracing::debug!("ANT SIM grade: {grade_percent:.1}%");
+    }
 }
 
 /// Iterate complete ANT frames in `buf`, invoking `f(msg_id, data)` for each.
@@ -406,6 +431,15 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     if connected && erg_enabled {
                         if let Some(s) = &stick {
                             s.send_target_power(watts);
+                        }
+                    }
+                }
+                Ok(AntCommand::SetTrackResistance(grade_percent)) => {
+                    // Gated on the same "automatic resistance" switch as ERG —
+                    // it is the user's kill switch for trainer control.
+                    if connected && erg_enabled {
+                        if let Some(s) = &stick {
+                            s.send_track_resistance(grade_percent);
                         }
                     }
                 }
@@ -524,6 +558,36 @@ mod tests {
         // 200 W → 800 = 0x0320 little-endian
         let page = build_target_power_page(200);
         assert_eq!(page, [0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x03]);
+    }
+
+    #[test]
+    fn should_build_track_resistance_page_for_flat_road() {
+        // 0% → (0 + 200) × 100 = 20000 = 0x4E20 LE; Crr byte 80 = 0.004
+        let page = build_track_resistance_page(0.0);
+        assert_eq!(page, [0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x4E, 80]);
+    }
+
+    #[test]
+    fn should_build_track_resistance_page_for_climb_and_descent() {
+        // 6% → 20600 = 0x5078 LE
+        assert_eq!(
+            build_track_resistance_page(6.0),
+            [0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0x78, 0x50, 80]
+        );
+        // −5% → 19500 = 0x4C2C LE
+        assert_eq!(
+            build_track_resistance_page(-5.0),
+            [0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0x2C, 0x4C, 80]
+        );
+    }
+
+    #[test]
+    fn should_clamp_track_resistance_grade() {
+        // 45% clamps to 20% → 22000 = 0x55F0 LE
+        assert_eq!(
+            build_track_resistance_page(45.0),
+            [0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0x55, 80]
+        );
     }
 
     #[test]

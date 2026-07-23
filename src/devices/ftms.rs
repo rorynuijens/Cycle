@@ -217,6 +217,19 @@ pub fn reset_command() -> Vec<u8> {
     vec![0x01]
 }
 
+/// OpCode 0x11 — Set Indoor Bike Simulation Parameters (SIM mode).
+///
+/// Field layout: wind speed (sint16, 0.001 m/s), grade (sint16, 0.01 %),
+/// rolling resistance coefficient (uint8, 0.0001), wind resistance
+/// coefficient (uint8, 0.01 kg/m). Wind is fixed at zero; Crr/CdA match the
+/// virtual-speed physics model in `data::route` (0.004 / ~0.51 kg/m).
+/// Grade is clamped to ±20 % — never trust raw route data (CLAUDE.md §5.1).
+pub fn set_simulation_command(grade_percent: f32) -> Vec<u8> {
+    let grade = (grade_percent.clamp(-20.0, 20.0) * 100.0).round() as i16;
+    let g = grade.to_le_bytes();
+    vec![0x11, 0x00, 0x00, g[0], g[1], 40, 51]
+}
+
 /// OpCode 0x07 — Start or Resume.
 ///
 /// Many FTMS trainers (e.g. Elite) sit in the *Idle* state after Request Control
@@ -372,5 +385,37 @@ mod tests {
     fn should_build_correct_set_target_power_command() {
         // 300 = 0x012C, little-endian
         assert_eq!(set_target_power_command(300), vec![0x05, 0x2C, 0x01]);
+    }
+
+    #[test]
+    fn should_build_simulation_command_for_positive_grade() {
+        // 6% → 600 (0x0258 LE); wind 0; Crr 40; Cw 51
+        assert_eq!(
+            set_simulation_command(6.0),
+            vec![0x11, 0x00, 0x00, 0x58, 0x02, 40, 51]
+        );
+    }
+
+    #[test]
+    fn should_build_simulation_command_for_descent() {
+        // −5% → −500 as i16 LE = 0x0C 0xFE
+        assert_eq!(
+            set_simulation_command(-5.0),
+            vec![0x11, 0x00, 0x00, 0x0C, 0xFE, 40, 51]
+        );
+    }
+
+    #[test]
+    fn should_clamp_simulation_grade_to_plus_minus_20_percent() {
+        // 45% clamps to 20% → 2000 (0x07D0 LE)
+        assert_eq!(
+            set_simulation_command(45.0),
+            vec![0x11, 0x00, 0x00, 0xD0, 0x07, 40, 51]
+        );
+        // −45% clamps to −20% → −2000 as i16 LE = 0x30 0xF8
+        assert_eq!(
+            set_simulation_command(-45.0),
+            vec![0x11, 0x00, 0x00, 0x30, 0xF8, 40, 51]
+        );
     }
 }

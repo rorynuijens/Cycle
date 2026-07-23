@@ -18,7 +18,7 @@ use crate::data::{
     route::Route,
     workout::Workout,
 };
-use crate::devices::manager::{DeviceCommand, DeviceEvent};
+use crate::devices::manager::{DeviceCommand, DeviceEvent, DeviceType};
 use crate::training::engine::{EngineState, WorkoutEngine};
 
 pub struct CycleGtkWindow {
@@ -456,6 +456,11 @@ impl CycleGtkWindow {
         let route_timer_alive = Rc::new(Cell::new(false));
         let route_timer_started = Rc::new(Cell::new(false));
 
+        // True while a controllable trainer (BLE FTMS or ANT+ FE-C) is connected.
+        // The route player checks this each tick to pick SIM vs ERG emulation.
+        let sim_capable = Rc::new(Cell::new(false));
+        let trainer_addr: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
         // on_start_route: called from the library when the user clicks "Ride this Route"
         let on_start_route: Rc<dyn Fn(Route)> = {
             let route_player = Rc::clone(&route_player_rc);
@@ -466,6 +471,7 @@ impl CycleGtkWindow {
             let toast_route = self.toast_overlay.clone();
             let timer_alive = Rc::clone(&route_timer_alive);
             let timer_started = Rc::clone(&route_timer_started);
+            let sim_capable = Rc::clone(&sim_capable);
             let mass_kg = athlete.weight_kg;
             Rc::new(move |route: Route| {
                 timer_alive.set(false);
@@ -484,6 +490,7 @@ impl CycleGtkWindow {
                         route,
                         mass_kg,
                         cmd_tx.clone(),
+                        Rc::clone(&sim_capable),
                         move |session| {
                             stack_done.set_visible_child_name("dashboard");
                             let pool_save = pool_c.clone();
@@ -813,6 +820,16 @@ impl CycleGtkWindow {
                             connected,
                             device_type,
                         );
+                        // Track whether a controllable trainer is available for SIM mode.
+                        if connected && device_type == Some(DeviceType::FtmsTrainer) {
+                            *trainer_addr.borrow_mut() = Some(address.clone());
+                            sim_capable.set(true);
+                        } else if !connected
+                            && trainer_addr.borrow().as_deref() == Some(address.as_str())
+                        {
+                            *trainer_addr.borrow_mut() = None;
+                            sim_capable.set(false);
+                        }
                         if connected {
                             player_for_loop
                                 .borrow()

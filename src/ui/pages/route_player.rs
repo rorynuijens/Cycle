@@ -14,6 +14,7 @@ type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 pub struct RoutePlayerPage {
     root: gtk::Box,
     route_name_label: gtk::Label,
+    mode_label: gtk::Label,
     power_label: gtk::Label,
     target_label: gtk::Label,
     gradient_label: gtk::Label,
@@ -57,13 +58,26 @@ impl RoutePlayerPage {
             .spacing(18)
             .build();
 
-        // ── Route name ───────────────────────────────────────────────────────
+        // ── Route name + ride mode ───────────────────────────────────────────
+        let name_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .build();
         let route_name_label = gtk::Label::builder()
             .label(&route.name)
             .halign(gtk::Align::Start)
             .css_classes(["title-3"])
             .build();
-        inner.append(&route_name_label);
+        // Which mode drives the trainer: SIM (resistance follows the road) or
+        // ERG fallback (fixed-speed power targets). Set by the ride loop.
+        let mode_label = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .halign(gtk::Align::End)
+            .hexpand(true)
+            .build();
+        name_row.append(&route_name_label);
+        name_row.append(&mode_label);
+        inner.append(&name_row);
 
         // ── Elevation profile ─────────────────────────────────────────────────
         let ele_pts: Vec<(f32, f32)> = route
@@ -231,6 +245,7 @@ impl RoutePlayerPage {
         Self {
             root,
             route_name_label,
+            mode_label,
             power_label,
             target_label,
             gradient_label,
@@ -272,6 +287,7 @@ impl RoutePlayerPage {
     /// Reset the page for a new route.
     pub fn reset_route(&self, route: &Route) {
         self.route_name_label.set_label(&route.name);
+        self.mode_label.set_label("");
         let total_dist_km = route.total_distance_m / 1000.0;
         self.dist_remaining_label
             .set_label(&format!("{total_dist_km:.1} km remaining"));
@@ -302,6 +318,7 @@ impl RoutePlayerPage {
         route: Route,
         mass_kg: f32,
         cmd_tx: async_channel::Sender<DeviceCommand>,
+        sim_capable: Rc<Cell<bool>>,
         on_complete: impl Fn(Session) + 'static,
         timer_alive: Rc<Cell<bool>>,
     ) {
@@ -313,6 +330,9 @@ impl RoutePlayerPage {
         let session = Rc::new(RefCell::new(Session::new(None)));
         let paused = Rc::new(Cell::new(false));
         let elapsed_secs = Rc::new(Cell::new(0u32));
+        // Grade last sent to the trainer — SIM commands go out only on a real
+        // change (or as a periodic keepalive), not every tick.
+        let last_sent_grade = Rc::new(Cell::new(f32::NAN));
 
         // ── Pause / resume ───────────────────────────────────────────────────
         {
@@ -382,23 +402,44 @@ impl RoutePlayerPage {
                 return glib::ControlFlow::Continue;
             }
 
-            // Advance position using speed from sensor or a default 6.944 m/s (25 km/h)
-            let speed_ms = readings.speed_kmh.map(|kmh| kmh / 3.6).unwrap_or(6.944);
-            engine.borrow_mut().set_speed(speed_ms);
+            let elapsed = elapsed_secs.get() + 1;
+            elapsed_secs.set(elapsed);
 
-            let target_watts = engine.borrow_mut().tick();
+            // SIM when a controllable trainer is connected (checked live, so a
+            // mid-ride trainer drop falls back to ERG emulation gracefully);
+            // otherwise the original fixed-speed ERG-target emulation.
+            let sim = sim_capable.get();
+            let (speed_ms, target_watts) = if sim {
+                let power = readings.power_watts.unwrap_or(0);
+                let speed_ms = engine.borrow_mut().tick_sim(power);
+                let gradient_pct = engine.borrow().current_gradient() * 100.0;
+                // Send the grade on a ≥0.1% change, with a 5 s keepalive.
+                let last = last_sent_grade.get();
+                if (gradient_pct - last).abs() >= 0.1 || last.is_nan() || elapsed.is_multiple_of(5)
+                {
+                    let _ = cmd_tx.try_send(DeviceCommand::SetSimulation {
+                        grade_percent: gradient_pct,
+                    });
+                    last_sent_grade.set(gradient_pct);
+                }
+                (speed_ms, None)
+            } else {
+                // Advance position using speed from sensor or a default 6.944 m/s (25 km/h)
+                let speed_ms = readings.speed_kmh.map(|kmh| kmh / 3.6).unwrap_or(6.944);
+                engine.borrow_mut().set_speed(speed_ms);
+                let target_watts = engine.borrow_mut().tick();
+                // Send power target to trainer (clamped per CLAUDE.md §5.1)
+                if target_watts > 0 {
+                    let watts = target_watts.min(1000) as u16;
+                    let _ = cmd_tx.try_send(DeviceCommand::SetTargetPower { watts });
+                }
+                (speed_ms, Some(target_watts))
+            };
+
             let gradient_pct = engine.borrow().current_gradient() * 100.0;
             let distance_m = engine.borrow().distance_m;
             let total_dist = engine.borrow().route.total_distance_m;
             let is_done = engine.borrow().is_done();
-            let elapsed = elapsed_secs.get() + 1;
-            elapsed_secs.set(elapsed);
-
-            // Send power target to trainer (clamped per CLAUDE.md §5.1)
-            if target_watts > 0 {
-                let watts = target_watts.min(1000) as u16;
-                let _ = cmd_tx.try_send(DeviceCommand::SetTargetPower { watts });
-            }
 
             // Record data point
             session.borrow_mut().data_points.push(DataPoint {
@@ -419,7 +460,18 @@ impl RoutePlayerPage {
                     .map(|w| w.to_string())
                     .unwrap_or_else(|| "—".into())
             ));
-            page.target_label.set_label(&format!("{target_watts} W"));
+            match target_watts {
+                Some(w) => page.target_label.set_label(&format!("{w} W")),
+                None => page.target_label.set_label("— W"), // SIM: no power target
+            }
+            let mode_text = if sim {
+                "SIM · resistance follows the road"
+            } else {
+                "ERG · fixed-speed power targets"
+            };
+            if page.mode_label.label() != mode_text {
+                page.mode_label.set_label(mode_text);
+            }
             page.gradient_label
                 .set_label(&format!("{gradient_pct:+.1}%"));
             page.speed_label

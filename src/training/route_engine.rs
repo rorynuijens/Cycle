@@ -13,6 +13,9 @@ pub struct RouteEngine {
     pub mass_kg: f32,
     /// Elapsed simulation seconds.
     pub elapsed_secs: u32,
+    /// Exponentially smoothed rider power (W) used by SIM mode — keeps virtual
+    /// speed from jittering with every power-meter fluctuation.
+    smoothed_power: f32,
 }
 
 impl RouteEngine {
@@ -23,6 +26,7 @@ impl RouteEngine {
             speed_ms,
             mass_kg,
             elapsed_secs: 0,
+            smoothed_power: 0.0,
         }
     }
 
@@ -47,6 +51,20 @@ impl RouteEngine {
         self.distance_m = (self.distance_m + self.speed_ms).min(self.route.total_distance_m);
         self.elapsed_secs += 1;
         watts
+    }
+
+    /// Advance one simulated second in SIM mode: the rider's measured power is
+    /// smoothed (~3 s EMA) and converted to a virtual speed for the current
+    /// gradient, which drives position. Returns that speed in m/s.
+    pub fn tick_sim(&mut self, power_watts: u32) -> f32 {
+        const ALPHA: f32 = 0.3; // EMA weight ≈ 3-second smoothing at 1 Hz
+        self.smoothed_power = self.smoothed_power * (1.0 - ALPHA) + power_watts as f32 * ALPHA;
+        let speed =
+            Route::speed_from_power(self.smoothed_power, self.current_gradient(), self.mass_kg);
+        self.speed_ms = speed;
+        self.distance_m = (self.distance_m + speed).min(self.route.total_distance_m);
+        self.elapsed_secs += 1;
+        speed
     }
 
     /// Set the rider's speed (e.g. from a real-time speed sensor or ERG override).
@@ -165,5 +183,47 @@ mod tests {
             engine.tick();
         }
         assert!((engine.progress() - 1.0).abs() < 0.01);
+    }
+
+    // ── SIM mode ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tick_sim_advances_with_power() {
+        let route = make_flat_route();
+        let mut engine = RouteEngine::new(route, 0.0, 75.0);
+        for _ in 0..10 {
+            engine.tick_sim(200);
+        }
+        // 10 s at ~200 W on the flat: EMA ramps up, but well past 50 m
+        assert!(engine.distance_m > 50.0, "got {} m", engine.distance_m);
+        assert!(engine.speed_ms > 8.0, "got {} m/s", engine.speed_ms);
+    }
+
+    #[test]
+    fn tick_sim_stalls_without_power_on_the_flat() {
+        let route = make_flat_route();
+        let mut engine = RouteEngine::new(route, 0.0, 75.0);
+        for _ in 0..10 {
+            engine.tick_sim(0);
+        }
+        assert!(engine.distance_m < 2.0, "got {} m", engine.distance_m);
+    }
+
+    #[test]
+    fn tick_sim_smooths_power_spikes() {
+        let route = make_flat_route();
+        let mut engine = RouteEngine::new(route, 0.0, 75.0);
+        for _ in 0..30 {
+            engine.tick_sim(200);
+        }
+        let settled = engine.speed_ms;
+        engine.tick_sim(800); // one-second spike
+        let after_spike = engine.speed_ms;
+        // Speed rises, but nowhere near the steady-state speed of 800 W (~15 m/s)
+        assert!(after_spike > settled);
+        assert!(
+            after_spike < settled + 3.0,
+            "spike passed through unsmoothed"
+        );
     }
 }

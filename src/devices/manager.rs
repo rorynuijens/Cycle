@@ -12,7 +12,7 @@ use futures::StreamExt;
 use crate::data::session::LiveReadings;
 use crate::devices::ftms::{
     compute_cadence_rpm, parse_csc_measurement, parse_cycling_power_measurement,
-    parse_hr_measurement, parse_indoor_bike_data, request_control_command,
+    parse_hr_measurement, parse_indoor_bike_data, request_control_command, set_simulation_command,
     set_target_power_command, start_resume_command, CONTROL_POINT_UUID, CSC_MEASUREMENT_UUID,
     CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID, CYCLING_POWER_SERVICE_UUID,
     FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID, INDOOR_BIKE_DATA_UUID,
@@ -33,6 +33,11 @@ pub enum DeviceCommand {
     },
     SetTargetPower {
         watts: u16,
+    },
+    /// SIM mode: set the simulated road gradient in percent. The trainer adjusts
+    /// resistance to the grade and the rider's power determines virtual speed.
+    SetSimulation {
+        grade_percent: f32,
     },
     /// Enable or disable ERG mode (automatic resistance control) for the connected trainer.
     SetErgMode(bool),
@@ -636,6 +641,27 @@ impl DeviceManager {
                                     tracing::warn!(
                                         "ERG target {watts}W dropped — no trainer/control point connected"
                                     );
+                                }
+                            }
+                        }
+
+                        DeviceCommand::SetSimulation { grade_percent } => {
+                            // Forward to the ANT trainer (it applies the grade only when
+                            // connected and resistance control is enabled).
+                            let _ = ant_tx.send(
+                                crate::devices::ant::AntCommand::SetTrackResistance(grade_percent),
+                            );
+                            // Same kill switch as ERG: erg_enabled is the user's
+                            // "automatic resistance" toggle.
+                            if erg_enabled {
+                                if let (Some(ref p), Some(ref ch)) = (&trainer, &ctrl_char) {
+                                    tracing::debug!("SIM grade: {grade_percent:.1}%");
+                                    let cmd = set_simulation_command(grade_percent);
+                                    if let Err(e) =
+                                        p.write(ch, &cmd, WriteType::WithoutResponse).await
+                                    {
+                                        tracing::warn!("SIM write failed: {e}");
+                                    }
                                 }
                             }
                         }
