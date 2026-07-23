@@ -27,6 +27,12 @@ pub fn load_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // Make the bundled symbolic icons (gresource icons/scalable/actions/…)
+        // resolvable by name. GtkApplication normally registers the base path
+        // itself; adding it explicitly keeps icon lookup independent of how
+        // the application id maps to a resource base path.
+        let theme = gtk::IconTheme::for_display(&display);
+        theme.add_resource_path("/io/github/rorynuijens/Cycle/icons");
     }
 }
 
