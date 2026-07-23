@@ -481,6 +481,8 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     name: "ANT+ Trainer (FE-C)".to_string(),
                     rssi: None,
                     transport: Transport::AntPlus,
+                    // FE-C is by definition a controllable trainer.
+                    kind: DeviceType::FtmsTrainer,
                 });
             }
 

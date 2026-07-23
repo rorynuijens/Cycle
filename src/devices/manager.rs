@@ -11,11 +11,11 @@ use futures::StreamExt;
 
 use crate::data::session::LiveReadings;
 use crate::devices::ftms::{
-    compute_cadence_rpm, parse_cycling_power_measurement, parse_hr_measurement,
-    parse_indoor_bike_data, request_control_command, set_target_power_command,
-    start_resume_command, CONTROL_POINT_UUID, CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID,
-    CYCLING_POWER_SERVICE_UUID, FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID,
-    INDOOR_BIKE_DATA_UUID,
+    compute_cadence_rpm, parse_csc_measurement, parse_cycling_power_measurement,
+    parse_hr_measurement, parse_indoor_bike_data, request_control_command,
+    set_target_power_command, start_resume_command, CONTROL_POINT_UUID, CSC_MEASUREMENT_UUID,
+    CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID, CYCLING_POWER_SERVICE_UUID,
+    FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID, INDOOR_BIKE_DATA_UUID,
 };
 use crate::devices::peripheral::Transport;
 
@@ -38,13 +38,59 @@ pub enum DeviceCommand {
     SetErgMode(bool),
 }
 
-/// The GATT profile a device was identified as at connect time.
+/// The GATT profile a device was identified as, either from its advertised
+/// services at scan time or from its characteristics at connect time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
     FtmsTrainer,
     CyclingPowerMeter,
     HeartRateMonitor,
+    CadenceSensor,
     Unknown,
+}
+
+impl DeviceType {
+    /// Plain-language name shown to the user (novice-friendly, no protocol jargon).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FtmsTrainer => "Smart trainer",
+            Self::CyclingPowerMeter => "Power meter",
+            Self::HeartRateMonitor => "Heart rate monitor",
+            Self::CadenceSensor => "Cadence sensor",
+            Self::Unknown => "Sensor",
+        }
+    }
+
+    /// Symbolic icon representing the device's role.
+    pub fn icon_name(&self) -> &'static str {
+        match self {
+            Self::FtmsTrainer => "preferences-system-symbolic",
+            Self::CyclingPowerMeter => "power-profile-performance-symbolic",
+            Self::HeartRateMonitor => "emblem-favorite-symbolic",
+            Self::CadenceSensor => "media-playlist-repeat-symbolic",
+            Self::Unknown => "bluetooth-symbolic",
+        }
+    }
+
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::FtmsTrainer => "trainer",
+            Self::CyclingPowerMeter => "power",
+            Self::HeartRateMonitor => "hr",
+            Self::CadenceSensor => "cadence",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "trainer" => Self::FtmsTrainer,
+            "power" => Self::CyclingPowerMeter,
+            "hr" => Self::HeartRateMonitor,
+            "cadence" => Self::CadenceSensor,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Events broadcast from the Device Manager back to the UI thread.
@@ -55,6 +101,8 @@ pub enum DeviceEvent {
         name: String,
         rssi: Option<i16>,
         transport: Transport,
+        /// Role derived from the advertised GATT services (or the ANT+ profile).
+        kind: DeviceType,
     },
     ConnectionChanged {
         address: String,
@@ -120,6 +168,8 @@ impl DeviceManager {
         let mut power_meter_address: Option<String> = None;
         let mut hr_monitor: Option<Peripheral> = None;
         let mut hr_monitor_address: Option<String> = None;
+        let mut cadence_sensor: Option<Peripheral> = None;
+        let mut cadence_sensor_address: Option<String> = None;
         // ERG mode: only send SetTargetPower to the trainer when enabled.
         // Default true; overridden by SetErgMode commands from the UI.
         let mut erg_enabled = true;
@@ -235,6 +285,9 @@ impl DeviceManager {
                                 .cloned();
                             let power_char = chars.iter()
                                 .find(|c| c.uuid.to_string() == CYCLING_POWER_MEASUREMENT_UUID)
+                                .cloned();
+                            let csc_char = chars.iter()
+                                .find(|c| c.uuid.to_string() == CSC_MEASUREMENT_UUID)
                                 .cloned();
 
                             let mut connected_as = DeviceType::Unknown;
@@ -444,9 +497,71 @@ impl DeviceManager {
                                     tracing::info!("HR monitor connected: {address}");
                                 }
 
+                            } else if let Some(csc_ch) = csc_char {
+                                // ── Dedicated cadence/speed sensor (CSC, no power) ──────
+                                if let Err(e) = peripheral.subscribe(&csc_ch).await {
+                                    tracing::error!("subscribe(csc_measurement) failed: {e}");
+                                } else {
+                                    let p = peripheral.clone();
+                                    let event_tx = self.event_tx.clone();
+                                    tokio::spawn(async move {
+                                        // Cadence needs two successive crank samples; the
+                                        // counters are cumulative and wrap (see ftms.rs).
+                                        let mut last_revs: Option<u16> = None;
+                                        let mut last_time: Option<u16> = None;
+                                        match p.notifications().await {
+                                            Ok(mut stream) => {
+                                                while let Some(n) = stream.next().await {
+                                                    if n.uuid.to_string() != CSC_MEASUREMENT_UUID {
+                                                        continue;
+                                                    }
+                                                    let Some(csc) = parse_csc_measurement(&n.value)
+                                                    else {
+                                                        continue;
+                                                    };
+                                                    let cadence = match (
+                                                        last_revs,
+                                                        last_time,
+                                                        csc.crank_revs,
+                                                        csc.crank_event_time,
+                                                    ) {
+                                                        (Some(pr), Some(pt), Some(cr), Some(ct)) => {
+                                                            compute_cadence_rpm(pr, pt, cr, ct)
+                                                        }
+                                                        _ => None,
+                                                    };
+                                                    if csc.crank_revs.is_some() {
+                                                        last_revs = csc.crank_revs;
+                                                        last_time = csc.crank_event_time;
+                                                    }
+                                                    let Some(rpm) = cadence else { continue };
+                                                    let readings = LiveReadings {
+                                                        cadence_rpm: Some(rpm),
+                                                        ..Default::default()
+                                                    };
+                                                    if event_tx
+                                                        .send(DeviceEvent::Readings(readings))
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("notifications() failed: {e}")
+                                            }
+                                        }
+                                    });
+                                    cadence_sensor = Some(peripheral);
+                                    cadence_sensor_address = Some(address.clone());
+                                    connected_as = DeviceType::CadenceSensor;
+                                    tracing::info!("Cadence sensor connected: {address}");
+                                }
+
                             } else {
                                 tracing::warn!(
-                                    "Connect: {address} has no FTMS or HR characteristics — ignoring"
+                                    "Connect: {address} has no FTMS, power, HR, or CSC characteristics — ignoring"
                                 );
                             }
 
@@ -485,6 +600,13 @@ impl DeviceManager {
                                 hr_monitor = None;
                                 hr_monitor_address = None;
                                 tracing::info!("HR monitor disconnected");
+                            } else if cadence_sensor_address.as_deref() == Some(address.as_str()) {
+                                if let Some(ref p) = cadence_sensor {
+                                    p.disconnect().await.ok();
+                                }
+                                cadence_sensor = None;
+                                cadence_sensor_address = None;
+                                tracing::info!("Cadence sensor disconnected");
                             }
                             let _ = self.event_tx.send(DeviceEvent::ConnectionChanged {
                                 address,
@@ -533,21 +655,26 @@ impl DeviceManager {
                             if let Ok(peripheral) = adapter.peripheral(&id).await {
                                 if let Ok(Some(props)) = peripheral.properties().await {
                                     // Only surface devices that advertise a cycling-relevant
-                                    // GATT service. Devices that haven't included service UUIDs
-                                    // in their advertisement packet are also skipped; they will
+                                    // GATT service, and classify them by role so the UI can
+                                    // say "Heart rate monitor" instead of a raw device name.
+                                    // FTMS wins over CPS/CSC: trainers often advertise all
+                                    // three. Devices that haven't included service UUIDs in
+                                    // their advertisement packet are also skipped; they will
                                     // reappear via a DeviceUpdated event once the data arrives.
-                                    let is_cycling_device = props.services.iter().any(|svc| {
-                                        matches!(
-                                            svc.to_string().as_str(),
-                                            FTMS_SERVICE_UUID
-                                                | HR_SERVICE_UUID
-                                                | CYCLING_POWER_SERVICE_UUID
-                                                | CSC_SERVICE_UUID
-                                        )
-                                    });
-                                    if !is_cycling_device {
+                                    let has_svc = |uuid: &str| {
+                                        props.services.iter().any(|svc| svc.to_string() == uuid)
+                                    };
+                                    let kind = if has_svc(FTMS_SERVICE_UUID) {
+                                        DeviceType::FtmsTrainer
+                                    } else if has_svc(CYCLING_POWER_SERVICE_UUID) {
+                                        DeviceType::CyclingPowerMeter
+                                    } else if has_svc(HR_SERVICE_UUID) {
+                                        DeviceType::HeartRateMonitor
+                                    } else if has_svc(CSC_SERVICE_UUID) {
+                                        DeviceType::CadenceSensor
+                                    } else {
                                         continue;
-                                    }
+                                    };
 
                                     let name = props.local_name.unwrap_or_else(|| "Unknown".into());
                                     let rssi = props.rssi;
@@ -558,6 +685,7 @@ impl DeviceManager {
                                         name,
                                         rssi,
                                         transport: Transport::BluetoothLe,
+                                        kind,
                                     }).await;
                                 }
                             }
