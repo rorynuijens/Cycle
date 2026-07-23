@@ -109,7 +109,7 @@ pub fn show_intervals_detail(
 
     // ── Schedule This Ride button ─────────────────────────────────────────────
     let schedule_btn_icu = gtk::Button::builder()
-        .icon_name("x-office-calendar-symbolic")
+        .icon_name("calendar-symbolic")
         .tooltip_text("Schedule this ride as a future workout for AI nutrition advice")
         .css_classes(["flat", "circular"])
         .build();
@@ -656,7 +656,7 @@ pub fn show_session_detail(
 
     // ── Schedule This Ride button ─────────────────────────────────────────────
     let schedule_btn = gtk::Button::builder()
-        .icon_name("x-office-calendar-symbolic")
+        .icon_name("calendar-symbolic")
         .tooltip_text("Schedule this ride as a future workout for AI nutrition advice")
         .css_classes(["flat", "circular"])
         .build();

@@ -61,13 +61,15 @@ impl DeviceType {
         }
     }
 
-    /// Symbolic icon representing the device's role.
+    /// Symbolic icon representing the device's role. All non-standard names
+    /// are bundled in the app gresource (see data/icons/symbolic/README.md),
+    /// so they resolve on every icon theme.
     pub fn icon_name(&self) -> &'static str {
         match self {
-            Self::FtmsTrainer => "preferences-system-symbolic",
-            Self::CyclingPowerMeter => "power-profile-performance-symbolic",
-            Self::HeartRateMonitor => "emblem-favorite-symbolic",
-            Self::CadenceSensor => "media-playlist-repeat-symbolic",
+            Self::FtmsTrainer => "activity-cycling-indoor-symbolic",
+            Self::CyclingPowerMeter => "speedometer-symbolic",
+            Self::HeartRateMonitor => "heart-symbolic",
+            Self::CadenceSensor => "rotate-cw-symbolic",
             Self::Unknown => "bluetooth-symbolic",
         }
     }

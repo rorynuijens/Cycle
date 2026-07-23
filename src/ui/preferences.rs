@@ -316,7 +316,7 @@ pub fn show(
     // ── Page 3: Integrations ──────────────────────────────────────────────
     let integrations_page = adw::PreferencesPage::builder()
         .title("Integrations")
-        .icon_name("emblem-shared-symbolic")
+        .icon_name("share-symbolic")
         .build();
 
     // ── Intervals.icu ─────────────────────────────────────────────────────

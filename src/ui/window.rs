@@ -124,23 +124,11 @@ impl CycleGtkWindow {
 
         let stack = adw::ViewStack::new();
 
-        // ── Resolve icon names early (needed by library page) ─────────────────
-        let calendar_icon = Self::resolve_icon(&[
-            "x-office-calendar-symbolic",
-            "org.gnome.Calendar-symbolic",
-            "month-symbolic",
-        ]);
-        let fitness_icon = Self::resolve_icon(&[
-            "org.gnome.Charts-symbolic",
-            "chart-line-symbolic",
-            "utilities-system-monitor-symbolic",
-            "preferences-system-symbolic",
-        ]);
-        let coaching_icon = Self::resolve_icon(&[
-            "brain-augmented-symbolic",
-            "chat-message-new-symbolic",
-            "system-search-symbolic",
-        ]);
+        // ── Nav icons — bundled in the app gresource, so they always resolve
+        // (see data/icons/symbolic/README.md) ─────────────────────────────────
+        let calendar_icon = "calendar-symbolic";
+        let fitness_icon = "graph-symbolic";
+        let coaching_icon = "brain-augmented-symbolic";
 
         // ── Non-library pages ─────────────────────────────────────────────────
         let devices_rc = Rc::new(RefCell::new(DevicesPage::new(
@@ -881,17 +869,5 @@ impl CycleGtkWindow {
             .child(&row_box)
             .name(page_name)
             .build()
-    }
-
-    fn resolve_icon(candidates: &[&'static str]) -> &'static str {
-        if let Some(display) = gtk::gdk::Display::default() {
-            let theme = gtk::IconTheme::for_display(&display);
-            for candidate in candidates {
-                if theme.has_icon(candidate) {
-                    return candidate;
-                }
-            }
-        }
-        candidates.last().copied().unwrap_or("image-missing")
     }
 }

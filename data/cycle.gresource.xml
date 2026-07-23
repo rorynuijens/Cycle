@@ -7,12 +7,23 @@
     <file>thumbnails/rpe_4.png</file>
     <file>thumbnails/rpe_5.png</file>
     <file>thumbnails/rpe_6.png</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-cycling-outdoor-symbolic.svg">icons/activities/activity-cycling-outdoor.svg</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-cycling-indoor-symbolic.svg">icons/activities/activity-cycling-indoor.svg</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-run-symbolic.svg">icons/activities/activity-run.svg</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-walk-symbolic.svg">icons/activities/activity-walk.svg</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-swim-symbolic.svg">icons/activities/activity-swim.svg</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-strength-symbolic.svg">icons/activities/activity-strength.svg</file>
-    <file preprocess="xml-stripblanks" alias="icons/hicolor/scalable/actions/activity-generic-symbolic.svg">icons/activities/activity-generic.svg</file>
+    <!-- GtkIconTheme resource lookup expects icons/<size>/<category>/name.svg
+         (no hicolor level) under the application's resource base path. -->
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-cycling-outdoor-symbolic.svg">icons/activities/activity-cycling-outdoor.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-cycling-indoor-symbolic.svg">icons/activities/activity-cycling-indoor.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-run-symbolic.svg">icons/activities/activity-run.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-walk-symbolic.svg">icons/activities/activity-walk.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-swim-symbolic.svg">icons/activities/activity-swim.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-strength-symbolic.svg">icons/activities/activity-strength.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/activity-generic-symbolic.svg">icons/activities/activity-generic.svg</file>
+    <!-- GNOME icon development kit (CC0) — see data/icons/symbolic/README.md -->
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/heart-symbolic.svg">icons/symbolic/heart.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/speedometer-symbolic.svg">icons/symbolic/speedometer.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/rotate-cw-symbolic.svg">icons/symbolic/rotate-cw.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/share-symbolic.svg">icons/symbolic/share.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/map-symbolic.svg">icons/symbolic/map.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/calendar-symbolic.svg">icons/symbolic/calendar.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/graph-symbolic.svg">icons/symbolic/graph.svg</file>
+    <file preprocess="xml-stripblanks" alias="icons/scalable/actions/brain-augmented-symbolic.svg">icons/symbolic/brain-augmented.svg</file>
   </gresource>
 </gresources>
