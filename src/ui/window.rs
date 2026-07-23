@@ -808,10 +808,11 @@ impl CycleGtkWindow {
                         name,
                         rssi,
                         transport,
+                        kind,
                     } => {
                         devices_for_loop
                             .borrow_mut()
-                            .on_discovered(address, name, rssi, transport);
+                            .on_discovered(address, name, rssi, transport, kind);
                     }
                     DeviceEvent::ConnectionChanged {
                         address,
