@@ -1,92 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <defs>
-    <!-- Background gradient: GNOME blue, top-left to bottom-right -->
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%"   stop-color="#4a90d9"/>
-      <stop offset="100%" stop-color="#1553a0"/>
-    </linearGradient>
-    <!-- Subtle top-shine highlight -->
-    <linearGradient id="shine" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.22"/>
-      <stop offset="55%"  stop-color="#ffffff" stop-opacity="0.0"/>
-    </linearGradient>
-    <!-- Bolt glow: bloom behind the lightning bolt -->
-    <filter id="boltGlow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur in="SourceGraphic" stdDeviation="3.5" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-    <!-- Rim shadow -->
-    <filter id="rimShadow" x="-5%" y="-5%" width="110%" height="115%">
-      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#000000" flood-opacity="0.3"/>
-    </filter>
-  </defs>
+  <!-- Cycle app icon: a Shimano Ultegra-style crankset on a Tour de France
+       yellow tile (GNOME Yellow 2->4). 48T ring, four-arm asymmetric spider
+       (arms at crank +-40deg/+-140deg), 36T small ring behind the windows,
+       alloy crank arm; greys from the GNOME HIG palette.
+       Generated geometry - regenerate via a script rather than hand-editing
+       the polygon points.
+       NOTE: keep <?xml ...?> as the very first bytes and comments INSIDE the
+       root element, or gdk-pixbuf format sniffing (appstream compose,
+       GNOME Shell) fails to recognise the file. -->
 
-  <!-- ── Background ─────────────────────────────────────────────── -->
-  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#bgGrad)"/>
-  <!-- top highlight -->
-  <rect x="4" y="4" width="120" height="64"  rx="26" fill="url(#shine)"/>
-
-  <!-- ── Wheel rim ──────────────────────────────────────────────── -->
-  <!-- shadow ring (depth) -->
-  <circle cx="64" cy="65" r="46" fill="none"
-          stroke="#000000" stroke-opacity="0.22" stroke-width="9"/>
-  <!-- tyre -->
-  <circle cx="64" cy="64" r="46" fill="none"
-          stroke="#ffffff" stroke-opacity="0.96" stroke-width="6.5"/>
-
-  <!-- ── 8 Spokes (hub at 64,64 → inner tyre edge r≈43) ────────── -->
-  <!--
-    Endpoint formula: (64 + 43·sin θ, 64 − 43·cos θ)
-      0°   → (64,    21   )
-      45°  → (94.4,  33.6 )
-      90°  → (107,   64   )
-      135° → (94.4,  94.4 )
-      180° → (64,    107  )
-      225° → (33.6,  94.4 )
-      270° → (21,    64   )
-      315° → (33.6,  33.6 )
-  -->
-  <g stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-opacity="0.72">
-    <line x1="64"   y1="64"   x2="64"   y2="21"  />
-    <line x1="64"   y1="64"   x2="94.4" y2="33.6"/>
-    <line x1="64"   y1="64"   x2="107"  y2="64"  />
-    <line x1="64"   y1="64"   x2="94.4" y2="94.4"/>
-    <line x1="64"   y1="64"   x2="64"   y2="107" />
-    <line x1="64"   y1="64"   x2="33.6" y2="94.4"/>
-    <line x1="64"   y1="64"   x2="21"   y2="64"  />
-    <line x1="64"   y1="64"   x2="33.6" y2="33.6"/>
-  </g>
-
-  <!-- ── Inner track ring (subtle chainring echo) ───────────────── -->
-  <circle cx="64" cy="64" r="30" fill="none"
-          stroke="#ffffff" stroke-opacity="0.14" stroke-width="1.5"/>
-
-  <!-- ── Lightning bolt ────────────────────────────────────────── -->
-  <!--
-    6-point polygon, centred at (64, 64):
-      leftmost x=50, rightmost x=78 → midpoint 64 ✓
-      topmost  y=24, bottommost y=104 → midpoint 64 ✓
-    Clockwise from top:
-      (68,24) top
-      (50,66) mid-left outer
-      (63,66) mid-left inner  (step right at waist)
-      (60,104) bottom tip
-      (78,62) mid-right outer
-      (65,62) mid-right inner (step left at waist)
-  -->
-  <polygon points="68,24 50,66 63,66 60,104 78,62 65,62"
-           fill="#f9c42a"
-           filter="url(#boltGlow)"
-           stroke="#d4920a" stroke-width="0.8" stroke-linejoin="round"/>
-
-  <!-- ── Hub ────────────────────────────────────────────────────── -->
-  <!-- outer white ring -->
-  <circle cx="64" cy="64" r="8.5" fill="#ffffff" fill-opacity="0.97"/>
-  <!-- coloured centre (matches background) -->
-  <circle cx="64" cy="64" r="5"   fill="#1e5eb5"/>
-  <!-- axle dot -->
-  <circle cx="64" cy="64" r="2"   fill="#ffffff" fill-opacity="0.65"/>
+<defs>
+  <linearGradient id="tile-b" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#f8e45c"/>
+    <stop offset="1" stop-color="#f5c211"/>
+  </linearGradient>
+  <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#9a9996"/>
+    <stop offset="0.5" stop-color="#5e5c64"/>
+    <stop offset="1" stop-color="#3d3846"/>
+  </linearGradient>
+  <linearGradient id="crank" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#9a9996"/>
+    <stop offset="0.45" stop-color="#77767b"/>
+    <stop offset="1" stop-color="#5e5c64"/>
+  </linearGradient>
+  <mask id="spider">
+    <rect x="0" y="0" width="128" height="128" fill="#fff"/>
+    <path d="M 91.37 78.55 A 31.0 31.0 0 0 1 68.31 94.70" fill="none" stroke="#000" stroke-width="28" stroke-linecap="butt"/>
+    <path d="M 54.42 93.48 A 31.0 31.0 0 0 1 33.02 62.92" fill="none" stroke="#000" stroke-width="28" stroke-linecap="butt"/>
+    <path d="M 36.63 49.45 A 31.0 31.0 0 0 1 59.69 33.30" fill="none" stroke="#000" stroke-width="28" stroke-linecap="butt"/>
+    <path d="M 73.58 34.52 A 31.0 31.0 0 0 1 94.98 65.08" fill="none" stroke="#000" stroke-width="28" stroke-linecap="butt"/>
+    <circle cx="64.0" cy="64.0" r="7" fill="#000"/>
+  </mask>
+</defs>
+<rect x="8" y="8" width="112" height="112" rx="22" fill="#e5a50a"/>
+<rect x="8" y="8" width="112" height="110" rx="22" fill="url(#tile-b)"/>
+<g transform="translate(64 64) scale(0.84) translate(-64 -64)">
+<circle cx="64.0" cy="64.0" r="39.5" fill="none" stroke="#241f31" stroke-width="5"/>
+<path d="M 115.50 64.00 L 119.47 65.82 L 119.23 69.44 L 115.06 70.72 L 115.06 70.72 L 118.76 73.04 L 118.05 76.60 L 113.75 77.33 L 113.75 77.33 L 117.11 80.11 L 115.94 83.55 L 111.58 83.71 L 111.58 83.71 L 114.55 86.91 L 112.95 90.16 L 108.60 89.75 L 108.60 89.75 L 111.13 93.31 L 109.11 96.33 L 104.86 95.35 L 104.86 95.35 L 106.90 99.21 L 104.51 101.94 L 100.42 100.42 L 100.42 100.42 L 101.94 104.51 L 99.21 106.90 L 95.35 104.86 L 95.35 104.86 L 96.33 109.11 L 93.31 111.13 L 89.75 108.60 L 89.75 108.60 L 90.16 112.95 L 86.91 114.55 L 83.71 111.58 L 83.71 111.58 L 83.55 115.94 L 80.11 117.11 L 77.33 113.75 L 77.33 113.75 L 76.60 118.05 L 73.04 118.76 L 70.72 115.06 L 70.72 115.06 L 69.44 119.23 L 65.82 119.47 L 64.00 115.50 L 64.00 115.50 L 62.18 119.47 L 58.56 119.23 L 57.28 115.06 L 57.28 115.06 L 54.96 118.76 L 51.40 118.05 L 50.67 113.75 L 50.67 113.75 L 47.89 117.11 L 44.45 115.94 L 44.29 111.58 L 44.29 111.58 L 41.09 114.55 L 37.84 112.95 L 38.25 108.60 L 38.25 108.60 L 34.69 111.13 L 31.67 109.11 L 32.65 104.86 L 32.65 104.86 L 28.79 106.90 L 26.06 104.51 L 27.58 100.42 L 27.58 100.42 L 23.49 101.94 L 21.10 99.21 L 23.14 95.35 L 23.14 95.35 L 18.89 96.33 L 16.87 93.31 L 19.40 89.75 L 19.40 89.75 L 15.05 90.16 L 13.45 86.91 L 16.42 83.71 L 16.42 83.71 L 12.06 83.55 L 10.89 80.11 L 14.25 77.33 L 14.25 77.33 L 9.95 76.60 L 9.24 73.04 L 12.94 70.72 L 12.94 70.72 L 8.77 69.44 L 8.53 65.82 L 12.50 64.00 L 12.50 64.00 L 8.53 62.18 L 8.77 58.56 L 12.94 57.28 L 12.94 57.28 L 9.24 54.96 L 9.95 51.40 L 14.25 50.67 L 14.25 50.67 L 10.89 47.89 L 12.06 44.45 L 16.42 44.29 L 16.42 44.29 L 13.45 41.09 L 15.05 37.84 L 19.40 38.25 L 19.40 38.25 L 16.87 34.69 L 18.89 31.67 L 23.14 32.65 L 23.14 32.65 L 21.10 28.79 L 23.49 26.06 L 27.58 27.58 L 27.58 27.58 L 26.06 23.49 L 28.79 21.10 L 32.65 23.14 L 32.65 23.14 L 31.67 18.89 L 34.69 16.87 L 38.25 19.40 L 38.25 19.40 L 37.84 15.05 L 41.09 13.45 L 44.29 16.42 L 44.29 16.42 L 44.45 12.06 L 47.89 10.89 L 50.67 14.25 L 50.67 14.25 L 51.40 9.95 L 54.96 9.24 L 57.28 12.94 L 57.28 12.94 L 58.56 8.77 L 62.18 8.53 L 64.00 12.50 L 64.00 12.50 L 65.82 8.53 L 69.44 8.77 L 70.72 12.94 L 70.72 12.94 L 73.04 9.24 L 76.60 9.95 L 77.33 14.25 L 77.33 14.25 L 80.11 10.89 L 83.55 12.06 L 83.71 16.42 L 83.71 16.42 L 86.91 13.45 L 90.16 15.05 L 89.75 19.40 L 89.75 19.40 L 93.31 16.87 L 96.33 18.89 L 95.35 23.14 L 95.35 23.14 L 99.21 21.10 L 101.94 23.49 L 100.42 27.58 L 100.42 27.58 L 104.51 26.06 L 106.90 28.79 L 104.86 32.65 L 104.86 32.65 L 109.11 31.67 L 111.13 34.69 L 108.60 38.25 L 108.60 38.25 L 112.95 37.84 L 114.55 41.09 L 111.58 44.29 L 111.58 44.29 L 115.94 44.45 L 117.11 47.89 L 113.75 50.67 L 113.75 50.67 L 118.05 51.40 L 118.76 54.96 L 115.06 57.28 L 115.06 57.28 L 119.23 58.56 L 119.47 62.18 L 115.50 64.00 Z" fill="url(#ring)" mask="url(#spider)"/>
+<circle cx="109.88" cy="76.29" r="2.8" fill="#9a9996"/>
+<circle cx="59.86" cy="111.32" r="2.8" fill="#9a9996"/>
+<circle cx="18.12" cy="51.71" r="2.8" fill="#9a9996"/>
+<circle cx="68.14" cy="16.68" r="2.8" fill="#9a9996"/>
+<line x1="58.26" y1="55.81" x2="89.24" y2="100.04" stroke="url(#crank)" stroke-width="20" stroke-linecap="round"/>
+<circle cx="89.24" cy="100.04" r="5.5" fill="#deddda"/>
+<circle cx="89.24" cy="100.04" r="2.5" fill="#77767b"/>
+<circle cx="64.0" cy="64.0" r="7.5" fill="#deddda"/>
+<circle cx="64.0" cy="64.0" r="3" fill="#77767b"/>
+</g>
 </svg>
