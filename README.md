@@ -12,12 +12,12 @@ The application targets GNOME desktop environments and is distributed as a Flatp
 
 Cycle communicates with BLE devices using standard GATT profiles:
 
-- **Smart trainers** — Fitness Machine Service (FTMS). ERG mode only: the app sends a target power and the trainer adjusts resistance automatically. Slope simulation mode is not implemented.
+- **Smart trainers** — Fitness Machine Service (FTMS). ERG mode for structured workouts (the app sends a target power and the trainer adjusts resistance automatically) and SIM mode for route rides (the app sends the road gradient and the trainer sets resistance to match).
 - **Power meters** — Cycling Power Service (CPS). Read-only; power data is recorded but the meter cannot be commanded.
 - **Heart rate monitors** — Heart Rate Service (HRS). Supports both 8-bit and 16-bit HR measurement formats.
 - **Cadence sensors** — Cycling Speed and Cadence Service (CSC), crank revolution data.
 
-Trainers that expose no usable BLE interface are supported over **ANT+**: with a USB ANT+ stick, Cycle drives FE-C trainers with full ERG control plus power and speed readings.
+Trainers that expose no usable BLE interface are supported over **ANT+**: with a USB ANT+ stick, Cycle drives FE-C trainers with full ERG and SIM control plus power and speed readings.
 
 Devices paired in a previous session are remembered and reconnected automatically on the next launch.
 
@@ -26,6 +26,10 @@ Devices paired in a previous session are remembered and reconnected automaticall
 Structured workouts are executed segment by segment. Each segment specifies a target power as a percentage of the athlete's FTP. Ramp segments interpolate linearly between two power values. During execution the player displays elapsed and remaining time, target power in watts, live power, cadence, and heart rate from connected devices, and a colour-coded workout graph with a position cursor.
 
 Workouts can be paused and resumed. Ending a workout early saves the recorded portion as a complete session. At the end of a session the athlete is prompted to record a Rate of Perceived Exertion (RPE) on a 1–10 scale.
+
+### Route rides (SIM mode)
+
+GPX routes can be ridden in simulation mode: the trainer's resistance follows the route's gradient, and the rider's measured power is converted to a virtual speed through a road-cycling physics model — ease off on a climb and the climb takes longer. The route player shows live gradient, virtual speed, position on the elevation profile, and distance remaining. Without a controllable trainer, route rides fall back to ERG emulation: power targets computed from the gradient at a fixed assumed speed.
 
 ### Workout library
 
@@ -90,8 +94,11 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 ### Device connectivity
 
-- **ERG mode only.** Slope simulation mode — adjusting resistance based on gradient — is not implemented. The app cannot command a trainer to simulate a specific incline.
 - **ANT+ covers FE-C trainers only.** ANT+ heart rate straps and cadence sensors are not supported; use their BLE mode instead. Running the ANT+ stick outside Flatpak may require a udev rule granting USB access.
+
+### Simulation
+
+- The SIM physics model is simplified: fixed air density, rolling resistance, and drag area, with no wind, drafting, or surface changes. Rider weight comes from the athlete profile.
 
 ### AI integration
 
