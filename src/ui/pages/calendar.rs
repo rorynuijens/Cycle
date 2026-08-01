@@ -344,6 +344,14 @@ impl CalendarPage {
                             db::load_intervals_activities_between(&pool_load, &start_s, &end_s)
                                 .await
                                 .unwrap_or_default();
+                        // Activities already accounted for by a local session — the
+                        // same ride returned from Intervals.icu after a round trip
+                        // through Garmin or Strava.
+                        let linked = db::linked_icu_ids(&pool_load).await.unwrap_or_default();
+                        let icu_activities: Vec<_> = icu_activities
+                            .into_iter()
+                            .filter(|a| !linked.contains(&a.icu_id))
+                            .collect();
                         let time_off = db::load_time_off_between(&pool_load, &start_s, &end_s)
                             .await
                             .unwrap_or_default();
@@ -602,6 +610,12 @@ impl CalendarPage {
                                 )
                                 .await;
                             }
+                        // A ride recorded in-app can arrive back here after a round
+                        // trip through Garmin or Strava — link the two so it is shown
+                        // and counted once.
+                        if let Err(e) = crate::data::db::reconcile_icu_links(&pool_s).await {
+                            tracing::error!("reconcile_icu_links: {e}");
+                        }
                             let _ = tx.send(Ok(count)).await;
                         }
                         Err(e) => {

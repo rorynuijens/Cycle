@@ -18,6 +18,16 @@ pub struct Session {
     /// compliance and zones after the profile FTP changes (docs/ftp-detection.md).
     #[serde(default)]
     pub ftp_watts: Option<u32>,
+    /// Display name for the activity — the route name for a GPX ride, or a name
+    /// the rider typed. `None` falls back to the linked workout's name.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The Intervals.icu activity this ride is the same event as, once the two
+    /// have been matched. Set when the ride reaches Intervals.icu by any route —
+    /// uploaded by the app, or synced in from Garmin or Strava — so the ride is
+    /// shown and counted once. See [`crate::data::dedupe`].
+    #[serde(default)]
+    pub icu_id: Option<String>,
 }
 
 impl Session {
@@ -30,6 +40,8 @@ impl Session {
             data_points: Vec::new(),
             rpe: None,
             ftp_watts: None,
+            title: None,
+            icu_id: None,
         }
     }
 
@@ -58,6 +70,93 @@ impl Session {
         } else {
             Some(readings.iter().sum::<f32>() / readings.len() as f32)
         }
+    }
+
+    /// Mean of a per-second field over the points where it was recorded.
+    fn average_of(&self, f: impl Fn(&DataPoint) -> Option<u32>) -> Option<f32> {
+        let values: Vec<f32> = self
+            .data_points
+            .iter()
+            .filter_map(&f)
+            .map(|v| v as f32)
+            .collect();
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f32>() / values.len() as f32)
+        }
+    }
+
+    /// Average heart rate in bpm, over the seconds a monitor was reporting.
+    pub fn average_hr(&self) -> Option<f32> {
+        self.average_of(|p| p.heart_rate_bpm)
+    }
+
+    /// Peak heart rate in bpm.
+    pub fn max_hr(&self) -> Option<u32> {
+        self.data_points
+            .iter()
+            .filter_map(|p| p.heart_rate_bpm)
+            .max()
+    }
+
+    /// Average cadence in rpm, counting only the seconds the rider was pedalling —
+    /// coasting zeros would otherwise drag the figure down misleadingly.
+    pub fn average_cadence(&self) -> Option<f32> {
+        self.average_of(|p| p.cadence_rpm.filter(|&c| c > 0))
+    }
+
+    /// Peak power in watts.
+    pub fn max_power(&self) -> Option<u32> {
+        self.data_points.iter().filter_map(|p| p.power_watts).max()
+    }
+
+    /// Distance covered in metres, integrating the per-second speed.
+    pub fn distance_m(&self) -> f32 {
+        self.data_points
+            .iter()
+            .filter_map(|p| p.speed_kmh)
+            .map(|kmh| kmh / 3.6)
+            .sum()
+    }
+
+    /// Total elevation gain in metres — the sum of the positive altitude changes.
+    ///
+    /// Rises below `MIN_CLIMB_STEP_M` are treated as noise and ignored, so a
+    /// jittery altitude trace does not accumulate phantom metres.
+    pub fn elevation_gain_m(&self) -> Option<f32> {
+        const MIN_CLIMB_STEP_M: f32 = 0.5;
+        let alts: Vec<f32> = self
+            .data_points
+            .iter()
+            .filter_map(|p| p.altitude_m)
+            .collect();
+        if alts.len() < 2 {
+            return None;
+        }
+        let mut gain = 0.0;
+        let mut reference = alts[0];
+        for &a in &alts[1..] {
+            let delta = a - reference;
+            if delta >= MIN_CLIMB_STEP_M {
+                gain += delta;
+                reference = a;
+            } else if delta < 0.0 {
+                reference = a;
+            }
+        }
+        Some(gain)
+    }
+
+    /// Seconds spent in each Coggan power zone Z1–Z7, indexed Z1 = 0.
+    pub fn time_in_zones(&self, ftp: u32) -> [u32; 7] {
+        let mut zones = [0u32; 7];
+        for p in &self.data_points {
+            if let Some(w) = p.power_watts {
+                zones[crate::data::athlete::power_zone_index(w, ftp)] += 1;
+            }
+        }
+        zones
     }
 
     /// Normalised Power — 30s rolling average → 4th power → mean → 4th root.
@@ -126,6 +225,9 @@ pub struct DataPoint {
     /// WGS-84 longitude in degrees. Present only for GPS activities.
     #[serde(default)]
     pub lng: Option<f64>,
+    /// Altitude in metres above sea level. Present only for GPS activities.
+    #[serde(default)]
+    pub altitude_m: Option<f32>,
 }
 
 /// Per-segment stats computed from session data vs. the structured workout plan.
@@ -237,6 +339,7 @@ mod tests {
             speed_kmh: None,
             lat: None,
             lng: None,
+            altitude_m: None,
         }
     }
 

@@ -72,6 +72,14 @@ fn main() -> glib::ExitCode {
         tracing::warn!("Secret migration failed (non-fatal): {e}");
     }
 
+    // One-off: pair up historic rides with their Intervals.icu copies, which the
+    // everyday matcher cannot reach because their start times predate the fix that
+    // stamps the real start. Runs once and marks itself done — see
+    // data::db::backfill_icu_links, which is temporary and can be removed later.
+    if let Err(e) = rt.block_on(data::db::backfill_icu_links(&pool)) {
+        tracing::warn!("Intervals.icu backfill failed (non-fatal): {e}");
+    }
+
     rt.block_on(data::db::seed_workouts(&pool))
         .expect("failed to seed workouts");
 

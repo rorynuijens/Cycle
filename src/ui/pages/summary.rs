@@ -3,7 +3,7 @@ use gtk::gio;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::data::athlete::{power_zone_index, AthleteProfile, ZONE_COLORS};
+use crate::data::athlete::{AthleteProfile, ZONE_COLORS};
 use crate::data::session::Session;
 use crate::data::workout::{Segment, Workout, WorkoutCategory};
 use crate::training::engine::WorkoutEngine;
@@ -21,7 +21,13 @@ pub struct SummaryPage {
     if_label: gtk::Label,
     avg_label: gtk::Label,
     np_label: gtk::Label,
+    max_power_label: gtk::Label,
     kj_label: gtk::Label,
+    distance_label: gtk::Label,
+    climb_label: gtk::Label,
+    avg_hr_label: gtk::Label,
+    max_hr_label: gtk::Label,
+    cadence_label: gtk::Label,
     /// Holds the ride graph (profile + actual trace), rebuilt per session.
     graph_holder: gtk::Box,
     last_session: Rc<RefCell<Option<Session>>>,
@@ -134,8 +140,43 @@ impl SummaryPage {
         };
         let avg_label = make_total_pair("Avg", "Average power");
         let np_label = make_total_pair("NP", "Normalised power");
+        let max_power_label = make_total_pair("Max", "Peak power");
         let kj_label = make_total_pair("Energy", "Total work in kilojoules");
         inner.append(&totals_row);
+
+        // ── Ride totals: distance, climbing and the body's side of the effort ──
+        // A second row so the power figures above stay together as one group.
+        let ride_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(18)
+            .halign(gtk::Align::Center)
+            .build();
+        let make_ride_pair = |name: &str, tooltip: &str| -> gtk::Label {
+            let pair = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .tooltip_text(tooltip)
+                .build();
+            pair.append(
+                &gtk::Label::builder()
+                    .label(name)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+            let value = gtk::Label::builder()
+                .label("—")
+                .css_classes(["caption", "numeric"])
+                .build();
+            pair.append(&value);
+            ride_row.append(&pair);
+            value
+        };
+        let distance_label = make_ride_pair("Distance", "Distance covered");
+        let climb_label = make_ride_pair("Climbed", "Total elevation gain");
+        let avg_hr_label = make_ride_pair("Avg HR", "Average heart rate");
+        let max_hr_label = make_ride_pair("Max HR", "Peak heart rate");
+        let cadence_label = make_ride_pair("Cadence", "Average cadence while pedalling");
+        inner.append(&ride_row);
 
         // ── Zone breakdown ────────────────────────────────────────────────────
         let zone_seconds: Rc<RefCell<[u32; 7]>> = Rc::new(RefCell::new([0u32; 7]));
@@ -291,7 +332,13 @@ impl SummaryPage {
             if_label,
             avg_label,
             np_label,
+            max_power_label,
             kj_label,
+            distance_label,
+            climb_label,
+            avg_hr_label,
+            max_hr_label,
+            cadence_label,
             graph_holder,
             last_session,
             export_banner,
@@ -393,8 +440,36 @@ impl SummaryPage {
             Some(p) => self.np_label.set_label(&format!("{} W", p as u32)),
             None => self.np_label.set_label("—"),
         }
+        match session.max_power() {
+            Some(p) => self.max_power_label.set_label(&format!("{p} W")),
+            None => self.max_power_label.set_label("—"),
+        }
         self.kj_label
             .set_label(&format!("{:.0} kJ", session.kilojoules()));
+
+        let distance_km = session.distance_m() / 1000.0;
+        if distance_km > 0.0 {
+            self.distance_label
+                .set_label(&format!("{distance_km:.1} km"));
+        } else {
+            self.distance_label.set_label("—");
+        }
+        match session.elevation_gain_m() {
+            Some(g) => self.climb_label.set_label(&format!("{g:.0} m")),
+            None => self.climb_label.set_label("—"),
+        }
+        match session.average_hr() {
+            Some(h) => self.avg_hr_label.set_label(&format!("{} bpm", h as u32)),
+            None => self.avg_hr_label.set_label("—"),
+        }
+        match session.max_hr() {
+            Some(h) => self.max_hr_label.set_label(&format!("{h} bpm")),
+            None => self.max_hr_label.set_label("—"),
+        }
+        match session.average_cadence() {
+            Some(c) => self.cadence_label.set_label(&format!("{} rpm", c as u32)),
+            None => self.cadence_label.set_label("—"),
+        }
 
         // ── Ride graph: the workout profile with the actual trace over it ────
         while let Some(child) = self.graph_holder.first_child() {
@@ -436,12 +511,7 @@ impl SummaryPage {
         }
 
         // ── Zone breakdown ────────────────────────────────────────────────────
-        let mut zone_secs = [0u32; 7];
-        for dp in &session.data_points {
-            if let Some(watts) = dp.power_watts {
-                zone_secs[power_zone_index(watts, ftp)] += 1;
-            }
-        }
+        let zone_secs = session.time_in_zones(ftp);
         let has_power = zone_secs.iter().any(|&s| s > 0);
         self.zone_section.set_visible(has_power);
         if has_power {

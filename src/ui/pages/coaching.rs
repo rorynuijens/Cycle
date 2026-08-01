@@ -1233,7 +1233,7 @@ fn compute_ctl_atl(
 ) -> (f64, f64) {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
     for r in records {
-        if r.uploaded_to_icu {
+        if r.counted_via_intervals() {
             continue;
         }
         let date = r.session.started_at.with_timezone(&Local).date_naive();

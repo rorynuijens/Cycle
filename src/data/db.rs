@@ -175,6 +175,26 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .ok();
 
+    // Activity name — the route name for a GPX ride, or a name the rider typed.
+    sqlx::query("ALTER TABLE sessions ADD COLUMN title TEXT")
+        .execute(pool)
+        .await
+        .ok();
+
+    // Link to the same ride as it exists on Intervals.icu, so a ride that made the
+    // round trip through Garmin or Strava is not shown or counted twice.
+    sqlx::query("ALTER TABLE sessions ADD COLUMN icu_id TEXT")
+        .execute(pool)
+        .await
+        .ok();
+
+    // Set when the rider unlinks a ride from Intervals.icu, so the matcher does not
+    // simply pair them again on the next sync.
+    sqlx::query("ALTER TABLE sessions ADD COLUMN icu_link_rejected INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await
+        .ok();
+
     for col in [
         "ALTER TABLE intervals_activities ADD COLUMN average_watts REAL",
         "ALTER TABLE intervals_activities ADD COLUMN normalized_watts REAL",
@@ -410,17 +430,204 @@ pub async fn save_session(pool: &SqlitePool, session: &Session) -> Result<i64> {
     let ended_at = session.ended_at.map(|t| t.to_rfc3339());
 
     let result = sqlx::query(
-        "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json, ftp_watts)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json, ftp_watts,
+                               title, icu_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session.workout_id)
     .bind(&started_at)
     .bind(&ended_at)
     .bind(&data_points_json)
     .bind(session.ftp_watts.map(|v| v as i64))
+    .bind(session.title.as_deref())
+    .bind(session.icu_id.as_deref())
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+/// Link a session to the Intervals.icu activity that is the same ride, or pass
+/// `None` to unlink it.
+pub async fn set_session_icu_id(
+    pool: &SqlitePool,
+    session_id: i64,
+    icu_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query("UPDATE sessions SET icu_id = ? WHERE id = ?")
+        .bind(icu_id)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Unlink a ride from its Intervals.icu activity at the rider's request, and
+/// remember the decision so the matcher does not pair them again.
+pub async fn unlink_session_from_icu(pool: &SqlitePool, session_id: i64) -> Result<()> {
+    sqlx::query("UPDATE sessions SET icu_id = NULL, icu_link_rejected = 1 WHERE id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Match unlinked local sessions against synced Intervals.icu activities and record
+/// the links found. Returns how many new links were made.
+///
+/// Runs after an Intervals.icu sync and after a session is saved, because either
+/// record can arrive first: a ride recorded today reaches Intervals.icu hours later
+/// via Garmin, while a FIT file imported from an old ride may arrive long after
+/// Intervals.icu already knew about it.
+///
+/// Only the recent past is considered — re-examining years of history on every sync
+/// would be wasted work, and a ride old enough to have fallen out of this window has
+/// long since been matched or will never match.
+pub async fn reconcile_icu_links(pool: &SqlitePool) -> Result<usize> {
+    use crate::data::dedupe;
+
+    const RECONCILE_WINDOW_DAYS: i64 = 60;
+
+    let cutoff = (Utc::now() - chrono::Duration::days(RECONCILE_WINDOW_DAYS)).to_rfc3339();
+
+    // Rides the rider has explicitly unlinked must not be paired up again.
+    let rejected: std::collections::HashSet<i64> =
+        sqlx::query("SELECT id FROM sessions WHERE icu_link_rejected = 1")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<i64, _>("id"))
+            .collect();
+
+    let sessions: Vec<SessionRecord> = load_session_records(pool)
+        .await?
+        .into_iter()
+        .filter(|r| {
+            r.session.icu_id.is_none()
+                && !rejected.contains(&r.session.id)
+                && r.session.started_at.to_rfc3339() >= cutoff
+        })
+        .collect();
+    if sessions.is_empty() {
+        return Ok(0);
+    }
+
+    // An activity already claimed by another session must not be claimed twice.
+    let mut taken: std::collections::HashSet<String> =
+        sqlx::query("SELECT icu_id FROM sessions WHERE icu_id IS NOT NULL")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<String, _>("icu_id"))
+            .collect();
+
+    let activities = load_intervals_activities(pool).await?;
+    let mut linked = 0;
+
+    for record in sessions {
+        let candidates: Vec<&IntervalsActivity> = activities
+            .iter()
+            .filter(|a| !taken.contains(&a.icu_id))
+            .collect();
+        if let Some(activity) = dedupe::find_match(&record.session, candidates) {
+            set_session_icu_id(pool, record.session.id, Some(&activity.icu_id)).await?;
+            taken.insert(activity.icu_id.clone());
+            linked += 1;
+            tracing::info!(
+                "Linked session {} to Intervals.icu activity {}",
+                record.session.id,
+                activity.icu_id
+            );
+        }
+    }
+
+    Ok(linked)
+}
+
+/// Setting key marking the one-off legacy backfill as done.
+const LEGACY_BACKFILL_KEY: &str = "dedupe.legacy_backfill_done";
+
+/// One-off pass linking rides recorded before the start-time fix.
+///
+/// Those sessions were stamped when the workout was selected rather than when the
+/// rider started pedalling, so their start times sit minutes early and the everyday
+/// matcher's three-minute window misses them — leaving historic duplicates on the
+/// calendar. This runs once over the whole history using
+/// [`dedupe::is_same_activity_legacy`], which asks the real ride to fit inside the
+/// session's inflated span instead, then records that it has run.
+///
+/// **Temporary.** Once it has run on every installation this function, its setting
+/// key and `dedupe::is_same_activity_legacy` can all be deleted; nothing else
+/// depends on them. Any link it gets wrong is reversible with Unlink in the ride's
+/// detail dialog.
+pub async fn backfill_icu_links(pool: &SqlitePool) -> Result<usize> {
+    use crate::data::dedupe;
+
+    if get_setting(pool, LEGACY_BACKFILL_KEY).await?.is_some() {
+        return Ok(0);
+    }
+
+    let rejected: std::collections::HashSet<i64> =
+        sqlx::query("SELECT id FROM sessions WHERE icu_link_rejected = 1")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<i64, _>("id"))
+            .collect();
+
+    let mut taken = linked_icu_ids(pool).await?;
+    let activities = load_intervals_activities(pool).await?;
+    let mut linked = 0;
+
+    for record in load_session_records(pool).await? {
+        if record.session.icu_id.is_some() || rejected.contains(&record.session.id) {
+            continue;
+        }
+        let candidates: Vec<&IntervalsActivity> = activities
+            .iter()
+            .filter(|a| !taken.contains(&a.icu_id))
+            .collect();
+        if let Some(activity) =
+            dedupe::find_match_with(&record.session, candidates, dedupe::is_same_activity_legacy)
+        {
+            set_session_icu_id(pool, record.session.id, Some(&activity.icu_id)).await?;
+            taken.insert(activity.icu_id.clone());
+            linked += 1;
+            tracing::info!(
+                "Backfill linked session {} to Intervals.icu activity {}",
+                record.session.id,
+                activity.icu_id
+            );
+        }
+    }
+
+    set_setting(pool, LEGACY_BACKFILL_KEY, "1").await?;
+    tracing::info!("Legacy Intervals.icu backfill linked {linked} historic ride(s)");
+    Ok(linked)
+}
+
+/// The Intervals.icu activities already accounted for by a local session. Callers
+/// use this to show and count each ride once.
+pub async fn linked_icu_ids(pool: &SqlitePool) -> Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query("SELECT icu_id FROM sessions WHERE icu_id IS NOT NULL")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.get::<String, _>("icu_id"))
+        .collect())
+}
+
+/// Rename a saved activity. An empty `title` clears the name, so the session
+/// falls back to its linked workout's name (or "Unstructured Ride").
+pub async fn set_session_title(pool: &SqlitePool, session_id: i64, title: &str) -> Result<()> {
+    let trimmed = title.trim();
+    let value = (!trimmed.is_empty()).then_some(trimmed);
+    sqlx::query("UPDATE sessions SET title = ? WHERE id = ?")
+        .bind(value)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ── FTP history ───────────────────────────────────────────────────────────────
@@ -794,6 +1001,18 @@ pub struct SessionRecord {
     pub uploaded_to_icu: bool,
 }
 
+impl SessionRecord {
+    /// Is this ride already represented in `intervals_activities`?
+    ///
+    /// True whether the app uploaded it directly or it came back from
+    /// Intervals.icu after a round trip through Garmin or Strava and was matched
+    /// to it. Load calculations must skip such rides, since the same training
+    /// stress arrives again through the Intervals.icu figures.
+    pub fn counted_via_intervals(&self) -> bool {
+        self.uploaded_to_icu || self.session.icu_id.is_some()
+    }
+}
+
 /// Returns true if any session already has the given `started_at` timestamp — used
 /// to prevent re-importing the same FIT file twice.
 pub async fn session_exists_at(pool: &SqlitePool, started_at: &DateTime<Utc>) -> Result<bool> {
@@ -809,7 +1028,8 @@ pub async fn session_exists_at(pool: &SqlitePool, started_at: &DateTime<Utc>) ->
 pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord>> {
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
-                s.uploaded_to_icu, s.rpe, s.ftp_watts, w.name AS workout_name
+                s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
+                COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
          ORDER BY s.started_at DESC",
@@ -841,6 +1061,8 @@ pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord
                 data_points,
                 rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
                 ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
+                title: r.get("title"),
+                icu_id: r.get("icu_id"),
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -1320,7 +1542,8 @@ pub async fn load_sessions_between(
 ) -> Result<Vec<SessionRecord>> {
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
-                s.uploaded_to_icu, s.rpe, s.ftp_watts, w.name AS workout_name
+                s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
+                COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
          WHERE s.started_at >= ? AND s.started_at <= ?
@@ -1352,6 +1575,8 @@ pub async fn load_sessions_between(
                 data_points,
                 rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
                 ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
+                title: r.get("title"),
+                icu_id: r.get("icu_id"),
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -1780,6 +2005,7 @@ mod tests {
             speed_kmh: Some(32.0),
             lat: None,
             lng: None,
+            altitude_m: None,
         });
         let id = save_session(&pool, &session).await.unwrap();
         assert!(id > 0);
@@ -1809,6 +2035,7 @@ mod tests {
             speed_kmh: None,
             lat: None,
             lng: None,
+            altitude_m: None,
         });
         let id = save_session(&pool, &session).await.unwrap();
 
@@ -1821,6 +2048,225 @@ mod tests {
         let points: Vec<DataPoint> =
             serde_json::from_str(row.get::<&str, _>("data_points_json")).unwrap();
         assert_eq!(points[0].target_watts, Some(230));
+    }
+
+    #[tokio::test]
+    async fn session_title_survives_a_round_trip_and_names_the_activity() {
+        let pool = test_pool().await;
+        let mut session = Session::new(None);
+        session.title = Some("Alpe d'Huez".into());
+        save_session(&pool, &session).await.unwrap();
+
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.title.as_deref(), Some("Alpe d'Huez"));
+        // A named ride must no longer read as "Unstructured Ride" in the calendar,
+        // which takes its label from workout_name.
+        assert_eq!(records[0].workout_name.as_deref(), Some("Alpe d'Huez"));
+    }
+
+    /// Store an Intervals.icu activity that mirrors `session`, as the sync would
+    /// after the ride made the round trip through Garmin.
+    async fn insert_icu_mirror(pool: &SqlitePool, icu_id: &str, session: &Session) {
+        let local = session.started_at.with_timezone(&chrono::Local);
+        upsert_intervals_activity(
+            pool,
+            icu_id,
+            local.date_naive(),
+            "Morning Ride",
+            Some(80.0),
+            Some(session.duration_secs() as u32),
+            Some(200),
+            Some(210),
+            Some(140),
+            Some(170),
+            "Ride",
+            Some(local.naive_local()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn hour_long_ride() -> Session {
+        let mut s = Session::new(None);
+        s.started_at = Utc::now() - chrono::Duration::hours(3);
+        s.ended_at = Some(s.started_at + chrono::Duration::hours(1));
+        s
+    }
+
+    #[tokio::test]
+    async fn reconcile_links_a_ride_that_came_back_from_intervals() {
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 1);
+
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.icu_id.as_deref(), Some("icu-1"));
+        // The calendar hides the Intervals.icu copy, and load metrics skip the
+        // local ride so the same stress is not counted twice.
+        assert!(linked_icu_ids(&pool).await.unwrap().contains("icu-1"));
+        assert!(records[0].counted_via_intervals());
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent_and_leaves_unrelated_rides_alone() {
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+
+        // A ride on another day must not be swept up.
+        let mut other = hour_long_ride();
+        other.started_at = Utc::now() - chrono::Duration::days(4);
+        other.ended_at = Some(other.started_at + chrono::Duration::hours(1));
+        save_session(&pool, &other).await.unwrap();
+
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 1);
+        // A second pass finds nothing new — links are not remade or duplicated.
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 0);
+        assert_eq!(linked_icu_ids(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_activity_cannot_be_claimed_by_two_sessions() {
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        save_session(&pool, &session).await.unwrap();
+        // A near-identical second recording of the same slot — only one may win.
+        save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 1);
+        let linked = load_session_records(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.session.icu_id.is_some())
+            .count();
+        assert_eq!(linked, 1);
+    }
+
+    #[tokio::test]
+    async fn unlinking_survives_the_next_sync() {
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        let id = save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+        reconcile_icu_links(&pool).await.unwrap();
+
+        unlink_session_from_icu(&pool, id).await.unwrap();
+        // The matcher would happily pair these again — the rider's decision wins.
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 0);
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.icu_id, None);
+        assert!(!records[0].counted_via_intervals());
+    }
+
+    #[tokio::test]
+    async fn backfill_links_a_historic_ride_the_everyday_matcher_misses() {
+        let pool = test_pool().await;
+        // A ride recorded before the fix: stamped 40 minutes before the rider
+        // actually started, so its span is inflated at the front.
+        let mut session = hour_long_ride();
+        session.started_at -= chrono::Duration::minutes(40);
+        save_session(&pool, &session).await.unwrap();
+
+        // Intervals.icu has the real ride, starting 40 minutes into that span.
+        let real_start = session.ended_at.unwrap() - chrono::Duration::hours(1);
+        let local = real_start.with_timezone(&chrono::Local);
+        upsert_intervals_activity(
+            &pool,
+            "icu-old",
+            local.date_naive(),
+            "Morning Ride",
+            Some(80.0),
+            Some(3600),
+            Some(200),
+            Some(210),
+            Some(140),
+            Some(170),
+            "Ride",
+            Some(local.naive_local()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The everyday pass cannot reach it — that is the whole reason for the backfill.
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 0);
+        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 1);
+
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.icu_id.as_deref(), Some("icu-old"));
+    }
+
+    #[tokio::test]
+    async fn backfill_runs_only_once() {
+        let pool = test_pool().await;
+        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 0);
+        assert_eq!(
+            get_setting(&pool, LEGACY_BACKFILL_KEY).await.unwrap(),
+            Some("1".into()),
+            "the backfill must record that it has run"
+        );
+
+        // A ride added afterwards must not be swept up by a second pass.
+        let session = hour_long_ride();
+        save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 0);
+        // The everyday matcher still handles it, as it should.
+        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn backfill_respects_an_unlinked_ride() {
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        let id = save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+        unlink_session_from_icu(&pool, id).await.unwrap();
+
+        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 0);
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.icu_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_directly_uploaded_ride_is_still_excluded_from_load() {
+        // The pre-existing upload path must keep working untouched.
+        let pool = test_pool().await;
+        let id = save_session(&pool, &hour_long_ride()).await.unwrap();
+        mark_session_uploaded_to_icu(&pool, id).await.unwrap();
+
+        let records = load_session_records(&pool).await.unwrap();
+        assert!(records[0].counted_via_intervals());
+        assert_eq!(records[0].session.icu_id, None);
+    }
+
+    #[tokio::test]
+    async fn clearing_a_title_restores_the_default_name() {
+        let pool = test_pool().await;
+        let mut session = Session::new(None);
+        session.title = Some("Typo Ride".into());
+        let id = save_session(&pool, &session).await.unwrap();
+
+        set_session_title(&pool, id, "Evening Ride").await.unwrap();
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].workout_name.as_deref(), Some("Evening Ride"));
+
+        // Blank input clears the name rather than storing an empty string.
+        set_session_title(&pool, id, "   ").await.unwrap();
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.title, None);
+        assert_eq!(records[0].workout_name, None);
     }
 
     #[tokio::test]

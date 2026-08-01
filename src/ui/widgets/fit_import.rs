@@ -94,7 +94,14 @@ pub fn connect_fit_import_button(
                         Ok(false) => {}
                     }
                     match db::save_session(&pool, &session).await {
-                        Ok(_) => ImportOutcome::Saved,
+                        Ok(_) => {
+                            // The imported ride may already have reached
+                            // Intervals.icu by another route — link it if so.
+                            if let Err(e) = db::reconcile_icu_links(&pool).await {
+                                tracing::error!("reconcile_icu_links: {e}");
+                            }
+                            ImportOutcome::Saved
+                        }
                         Err(e) => {
                             tracing::error!("save_session after FIT import failed: {e}");
                             ImportOutcome::SaveFailed(e.to_string())
