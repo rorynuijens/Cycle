@@ -468,7 +468,7 @@ impl CycleGtkWindow {
             total_distance_m: 0.0,
             total_gain_m: 0.0,
         };
-        let route_player_rc = Rc::new(RoutePlayerPage::new(&blank_route));
+        let route_player_rc = Rc::new(RoutePlayerPage::new(&blank_route, athlete.ftp_watts));
         let route_timer_alive = Rc::new(Cell::new(false));
         let route_timer_started = Rc::new(Cell::new(false));
 

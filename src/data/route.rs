@@ -9,6 +9,9 @@ const RHO: f32 = 1.22; // air density kg/m³
 const CRR: f32 = 0.004; // rolling resistance coefficient
 const CDA: f32 = 0.32; // combined drag area m²
 
+/// Half-width of the window used to measure gradient, in metres.
+const GRADIENT_WINDOW_M: f32 = 25.0;
+
 /// A single point on a GPX route.
 #[derive(Debug, Clone)]
 pub struct RoutePoint {
@@ -89,6 +92,50 @@ impl Route {
             }
         }
         (lo + hi) / 2.0
+    }
+
+    /// Elevation at `distance_m` by linear interpolation between route points.
+    pub fn elevation_at(&self, distance_m: f32) -> f32 {
+        let pts = &self.points;
+        if pts.is_empty() {
+            return 0.0;
+        }
+        let idx = pts.partition_point(|p| p.distance_m <= distance_m);
+        if idx == 0 {
+            return pts[0].elevation_m;
+        }
+        if idx >= pts.len() {
+            return pts[pts.len() - 1].elevation_m;
+        }
+        let p0 = &pts[idx - 1];
+        let p1 = &pts[idx];
+        let span = p1.distance_m - p0.distance_m;
+        if span < 0.1 {
+            return p0.elevation_m;
+        }
+        let t = (distance_m - p0.distance_m) / span;
+        p0.elevation_m + t * (p1.elevation_m - p0.elevation_m)
+    }
+
+    /// Gradient (fraction) at `distance_m`, measured as rise over a
+    /// ±[`GRADIENT_WINDOW_M`] run of interpolated elevation rather than taken
+    /// from the nearest point.
+    ///
+    /// GPX points are often only a few metres apart, where GPS elevation noise
+    /// dominates the real slope and each point's own gradient is a step change.
+    /// Measuring over a window instead gives a gradient that varies continuously
+    /// with position — used both to drive the trainer and to colour the profile.
+    pub fn gradient_at(&self, distance_m: f32) -> f32 {
+        if self.points.len() < 2 {
+            return 0.0;
+        }
+        let lo = (distance_m - GRADIENT_WINDOW_M).max(0.0);
+        let hi = (distance_m + GRADIENT_WINDOW_M).min(self.total_distance_m);
+        let run = hi - lo;
+        if run < 1.0 {
+            return 0.0; // route shorter than the window — no meaningful slope
+        }
+        (self.elevation_at(hi) - self.elevation_at(lo)) / run
     }
 
     /// Build a per-second workout segment list for the route driven at constant FTP percentage.

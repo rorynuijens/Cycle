@@ -19,6 +19,25 @@ pub fn category_zone_rgb(cat: &WorkoutCategory) -> Option<(f64, f64, f64)> {
     }
 }
 
+/// Colour for a road gradient, in percent, reusing the zone palette so a climb
+/// reads at the same glance as a hard interval.
+///
+/// Descents and the flat take the recovery and endurance colours; the climb
+/// bands follow the rough effort a rider feels — 3% tempo, 6% threshold, 9%
+/// VO₂max, 12% anaerobic, and anything above that neuromuscular. Negative
+/// gradients all read as recovery, however steep.
+pub fn gradient_rgb(percent: f32) -> (f64, f64, f64) {
+    match percent {
+        g if g < -1.0 => ZONE_COLORS[0], // descent
+        g if g < 1.0 => ZONE_COLORS[1],  // flat
+        g if g < 3.0 => ZONE_COLORS[2],
+        g if g < 6.0 => ZONE_COLORS[3],
+        g if g < 9.0 => ZONE_COLORS[4],
+        g if g < 12.0 => ZONE_COLORS[5],
+        _ => ZONE_COLORS[6],
+    }
+}
+
 /// Slim vertical colour stripe marking a row's intensity category.
 /// `None` renders a neutral foreground-tinted stripe (theme-aware).
 pub fn color_stripe(rgb: Option<(f64, f64, f64)>) -> gtk::DrawingArea {

@@ -2,14 +2,6 @@
 
 use crate::data::route::Route;
 
-/// Half-width of the window used to measure gradient, in metres.
-///
-/// GPX points are often only a few metres apart, where GPS elevation noise
-/// dominates the real slope and each point's own gradient is a step change.
-/// Measuring rise over a ±25 m run instead gives a gradient that varies
-/// continuously with position.
-const GRADIENT_WINDOW_M: f32 = 25.0;
-
 /// Maximum change in the grade sent to the trainer, in percentage points per second.
 ///
 /// Real roads ramp into their gradient; stepping the trainer straight to a new
@@ -104,6 +96,23 @@ impl RouteEngine {
         speed
     }
 
+    /// Speed (m/s) for ERG-emulation mode, where the trainer cannot follow the
+    /// road and the ride is driven at a nominal pace instead.
+    ///
+    /// A rider producing nothing is not riding: with no power and no speed sensor
+    /// to say otherwise, the route stops advancing. A real speed reading always
+    /// wins, since a freewheeling flywheel is genuine movement.
+    pub fn emulated_speed_ms(power_watts: Option<u32>, speed_kmh: Option<f32>) -> f32 {
+        /// Nominal pace for ERG emulation — 25 km/h.
+        const NOMINAL_SPEED_MS: f32 = 6.944;
+
+        match speed_kmh {
+            Some(kmh) => (kmh / 3.6).max(0.0),
+            None if power_watts.unwrap_or(0) > 0 => NOMINAL_SPEED_MS,
+            None => 0.0,
+        }
+    }
+
     /// Set the rider's speed (e.g. from a real-time speed sensor or ERG override).
     pub fn set_speed(&mut self, speed_ms: f32) {
         self.speed_ms = speed_ms.max(0.0);
@@ -160,42 +169,14 @@ impl RouteEngine {
         ))
     }
 
-    /// Elevation at `distance_m` by linear interpolation between route points.
+    /// Elevation at `distance_m` — see [`Route::elevation_at`].
     pub fn elevation_at(&self, distance_m: f32) -> f32 {
-        let pts = &self.route.points;
-        if pts.is_empty() {
-            return 0.0;
-        }
-        let idx = pts.partition_point(|p| p.distance_m <= distance_m);
-        if idx == 0 {
-            return pts[0].elevation_m;
-        }
-        if idx >= pts.len() {
-            return pts[pts.len() - 1].elevation_m;
-        }
-        let p0 = &pts[idx - 1];
-        let p1 = &pts[idx];
-        let span = p1.distance_m - p0.distance_m;
-        if span < 0.1 {
-            return p0.elevation_m;
-        }
-        let t = (distance_m - p0.distance_m) / span;
-        p0.elevation_m + t * (p1.elevation_m - p0.elevation_m)
+        self.route.elevation_at(distance_m)
     }
 
-    /// Gradient (fraction) at `distance_m`, measured as rise over a ±[`GRADIENT_WINDOW_M`]
-    /// run of interpolated elevation rather than taken from the nearest point.
+    /// Gradient (fraction) at `distance_m` — see [`Route::gradient_at`].
     fn gradient_at(&self, distance_m: f32) -> f32 {
-        if self.route.points.len() < 2 {
-            return 0.0;
-        }
-        let lo = (distance_m - GRADIENT_WINDOW_M).max(0.0);
-        let hi = (distance_m + GRADIENT_WINDOW_M).min(self.route.total_distance_m);
-        let run = hi - lo;
-        if run < 1.0 {
-            return 0.0; // route shorter than the window — no meaningful slope
-        }
-        (self.elevation_at(hi) - self.elevation_at(lo)) / run
+        self.route.gradient_at(distance_m)
     }
 }
 
@@ -304,6 +285,29 @@ mod tests {
             after_spike < settled + 3.0,
             "spike passed through unsmoothed"
         );
+    }
+
+    // ── ERG-emulation speed ──────────────────────────────────────────────────
+
+    #[test]
+    fn emulated_speed_is_zero_without_power() {
+        assert_eq!(RouteEngine::emulated_speed_ms(None, None), 0.0);
+        assert_eq!(RouteEngine::emulated_speed_ms(Some(0), None), 0.0);
+    }
+
+    #[test]
+    fn emulated_speed_runs_at_the_nominal_pace_while_pedalling() {
+        let speed = RouteEngine::emulated_speed_ms(Some(150), None);
+        assert!((speed - 6.944).abs() < 0.001, "got {speed}");
+    }
+
+    #[test]
+    fn a_real_speed_reading_wins_over_the_nominal_pace() {
+        // A freewheeling flywheel is genuine movement, power or no power.
+        let speed = RouteEngine::emulated_speed_ms(None, Some(18.0));
+        assert!((speed - 5.0).abs() < 0.001, "got {speed}");
+        let stopped = RouteEngine::emulated_speed_ms(Some(200), Some(0.0));
+        assert_eq!(stopped, 0.0, "a sensor reporting a standstill is believed");
     }
 
     // ── Gradient smoothing ───────────────────────────────────────────────────

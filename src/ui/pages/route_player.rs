@@ -8,6 +8,9 @@ use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
 use crate::training::route_engine::RouteEngine;
+use crate::ui::widgets::route_map::RouteMap;
+use crate::ui::widgets::zone_color::gradient_rgb;
+use crate::ui::widgets::zone_meter::ZoneMeter;
 
 type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
@@ -23,6 +26,28 @@ const PRE_START_SECS: u32 = 10;
 /// unit or Intervals.icu records for the same ride.
 fn stamp_start(session: &Rc<RefCell<Session>>) {
     session.borrow_mut().started_at = chrono::Utc::now();
+}
+
+/// Sample a route into `(distance km, elevation m, gradient %)` for the profile
+/// chart, at about one sample per 25 m so the gradient colouring is smooth
+/// without redrawing thousands of segments each tick.
+fn profile_samples(route: &Route) -> Vec<(f32, f32, f32)> {
+    const SAMPLE_SPACING_M: f32 = 25.0;
+    let total = route.total_distance_m;
+    if total <= 0.0 || route.points.len() < 2 {
+        return Vec::new();
+    }
+    let steps = (total / SAMPLE_SPACING_M).ceil().max(1.0) as usize;
+    (0..=steps)
+        .map(|i| {
+            let d = (i as f32 * SAMPLE_SPACING_M).min(total);
+            (
+                d / 1000.0,
+                route.elevation_at(d),
+                route.gradient_at(d) * 100.0,
+            )
+        })
+        .collect()
 }
 
 pub struct RoutePlayerPage {
@@ -47,6 +72,10 @@ pub struct RoutePlayerPage {
     elapsed_label: gtk::Label,
     dist_remaining_label: gtk::Label,
     progress_bar: gtk::ProgressBar,
+    /// Effort ribbon across Z1–Z7, as on the workout screen.
+    zone_meter: ZoneMeter,
+    /// Slippy map following the rider along the route.
+    route_map: RouteMap,
     elevation_chart: gtk::DrawingArea,
     pause_btn: gtk::Button,
     end_btn: gtk::Button,
@@ -55,12 +84,13 @@ pub struct RoutePlayerPage {
     pause_cb: ButtonCb,
     /// Current distance_m for the playhead marker on the chart.
     playhead_dist: Rc<Cell<f32>>,
-    /// Elevation profile points — updated by reset_route() for each new ride.
-    ele_pts: Rc<RefCell<Vec<(f32, f32)>>>,
+    /// Profile samples as (distance km, elevation m, gradient %) — rebuilt by
+    /// reset_route() for each new ride. The gradient colours the trace.
+    ele_pts: Rc<RefCell<Vec<(f32, f32, f32)>>>,
 }
 
 impl RoutePlayerPage {
-    pub fn new(route: &Route) -> Self {
+    pub fn new(route: &Route, ftp_watts: u32) -> Self {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
@@ -146,13 +176,9 @@ impl RoutePlayerPage {
         devices_section.append(&devices_flow);
         inner.append(&devices_section);
 
-        // ── Elevation profile ─────────────────────────────────────────────────
-        let ele_pts: Vec<(f32, f32)> = route
-            .points
-            .iter()
-            .map(|p| (p.distance_m / 1000.0, p.elevation_m))
-            .collect();
-        let ele_pts_rc: Rc<RefCell<Vec<(f32, f32)>>> = Rc::new(RefCell::new(ele_pts));
+        // ── Gradient profile ──────────────────────────────────────────────────
+        let ele_pts_rc: Rc<RefCell<Vec<(f32, f32, f32)>>> =
+            Rc::new(RefCell::new(profile_samples(route)));
         let playhead_dist = Rc::new(Cell::new(0.0f32));
         let total_dist_km = route.total_distance_m / 1000.0;
 
@@ -162,12 +188,13 @@ impl RoutePlayerPage {
             .accessible_role(gtk::AccessibleRole::Img)
             .build();
         elevation_chart.update_property(&[gtk::accessible::Property::Label(
-            "Route elevation profile with current position marker",
+            "Route gradient profile, coloured by steepness, with current position marker",
         )]);
         {
             let pts = Rc::clone(&ele_pts_rc);
             let ph = Rc::clone(&playhead_dist);
-            elevation_chart.set_draw_func(move |_w, cr, width, height| {
+            elevation_chart.set_draw_func(move |area, cr, width, height| {
+                let fg = area.color(); // theme foreground — works in light and dark
                 let pts = pts.borrow();
                 if pts.len() < 2 {
                     return;
@@ -184,21 +211,23 @@ impl RoutePlayerPage {
                 let to_x = |x: f32| x as f64 / x_max * w;
                 let to_y = |y: f32| pad_t + (1.0 - (y as f64 - y_min) / y_span) * usable;
 
-                // Fill
-                let (x0, y0) = (to_x(pts[0].0), to_y(pts[0].1));
-                cr.set_source_rgba(1.0, 0.75, 0.20, 0.20);
-                cr.move_to(x0, h);
-                cr.line_to(x0, y0);
-                for p in &pts[1..] {
-                    cr.line_to(to_x(p.0), to_y(p.1));
+                // Fill, one quad per sample, coloured by that stretch's gradient
+                // so climbs read at a glance in the same palette as power zones.
+                for pair in pts.windows(2) {
+                    let (p0, p1) = (pair[0], pair[1]);
+                    let (r, g, b) = gradient_rgb(p1.2);
+                    cr.set_source_rgba(r, g, b, 0.55);
+                    cr.move_to(to_x(p0.0), h);
+                    cr.line_to(to_x(p0.0), to_y(p0.1));
+                    cr.line_to(to_x(p1.0), to_y(p1.1));
+                    cr.line_to(to_x(p1.0), h);
+                    cr.close_path();
+                    cr.fill().ok();
                 }
-                let xl = to_x(pts[pts.len() - 1].0);
-                cr.line_to(xl, h);
-                cr.close_path();
-                cr.fill().ok();
 
-                // Line
-                cr.set_source_rgba(1.0, 0.75, 0.20, 0.85);
+                // Ridge line, in the theme foreground so it reads on any fill.
+                let (x0, y0) = (to_x(pts[0].0), to_y(pts[0].1));
+                cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.7);
                 cr.set_line_width(1.5);
                 cr.move_to(x0, y0);
                 for p in &pts[1..] {
@@ -216,7 +245,6 @@ impl RoutePlayerPage {
                 cr.stroke().ok();
             });
         }
-        inner.append(&elevation_chart);
 
         // ── Overall progress bar ──────────────────────────────────────────────
         let progress_bar = gtk::ProgressBar::builder()
@@ -224,7 +252,6 @@ impl RoutePlayerPage {
             .show_text(false)
             .build();
         progress_bar.add_css_class("accent");
-        inner.append(&progress_bar);
 
         let time_dist_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -241,31 +268,68 @@ impl RoutePlayerPage {
             .build();
         time_dist_row.append(&elapsed_label);
         time_dist_row.append(&dist_remaining_label);
-        inner.append(&time_dist_row);
 
-        // ── 3×2 live metric grid ──────────────────────────────────────────────
-        // A SIM route ride has no power target — the road sets the resistance —
-        // so the slot the workout player gives to Target goes to heart rate.
-        let metrics_grid = gtk::Grid::builder()
-            .row_spacing(12)
+        // ── Hero row: gradient | live power | speed ──────────────────────────
+        // Mirrors the workout screen: power is the page's reason to exist and
+        // takes the centre with the `display` class (CLAUDE.md §1.5), flanked by
+        // what the road is doing and what it is producing.
+        let hero_grid = gtk::Grid::builder()
             .column_spacing(12)
             .column_homogeneous(true)
             .build();
+        let (gradient_box, gradient_label) =
+            Self::metric_column("Gradient", "— %", &["title-1", "numeric"]);
+        let (power_box, power_label) = Self::metric_column("Power", "— W", &["display", "numeric"]);
+        let (speed_box, speed_label) =
+            Self::metric_column("Speed", "— km/h", &["title-1", "numeric"]);
+        hero_grid.attach(&gradient_box, 0, 0, 1, 1);
+        hero_grid.attach(&power_box, 1, 0, 1, 1);
+        hero_grid.attach(&speed_box, 2, 0, 1, 1);
+        inner.append(&hero_grid);
 
-        let (power_frame, power_label) = Self::metric_card("Power", "— W", &["accent"]);
-        let (hr_frame, hr_label) = Self::metric_card("Heart Rate", "— bpm", &["error"]);
-        let (speed_frame, speed_label) = Self::metric_card("Speed", "— km/h", &[]);
-        let (gradient_frame, gradient_label) = Self::metric_card("Gradient", "— %", &[]);
-        let (cadence_frame, cadence_label) = Self::metric_card("Cadence", "— rpm", &[]);
-        let (climb_frame, climb_label) = Self::metric_card("Climbed", "— m", &[]);
+        // ── Zone ribbon ──────────────────────────────────────────────────────
+        let zone_meter = ZoneMeter::new(ftp_watts);
+        inner.append(zone_meter.widget());
 
-        metrics_grid.attach(&power_frame, 0, 0, 1, 1);
-        metrics_grid.attach(&hr_frame, 1, 0, 1, 1);
-        metrics_grid.attach(&speed_frame, 2, 0, 1, 1);
-        metrics_grid.attach(&gradient_frame, 0, 1, 1, 1);
-        metrics_grid.attach(&cadence_frame, 1, 1, 1, 1);
-        metrics_grid.attach(&climb_frame, 2, 1, 1, 1);
-        inner.append(&metrics_grid);
+        // ── Secondary metrics: HR · cadence · elapsed · remaining ────────────
+        let secondary_grid = gtk::Grid::builder()
+            .column_spacing(12)
+            .column_homogeneous(true)
+            .build();
+        let (hr_box, hr_label) =
+            Self::metric_column("Heart Rate", "— bpm", &["title-2", "numeric"]);
+        let (cadence_box, cadence_label) =
+            Self::metric_column("Cadence", "— rpm", &["title-2", "numeric"]);
+        let (elapsed_box, elapsed_label) =
+            Self::metric_column("Elapsed", "0:00", &["title-2", "numeric"]);
+        let (climb_box, climb_label) =
+            Self::metric_column("Climbed", "— m", &["title-2", "numeric"]);
+        secondary_grid.attach(&hr_box, 0, 0, 1, 1);
+        secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
+        secondary_grid.attach(&elapsed_box, 2, 0, 1, 1);
+        secondary_grid.attach(&climb_box, 3, 0, 1, 1);
+        inner.append(&secondary_grid);
+
+        // ── Map and profile — the slot the workout screen gives its graph ────
+        // Both span the full width: the map takes the height, since "where am I"
+        // is what the rider looks at mid-ride, with the profile as a strip
+        // beneath answering "what is coming". Full-width rows stay legible at any
+        // window size, so this needs no breakpoint.
+        let route_map = RouteMap::new();
+        route_map.widget().set_vexpand(true);
+        elevation_chart.set_content_height(90);
+
+        let graph_column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .vexpand(true)
+            .build();
+        graph_column.append(route_map.widget());
+        graph_column.append(&elevation_chart);
+        inner.append(&graph_column);
+
+        inner.append(&progress_bar);
+        inner.append(&time_dist_row);
 
         // ── Controls ─────────────────────────────────────────────────────────
         let controls = gtk::Box::builder()
@@ -333,6 +397,8 @@ impl RoutePlayerPage {
             elapsed_label,
             dist_remaining_label,
             progress_bar,
+            zone_meter,
+            route_map,
             elevation_chart,
             pause_btn,
             end_btn,
@@ -434,13 +500,12 @@ impl RoutePlayerPage {
             .set_icon_name("media-playback-pause-symbolic");
         self.pause_btn.set_tooltip_text(Some("Pause ride"));
 
-        // Update elevation profile data for the new route.
-        *self.ele_pts.borrow_mut() = route
-            .points
-            .iter()
-            .map(|p| (p.distance_m / 1000.0, p.elevation_m))
-            .collect();
+        // Rebuild the profile and hand the map the new route line.
+        *self.ele_pts.borrow_mut() = profile_samples(route);
         self.elevation_chart.queue_draw();
+        self.zone_meter.set_power(None);
+        let line: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lng)).collect();
+        self.route_map.set_route(&line);
     }
 
     /// Start the 1 Hz ride loop. Calls `on_complete` with the session when the route
@@ -580,7 +645,7 @@ impl RoutePlayerPage {
 
             // ── Pre-start: count consecutive seconds of power data ───────────
             if !started_tick.get() {
-                if readings.power_watts.is_some() {
+                if readings.power_watts.is_some_and(|w| w > 0) {
                     let n = power_countdown.get() + 1;
                     power_countdown.set(n);
                     if n >= PRE_START_SECS {
@@ -596,7 +661,7 @@ impl RoutePlayerPage {
                 if !started_tick.get() {
                     let n = power_countdown.get();
                     let title = if n == 0 {
-                        "Connect a power meter or trainer to begin".to_string()
+                        "Start pedalling to begin".to_string()
                     } else {
                         format!("Starting in {} s…", PRE_START_SECS.saturating_sub(n))
                     };
@@ -632,8 +697,10 @@ impl RoutePlayerPage {
                 }
                 speed_ms
             } else {
-                // Advance position using speed from sensor or a default 6.944 m/s (25 km/h)
-                let speed_ms = readings.speed_kmh.map(|kmh| kmh / 3.6).unwrap_or(6.944);
+                // No power and no speed sensor means the rider is not riding, so
+                // the route does not advance — see RouteEngine::emulated_speed_ms.
+                let speed_ms =
+                    RouteEngine::emulated_speed_ms(readings.power_watts, readings.speed_kmh);
                 engine.borrow_mut().set_speed(speed_ms);
                 let target_watts = engine.borrow_mut().tick();
                 // Send power target to trainer (clamped per CLAUDE.md §5.1)
@@ -720,6 +787,10 @@ impl RoutePlayerPage {
 
             page.playhead_dist.set(distance_m);
             page.elevation_chart.queue_draw();
+            page.zone_meter.set_power(readings.power_watts);
+            if let Some((lat, lng)) = position {
+                page.route_map.set_position(lat, lng);
+            }
 
             if is_done && !completed_tick.get() {
                 completed_tick.set(true);
@@ -734,6 +805,29 @@ impl RoutePlayerPage {
         });
     }
 
+    /// A centred caption-over-value column, as used on the workout screen.
+    fn metric_column(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
+        let vbox = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .build();
+        vbox.append(
+            &gtk::Label::builder()
+                .label(title)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+        let value_label = gtk::Label::builder()
+            .label(initial)
+            .css_classes(value_css.to_vec())
+            .build();
+        vbox.append(&value_label);
+        (vbox, value_label)
+    }
+
+    #[allow(dead_code)]
     fn metric_card(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
         let card = gtk::Box::builder()
             .css_classes(["card"])
