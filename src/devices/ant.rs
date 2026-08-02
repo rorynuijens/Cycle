@@ -298,18 +298,20 @@ impl AntStick {
         }
     }
 
-    /// Read whatever bytes are available; returns an empty slice on timeout.
-    fn read(&self, buf: &mut [u8]) -> usize {
+    /// Read whatever bytes are available.
+    ///
+    /// `Ok(0)` means the read timed out with nothing to report, which is the
+    /// normal idle case and paces the loop. An error means the stick itself is
+    /// gone — the caller must stop reading rather than ask again, since a failing
+    /// read returns instantly and would spin the thread flat out.
+    fn read(&self, buf: &mut [u8]) -> Result<usize, rusb::Error> {
         match self
             .handle
             .read_bulk(self.in_ep, buf, Duration::from_millis(50))
         {
-            Ok(n) => n,
-            Err(rusb::Error::Timeout) => 0,
-            Err(e) => {
-                tracing::debug!("ANT read: {e}");
-                0
-            }
+            Ok(n) => Ok(n),
+            Err(rusb::Error::Timeout) => Ok(0),
+            Err(e) => Err(e),
         }
     }
 
@@ -529,9 +531,18 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             }
         }
 
-        // Pump USB if a channel is up; otherwise idle briefly.
+        // Pump USB if a channel is up; otherwise idle, retrying the open so a
+        // stick plugged in later is picked up without restarting the app.
         let Some(s) = &stick else {
             std::thread::sleep(Duration::from_millis(100));
+            if last_open_attempt.elapsed() >= CHANNEL_RETRY_INTERVAL {
+                last_open_attempt = Instant::now();
+                stick = AntStick::open();
+                if stick.is_some() {
+                    tracing::info!("ANT stick reappeared");
+                    channel_open = false; // configured by the retry below
+                }
+            }
             continue;
         };
 
@@ -543,7 +554,26 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             last_open_attempt = Instant::now();
             channel_open = s.open_channels();
         }
-        let n = s.read(&mut buf);
+        let n = match s.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // The stick has gone — unplugged, or taken by another process.
+                // Drop it so the loop idles instead of spinning on a read that
+                // fails instantly, and let the retry above pick it up again.
+                tracing::warn!("ANT stick lost ({e}) — waiting for it to return");
+                stick = None;
+                channel_open = false;
+                connected = false;
+                discovered = false;
+                hr_discovered = false;
+                let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
+                    address: ANT_FEC_ADDRESS.to_string(),
+                    connected: false,
+                    device_type: None,
+                });
+                continue;
+            }
+        };
         if n == 0 {
             continue;
         }
