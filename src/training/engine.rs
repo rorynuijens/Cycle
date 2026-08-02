@@ -67,6 +67,11 @@ impl WorkoutEngine {
 
     pub fn start(&mut self) {
         self.start_instant = Some(Instant::now());
+        // The session was created when the workout was selected, which can be long
+        // before the first pedal stroke. Stamp the real start so the ride's duration
+        // (and the TSS derived from it) covers only time actually ridden, and so it
+        // lines up with what a head unit or Intervals.icu records for the same ride.
+        self.session.started_at = chrono::Utc::now();
         self.state = EngineState::Running;
         tracing::info!("Workout started: {}", self.workout.name);
     }
@@ -184,6 +189,7 @@ impl WorkoutEngine {
                 speed_kmh: readings.speed_kmh,
                 lat: None,
                 lng: None,
+                altitude_m: None,
             });
         }
 

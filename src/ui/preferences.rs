@@ -9,7 +9,9 @@ use crate::data::{athlete::AthleteProfile, db, keystore};
 /// Create and present the modal preferences window.
 ///
 /// Changes apply immediately — no Save button. `on_saved` is called whenever the athlete
-/// profile changes; `on_erg_rate_changed` is called whenever the ERG ramp rate changes.
+/// profile changes; `on_erg_rate_changed` is called whenever the ERG ramp rate changes;
+/// `on_sim_changed` is called with `(difficulty_percent, max_gradient_percent)` whenever
+/// either SIM mode setting changes.
 pub fn show(
     parent: &adw::ApplicationWindow,
     athlete: AthleteProfile,
@@ -17,6 +19,7 @@ pub fn show(
     rt_handle: tokio::runtime::Handle,
     on_saved: impl Fn(AthleteProfile) + 'static,
     on_erg_rate_changed: impl Fn(u32) + 'static,
+    on_sim_changed: impl Fn(u32, u32) + 'static,
 ) {
     let win = adw::PreferencesWindow::builder()
         .transient_for(parent)
@@ -325,7 +328,87 @@ pub fn show(
     ramp_row.set_subtitle("Watts per second (0 = instant)");
     erg_group.add(&ramp_row);
     training_page.add(&erg_group);
+
+    // ── SIM mode (route rides) ────────────────────────────────────────────
+    let sim_group = adw::PreferencesGroup::builder()
+        .title("SIM Mode")
+        .description(
+            "How road gradients from a GPX route reach the trainer. \
+             Lower the difficulty if steep climbs force you out of gears.",
+        )
+        .build();
+
+    let saved_difficulty = rt_handle
+        .block_on(db::get_setting(&pool, "training.sim_difficulty"))
+        .unwrap_or(None)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(100.0);
+    let saved_max_grade = rt_handle
+        .block_on(db::get_setting(&pool, "training.sim_max_gradient"))
+        .unwrap_or(None)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(20.0);
+
+    let difficulty_adj = gtk::Adjustment::new(saved_difficulty, 0.0, 100.0, 5.0, 10.0, 0.0);
+    let difficulty_row = adw::SpinRow::new(Some(&difficulty_adj), 5.0, 0);
+    difficulty_row.set_title("Trainer Difficulty");
+    difficulty_row.set_subtitle("Percentage of the real gradient sent to the trainer");
+    sim_group.add(&difficulty_row);
+
+    let max_grade_adj = gtk::Adjustment::new(saved_max_grade, 5.0, 20.0, 1.0, 5.0, 0.0);
+    let max_grade_row = adw::SpinRow::new(Some(&max_grade_adj), 1.0, 0);
+    max_grade_row.set_title("Maximum Gradient");
+    max_grade_row.set_subtitle("Climbs steeper than this are capped (%)");
+    sim_group.add(&max_grade_row);
+
+    training_page.add(&sim_group);
     win.add(&training_page);
+
+    {
+        // Both rows report the pair, so the ride loop takes a single update.
+        let on_sim_changed: Rc<dyn Fn(u32, u32)> = Rc::new(on_sim_changed);
+        let pool_s = pool.clone();
+        let rt_s = rt_handle.clone();
+
+        let save_sim = move |difficulty: u32, max_grade: u32| {
+            let pool = pool_s.clone();
+            rt_s.spawn(async move {
+                if let Err(e) =
+                    db::set_setting(&pool, "training.sim_difficulty", &difficulty.to_string()).await
+                {
+                    tracing::error!("save training.sim_difficulty failed: {e}");
+                }
+                if let Err(e) =
+                    db::set_setting(&pool, "training.sim_max_gradient", &max_grade.to_string())
+                        .await
+                {
+                    tracing::error!("save training.sim_max_gradient failed: {e}");
+                }
+            });
+        };
+        let save_sim: Rc<dyn Fn(u32, u32)> = Rc::new(save_sim);
+
+        {
+            let cb = Rc::clone(&on_sim_changed);
+            let save = Rc::clone(&save_sim);
+            let other = max_grade_row.clone();
+            difficulty_row.connect_value_notify(move |row| {
+                let (d, m) = (row.value() as u32, other.value() as u32);
+                cb(d, m);
+                save(d, m);
+            });
+        }
+        {
+            let cb = Rc::clone(&on_sim_changed);
+            let save = Rc::clone(&save_sim);
+            let other = difficulty_row.clone();
+            max_grade_row.connect_value_notify(move |row| {
+                let (d, m) = (other.value() as u32, row.value() as u32);
+                cb(d, m);
+                save(d, m);
+            });
+        }
+    }
 
     {
         let pool_r = pool.clone();
@@ -886,6 +969,12 @@ pub fn show(
                                 Ok(_) => count += 1,
                                 Err(e) => tracing::error!("upsert intervals activity: {e}"),
                             }
+                        }
+                        // A ride recorded in-app can arrive back here after a round
+                        // trip through Garmin or Strava — link the two so it is shown
+                        // and counted once.
+                        if let Err(e) = crate::data::db::reconcile_icu_links(&pool_async).await {
+                            tracing::error!("reconcile_icu_links: {e}");
                         }
                         count
                     }

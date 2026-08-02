@@ -1,5 +1,6 @@
 pub mod athlete;
 pub mod db;
+pub mod dedupe;
 pub mod fit;
 pub mod import;
 pub mod keystore;

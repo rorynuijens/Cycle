@@ -100,10 +100,10 @@ pub(crate) fn compute_load_metrics(
 ) -> (f64, f64, f64) {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
     for record in records {
-        // Skip sessions that were uploaded to Intervals.icu — their TSS is
-        // already included via intervals_pairs, so counting them here too would
-        // inflate CTL/ATL by double-counting the same workout.
-        if record.uploaded_to_icu {
+        // Skip rides Intervals.icu already accounts for — their TSS arrives
+        // via intervals_pairs, so counting them here too would inflate CTL/ATL
+        // by double-counting the same workout.
+        if record.counted_via_intervals() {
             continue;
         }
         let date = record.session.started_at.with_timezone(&Local).date_naive();
@@ -155,7 +155,7 @@ fn compute_pmc_series(
 ) -> Vec<PmcPoint> {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
     for record in records {
-        if record.uploaded_to_icu {
+        if record.counted_via_intervals() {
             continue;
         }
         let date = record.session.started_at.with_timezone(&Local).date_naive();

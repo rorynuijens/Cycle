@@ -13,11 +13,11 @@
 //! (see CLAUDE.md §2.3). This file imports no GTK.
 
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 
-use crate::data::session::LiveReadings;
+use crate::data::session::{LiveReadings, ReadingSource};
 use crate::devices::ftms::compute_cadence_rpm;
 use crate::devices::manager::{DeviceEvent, DeviceType};
 use crate::devices::peripheral::Transport;
@@ -29,6 +29,10 @@ const ANT_PIDS: [u16; 2] = [0x1008, 0x1009]; // ANTUSB2, ANTUSB-m
 /// Synthetic device address used so the ANT trainer flows through the same
 /// discovery/connect pipeline as BLE devices in the Devices page.
 pub const ANT_FEC_ADDRESS: &str = "ant:fec";
+
+/// Synthetic device address for a heart rate monitor found on the ANT+ HR
+/// channel, so it appears in the Devices page like any other sensor.
+pub const ANT_HR_ADDRESS: &str = "ant:hr";
 
 // ── ANT Message Protocol ─────────────────────────────────────────────────────
 const ANT_SYNC: u8 = 0xA4;
@@ -60,6 +64,13 @@ const FEC_CHANNEL_PERIOD: u16 = 8192; // 4 Hz (32768 / 8192)
 /// Channel 1 — Bike Speed & Cadence: some trainers (e.g. Elite Drivo) report a bogus
 /// cadence of 0 in both the FE-C and Bike Power pages, so we open this dedicated
 /// channel and derive cadence from its crank-revolution counter instead.
+/// How long to wait before retrying a channel configuration that failed.
+const CHANNEL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+const HR_CHANNEL: u8 = 0x02;
+const HR_DEVICE_TYPE: u8 = 0x78; // 120 = Heart Rate Monitor
+const HR_CHANNEL_PERIOD: u16 = 8070; // ANT+ HR profile period (~4.06 Hz)
+
 const CADENCE_CHANNEL: u8 = 0x01;
 const SC_DEVICE_TYPE: u8 = 0x79; // 121 = Bike Speed and Cadence (combined)
 const SC_CHANNEL_PERIOD: u16 = 8086; // ANT+ combined Speed & Cadence period
@@ -144,6 +155,7 @@ fn parse_specific_trainer(payload: &[u8]) -> Option<LiveReadings> {
     Some(LiveReadings {
         power_watts: power,
         cadence_rpm: cadence,
+        source: ReadingSource::Ant,
         ..Default::default()
     })
 }
@@ -167,11 +179,27 @@ fn parse_general_fe(payload: &[u8]) -> Option<LiveReadings> {
     Some(LiveReadings {
         speed_kmh: speed_kmh.map(|s| s as f32),
         heart_rate_bpm,
+        source: ReadingSource::Ant,
         ..Default::default()
     })
 }
 
 /// Extract `(cumulative cadence revolutions, cadence event time)` from a combined
+/// Computed heart rate from an ANT+ HR page (device type 120).
+///
+/// Every HR data page carries the computed heart rate in the last byte, whatever
+/// the page number, so the page type never has to be decoded. Zero means the
+/// monitor has no reading yet.
+fn parse_ant_heart_rate(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 8 {
+        return None;
+    }
+    match payload[7] {
+        0 => None,
+        bpm => Some((bpm as u32).min(250)), // clamp per CLAUDE.md §5.1
+    }
+}
+
 /// ANT+ Bike Speed & Cadence page (device type 121). Cadence is bytes 0–3:
 /// event time (1/1024 s) then revolution count, both little-endian. Cadence rpm is
 /// derived from successive samples via [`compute_cadence_rpm`].
@@ -255,12 +283,18 @@ impl AntStick {
         None
     }
 
-    fn write(&self, msg: &[u8]) {
-        if let Err(e) = self
+    /// Send one ANT message. Returns false if it could not be written — most often
+    /// because another process is holding the stick, which shows up as a timeout.
+    fn write(&self, msg: &[u8]) -> bool {
+        match self
             .handle
             .write_bulk(self.out_ep, msg, Duration::from_millis(200))
         {
-            tracing::warn!("ANT write failed: {e}");
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("ANT write failed: {e}");
+                false
+            }
         }
     }
 
@@ -281,44 +315,57 @@ impl AntStick {
 
     /// Configure and open one ANT+ slave channel, paired by wildcard to any device
     /// of `device_type`.
-    fn open_channel(&self, channel: u8, device_type: u8, period: u16) {
-        self.write(&encode_message(
+    fn open_channel(&self, channel: u8, device_type: u8, period: u16) -> bool {
+        let mut ok = self.write(&encode_message(
             MSG_ASSIGN_CHANNEL,
             &[channel, CHANNEL_TYPE_SLAVE, NETWORK_NUMBER],
         ));
         // Device number 0,0 = wildcard.
-        self.write(&encode_message(
+        ok &= self.write(&encode_message(
             MSG_SET_CHANNEL_ID,
             &[channel, 0x00, 0x00, device_type, 0x00],
         ));
-        self.write(&encode_message(
+        ok &= self.write(&encode_message(
             MSG_SET_CHANNEL_RF_FREQ,
             &[channel, RF_FREQUENCY],
         ));
         let [plsb, pmsb] = period.to_le_bytes();
-        self.write(&encode_message(
+        ok &= self.write(&encode_message(
             MSG_SET_CHANNEL_PERIOD,
             &[channel, plsb, pmsb],
         ));
-        self.write(&encode_message(MSG_OPEN_CHANNEL, &[channel]));
+        ok & self.write(&encode_message(MSG_OPEN_CHANNEL, &[channel]))
     }
 
     /// Reset the stick and bring up both the FE-C control channel and the Bike Power
     /// channel (the latter only to recover cadence on trainers that omit it from FE-C).
-    fn open_channels(&self) {
-        self.write(&encode_message(MSG_RESET_SYSTEM, &[0x00]));
+    /// Configure and open every channel. Returns false if any message failed to
+    /// reach the stick, in which case the channels are in an unknown state and the
+    /// caller must try again rather than assume they are searching.
+    fn open_channels(&self) -> bool {
+        let mut ok = self.write(&encode_message(MSG_RESET_SYSTEM, &[0x00]));
         std::thread::sleep(Duration::from_millis(600));
         let mut key = vec![NETWORK_NUMBER];
         key.extend_from_slice(&ANT_PLUS_NETWORK_KEY);
-        self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
-        self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
-        self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
-        tracing::info!("ANT channels opened (FE-C + Speed/Cadence, searching)");
+        ok &= self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
+        ok &= self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
+        ok &= self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
+        ok &= self.open_channel(HR_CHANNEL, HR_DEVICE_TYPE, HR_CHANNEL_PERIOD);
+        if ok {
+            tracing::info!("ANT channels opened (FE-C + Speed/Cadence + HR, searching)");
+        } else {
+            tracing::warn!(
+                "ANT channels could not be configured — the stick did not accept every \
+                 message. Another copy of the app may still be holding it. Will retry."
+            );
+        }
+        ok
     }
 
     fn close_channels(&self) {
         self.write(&encode_message(MSG_CLOSE_CHANNEL, &[FEC_CHANNEL]));
         self.write(&encode_message(MSG_CLOSE_CHANNEL, &[CADENCE_CHANNEL]));
+        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[HR_CHANNEL]));
     }
 
     fn send_target_power(&self, watts: u16) {
@@ -366,6 +413,9 @@ fn for_each_frame(buf: &[u8], mut f: impl FnMut(u8, &[u8])) {
 pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut stick: Option<AntStick> = None;
     let mut discovered = false;
+    // The ANT+ HR strap is announced separately from the trainer — it is a
+    // different device on its own channel.
+    let mut hr_discovered = false;
     let mut connected = false;
     let mut channel_open = false;
     let mut erg_enabled = true;
@@ -375,6 +425,8 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     // Previous (revolutions, event_time) sample from the cadence channel.
     let mut last_cadence_sample: Option<(u16, u16)> = None;
     let mut buf = [0u8; 512];
+    // Paced retries of a failed channel open — see the loop below.
+    let mut last_open_attempt = Instant::now();
 
     loop {
         // Drain pending commands first.
@@ -386,9 +438,14 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     }
                     match &stick {
                         Some(s) => {
+                            // Re-announce whatever is found, but leave the channels
+                            // alone if they are already up: reopening restarts the
+                            // ANT search and throws away sensors already paired.
                             discovered = false;
-                            s.open_channels();
-                            channel_open = true;
+                            hr_discovered = false;
+                            if !channel_open {
+                                channel_open = s.open_channels();
+                            }
                         }
                         None => tracing::warn!("ANT scan requested but no stick available"),
                     }
@@ -401,8 +458,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                         // The user may connect a saved ANT device without scanning first,
                         // so make sure the FE-C channel is up before going live.
                         if !channel_open {
-                            s.open_channels();
-                            channel_open = true;
+                            channel_open = s.open_channels();
                         }
                         connected = true;
                         let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
@@ -421,11 +477,22 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     }
                     connected = false;
                     discovered = false;
+                    channel_open = false;
                     let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
                         address: ANT_FEC_ADDRESS.to_string(),
                         connected: false,
                         device_type: None,
                     });
+                    // Closing the channels takes the HR strap down with the trainer,
+                    // so say so rather than leaving it shown as connected.
+                    if hr_discovered {
+                        hr_discovered = false;
+                        let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
+                            address: ANT_HR_ADDRESS.to_string(),
+                            connected: false,
+                            device_type: None,
+                        });
+                    }
                 }
                 Ok(AntCommand::SetTargetPower(watts)) => {
                     if connected && erg_enabled {
@@ -467,6 +534,15 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
+
+        // Retry a failed channel configuration on our own schedule. Opening can
+        // fail while another copy of the app still holds the stick, and without
+        // this nothing would try again until the rider happened to start a scan —
+        // leaving the trainer permanently undiscoverable.
+        if !channel_open && last_open_attempt.elapsed() >= CHANNEL_RETRY_INTERVAL {
+            last_open_attempt = Instant::now();
+            channel_open = s.open_channels();
+        }
         let n = s.read(&mut buf);
         if n == 0 {
             continue;
@@ -484,6 +560,39 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                 payload
             );
 
+            // Heart rate channel — independent of the trainer, so it reports
+            // whether or not an FE-C trainer has been found.
+            if channel == HR_CHANNEL {
+                if let Some(bpm) = parse_ant_heart_rate(payload) {
+                    // Announce the strap the first time it reports, so it shows up
+                    // in the Devices page and as a connected chip during a ride.
+                    // A broadcast sensor has nothing to connect to, so it counts as
+                    // connected the moment it is heard.
+                    if !hr_discovered {
+                        hr_discovered = true;
+                        let _ = event_tx.send_blocking(DeviceEvent::PeripheralDiscovered {
+                            address: ANT_HR_ADDRESS.to_string(),
+                            name: "ANT+ Heart Rate".to_string(),
+                            rssi: None,
+                            transport: Transport::AntPlus,
+                            kind: DeviceType::HeartRateMonitor,
+                        });
+                        let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
+                            address: ANT_HR_ADDRESS.to_string(),
+                            connected: true,
+                            device_type: Some(DeviceType::HeartRateMonitor),
+                        });
+                        tracing::info!("ANT+ heart rate monitor found");
+                    }
+                    let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
+                        heart_rate_bpm: Some(bpm),
+                        source: ReadingSource::Ant,
+                        ..Default::default()
+                    }));
+                }
+                return;
+            }
+
             // Speed & Cadence channel — used to recover cadence on trainers that
             // omit it from the FE-C trainer page. Cadence is derived from the change
             // in crank revolutions between samples.
@@ -497,6 +606,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                                 let _ =
                                     event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
                                         cadence_rpm: Some(rpm),
+                                        source: ReadingSource::Ant,
                                         ..Default::default()
                                     }));
                             }
@@ -635,6 +745,26 @@ mod tests {
         let (r0, t0) = parse_speed_cadence(&[0x00, 0x00, 0x63, 0x00, 0, 0, 0, 0]).unwrap();
         let (r1, t1) = parse_speed_cadence(&[0x00, 0x04, 0x64, 0x00, 0, 0, 0, 0]).unwrap();
         assert_eq!(compute_cadence_rpm(r0, t0, r1, t1), Some(60));
+    }
+
+    #[test]
+    fn should_parse_computed_heart_rate_from_an_ant_hr_page() {
+        // Every HR page carries computed HR in the last byte, whatever the page.
+        let page = [0x04, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8c];
+        assert_eq!(parse_ant_heart_rate(&page), Some(140));
+    }
+
+    #[test]
+    fn should_ignore_an_ant_hr_page_with_no_reading_yet() {
+        let page = [0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_ant_heart_rate(&page), None);
+        assert_eq!(parse_ant_heart_rate(&[0x04]), None);
+    }
+
+    #[test]
+    fn should_clamp_an_implausible_ant_heart_rate() {
+        let page = [0x04, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        assert_eq!(parse_ant_heart_rate(&page), Some(250));
     }
 
     #[test]

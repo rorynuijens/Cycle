@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use super::session::{DataPoint, Session};
@@ -41,6 +41,32 @@ fn definition(buf: &mut Vec<u8>, local_type: u8, global_num: u16, fields: &[(u8,
     }
 }
 
+/// Degrees → semicircles, the angular unit FIT stores positions in.
+/// `None` (and any non-finite value) becomes the invalid sentinel `i32::MAX`.
+fn semicircles(degrees: Option<f64>) -> i32 {
+    match degrees {
+        Some(d) if d.is_finite() => (d * (2_147_483_648.0 / 180.0)) as i32,
+        _ => i32::MAX,
+    }
+}
+
+/// A filename-safe name for an exported activity, e.g. `Alpe_d_Huez-2026-08-01-1930.fit`.
+pub fn suggested_filename(session: &Session, title: &str) -> String {
+    let safe: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let safe = safe.trim_matches('_');
+    let stem = if safe.is_empty() { "Ride" } else { safe };
+    format!(
+        "{stem}-{}.fit",
+        session
+            .started_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d-%H%M")
+    )
+}
+
 fn avg_of<F: Fn(&super::session::DataPoint) -> Option<u32>>(
     session: &Session,
     f: F,
@@ -81,6 +107,19 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     let avg_cad = avg_of(session, |p| p.cadence_rpm)
         .map(|v| v.min(0xFE) as u8)
         .unwrap_or(0xFF);
+    let max_power = session
+        .max_power()
+        .map(|p| (p.min(0xFFFE)) as u16)
+        .unwrap_or(0xFFFF);
+    let max_hr = session.max_hr().map(|h| h.min(254) as u8).unwrap_or(0xFF);
+    let total_ascent_m = session
+        .elevation_gain_m()
+        .map(|g| g.clamp(0.0, 65534.0) as u16)
+        .unwrap_or(0);
+    // A ride carrying GPS positions followed a course, so it is reported as a
+    // virtual activity — that is what makes services draw it on a map instead of
+    // filing it as a stationary indoor session.
+    let has_position = session.data_points.iter().any(|p| p.lat.is_some());
 
     // ── file_id (local 0, global 0) ─────────────────────────────────────────
     definition(
@@ -112,8 +151,14 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
             (7, 2, 0x84),   // power: uint16
             (3, 1, 0x02),   // heart_rate: uint8
             (4, 1, 0x02),   // cadence: uint8
+            (0, 4, 0x85),   // position_lat: sint32 (semicircles)
+            (1, 4, 0x85),   // position_long: sint32 (semicircles)
+            (2, 2, 0x84),   // altitude: uint16 (5/m, offset 500 m)
+            (5, 4, 0x86),   // distance: uint32 (cm)
+            (6, 2, 0x84),   // speed: uint16 (mm/s)
         ],
     );
+    let mut distance_m = 0.0f32;
     for pt in &session.data_points {
         let ts = start_ts + pt.elapsed_secs;
         let power = pt
@@ -122,12 +167,30 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
             .unwrap_or(0xFFFF);
         let hr = pt.heart_rate_bpm.map(|h| h.min(254) as u8).unwrap_or(0xFF);
         let cad = pt.cadence_rpm.map(|c| c.min(254) as u8).unwrap_or(0xFF);
+        // Data points are one second apart, so speed integrates straight to distance.
+        if let Some(kmh) = pt.speed_kmh {
+            distance_m += kmh / 3.6;
+        }
+        let alt = pt
+            .altitude_m
+            .map(|a| ((a + 500.0) * 5.0).round().clamp(0.0, 65534.0) as u16)
+            .unwrap_or(0xFFFF);
+        let speed_mms = pt
+            .speed_kmh
+            .map(|kmh| (kmh / 3.6 * 1000.0).round().clamp(0.0, 65534.0) as u16)
+            .unwrap_or(0xFFFF);
         msgs.push(0x01); // data: local type 1
         msgs.extend_from_slice(&ts.to_le_bytes());
         msgs.extend_from_slice(&power.to_le_bytes());
         msgs.push(hr);
         msgs.push(cad);
+        msgs.extend_from_slice(&semicircles(pt.lat).to_le_bytes());
+        msgs.extend_from_slice(&semicircles(pt.lng).to_le_bytes());
+        msgs.extend_from_slice(&alt.to_le_bytes());
+        msgs.extend_from_slice(&((distance_m * 100.0) as u32).to_le_bytes());
+        msgs.extend_from_slice(&speed_mms.to_le_bytes());
     }
+    let total_distance_cm = (distance_m * 100.0) as u32;
 
     // ── lap (local 2, global 19) ────────────────────────────────────────────
     definition(
@@ -148,6 +211,7 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
             (20, 2, 0x84),  // avg_power: uint16
             (32, 2, 0x84),  // normalized_power: uint16
             (41, 4, 0x86),  // total_work: uint32 (J)
+            (9, 4, 0x86),   // total_distance: uint32 (cm)
             (24, 1, 0x00),  // lap_trigger: enum
             (25, 1, 0x00),  // sport: enum
         ],
@@ -166,6 +230,7 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     msgs.extend_from_slice(&avg_power.to_le_bytes());
     msgs.extend_from_slice(&np.to_le_bytes());
     msgs.extend_from_slice(&total_work_j.to_le_bytes());
+    msgs.extend_from_slice(&total_distance_cm.to_le_bytes());
     msgs.push(0); // lap_trigger = manual
     msgs.push(2); // sport = cycling
 
@@ -191,6 +256,10 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
             (34, 2, 0x84),  // normalized_power: uint16
             (25, 2, 0x84),  // first_lap_index: uint16
             (26, 2, 0x84),  // num_laps: uint16
+            (9, 4, 0x86),   // total_distance: uint32 (cm)
+            (22, 2, 0x84),  // total_ascent: uint16 (m)
+            (21, 2, 0x84),  // max_power: uint16
+            (17, 1, 0x02),  // max_heart_rate: uint8
             (28, 1, 0x00),  // trigger: enum
         ],
     );
@@ -201,7 +270,11 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     msgs.push(1); // event_type = stop_disable_all
     msgs.extend_from_slice(&start_ts.to_le_bytes());
     msgs.push(2); // sport = cycling
-    msgs.push(6); // sub_sport = indoor_cycling
+    msgs.push(if has_position {
+        58 // sub_sport = virtual_activity
+    } else {
+        6 // sub_sport = indoor_cycling
+    });
     msgs.extend_from_slice(&elapsed_ms.to_le_bytes());
     msgs.extend_from_slice(&elapsed_ms.to_le_bytes());
     msgs.extend_from_slice(&calories.to_le_bytes());
@@ -211,6 +284,10 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     msgs.extend_from_slice(&np.to_le_bytes());
     msgs.extend_from_slice(&0u16.to_le_bytes()); // first_lap_index = 0
     msgs.extend_from_slice(&1u16.to_le_bytes()); // num_laps = 1
+    msgs.extend_from_slice(&total_distance_cm.to_le_bytes());
+    msgs.extend_from_slice(&total_ascent_m.to_le_bytes());
+    msgs.extend_from_slice(&max_power.to_le_bytes());
+    msgs.push(max_hr);
     msgs.push(0); // trigger = activity_end
 
     // ── activity (local 4, global 34) ───────────────────────────────────────
@@ -309,6 +386,7 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
                 let mut speed_kmh: Option<f32> = None;
                 let mut lat_deg: Option<f64> = None;
                 let mut lng_deg: Option<f64> = None;
+                let mut altitude_m: Option<f32> = None;
 
                 for field in record.fields() {
                     match field.name() {
@@ -372,6 +450,14 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
                                 }
                             }
                         }
+                        // fitparser applies the scale/offset, so altitude arrives in metres.
+                        "altitude" | "enhanced_altitude" => {
+                            if let Some(v) = fit_f32(field.value()) {
+                                if v.is_finite() {
+                                    altitude_m = Some(v);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -396,6 +482,7 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
                         speed_kmh,
                         lat: lat_deg,
                         lng: lng_deg,
+                        altitude_m,
                     });
                 }
             }
@@ -432,10 +519,27 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
         rpe: None,
         // Imported rides were not executed against app targets.
         ftp_watts: None,
+        title: None,
+        icu_id: None,
     })
 }
 
 /// Extract a u32 from common FIT numeric value variants.
+/// Extract an f32 from common FIT numeric value variants.
+fn fit_f32(value: &fitparser::Value) -> Option<f32> {
+    match value {
+        fitparser::Value::Float32(v) => Some(*v),
+        fitparser::Value::Float64(v) => Some(*v as f32),
+        fitparser::Value::SInt8(v) => Some(*v as f32),
+        fitparser::Value::SInt16(v) => Some(*v as f32),
+        fitparser::Value::SInt32(v) => Some(*v as f32),
+        fitparser::Value::UInt8(v) => Some(*v as f32),
+        fitparser::Value::UInt16(v) => Some(*v as f32),
+        fitparser::Value::UInt32(v) => Some(*v as f32),
+        _ => None,
+    }
+}
+
 fn fit_u32(value: &fitparser::Value) -> Option<u32> {
     match value {
         fitparser::Value::UInt8(v) => Some(*v as u32),
@@ -446,6 +550,14 @@ fn fit_u32(value: &fitparser::Value) -> Option<u32> {
         fitparser::Value::SInt32(v) if *v >= 0 => Some(*v as u32),
         _ => None,
     }
+}
+
+/// Write `session` to `path` as a FIT activity file.
+///
+/// Fails if the file cannot be created or written.
+pub fn write_session_fit(path: &Path, session: &Session) -> Result<()> {
+    std::fs::write(path, encode_session(session))
+        .with_context(|| format!("failed to write FIT file to {}", path.display()))
 }
 
 /// Write the FIT file to `~/.local/share/cycle/exports/` and return the path.
@@ -462,4 +574,138 @@ pub fn export_to_xdg_path(session: &Session) -> Result<PathBuf> {
     let path = exports_dir.join(format!("workout_{}.fit", ts));
     std::fs::write(&path, encode_session(session))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(elapsed: u32, with_gps: bool) -> DataPoint {
+        DataPoint {
+            elapsed_secs: elapsed,
+            power_watts: Some(200),
+            target_watts: None,
+            heart_rate_bpm: Some(145),
+            cadence_rpm: Some(88),
+            speed_kmh: Some(36.0), // 10 m/s — one metre per 0.1 s, easy to reason about
+            lat: with_gps.then_some(51.5),
+            lng: with_gps.then_some(-0.12),
+            altitude_m: with_gps.then_some(100.0 + elapsed as f32),
+        }
+    }
+
+    fn ride(points: u32, with_gps: bool) -> Session {
+        let mut s = Session::new(None);
+        s.ended_at = Some(s.started_at + chrono::Duration::seconds(points as i64));
+        s.data_points = (0..points).map(|i| point(i, with_gps)).collect();
+        s
+    }
+
+    #[test]
+    fn should_write_a_valid_fit_header() {
+        let bytes = encode_session(&ride(10, true));
+        assert_eq!(bytes[0], 14, "header size");
+        assert_eq!(&bytes[8..12], b".FIT");
+        // data_size must cover exactly the bytes between header and trailing CRC
+        let data_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        assert_eq!(bytes.len(), 14 + data_size + 2);
+    }
+
+    #[test]
+    fn should_end_with_a_crc_over_the_message_stream() {
+        let bytes = encode_session(&ride(10, true));
+        let msgs = &bytes[14..bytes.len() - 2];
+        let stored = u16::from_le_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]]);
+        assert_eq!(crc16(msgs), stored);
+        let header_crc = u16::from_le_bytes([bytes[12], bytes[13]]);
+        assert_eq!(crc16(&bytes[..12]), header_crc);
+    }
+
+    #[test]
+    fn should_grow_by_one_record_per_data_point() {
+        let short = encode_session(&ride(10, true)).len();
+        let long = encode_session(&ride(11, true)).len();
+        // 1 header byte + 24 bytes of record fields:
+        // timestamp 4, power 2, hr 1, cadence 1, lat 4, lng 4, altitude 2, distance 4, speed 2
+        assert_eq!(long - short, 25);
+    }
+
+    #[test]
+    fn should_encode_position_as_semicircles() {
+        let bytes = encode_session(&ride(1, true));
+        let expected = (51.5 * (2_147_483_648.0 / 180.0)) as i32;
+        assert!(
+            bytes
+                .windows(4)
+                .any(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]) == expected),
+            "latitude not present in the encoded file"
+        );
+    }
+
+    #[test]
+    fn should_mark_a_missing_position_invalid() {
+        let bytes = encode_session(&ride(1, false));
+        assert!(
+            bytes
+                .windows(4)
+                .any(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]) == i32::MAX),
+            "absent position was not written as the invalid sentinel"
+        );
+    }
+
+    #[test]
+    fn should_report_a_gps_ride_as_a_virtual_activity() {
+        // sub_sport follows sport (2 = cycling) in the session message
+        let with_gps = encode_session(&ride(5, true));
+        let without = encode_session(&ride(5, false));
+        assert!(with_gps.windows(2).any(|w| w == [2, 58]));
+        assert!(without.windows(2).any(|w| w == [2, 6]));
+    }
+
+    #[test]
+    fn should_accumulate_distance_from_speed() {
+        // 10 points at 36 km/h = 10 m/s → 100 m → 10 000 cm
+        let bytes = encode_session(&ride(10, true));
+        assert!(
+            bytes
+                .windows(4)
+                .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 10_000),
+            "total distance not present in the encoded file"
+        );
+    }
+
+    #[test]
+    fn should_round_trip_through_the_importer() {
+        let original = ride(30, true);
+        let dir = std::env::temp_dir().join("cycle-fit-roundtrip");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test.fit");
+        std::fs::write(&path, encode_session(&original)).expect("write");
+
+        let parsed = import_fit_file(&path).expect("the file we wrote must parse");
+        assert_eq!(parsed.data_points.len(), original.data_points.len());
+        let first = &parsed.data_points[0];
+        assert_eq!(first.power_watts, Some(200));
+        assert_eq!(first.heart_rate_bpm, Some(145));
+        assert_eq!(first.cadence_rpm, Some(88));
+        let lat = first.lat.expect("latitude must survive the round trip");
+        assert!((lat - 51.5).abs() < 0.0001, "got {lat}");
+        let alt = first.altitude_m.expect("altitude must survive");
+        assert!((alt - 100.0).abs() < 0.5, "got {alt}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn should_build_a_filename_from_the_activity_name() {
+        let name = suggested_filename(&ride(1, false), "Alpe d'Huez / lap 2");
+        assert!(name.starts_with("Alpe_d_Huez___lap_2-"), "got {name}");
+        assert!(name.ends_with(".fit"));
+        assert!(!name.contains('/'), "path separators must not survive");
+    }
+
+    #[test]
+    fn should_fall_back_to_ride_for_an_empty_name() {
+        assert!(suggested_filename(&ride(1, false), "  ").starts_with("Ride-"));
+    }
 }

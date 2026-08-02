@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use glib;
+use gtk::gio;
 use sqlx::SqlitePool;
 
 use crate::data::db;
@@ -676,6 +677,49 @@ pub fn show_session_detail(
     });
     header.pack_end(&schedule_btn);
 
+    // ── Export FIT button ─────────────────────────────────────────────────────
+    // Saves wherever the rider chooses, so the file can go straight into Strava,
+    // Garmin Connect or a shared folder.
+    let export_btn = gtk::Button::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Export this ride as a FIT file")
+        .css_classes(["flat", "circular"])
+        .build();
+    let session_for_export = session.clone();
+    let title_export = title.to_string();
+    export_btn.connect_clicked(move |btn| {
+        let parent = btn.root().and_downcast::<gtk::Window>();
+        let dialog = gtk::FileDialog::builder()
+            .title("Export FIT File")
+            .accept_label("Export")
+            .initial_name(crate::data::fit::suggested_filename(
+                &session_for_export,
+                &title_export,
+            ))
+            .build();
+        let session_save = session_for_export.clone();
+        dialog.save(
+            parent.as_ref(),
+            None::<&gio::Cancellable>,
+            move |result| match result {
+                Ok(file) => {
+                    let Some(path) = file.path() else {
+                        tracing::error!("Export target has no local path");
+                        return;
+                    };
+                    match crate::data::fit::write_session_fit(&path, &session_save) {
+                        Ok(()) => tracing::info!("Exported FIT to {}", path.display()),
+                        Err(e) => tracing::error!("FIT export failed: {e}"),
+                    }
+                }
+                // The rider dismissing the file chooser is not an error.
+                Err(e) if e.matches(gtk::DialogError::Dismissed) => {}
+                Err(e) => tracing::error!("Export dialog failed: {e}"),
+            },
+        );
+    });
+    header.pack_end(&export_btn);
+
     toolbar_view.add_top_bar(&header);
 
     let scroll = gtk::ScrolledWindow::builder()
@@ -695,6 +739,89 @@ pub fn show_session_detail(
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
         .build();
+
+    // ── Name ──────────────────────────────────────────────────────────────
+    // Saved on focus-out and on Enter; clearing the field restores the default
+    // name (the workout's, or "Unstructured Ride").
+    let name_group = adw::PreferencesGroup::builder().title("Activity").build();
+    let name_row = adw::EntryRow::builder().title("Name").build();
+    name_row.set_text(title);
+    name_group.add(&name_row);
+    inner.append(&name_group);
+
+    // ── Intervals.icu link ────────────────────────────────────────────────
+    // Shown only when this ride was matched to an Intervals.icu activity, so a
+    // ride that quietly vanished from the calendar is explainable — and undoable.
+    if let Some(icu_id) = session.icu_id.clone() {
+        let link_row = adw::ActionRow::builder()
+            .title("Synced with Intervals.icu")
+            .subtitle("Shown once — the copy from Intervals.icu is hidden")
+            .build();
+        link_row.add_prefix(&gtk::Image::from_icon_name("emblem-synchronizing-symbolic"));
+
+        let unlink_btn = gtk::Button::builder()
+            .label("Unlink")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Treat these as two separate rides and show both")
+            .build();
+        link_row.add_suffix(&unlink_btn);
+        name_group.add(&link_row);
+
+        let session_id = session.id;
+        let pool_unlink = pool.clone();
+        let rt_unlink = rt_handle.clone();
+        let reload_unlink = Rc::clone(&reload_holder);
+        unlink_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            let pool = pool_unlink.clone();
+            let reload = Rc::clone(&reload_unlink);
+            let row = link_row.clone();
+            tracing::info!("Unlinking session {session_id} from Intervals.icu {icu_id}");
+            crate::ui::spawn_to_main(
+                &rt_unlink,
+                async move { db::unlink_session_from_icu(&pool, session_id).await },
+                move |result| match result {
+                    Ok(()) => {
+                        row.set_subtitle("Unlinked — both rides will be shown");
+                        if let Some(cb) = reload.borrow().as_ref() {
+                            cb();
+                        }
+                    }
+                    Err(e) => tracing::error!("unlink session failed: {e}"),
+                },
+            );
+        });
+    }
+
+    {
+        let session_id = session.id;
+        let pool_name = pool.clone();
+        let rt_name = rt_handle.clone();
+        let reload_name = Rc::clone(&reload_holder);
+        let save_name = move |text: String| {
+            let pool = pool_name.clone();
+            let reload = Rc::clone(&reload_name);
+            crate::ui::spawn_to_main(
+                &rt_name,
+                async move { db::set_session_title(&pool, session_id, &text).await },
+                move |result| match result {
+                    Ok(()) => {
+                        if let Some(cb) = reload.borrow().as_ref() {
+                            cb();
+                        }
+                    }
+                    Err(e) => tracing::error!("rename session failed: {e}"),
+                },
+            );
+        };
+        let save_on_apply = save_name.clone();
+        name_row.connect_apply(move |row| save_on_apply(row.text().to_string()));
+        let focus_controller = gtk::EventControllerFocus::new();
+        let row_for_focus = name_row.clone();
+        focus_controller.connect_leave(move |_| save_name(row_for_focus.text().to_string()));
+        name_row.add_controller(focus_controller);
+    }
 
     // ── Stats group ───────────────────────────────────────────────────────
     let stats_group = adw::PreferencesGroup::builder()

@@ -21,6 +21,12 @@ use crate::data::{
 use crate::devices::manager::{DeviceCommand, DeviceEvent, DeviceType};
 use crate::training::engine::{EngineState, WorkoutEngine};
 
+/// Ends a ride: summary page, RPE prompt, save and upload. Takes the finished
+/// session, the name to file it under, and the workout plan it was ridden
+/// against (`None` for a route ride).
+type FinishSession =
+    Rc<dyn Fn(crate::data::session::Session, String, Option<Vec<crate::data::workout::Segment>>)>;
+
 pub struct CycleGtkWindow {
     pub window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -196,22 +202,13 @@ impl CycleGtkWindow {
         // Cloned so we can present the RPE dialog over the app window from inside the closure.
         let window_for_rpe = self.window.clone();
 
-        let on_complete = move |session: crate::data::session::Session| {
-            workout_active_complete.set(false);
-            start_btn_complete.set_visible(false);
-            // Reset timer state so the next "Start Workout" click starts fresh.
-            timer_alive_complete.set(false);
-            timer_started_complete.set(false);
-            // Reset engine and player so the same workout can be started again cleanly.
-            let workout = engine_for_complete.borrow().workout.clone();
-            engine_for_complete
-                .borrow_mut()
-                .reset_with_workout(workout.clone());
-            player_for_complete.borrow().reset_workout(&workout);
-            let name = engine_for_complete.borrow().workout.name.clone();
-            let segments = engine_for_complete.borrow().workout.segments.clone();
+        // The tail of finishing a ride — summary page, RPE, save, upload — is the
+        // same whether it was a structured workout or a route ride, so both paths
+        // funnel into this one closure. `segments` is None for a route ride, which
+        // has no plan to compare against.
+        let finish_session: FinishSession = Rc::new(move |session, name, segments| {
             let ftp = ftp_initial;
-            summary_for_complete.update(&session, &name, ftp, Some(&segments));
+            summary_for_complete.update(&session, &name, ftp, segments.as_deref());
             stack_for_complete.set_visible_child_name("summary");
 
             // FTP auto-suggestion based on 20-minute best power
@@ -330,6 +327,25 @@ impl CycleGtkWindow {
                     } // Ok(session_id)
                 } // match save_session
             });
+        });
+
+        // Finishing a structured workout also resets the engine and player so the
+        // same workout can be started again cleanly.
+        let finish_for_workout = Rc::clone(&finish_session);
+        let on_complete = move |session: crate::data::session::Session| {
+            workout_active_complete.set(false);
+            start_btn_complete.set_visible(false);
+            // Reset timer state so the next "Start Workout" click starts fresh.
+            timer_alive_complete.set(false);
+            timer_started_complete.set(false);
+            let workout = engine_for_complete.borrow().workout.clone();
+            engine_for_complete
+                .borrow_mut()
+                .reset_with_workout(workout.clone());
+            player_for_complete.borrow().reset_workout(&workout);
+            let name = workout.name.clone();
+            let segments = workout.segments.clone();
+            finish_for_workout(session, name, Some(segments));
         };
 
         // ── Shared "start" closure — dashboard card, library, calendar ──────
@@ -459,6 +475,25 @@ impl CycleGtkWindow {
         // True while a controllable trainer (BLE FTMS or ANT+ FE-C) is connected.
         // The route player checks this each tick to pick SIM vs ERG emulation.
         let sim_capable = Rc::new(Cell::new(false));
+
+        // SIM feel settings — read live by the ride loop so a change in
+        // Preferences applies mid-ride. Difficulty is stored as a percentage
+        // and held here as a 0.0–1.0 scale factor.
+        let sim_difficulty = Rc::new(Cell::new(
+            rt_handle
+                .block_on(db::get_setting(&pool, "training.sim_difficulty"))
+                .unwrap_or(None)
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(100.0)
+                / 100.0,
+        ));
+        let sim_max_grade = Rc::new(Cell::new(
+            rt_handle
+                .block_on(db::get_setting(&pool, "training.sim_max_gradient"))
+                .unwrap_or(None)
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(20.0),
+        ));
         let trainer_addr: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // on_start_route: called from the library when the user clicks "Ride this Route"
@@ -466,12 +501,12 @@ impl CycleGtkWindow {
             let route_player = Rc::clone(&route_player_rc);
             let stack = stack.clone();
             let cmd_tx = cmd_tx.clone();
-            let pool_route = pool.clone();
-            let rt_route = rt_handle.clone();
-            let toast_route = self.toast_overlay.clone();
             let timer_alive = Rc::clone(&route_timer_alive);
             let timer_started = Rc::clone(&route_timer_started);
             let sim_capable = Rc::clone(&sim_capable);
+            let sim_difficulty = Rc::clone(&sim_difficulty);
+            let sim_max_grade = Rc::clone(&sim_max_grade);
+            let finish_for_route = Rc::clone(&finish_session);
             let mass_kg = athlete.weight_kg;
             Rc::new(move |route: Route| {
                 timer_alive.set(false);
@@ -481,32 +516,21 @@ impl CycleGtkWindow {
 
                 if !timer_started.get() {
                     timer_started.set(true);
-                    let pool_c = pool_route.clone();
-                    let rt_c = rt_route.clone();
-                    let toast_c = toast_route.clone();
-                    let stack_done = stack.clone();
+                    let route_name = route.name.clone();
+                    let finish = Rc::clone(&finish_for_route);
                     RoutePlayerPage::start_timer(
                         Rc::clone(&route_player),
                         route,
                         mass_kg,
                         cmd_tx.clone(),
                         Rc::clone(&sim_capable),
+                        Rc::clone(&sim_difficulty),
+                        Rc::clone(&sim_max_grade),
                         move |session| {
-                            stack_done.set_visible_child_name("dashboard");
-                            let pool_save = pool_c.clone();
-                            rt_c.spawn(async move {
-                                if let Err(e) = db::save_session(&pool_save, &session).await {
-                                    tracing::error!("save route session failed: {e}");
-                                } else {
-                                    tracing::info!("Route session saved");
-                                }
-                            });
-                            toast_c.add_toast(
-                                adw::Toast::builder()
-                                    .title("Route ride saved")
-                                    .timeout(4)
-                                    .build(),
-                            );
+                            // A route ride ends the same way a workout does: summary
+                            // page, RPE, save and upload. It has no plan to compare
+                            // against, so it passes no segments.
+                            finish(session, route_name.clone(), None);
                         },
                         Rc::clone(&timer_alive),
                     );
@@ -762,6 +786,8 @@ impl CycleGtkWindow {
         let pool_for_prefs = pool.clone();
         let rt_for_prefs = rt_handle.clone();
         let window_for_prefs = self.window.clone();
+        let sim_difficulty_for_prefs = Rc::clone(&sim_difficulty);
+        let sim_max_grade_for_prefs = Rc::clone(&sim_max_grade);
         let prefs_action = gio::SimpleAction::new("preferences", None);
         prefs_action.connect_activate(move |_, _| {
             let current_athlete = engine_for_prefs.borrow().athlete.clone();
@@ -769,6 +795,8 @@ impl CycleGtkWindow {
             let ftp_cell = Rc::clone(&ftp_for_fitness);
             let athlete_for_pages = Rc::clone(&athlete_rc);
             let engine_for_erg = Rc::clone(&engine_for_prefs);
+            let sim_difficulty_prefs = Rc::clone(&sim_difficulty_for_prefs);
+            let sim_max_grade_prefs = Rc::clone(&sim_max_grade_for_prefs);
             crate::ui::preferences::show(
                 &window_for_prefs,
                 current_athlete,
@@ -781,6 +809,10 @@ impl CycleGtkWindow {
                 },
                 move |rate| {
                     engine_for_erg.borrow_mut().erg_ramp_rate = rate;
+                },
+                move |difficulty_pct, max_grade_pct| {
+                    sim_difficulty_prefs.set(difficulty_pct as f32 / 100.0);
+                    sim_max_grade_prefs.set(max_grade_pct as f32);
                 },
             );
         });
@@ -834,6 +866,7 @@ impl CycleGtkWindow {
                             player_for_loop
                                 .borrow()
                                 .add_connected_device(&address, &display_name);
+                            route_player_for_loop.add_connected_device(&address, &display_name);
                             toast_overlay_for_loop.add_toast(
                                 adw::Toast::builder()
                                     .title(format!("Connected: {}", display_name))
@@ -842,6 +875,7 @@ impl CycleGtkWindow {
                             );
                         } else {
                             player_for_loop.borrow().remove_connected_device(&address);
+                            route_player_for_loop.remove_connected_device(&address);
                         }
                     }
                     DeviceEvent::Error(e) => {

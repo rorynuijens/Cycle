@@ -619,6 +619,12 @@ impl DashboardPage {
                                 )
                                 .await;
                             }
+                            // A ride recorded in-app can arrive back here after a round
+                            // trip through Garmin or Strava — link the two so it is shown
+                            // and counted once.
+                            if let Err(e) = crate::data::db::reconcile_icu_links(&pool_t).await {
+                                tracing::error!("reconcile_icu_links: {e}");
+                            }
                         }
 
                         if let Ok(wellness) = crate::ai::intervals::fetch_wellness(
@@ -1374,7 +1380,7 @@ fn compute_ctl_atl(
 ) -> (f64, f64) {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
     for r in records {
-        if r.uploaded_to_icu {
+        if r.counted_via_intervals() {
             continue;
         }
         let date = r.session.started_at.with_timezone(&Local).date_naive();
