@@ -13,7 +13,7 @@
 //! (see CLAUDE.md §2.3). This file imports no GTK.
 
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 
@@ -64,6 +64,9 @@ const FEC_CHANNEL_PERIOD: u16 = 8192; // 4 Hz (32768 / 8192)
 /// Channel 1 — Bike Speed & Cadence: some trainers (e.g. Elite Drivo) report a bogus
 /// cadence of 0 in both the FE-C and Bike Power pages, so we open this dedicated
 /// channel and derive cadence from its crank-revolution counter instead.
+/// How long to wait before retrying a channel configuration that failed.
+const CHANNEL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 const HR_CHANNEL: u8 = 0x02;
 const HR_DEVICE_TYPE: u8 = 0x78; // 120 = Heart Rate Monitor
 const HR_CHANNEL_PERIOD: u16 = 8070; // ANT+ HR profile period (~4.06 Hz)
@@ -280,12 +283,18 @@ impl AntStick {
         None
     }
 
-    fn write(&self, msg: &[u8]) {
-        if let Err(e) = self
+    /// Send one ANT message. Returns false if it could not be written — most often
+    /// because another process is holding the stick, which shows up as a timeout.
+    fn write(&self, msg: &[u8]) -> bool {
+        match self
             .handle
             .write_bulk(self.out_ep, msg, Duration::from_millis(200))
         {
-            tracing::warn!("ANT write failed: {e}");
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("ANT write failed: {e}");
+                false
+            }
         }
     }
 
@@ -306,40 +315,51 @@ impl AntStick {
 
     /// Configure and open one ANT+ slave channel, paired by wildcard to any device
     /// of `device_type`.
-    fn open_channel(&self, channel: u8, device_type: u8, period: u16) {
-        self.write(&encode_message(
+    fn open_channel(&self, channel: u8, device_type: u8, period: u16) -> bool {
+        let mut ok = self.write(&encode_message(
             MSG_ASSIGN_CHANNEL,
             &[channel, CHANNEL_TYPE_SLAVE, NETWORK_NUMBER],
         ));
         // Device number 0,0 = wildcard.
-        self.write(&encode_message(
+        ok &= self.write(&encode_message(
             MSG_SET_CHANNEL_ID,
             &[channel, 0x00, 0x00, device_type, 0x00],
         ));
-        self.write(&encode_message(
+        ok &= self.write(&encode_message(
             MSG_SET_CHANNEL_RF_FREQ,
             &[channel, RF_FREQUENCY],
         ));
         let [plsb, pmsb] = period.to_le_bytes();
-        self.write(&encode_message(
+        ok &= self.write(&encode_message(
             MSG_SET_CHANNEL_PERIOD,
             &[channel, plsb, pmsb],
         ));
-        self.write(&encode_message(MSG_OPEN_CHANNEL, &[channel]));
+        ok & self.write(&encode_message(MSG_OPEN_CHANNEL, &[channel]))
     }
 
     /// Reset the stick and bring up both the FE-C control channel and the Bike Power
     /// channel (the latter only to recover cadence on trainers that omit it from FE-C).
-    fn open_channels(&self) {
-        self.write(&encode_message(MSG_RESET_SYSTEM, &[0x00]));
+    /// Configure and open every channel. Returns false if any message failed to
+    /// reach the stick, in which case the channels are in an unknown state and the
+    /// caller must try again rather than assume they are searching.
+    fn open_channels(&self) -> bool {
+        let mut ok = self.write(&encode_message(MSG_RESET_SYSTEM, &[0x00]));
         std::thread::sleep(Duration::from_millis(600));
         let mut key = vec![NETWORK_NUMBER];
         key.extend_from_slice(&ANT_PLUS_NETWORK_KEY);
-        self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
-        self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
-        self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
-        self.open_channel(HR_CHANNEL, HR_DEVICE_TYPE, HR_CHANNEL_PERIOD);
-        tracing::info!("ANT channels opened (FE-C + Speed/Cadence + HR, searching)");
+        ok &= self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
+        ok &= self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
+        ok &= self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
+        ok &= self.open_channel(HR_CHANNEL, HR_DEVICE_TYPE, HR_CHANNEL_PERIOD);
+        if ok {
+            tracing::info!("ANT channels opened (FE-C + Speed/Cadence + HR, searching)");
+        } else {
+            tracing::warn!(
+                "ANT channels could not be configured — the stick did not accept every \
+                 message. Another copy of the app may still be holding it. Will retry."
+            );
+        }
+        ok
     }
 
     fn close_channels(&self) {
@@ -405,6 +425,8 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     // Previous (revolutions, event_time) sample from the cadence channel.
     let mut last_cadence_sample: Option<(u16, u16)> = None;
     let mut buf = [0u8; 512];
+    // Paced retries of a failed channel open — see the loop below.
+    let mut last_open_attempt = Instant::now();
 
     loop {
         // Drain pending commands first.
@@ -422,8 +444,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                             discovered = false;
                             hr_discovered = false;
                             if !channel_open {
-                                s.open_channels();
-                                channel_open = true;
+                                channel_open = s.open_channels();
                             }
                         }
                         None => tracing::warn!("ANT scan requested but no stick available"),
@@ -437,8 +458,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                         // The user may connect a saved ANT device without scanning first,
                         // so make sure the FE-C channel is up before going live.
                         if !channel_open {
-                            s.open_channels();
-                            channel_open = true;
+                            channel_open = s.open_channels();
                         }
                         connected = true;
                         let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
@@ -514,6 +534,15 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
+
+        // Retry a failed channel configuration on our own schedule. Opening can
+        // fail while another copy of the app still holds the stick, and without
+        // this nothing would try again until the rider happened to start a scan —
+        // leaving the trainer permanently undiscoverable.
+        if !channel_open && last_open_attempt.elapsed() >= CHANNEL_RETRY_INTERVAL {
+            last_open_attempt = Instant::now();
+            channel_open = s.open_channels();
+        }
         let n = s.read(&mut buf);
         if n == 0 {
             continue;
