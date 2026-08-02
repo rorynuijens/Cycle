@@ -30,6 +30,10 @@ const ANT_PIDS: [u16; 2] = [0x1008, 0x1009]; // ANTUSB2, ANTUSB-m
 /// discovery/connect pipeline as BLE devices in the Devices page.
 pub const ANT_FEC_ADDRESS: &str = "ant:fec";
 
+/// Synthetic device address for a heart rate monitor found on the ANT+ HR
+/// channel, so it appears in the Devices page like any other sensor.
+pub const ANT_HR_ADDRESS: &str = "ant:hr";
+
 // ── ANT Message Protocol ─────────────────────────────────────────────────────
 const ANT_SYNC: u8 = 0xA4;
 
@@ -389,6 +393,9 @@ fn for_each_frame(buf: &[u8], mut f: impl FnMut(u8, &[u8])) {
 pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut stick: Option<AntStick> = None;
     let mut discovered = false;
+    // The ANT+ HR strap is announced separately from the trainer — it is a
+    // different device on its own channel.
+    let mut hr_discovered = false;
     let mut connected = false;
     let mut channel_open = false;
     let mut erg_enabled = true;
@@ -409,9 +416,15 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     }
                     match &stick {
                         Some(s) => {
+                            // Re-announce whatever is found, but leave the channels
+                            // alone if they are already up: reopening restarts the
+                            // ANT search and throws away sensors already paired.
                             discovered = false;
-                            s.open_channels();
-                            channel_open = true;
+                            hr_discovered = false;
+                            if !channel_open {
+                                s.open_channels();
+                                channel_open = true;
+                            }
                         }
                         None => tracing::warn!("ANT scan requested but no stick available"),
                     }
@@ -444,11 +457,22 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     }
                     connected = false;
                     discovered = false;
+                    channel_open = false;
                     let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
                         address: ANT_FEC_ADDRESS.to_string(),
                         connected: false,
                         device_type: None,
                     });
+                    // Closing the channels takes the HR strap down with the trainer,
+                    // so say so rather than leaving it shown as connected.
+                    if hr_discovered {
+                        hr_discovered = false;
+                        let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
+                            address: ANT_HR_ADDRESS.to_string(),
+                            connected: false,
+                            device_type: None,
+                        });
+                    }
                 }
                 Ok(AntCommand::SetTargetPower(watts)) => {
                     if connected && erg_enabled {
@@ -511,6 +535,26 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             // whether or not an FE-C trainer has been found.
             if channel == HR_CHANNEL {
                 if let Some(bpm) = parse_ant_heart_rate(payload) {
+                    // Announce the strap the first time it reports, so it shows up
+                    // in the Devices page and as a connected chip during a ride.
+                    // A broadcast sensor has nothing to connect to, so it counts as
+                    // connected the moment it is heard.
+                    if !hr_discovered {
+                        hr_discovered = true;
+                        let _ = event_tx.send_blocking(DeviceEvent::PeripheralDiscovered {
+                            address: ANT_HR_ADDRESS.to_string(),
+                            name: "ANT+ Heart Rate".to_string(),
+                            rssi: None,
+                            transport: Transport::AntPlus,
+                            kind: DeviceType::HeartRateMonitor,
+                        });
+                        let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
+                            address: ANT_HR_ADDRESS.to_string(),
+                            connected: true,
+                            device_type: Some(DeviceType::HeartRateMonitor),
+                        });
+                        tracing::info!("ANT+ heart rate monitor found");
+                    }
                     let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
                         heart_rate_bpm: Some(bpm),
                         source: ReadingSource::Ant,
