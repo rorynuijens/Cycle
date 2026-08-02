@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::data::route::Route;
-use crate::data::session::{DataPoint, LiveReadings, Session};
+use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
 use crate::training::route_engine::RouteEngine;
 
@@ -50,7 +50,7 @@ pub struct RoutePlayerPage {
     elevation_chart: gtk::DrawingArea,
     pause_btn: gtk::Button,
     end_btn: gtk::Button,
-    pub last_readings: Rc<RefCell<LiveReadings>>,
+    pub last_readings: Rc<RefCell<ReadingsTracker>>,
     end_cb: ButtonCb,
     pause_cb: ButtonCb,
     /// Current distance_m for the playhead marker on the chart.
@@ -336,7 +336,7 @@ impl RoutePlayerPage {
             elevation_chart,
             pause_btn,
             end_btn,
-            last_readings: Rc::new(RefCell::new(LiveReadings::default())),
+            last_readings: Rc::new(RefCell::new(ReadingsTracker::default())),
             end_cb,
             pause_cb,
             playhead_dist,
@@ -349,19 +349,9 @@ impl RoutePlayerPage {
     }
 
     pub fn set_readings(&self, readings: LiveReadings) {
-        let mut stored = self.last_readings.borrow_mut();
-        if readings.power_watts.is_some() {
-            stored.power_watts = readings.power_watts;
-        }
-        if readings.speed_kmh.is_some() {
-            stored.speed_kmh = readings.speed_kmh;
-        }
-        if readings.heart_rate_bpm.is_some() {
-            stored.heart_rate_bpm = readings.heart_rate_bpm;
-        }
-        if readings.cadence_rpm.is_some() {
-            stored.cadence_rpm = readings.cadence_rpm;
-        }
+        self.last_readings
+            .borrow_mut()
+            .merge(readings, std::time::Instant::now());
     }
 
     /// Show a chip for a newly connected device. Repeat calls for the same
@@ -561,6 +551,9 @@ impl RoutePlayerPage {
 
         // ── 1 Hz tick ────────────────────────────────────────────────────────
         let readings_rc = Rc::clone(&page.last_readings);
+        // Sensors already reported as dropped, so each is logged once per ride.
+        let stale_warned: Rc<RefCell<std::collections::HashSet<&'static str>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
         let timer_alive_tick = Rc::clone(&timer_alive);
         let completed_tick = Rc::clone(&completed);
         let started_tick = Rc::clone(&started);
@@ -571,7 +564,15 @@ impl RoutePlayerPage {
                 return glib::ControlFlow::Break;
             }
 
-            let readings = readings_rc.borrow().clone();
+            // Only sensors that are still transmitting contribute; a strap that
+            // has gone quiet must not have its last value recorded all ride.
+            let now = std::time::Instant::now();
+            let readings = readings_rc.borrow().current(now);
+            for sensor in readings_rc.borrow().stale_sensors(now) {
+                if stale_warned.borrow_mut().insert(sensor) {
+                    tracing::warn!("{sensor} sensor stopped reporting — dropping it from the ride");
+                }
+            }
 
             if paused.get() {
                 return glib::ControlFlow::Continue;

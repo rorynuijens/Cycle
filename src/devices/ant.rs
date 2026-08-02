@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_channel::Sender;
 
-use crate::data::session::LiveReadings;
+use crate::data::session::{LiveReadings, ReadingSource};
 use crate::devices::ftms::compute_cadence_rpm;
 use crate::devices::manager::{DeviceEvent, DeviceType};
 use crate::devices::peripheral::Transport;
@@ -60,6 +60,10 @@ const FEC_CHANNEL_PERIOD: u16 = 8192; // 4 Hz (32768 / 8192)
 /// Channel 1 — Bike Speed & Cadence: some trainers (e.g. Elite Drivo) report a bogus
 /// cadence of 0 in both the FE-C and Bike Power pages, so we open this dedicated
 /// channel and derive cadence from its crank-revolution counter instead.
+const HR_CHANNEL: u8 = 0x02;
+const HR_DEVICE_TYPE: u8 = 0x78; // 120 = Heart Rate Monitor
+const HR_CHANNEL_PERIOD: u16 = 8070; // ANT+ HR profile period (~4.06 Hz)
+
 const CADENCE_CHANNEL: u8 = 0x01;
 const SC_DEVICE_TYPE: u8 = 0x79; // 121 = Bike Speed and Cadence (combined)
 const SC_CHANNEL_PERIOD: u16 = 8086; // ANT+ combined Speed & Cadence period
@@ -144,6 +148,7 @@ fn parse_specific_trainer(payload: &[u8]) -> Option<LiveReadings> {
     Some(LiveReadings {
         power_watts: power,
         cadence_rpm: cadence,
+        source: ReadingSource::Ant,
         ..Default::default()
     })
 }
@@ -167,11 +172,27 @@ fn parse_general_fe(payload: &[u8]) -> Option<LiveReadings> {
     Some(LiveReadings {
         speed_kmh: speed_kmh.map(|s| s as f32),
         heart_rate_bpm,
+        source: ReadingSource::Ant,
         ..Default::default()
     })
 }
 
 /// Extract `(cumulative cadence revolutions, cadence event time)` from a combined
+/// Computed heart rate from an ANT+ HR page (device type 120).
+///
+/// Every HR data page carries the computed heart rate in the last byte, whatever
+/// the page number, so the page type never has to be decoded. Zero means the
+/// monitor has no reading yet.
+fn parse_ant_heart_rate(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 8 {
+        return None;
+    }
+    match payload[7] {
+        0 => None,
+        bpm => Some((bpm as u32).min(250)), // clamp per CLAUDE.md §5.1
+    }
+}
+
 /// ANT+ Bike Speed & Cadence page (device type 121). Cadence is bytes 0–3:
 /// event time (1/1024 s) then revolution count, both little-endian. Cadence rpm is
 /// derived from successive samples via [`compute_cadence_rpm`].
@@ -313,12 +334,14 @@ impl AntStick {
         self.write(&encode_message(MSG_SET_NETWORK_KEY, &key));
         self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
         self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
-        tracing::info!("ANT channels opened (FE-C + Speed/Cadence, searching)");
+        self.open_channel(HR_CHANNEL, HR_DEVICE_TYPE, HR_CHANNEL_PERIOD);
+        tracing::info!("ANT channels opened (FE-C + Speed/Cadence + HR, searching)");
     }
 
     fn close_channels(&self) {
         self.write(&encode_message(MSG_CLOSE_CHANNEL, &[FEC_CHANNEL]));
         self.write(&encode_message(MSG_CLOSE_CHANNEL, &[CADENCE_CHANNEL]));
+        self.write(&encode_message(MSG_CLOSE_CHANNEL, &[HR_CHANNEL]));
     }
 
     fn send_target_power(&self, watts: u16) {
@@ -484,6 +507,19 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                 payload
             );
 
+            // Heart rate channel — independent of the trainer, so it reports
+            // whether or not an FE-C trainer has been found.
+            if channel == HR_CHANNEL {
+                if let Some(bpm) = parse_ant_heart_rate(payload) {
+                    let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
+                        heart_rate_bpm: Some(bpm),
+                        source: ReadingSource::Ant,
+                        ..Default::default()
+                    }));
+                }
+                return;
+            }
+
             // Speed & Cadence channel — used to recover cadence on trainers that
             // omit it from the FE-C trainer page. Cadence is derived from the change
             // in crank revolutions between samples.
@@ -497,6 +533,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                                 let _ =
                                     event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
                                         cadence_rpm: Some(rpm),
+                                        source: ReadingSource::Ant,
                                         ..Default::default()
                                     }));
                             }
@@ -635,6 +672,26 @@ mod tests {
         let (r0, t0) = parse_speed_cadence(&[0x00, 0x00, 0x63, 0x00, 0, 0, 0, 0]).unwrap();
         let (r1, t1) = parse_speed_cadence(&[0x00, 0x04, 0x64, 0x00, 0, 0, 0, 0]).unwrap();
         assert_eq!(compute_cadence_rpm(r0, t0, r1, t1), Some(60));
+    }
+
+    #[test]
+    fn should_parse_computed_heart_rate_from_an_ant_hr_page() {
+        // Every HR page carries computed HR in the last byte, whatever the page.
+        let page = [0x04, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8c];
+        assert_eq!(parse_ant_heart_rate(&page), Some(140));
+    }
+
+    #[test]
+    fn should_ignore_an_ant_hr_page_with_no_reading_yet() {
+        let page = [0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(parse_ant_heart_rate(&page), None);
+        assert_eq!(parse_ant_heart_rate(&[0x04]), None);
+    }
+
+    #[test]
+    fn should_clamp_an_implausible_ant_heart_rate() {
+        let page = [0x04, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        assert_eq!(parse_ant_heart_rate(&page), Some(250));
     }
 
     #[test]

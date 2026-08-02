@@ -9,7 +9,7 @@ type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 use crate::data::{
     athlete::AthleteProfile,
-    session::{LiveReadings, Session},
+    session::{LiveReadings, ReadingsTracker, Session},
     workout::Workout,
 };
 use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine};
@@ -50,7 +50,7 @@ pub struct PlayerPage {
     /// before the workout has actually started.
     cancel_btn: gtk::Button,
     /// Latest readings from the device manager, updated by the GLib event loop.
-    pub last_readings: Rc<RefCell<LiveReadings>>,
+    pub last_readings: Rc<RefCell<ReadingsTracker>>,
     /// Consecutive seconds of power data received while the engine is Idle.
     pub power_countdown: Rc<Cell<u32>>,
     /// Callback wired by `start_timer` for the countdown banner's "Start now" button.
@@ -362,7 +362,7 @@ impl PlayerPage {
             pause_btn,
             skip_btn,
             end_btn,
-            last_readings: Rc::new(RefCell::new(LiveReadings::default())),
+            last_readings: Rc::new(RefCell::new(ReadingsTracker::default())),
             power_countdown: Rc::new(Cell::new(0)),
             start_now_cb,
             cancel_btn,
@@ -380,22 +380,9 @@ impl PlayerPage {
 
     /// Merge incoming readings into the stored state.
     pub fn set_readings(&self, readings: LiveReadings) {
-        let mut stored = self.last_readings.borrow_mut();
-        if readings.power_watts.is_some() {
-            stored.power_watts = readings.power_watts;
-        }
-        if readings.heart_rate_bpm.is_some() {
-            stored.heart_rate_bpm = readings.heart_rate_bpm;
-        }
-        if readings.cadence_rpm.is_some() {
-            stored.cadence_rpm = readings.cadence_rpm;
-        }
-        if readings.speed_kmh.is_some() {
-            stored.speed_kmh = readings.speed_kmh;
-        }
-        if readings.resistance_target_watts.is_some() {
-            stored.resistance_target_watts = readings.resistance_target_watts;
-        }
+        self.last_readings
+            .borrow_mut()
+            .merge(readings, std::time::Instant::now());
     }
 
     /// Add a connected-device chip to the status row.
@@ -599,6 +586,9 @@ impl PlayerPage {
 
         // ── 1 Hz tick loop ───────────────────────────────────────────────────
         let last_readings_rc = Rc::clone(&page.borrow().last_readings);
+        // Sensors already reported as dropped, so each is logged once per ride.
+        let stale_warned: Rc<RefCell<std::collections::HashSet<&'static str>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
         let power_countdown = Rc::clone(&page.borrow().power_countdown);
         let page_clone = Rc::clone(&page);
         let engine_clone = Rc::clone(&engine);
@@ -610,7 +600,15 @@ impl PlayerPage {
             if !timer_alive_in_timer.get() {
                 return glib::ControlFlow::Break;
             }
-            let readings = last_readings_rc.borrow().clone();
+            // Only sensors still transmitting contribute — a strap that has gone
+            // quiet must not have its last value recorded for the rest of the ride.
+            let now = std::time::Instant::now();
+            let readings = last_readings_rc.borrow().current(now);
+            for sensor in last_readings_rc.borrow().stale_sensors(now) {
+                if stale_warned.borrow_mut().insert(sensor) {
+                    tracing::warn!("{sensor} sensor stopped reporting — dropping it from the ride");
+                }
+            }
 
             let (snapshot, session, ftp) = {
                 let mut eng = engine_clone.borrow_mut();

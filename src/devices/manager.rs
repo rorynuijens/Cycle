@@ -9,7 +9,7 @@ use btleplug::api::{
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 
-use crate::data::session::LiveReadings;
+use crate::data::session::{LiveReadings, ReadingSource};
 use crate::devices::ftms::{
     compute_cadence_rpm, parse_csc_measurement, parse_cycling_power_measurement,
     parse_hr_measurement, parse_indoor_bike_data, request_control_command, set_simulation_command,
@@ -360,6 +360,7 @@ impl DeviceManager {
                                                             cadence_rpm:             data.cadence_rpm,
                                                             speed_kmh:               data.speed_kmh,
                                                             resistance_target_watts: None,
+                                                            source:                  ReadingSource::Ble,
                                                         };
                                                         if event_tx.send(DeviceEvent::Readings(readings)).await.is_err() {
                                                             break;
@@ -477,6 +478,7 @@ impl DeviceManager {
                                 } else {
                                     let p = peripheral.clone();
                                     let event_tx = self.event_tx.clone();
+                                    let stream_address = address.clone();
                                     tokio::spawn(async move {
                                         match p.notifications().await {
                                             Ok(mut stream) => {
@@ -494,6 +496,20 @@ impl DeviceManager {
                                                         }
                                                     }
                                                 }
+                                                // The stream ending means the peripheral went away —
+                                                // BlueZ reports no error for this. Left unreported it
+                                                // looks exactly like a rider with a very steady heart
+                                                // rate, so say so and mark the device disconnected.
+                                                tracing::warn!(
+                                                    "HR notification stream ended for {stream_address} — monitor stopped reporting"
+                                                );
+                                                let _ = event_tx
+                                                    .send(DeviceEvent::ConnectionChanged {
+                                                        address: stream_address,
+                                                        connected: false,
+                                                        device_type: None,
+                                                    })
+                                                    .await;
                                             }
                                             Err(e) => tracing::error!("notifications() failed: {e}"),
                                         }

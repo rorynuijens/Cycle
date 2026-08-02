@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 use super::workout::Segment;
 
@@ -322,11 +323,328 @@ pub struct LiveReadings {
     pub speed_kmh: Option<f32>,
     #[allow(dead_code)]
     pub resistance_target_watts: Option<u32>,
+    /// Which radio carried this reading. Defaults to BLE, so only ANT+ sources
+    /// need to say so.
+    pub source: ReadingSource,
+}
+
+/// Which radio a reading arrived over.
+///
+/// ANT+ is preferred wherever it is available: it is a broadcast protocol with no
+/// connection to lose, so it does not suffer the notification stalls BLE is prone
+/// to on a busy adapter. Anything not explicitly ANT+ is treated as the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadingSource {
+    /// Bluetooth LE, or a source that did not say.
+    #[default]
+    Ble,
+    Ant,
+}
+
+/// How long a sensor value stays usable after it last arrived.
+///
+/// Heart-rate straps and trainers transmit at roughly 1 Hz, so ten seconds of
+/// silence means the sensor has stopped — not that the rider's heart rate has
+/// been perfectly constant.
+pub const SENSOR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The latest value from each sensor, with the time it arrived.
+///
+/// Sensors report independently and at different rates, so readings have to be
+/// merged field by field rather than wholesale. But a merged value must not
+/// outlive its sensor: a strap that drops mid-ride would otherwise have its last
+/// reading displayed and recorded once a second for the rest of the ride,
+/// fabricating a flat trace that never happened. Each field is therefore kept
+/// with its arrival time and expires after [`SENSOR_TIMEOUT`].
+#[derive(Debug, Default, Clone)]
+pub struct ReadingsTracker {
+    power: Option<Sample<u32>>,
+    heart_rate: Option<Sample<u32>>,
+    cadence: Option<Sample<u32>>,
+    speed: Option<Sample<f32>>,
+    resistance_target: Option<Sample<u32>>,
+}
+
+/// One sensor value, with when it arrived and which radio carried it.
+#[derive(Debug, Clone, Copy)]
+struct Sample<T> {
+    value: T,
+    at: Instant,
+    source: ReadingSource,
+}
+
+impl<T: Copy> Sample<T> {
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.duration_since(self.at) < SENSOR_TIMEOUT
+    }
+}
+
+/// Should an incoming reading replace what is already held for a field?
+///
+/// ANT+ always wins. A BLE reading is only taken when no ANT+ reading for that
+/// field is still live, so a dual-band sensor is read over ANT+ while BLE quietly
+/// takes over if ANT+ stops — and a sensor that only speaks BLE, such as the
+/// cadence this trainer does not broadcast over ANT+, keeps working as before.
+fn should_replace<T: Copy>(
+    held: &Option<Sample<T>>,
+    incoming: ReadingSource,
+    now: Instant,
+) -> bool {
+    match held {
+        Some(held) if held.source == ReadingSource::Ant && incoming != ReadingSource::Ant => {
+            !held.is_fresh(now)
+        }
+        _ => true,
+    }
+}
+
+impl ReadingsTracker {
+    /// Record whichever fields `incoming` carries, stamped with `now`, subject to
+    /// the ANT+-first preference in [`should_replace`].
+    pub fn merge(&mut self, incoming: LiveReadings, now: Instant) {
+        let source = incoming.source;
+        if let Some(v) = incoming.power_watts {
+            if should_replace(&self.power, source, now) {
+                self.power = Some(Sample {
+                    value: v,
+                    at: now,
+                    source,
+                });
+            }
+        }
+        if let Some(v) = incoming.heart_rate_bpm {
+            if should_replace(&self.heart_rate, source, now) {
+                self.heart_rate = Some(Sample {
+                    value: v,
+                    at: now,
+                    source,
+                });
+            }
+        }
+        if let Some(v) = incoming.cadence_rpm {
+            if should_replace(&self.cadence, source, now) {
+                self.cadence = Some(Sample {
+                    value: v,
+                    at: now,
+                    source,
+                });
+            }
+        }
+        if let Some(v) = incoming.speed_kmh {
+            if should_replace(&self.speed, source, now) {
+                self.speed = Some(Sample {
+                    value: v,
+                    at: now,
+                    source,
+                });
+            }
+        }
+        if let Some(v) = incoming.resistance_target_watts {
+            if should_replace(&self.resistance_target, source, now) {
+                self.resistance_target = Some(Sample {
+                    value: v,
+                    at: now,
+                    source,
+                });
+            }
+        }
+    }
+
+    /// The readings still considered live at `now`. Fields whose sensor has gone
+    /// quiet come back as `None`, so they are neither shown nor recorded.
+    pub fn current(&self, now: Instant) -> LiveReadings {
+        fn fresh<T: Copy>(field: Option<Sample<T>>, now: Instant) -> Option<T> {
+            field.filter(|s| s.is_fresh(now)).map(|s| s.value)
+        }
+        LiveReadings {
+            power_watts: fresh(self.power, now),
+            heart_rate_bpm: fresh(self.heart_rate, now),
+            cadence_rpm: fresh(self.cadence, now),
+            speed_kmh: fresh(self.speed, now),
+            resistance_target_watts: fresh(self.resistance_target, now),
+            // The merged view is a blend of whatever is live; the per-field source
+            // has already done its work in `merge`.
+            source: ReadingSource::default(),
+        }
+    }
+
+    /// Names of the sensors that have a value but have gone quiet — for logging a
+    /// dropout once, rather than silently showing a dash.
+    pub fn stale_sensors(&self, now: Instant) -> Vec<&'static str> {
+        fn expired<T: Copy>(field: Option<Sample<T>>, now: Instant) -> bool {
+            field.is_some_and(|s| !s.is_fresh(now))
+        }
+        let mut names = Vec::new();
+        if expired(self.power, now) {
+            names.push("power");
+        }
+        if expired(self.heart_rate, now) {
+            names.push("heart rate");
+        }
+        if expired(self.cadence, now) {
+            names.push("cadence");
+        }
+        if expired(self.speed, now) {
+            names.push("speed");
+        }
+        names
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Sensor staleness ────────────────────────────────────────────────────
+    // Regression cover for a ride that recorded 94 bpm in all 5086 data points
+    // because the strap sent one value and then went quiet.
+
+    fn hr_only(bpm: u32) -> LiveReadings {
+        LiveReadings {
+            heart_rate_bpm: Some(bpm),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_report_a_reading_that_just_arrived() {
+        let now = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(hr_only(140), now);
+        assert_eq!(t.current(now).heart_rate_bpm, Some(140));
+    }
+
+    #[test]
+    fn should_drop_a_reading_once_its_sensor_goes_quiet() {
+        let start = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(hr_only(94), start);
+
+        let still_live = start + SENSOR_TIMEOUT - Duration::from_millis(1);
+        assert_eq!(t.current(still_live).heart_rate_bpm, Some(94));
+
+        let expired = start + SENSOR_TIMEOUT;
+        assert_eq!(
+            t.current(expired).heart_rate_bpm,
+            None,
+            "a silent strap must not keep reporting its last value"
+        );
+        assert_eq!(t.stale_sensors(expired), vec!["heart rate"]);
+    }
+
+    #[test]
+    fn should_keep_live_fields_when_another_sensor_drops() {
+        // The trainer keeps transmitting while the strap dies — power must survive.
+        let start = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(hr_only(94), start);
+
+        let later = start + SENSOR_TIMEOUT + Duration::from_secs(5);
+        t.merge(
+            LiveReadings {
+                power_watts: Some(210),
+                ..Default::default()
+            },
+            later,
+        );
+
+        let live = t.current(later);
+        assert_eq!(live.power_watts, Some(210));
+        assert_eq!(live.heart_rate_bpm, None);
+    }
+
+    #[test]
+    fn should_revive_a_sensor_that_starts_reporting_again() {
+        let start = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(hr_only(94), start);
+        let gap = start + SENSOR_TIMEOUT + Duration::from_secs(30);
+        assert_eq!(t.current(gap).heart_rate_bpm, None);
+
+        t.merge(hr_only(132), gap);
+        assert_eq!(t.current(gap).heart_rate_bpm, Some(132));
+        assert!(t.stale_sensors(gap).is_empty());
+    }
+
+    // ── ANT+ preference ─────────────────────────────────────────────────────
+
+    fn hr_from(bpm: u32, source: ReadingSource) -> LiveReadings {
+        LiveReadings {
+            heart_rate_bpm: Some(bpm),
+            source,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_prefer_ant_over_ble_for_the_same_sensor() {
+        let now = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(hr_from(150, ReadingSource::Ant), now);
+        t.merge(hr_from(94, ReadingSource::Ble), now);
+        assert_eq!(
+            t.current(now).heart_rate_bpm,
+            Some(150),
+            "a live ANT+ reading must not be overwritten by BLE"
+        );
+    }
+
+    #[test]
+    fn should_use_ble_when_ant_offers_nothing() {
+        // The trainer broadcasts no cadence over ANT+, so BLE has to serve it.
+        let now = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(
+            LiveReadings {
+                cadence_rpm: Some(88),
+                source: ReadingSource::Ble,
+                ..Default::default()
+            },
+            now,
+        );
+        assert_eq!(t.current(now).cadence_rpm, Some(88));
+    }
+
+    #[test]
+    fn should_fall_back_to_ble_once_ant_goes_quiet() {
+        let start = Instant::now();
+        let mut t = ReadingsTracker::default();
+        t.merge(hr_from(150, ReadingSource::Ant), start);
+
+        // While ANT+ is still live, BLE is ignored.
+        let during = start + Duration::from_secs(5);
+        t.merge(hr_from(94, ReadingSource::Ble), during);
+        assert_eq!(t.current(during).heart_rate_bpm, Some(150));
+
+        // Once ANT+ has gone quiet, BLE takes over rather than leaving a gap.
+        let after = start + SENSOR_TIMEOUT + Duration::from_secs(1);
+        t.merge(hr_from(96, ReadingSource::Ble), after);
+        assert_eq!(t.current(after).heart_rate_bpm, Some(96));
+    }
+
+    #[test]
+    fn should_return_to_ant_when_it_comes_back() {
+        let start = Instant::now();
+        let mut t = ReadingsTracker::default();
+        let after = start + SENSOR_TIMEOUT + Duration::from_secs(1);
+        t.merge(hr_from(96, ReadingSource::Ble), after);
+        assert_eq!(t.current(after).heart_rate_bpm, Some(96));
+
+        t.merge(hr_from(151, ReadingSource::Ant), after);
+        assert_eq!(t.current(after).heart_rate_bpm, Some(151));
+    }
+
+    #[test]
+    fn should_report_nothing_before_any_sensor_reports() {
+        let now = Instant::now();
+        let t = ReadingsTracker::default();
+        let live = t.current(now);
+        assert_eq!(live.heart_rate_bpm, None);
+        assert_eq!(live.power_watts, None);
+        // Nothing has ever reported, so nothing counts as having dropped out.
+        assert!(t.stale_sensors(now).is_empty());
+    }
+
     use crate::data::workout::Segment;
 
     fn dp(elapsed: u32, power: Option<u32>) -> DataPoint {
