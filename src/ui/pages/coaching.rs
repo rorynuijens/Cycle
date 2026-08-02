@@ -624,7 +624,7 @@ impl CoachingPage {
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
                         .await
                         .unwrap_or_default();
-                    let icu_activities = db::load_intervals_activities(&pool_t)
+                    let icu_activities = db::load_unlinked_intervals_activities(&pool_t)
                         .await
                         .unwrap_or_default();
                     let goals = db::load_goals(&pool_t).await.unwrap_or_default();

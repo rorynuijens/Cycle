@@ -617,6 +617,40 @@ pub async fn backfill_icu_links(pool: &SqlitePool) -> Result<usize> {
     Ok(linked)
 }
 
+/// Intervals.icu activities that no local session already accounts for.
+///
+/// Anything the app recorded itself is the better copy — it has per-second data,
+/// RPE and the plan it was ridden against — so a ride that made the round trip
+/// through Garmin or Strava is dropped here and read from the local session
+/// instead. Every place that merges the two lists should load through this, or
+/// the same ride is shown, counted and fed to the AI twice.
+pub async fn load_unlinked_intervals_activities(
+    pool: &SqlitePool,
+) -> Result<Vec<IntervalsActivity>> {
+    let linked = linked_icu_ids(pool).await?;
+    Ok(load_intervals_activities(pool)
+        .await?
+        .into_iter()
+        .filter(|a| !linked.contains(&a.icu_id))
+        .collect())
+}
+
+/// As [`load_unlinked_intervals_activities`], for a date range.
+pub async fn load_unlinked_intervals_activities_between(
+    pool: &SqlitePool,
+    start_date: &str,
+    end_date: &str,
+) -> Result<Vec<IntervalsActivity>> {
+    let linked = linked_icu_ids(pool).await?;
+    Ok(
+        load_intervals_activities_between(pool, start_date, end_date)
+            .await?
+            .into_iter()
+            .filter(|a| !linked.contains(&a.icu_id))
+            .collect(),
+    )
+}
+
 /// The Intervals.icu activities already accounted for by a local session. Callers
 /// use this to show and count each ride once.
 pub async fn linked_icu_ids(pool: &SqlitePool) -> Result<std::collections::HashSet<String>> {
@@ -2293,6 +2327,24 @@ mod tests {
         // local ride so the same stress is not counted twice.
         assert!(linked_icu_ids(&pool).await.unwrap().contains("icu-1"));
         assert!(records[0].counted_via_intervals());
+    }
+
+    #[tokio::test]
+    async fn a_linked_activity_is_hidden_from_everything_that_counts_rides() {
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        save_session(&pool, &session).await.unwrap();
+        insert_icu_mirror(&pool, "icu-1", &session).await;
+        insert_icu_mirror(&pool, "icu-2", &hour_long_ride()).await;
+        reconcile_icu_links(&pool).await.unwrap();
+
+        // The raw list still has both — reconciliation needs to see them.
+        assert_eq!(load_intervals_activities(&pool).await.unwrap().len(), 2);
+        // What the calendar, the fitness totals and the AI read has only the
+        // ride that no local session already covers.
+        let unlinked = load_unlinked_intervals_activities(&pool).await.unwrap();
+        assert_eq!(unlinked.len(), 1);
+        assert_eq!(unlinked[0].icu_id, "icu-2");
     }
 
     #[tokio::test]

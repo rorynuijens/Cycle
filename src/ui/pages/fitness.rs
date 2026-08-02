@@ -1420,7 +1420,7 @@ impl FitnessPage {
                         let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
                             .await
                             .unwrap_or_default();
-                        let icu_activities = db::load_intervals_activities(&pool_load)
+                        let icu_activities = db::load_unlinked_intervals_activities(&pool_load)
                             .await
                             .unwrap_or_default();
                         let wellness = db::load_wellness_recent(&pool_load, 14)
@@ -1974,7 +1974,7 @@ impl FitnessPage {
                     let records = db::load_sessions_between(&pool_t, &start_utc, &end_utc)
                         .await
                         .unwrap_or_default();
-                    let icu_acts = db::load_intervals_activities(&pool_t)
+                    let icu_acts = db::load_unlinked_intervals_activities(&pool_t)
                         .await
                         .unwrap_or_default();
                     let intervals_all = db::load_intervals_tss_pairs(&pool_t)
