@@ -490,9 +490,9 @@ impl CoachingPage {
                                 workout_detail_label_r.set_label(&cached_detail);
 
                                 // Restore action buttons only for built-in library workouts
-                                let is_builtin = workouts_r
-                                    .iter()
-                                    .find(|w| w.name.eq_ignore_ascii_case(&cached_name));
+                                let is_builtin = workouts_r.iter().find(|w| {
+                                    crate::ai::naming::names_match(&w.name, &cached_name)
+                                });
                                 if let Some(w) = is_builtin {
                                     update_thumb(&thumb_holder_r, Some(w), &athlete_r.borrow());
                                     *suggested_workout_r.borrow_mut() = Some(w.clone());
@@ -733,7 +733,7 @@ impl CoachingPage {
                                     // Check built-in library first
                                     if let Some(w) = workouts_c
                                         .iter()
-                                        .find(|w| w.name.eq_ignore_ascii_case(rec_name))
+                                        .find(|w| crate::ai::naming::names_match(&w.name, rec_name))
                                     {
                                         let detail = format!(
                                             "{} · {} min · TSS {:.0}",
@@ -755,10 +755,9 @@ impl CoachingPage {
                                         let lookup = rec_name
                                             .strip_prefix("[Intervals.icu] ")
                                             .unwrap_or(rec_name);
-                                        if let Some(w) = icu_workouts_c
-                                            .iter()
-                                            .find(|w| w.name.eq_ignore_ascii_case(lookup))
-                                        {
+                                        if let Some(w) = icu_workouts_c.iter().find(|w| {
+                                            crate::ai::naming::names_match(&w.name, lookup)
+                                        }) {
                                             let dur = w
                                                 .duration_secs
                                                 .map(|s| format!("{} min", s / 60))
@@ -1146,10 +1145,9 @@ impl CoachingPage {
                                 start_monday + CDuration::days(week_offset + day_offset);
                             let date_str = entry_date.format("%Y-%m-%d").to_string();
 
-                            if let Some(w) = workouts_d
-                                .iter()
-                                .find(|w| w.name.eq_ignore_ascii_case(&entry.workout_name))
-                            {
+                            if let Some(w) = workouts_d.iter().find(|w| {
+                                crate::ai::naming::names_match(&w.name, &entry.workout_name)
+                            }) {
                                 to_schedule.push((w.id, date_str));
                             } else {
                                 tracing::warn!(
@@ -1371,15 +1369,7 @@ fn workouts_as_options(
 }
 
 fn extract_recommended_workout(text: &str) -> Option<String> {
-    text.lines()
-        .find(|l| l.trim_start().starts_with("RECOMMENDED_WORKOUT:"))
-        .map(|l| {
-            l.trim_start()
-                .trim_start_matches("RECOMMENDED_WORKOUT:")
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
+    crate::ai::naming::extract_marker_value(text, "RECOMMENDED_WORKOUT:")
 }
 
 fn strip_recommended_line(text: &str) -> String {
@@ -1411,7 +1401,7 @@ fn format_program(
         }
         let duration_note = workouts
             .iter()
-            .find(|w| w.name.eq_ignore_ascii_case(&entry.workout_name))
+            .find(|w| crate::ai::naming::names_match(&w.name, &entry.workout_name))
             .map(|w| format!(" ({} min)", w.duration_secs / 60))
             .or_else(|| {
                 let lookup = entry
@@ -1420,7 +1410,7 @@ fn format_program(
                     .unwrap_or(&entry.workout_name);
                 icu_workouts
                     .iter()
-                    .find(|w| w.name.eq_ignore_ascii_case(lookup))
+                    .find(|w| crate::ai::naming::names_match(&w.name, lookup))
                     .and_then(|w| w.duration_secs)
                     .map(|s| format!(" ({} min) [Intervals.icu]", s / 60))
             })

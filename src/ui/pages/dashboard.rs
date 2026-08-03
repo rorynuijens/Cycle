@@ -177,17 +177,20 @@ impl DashboardPage {
                                 .unwrap_or_default();
                         // The suggestion only matters on an empty day — with a
                         // workout scheduled, the plan wins and the suggestion hides.
-                        let suggested_workout =
-                            if today_entry.is_none() && !ai_workout_name.trim().is_empty() {
-                                db::load_workouts(&pool_load)
-                                    .await
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    // Case-insensitive — the AI may return different casing
-                                    .find(|w| w.name.eq_ignore_ascii_case(ai_workout_name.trim()))
-                            } else {
-                                None
-                            };
+                        let suggested_workout = if today_entry.is_none()
+                            && !ai_workout_name.trim().is_empty()
+                        {
+                            db::load_workouts(&pool_load)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                // Case-insensitive — the AI may return different casing
+                                .find(|w| {
+                                    crate::ai::naming::names_match(&w.name, ai_workout_name.trim())
+                                })
+                        } else {
+                            None
+                        };
                         let ai_workout_detail =
                             db::get_setting(&pool_load, "ai.suggestion_workout_detail")
                                 .await
@@ -453,8 +456,9 @@ impl DashboardPage {
                             }
                         };
                         // Case-insensitive match — the AI may return a different casing
-                        let Some(found) =
-                            workouts.iter().find(|w| w.name.eq_ignore_ascii_case(&name))
+                        let Some(found) = workouts
+                            .iter()
+                            .find(|w| crate::ai::naming::names_match(&w.name, &name))
                         else {
                             tracing::warn!("Alternative workout '{name}' not found in library");
                             return None;
@@ -701,7 +705,7 @@ impl DashboardPage {
                         if !cached_name.trim().is_empty() {
                             workouts
                                 .iter()
-                                .find(|w| w.name.eq_ignore_ascii_case(&cached_name))
+                                .find(|w| crate::ai::naming::names_match(&w.name, &cached_name))
                                 .map(|w| PlannedWorkout {
                                     name: w.name.clone(),
                                     duration_mins: w.duration_secs / 60,
@@ -811,6 +815,38 @@ impl DashboardPage {
                                             &pool_c,
                                             "ai.suggestion_workout_name",
                                             &suggest_name,
+                                        )
+                                        .await;
+                                        // The detail belongs to whichever workout the name
+                                        // names. Leaving the coaching page's older detail
+                                        // in place left its card describing one workout in
+                                        // the title and another underneath, with no Start
+                                        // button because the stale pair matched nothing.
+                                        let detail = db::load_workouts(&pool_c)
+                                            .await
+                                            .ok()
+                                            .and_then(|ws| {
+                                                ws.into_iter()
+                                                    .find(|w| {
+                                                        crate::ai::naming::names_match(
+                                                            &w.name,
+                                                            &suggest_name,
+                                                        )
+                                                    })
+                                                    .map(|w| {
+                                                        format!(
+                                                            "{} · {} min · TSS {:.0}",
+                                                            w.category.label(),
+                                                            w.duration_secs / 60,
+                                                            w.tss
+                                                        )
+                                                    })
+                                            })
+                                            .unwrap_or_default();
+                                        let _ = db::set_setting(
+                                            &pool_c,
+                                            "ai.suggestion_workout_detail",
+                                            &detail,
                                         )
                                         .await;
                                     }

@@ -718,7 +718,7 @@ impl CalendarPage {
         let ai_matched = if !ai_suggestion_name.is_empty() {
             workouts
                 .iter()
-                .position(|w| w.name.eq_ignore_ascii_case(&ai_suggestion_name))
+                .position(|w| crate::ai::naming::names_match(&w.name, &ai_suggestion_name))
         } else {
             None
         };

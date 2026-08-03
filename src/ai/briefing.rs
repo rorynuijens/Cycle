@@ -65,15 +65,7 @@ pub fn parse_briefing_decision(text: &str) -> BriefingDecision {
 
 /// Extract the alternative workout name from a Modify briefing.
 pub fn parse_alternative_workout(text: &str) -> Option<String> {
-    let marker = "ALTERNATIVE_WORKOUT:";
-    let pos = text.to_uppercase().find(marker)?;
-    let after = text[pos + marker.len()..].trim();
-    let name = after.lines().next()?.trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
+    crate::ai::naming::extract_marker_value(text, "ALTERNATIVE_WORKOUT:")
 }
 
 pub fn build_briefing_prompt(ctx: &BriefingContext) -> String {
