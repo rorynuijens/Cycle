@@ -149,6 +149,43 @@ impl Session {
         Some(gain)
     }
 
+    /// Total elevation loss in metres — the sum of the negative altitude changes,
+    /// with the same noise floor as [`Session::elevation_gain_m`].
+    pub fn elevation_loss_m(&self) -> Option<f32> {
+        const MIN_DESCENT_STEP_M: f32 = 0.5;
+        let alts: Vec<f32> = self
+            .data_points
+            .iter()
+            .filter_map(|p| p.altitude_m)
+            .collect();
+        if alts.len() < 2 {
+            return None;
+        }
+        let mut loss = 0.0;
+        let mut reference = alts[0];
+        for &a in &alts[1..] {
+            let delta = reference - a;
+            if delta >= MIN_DESCENT_STEP_M {
+                loss += delta;
+                reference = a;
+            } else if delta < 0.0 {
+                reference = a;
+            }
+        }
+        Some(loss)
+    }
+
+    /// Peak speed in km/h.
+    pub fn max_speed_kmh(&self) -> Option<f32> {
+        self.data_points
+            .iter()
+            .filter_map(|p| p.speed_kmh)
+            .filter(|s| s.is_finite())
+            .fold(None, |acc: Option<f32>, s| {
+                Some(acc.map_or(s, |m| m.max(s)))
+            })
+    }
+
     /// Seconds spent in each Coggan power zone Z1–Z7, indexed Z1 = 0.
     pub fn time_in_zones(&self, ftp: u32) -> [u32; 7] {
         let mut zones = [0u32; 7];

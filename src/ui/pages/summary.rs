@@ -31,6 +31,9 @@ pub struct SummaryPage {
     /// Holds the ride graph (profile + actual trace), rebuilt per session.
     graph_holder: gtk::Box,
     last_session: Rc<RefCell<Option<Session>>>,
+    /// The profile the last summary was drawn against — the FIT export reads
+    /// FTP and heart-rate limits from it to derive training load.
+    last_athlete: Rc<RefCell<AthleteProfile>>,
     export_banner: adw::Banner,
     zone_section: gtk::Box,
     zone_seconds: Rc<RefCell<[u32; 7]>>,
@@ -248,6 +251,10 @@ impl SummaryPage {
 
         // ── FIT export ────────────────────────────────────────────────────────
         let last_session: Rc<RefCell<Option<Session>>> = Rc::new(RefCell::new(None));
+        // The export needs FTP and heart-rate limits to work out training load,
+        // so the profile behind the last summary is kept alongside the session.
+        let last_athlete: Rc<RefCell<AthleteProfile>> =
+            Rc::new(RefCell::new(AthleteProfile::default()));
 
         let export_banner = adw::Banner::builder()
             .title("")
@@ -277,11 +284,13 @@ impl SummaryPage {
         });
 
         let session_for_export = Rc::clone(&last_session);
+        let athlete_for_export = Rc::clone(&last_athlete);
         let banner_ref = export_banner.clone();
         export_btn.connect_clicked(move |_| {
             let session = session_for_export.borrow().clone();
             let Some(session) = session else { return };
-            match crate::data::fit::export_to_xdg_path(&session) {
+            let athlete = athlete_for_export.borrow().clone();
+            match crate::data::fit::export_to_xdg_path(&session, &athlete) {
                 Ok(path) => {
                     if let Some(parent) = path.parent() {
                         *folder_uri.borrow_mut() = format!("file://{}", parent.display());
@@ -341,6 +350,7 @@ impl SummaryPage {
             cadence_label,
             graph_holder,
             last_session,
+            last_athlete,
             export_banner,
             zone_section,
             zone_seconds,
@@ -407,10 +417,12 @@ impl SummaryPage {
         &self,
         session: &Session,
         workout_name: &str,
-        ftp: u32,
+        athlete: &AthleteProfile,
         segments: Option<&[Segment]>,
     ) {
+        let ftp = athlete.ftp_watts;
         *self.last_session.borrow_mut() = Some(session.clone());
+        *self.last_athlete.borrow_mut() = athlete.clone();
         self.export_banner.set_revealed(false);
         // Reset the hero icon — the RPE emoticon belongs to the previous ride.
         self.rpe_image.set_icon_name(Some("starred-symbolic"));

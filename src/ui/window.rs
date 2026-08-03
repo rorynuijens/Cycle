@@ -191,7 +191,7 @@ impl CycleGtkWindow {
         let summary_for_complete = summary_page.clone();
         let pool_for_complete = pool.clone();
         let rt_for_complete = rt_handle.clone();
-        let ftp_initial = athlete.ftp_watts;
+        let athlete_initial = athlete.clone();
         let workout_active_complete = Rc::clone(&workout_active);
         let start_btn_complete = start_btn.clone();
         let engine_for_complete = Rc::clone(&engine_rc);
@@ -207,8 +207,8 @@ impl CycleGtkWindow {
         // funnel into this one closure. `segments` is None for a route ride, which
         // has no plan to compare against.
         let finish_session: FinishSession = Rc::new(move |session, name, segments| {
-            let ftp = ftp_initial;
-            summary_for_complete.update(&session, &name, ftp, segments.as_deref());
+            let ftp = athlete_initial.ftp_watts;
+            summary_for_complete.update(&session, &name, &athlete_initial, segments.as_deref());
             stack_for_complete.set_visible_child_name("summary");
 
             // FTP auto-suggestion based on 20-minute best power
@@ -299,7 +299,13 @@ impl CycleGtkWindow {
                                 .unwrap_or(None)
                                 .unwrap_or_default();
                             if !api_key.trim().is_empty() && !athlete_id.trim().is_empty() {
-                                let fit_bytes = crate::data::fit::encode_session(&session);
+                                // Loaded fresh rather than captured at startup so the
+                                // export carries the FTP and heart-rate limits in
+                                // force now, which is what training load is scaled to.
+                                let profile =
+                                    db::load_or_create_athlete(&pool).await.unwrap_or_default();
+                                let fit_bytes =
+                                    crate::data::fit::encode_session(&session, &profile);
                                 match crate::ai::intervals::upload_fit_activity(
                                     &athlete_id,
                                     &api_key,

@@ -687,6 +687,8 @@ pub fn show_session_detail(
         .build();
     let session_for_export = session.clone();
     let title_export = title.to_string();
+    let pool_export = pool.clone();
+    let rt_export = rt_handle.clone();
     export_btn.connect_clicked(move |btn| {
         let parent = btn.root().and_downcast::<gtk::Window>();
         let dialog = gtk::FileDialog::builder()
@@ -698,6 +700,11 @@ pub fn show_session_detail(
             ))
             .build();
         let session_save = session_for_export.clone();
+        // One row, read when the rider asks to export: the FTP and heart-rate
+        // limits the training-load figure in the file is scaled to.
+        let athlete = rt_export
+            .block_on(db::load_or_create_athlete(&pool_export))
+            .unwrap_or_default();
         dialog.save(
             parent.as_ref(),
             None::<&gio::Cancellable>,
@@ -707,7 +714,7 @@ pub fn show_session_detail(
                         tracing::error!("Export target has no local path");
                         return;
                     };
-                    match crate::data::fit::write_session_fit(&path, &session_save) {
+                    match crate::data::fit::write_session_fit(&path, &session_save, &athlete) {
                         Ok(()) => tracing::info!("Exported FIT to {}", path.display()),
                         Err(e) => tracing::error!("FIT export failed: {e}"),
                     }

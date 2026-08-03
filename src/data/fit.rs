@@ -1,10 +1,30 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use super::athlete::AthleteProfile;
 use super::session::{DataPoint, Session};
 
 // FIT epoch: 1989-12-31 00:00:00 UTC = Unix timestamp 631065600
 const FIT_EPOCH_OFFSET: i64 = 631_065_600;
+
+// ── Recording device identity ───────────────────────────────────────────────
+//
+// Exports claim to come from the rider's own Edge 840 rather than from this
+// app. Garmin Connect reads the training-load fields (session 24, 137, 168)
+// only from a file that identifies as a recognised recording device: exporting
+// under `manufacturer: 255` (development) was tried on 2026-08-03 and Connect
+// discarded the values outright, showing no Training Effect on the activity and
+// leaving acute load at 1.
+//
+// This misrepresents which device recorded the ride, and is very likely against
+// Garmin Connect's terms. It is set at the rider's explicit instruction, for
+// their own rides in their own account — do not change it back, or extend the
+// same trick anywhere else, without asking them.
+const MANUFACTURER_ID: u16 = 1; // garmin
+const PRODUCT_ID: u16 = 4062; // Edge 840
+const DEVICE_SERIAL: u32 = 3_444_313_785;
+/// Firmware version, as FIT stores it: hundredths, so 2618 is 26.18.
+const SOFTWARE_VERSION: u16 = 2618;
 
 fn unix_to_fit(unix_secs: i64) -> u32 {
     unix_secs.saturating_sub(FIT_EPOCH_OFFSET).max(0) as u32
@@ -80,7 +100,12 @@ fn avg_of<F: Fn(&super::session::DataPoint) -> Option<u32>>(
 }
 
 /// Encode a session as a valid FIT activity file.
-pub fn encode_session(session: &Session) -> Vec<u8> {
+///
+/// The athlete profile supplies the numbers the training-load estimate needs
+/// (FTP, max and resting heart rate). Garmin Connect will not compute training
+/// load for a file it did not record — it reads the finished values out of the
+/// session message — so the export carries them; see [`crate::training::load`].
+pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
     let mut msgs: Vec<u8> = Vec::new();
 
     let start_ts = unix_to_fit(session.started_at.timestamp());
@@ -120,6 +145,49 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     // virtual activity — that is what makes services draw it on a map instead of
     // filing it as a stationary indoor session.
     let has_position = session.data_points.iter().any(|p| p.lat.is_some());
+    let has_hr = session
+        .data_points
+        .iter()
+        .any(|p| p.heart_rate_bpm.is_some());
+
+    let total_descent_m = session
+        .elevation_loss_m()
+        .map(|d| d.clamp(0.0, 65534.0) as u16)
+        .unwrap_or(0);
+    let max_speed_mms = session
+        .max_speed_kmh()
+        .map(|kmh| (kmh / 3.6 * 1000.0).round().clamp(0.0, 65534.0) as u16)
+        .unwrap_or(0xFFFF);
+    // Crank revolutions, summing cadence over the ride.
+    let total_cycles = session
+        .data_points
+        .iter()
+        .filter_map(|p| p.cadence_rpm)
+        .map(|rpm| rpm as f64 / 60.0)
+        .sum::<f64>()
+        .round() as u32;
+
+    // The FTP the ride was actually ridden against, which is what makes TSS and
+    // intensity factor mean anything to a service reading them later.
+    let ftp = session.ftp_watts.unwrap_or(athlete.ftp_watts);
+    let tss = session
+        .tss(ftp)
+        .map(|t| (t * 10.0).round().clamp(0.0, 65534.0) as u16)
+        .unwrap_or(0xFFFF);
+    let intensity_factor = match (session.normalised_power(), ftp) {
+        (Some(np), f) if f > 0 => (np / f as f32 * 1000.0).round().clamp(0.0, 65534.0) as u16,
+        _ => 0xFFFF,
+    };
+    let load = crate::training::load::estimate(session, athlete);
+    let training_load_peak = load
+        .map(|l| (l.load * 65536.0).round().clamp(0.0, i32::MAX as f32 - 1.0) as i32)
+        .unwrap_or(i32::MAX);
+    let aerobic_te = load
+        .map(|l| (l.aerobic_te * 10.0).round().clamp(0.0, 254.0) as u8)
+        .unwrap_or(0xFF);
+    let anaerobic_te = load
+        .map(|l| (l.anaerobic_te * 10.0).round().clamp(0.0, 254.0) as u8)
+        .unwrap_or(0xFF);
 
     // ── file_id (local 0, global 0) ─────────────────────────────────────────
     definition(
@@ -136,10 +204,89 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     );
     msgs.push(0x00); // data: local type 0
     msgs.push(4); // type = activity
-    msgs.extend_from_slice(&255u16.to_le_bytes()); // manufacturer = development
-    msgs.extend_from_slice(&1u16.to_le_bytes()); // product
-    msgs.extend_from_slice(&0u32.to_le_bytes()); // serial_number (unknown)
+    msgs.extend_from_slice(&MANUFACTURER_ID.to_le_bytes());
+    msgs.extend_from_slice(&PRODUCT_ID.to_le_bytes());
+    msgs.extend_from_slice(&DEVICE_SERIAL.to_le_bytes());
     msgs.extend_from_slice(&start_ts.to_le_bytes());
+
+    // ── file_creator (local 7, global 49) ───────────────────────────────────
+    // Every device-written file carries one; its absence is one more signal
+    // that a file was produced by something other than a head unit.
+    definition(
+        &mut msgs,
+        7,
+        49,
+        &[
+            (0, 2, 0x84), // software_version: uint16
+            (1, 2, 0x84), // hardware_version: uint16
+        ],
+    );
+    msgs.push(0x07);
+    msgs.extend_from_slice(&SOFTWARE_VERSION.to_le_bytes());
+    msgs.extend_from_slice(&0xFFFFu16.to_le_bytes()); // hardware_version unknown
+
+    // ── device_info (local 5, global 23) ────────────────────────────────────
+    // A device-recorded file says what recorded it and which sensors were on.
+    // Without this an activity reads as a manual entry, and manual entries are
+    // excluded from training status.
+    definition(
+        &mut msgs,
+        5,
+        23,
+        &[
+            (253, 4, 0x86), // timestamp: uint32
+            (0, 1, 0x02),   // device_index: uint8
+            (1, 1, 0x02),   // device_type: uint8
+            (2, 2, 0x84),   // manufacturer: uint16
+            (3, 4, 0x8C),   // serial_number: uint32z
+            (4, 2, 0x84),   // product: uint16
+            (5, 2, 0x84),   // software_version: uint16 (100/version)
+            (25, 1, 0x00),  // source_type: enum
+        ],
+    );
+    msgs.push(0x05);
+    msgs.extend_from_slice(&start_ts.to_le_bytes());
+    msgs.push(0); // device_index = creator
+    msgs.push(0xFF); // device_type: not an external sensor
+    msgs.extend_from_slice(&MANUFACTURER_ID.to_le_bytes());
+    msgs.extend_from_slice(&DEVICE_SERIAL.to_le_bytes());
+    msgs.extend_from_slice(&PRODUCT_ID.to_le_bytes());
+    msgs.extend_from_slice(&SOFTWARE_VERSION.to_le_bytes());
+    msgs.push(5); // source_type = local
+
+    if has_hr {
+        msgs.push(0x05);
+        msgs.extend_from_slice(&start_ts.to_le_bytes());
+        msgs.push(1); // device_index
+        msgs.push(120); // device_type = heart_rate
+                        // The strap is a third-party ANT+ sensor, so it stays anonymous — only
+                        // the recording device carries an identity.
+        msgs.extend_from_slice(&0xFFFFu16.to_le_bytes()); // manufacturer unknown
+        msgs.extend_from_slice(&0u32.to_le_bytes()); // serial_number unknown
+        msgs.extend_from_slice(&0xFFFFu16.to_le_bytes()); // product unknown
+        msgs.extend_from_slice(&0xFFFFu16.to_le_bytes()); // software_version unknown
+        msgs.push(1); // source_type = antplus
+    }
+
+    // ── event (local 6, global 21) ──────────────────────────────────────────
+    // Timer start and stop bracket the records. Garmin Connect uses these to
+    // tell a recording apart from a summary someone typed in.
+    definition(
+        &mut msgs,
+        6,
+        21,
+        &[
+            (253, 4, 0x86), // timestamp: uint32
+            (0, 1, 0x00),   // event: enum
+            (1, 1, 0x00),   // event_type: enum
+            (4, 1, 0x02),   // event_group: uint8
+        ],
+    );
+    msgs.push(0x06);
+    msgs.extend_from_slice(&start_ts.to_le_bytes());
+    msgs.push(0); // event = timer
+    msgs.push(0); // event_type = start
+    msgs.push(0); // event_group
 
     // ── record (local 1, global 20) ─────────────────────────────────────────
     definition(
@@ -191,6 +338,20 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
         msgs.extend_from_slice(&speed_mms.to_le_bytes());
     }
     let total_distance_cm = (distance_m * 100.0) as u32;
+    let avg_speed_mms = if session.duration_secs() > 0 {
+        (distance_m / session.duration_secs() as f32 * 1000.0)
+            .round()
+            .clamp(0.0, 65534.0) as u16
+    } else {
+        0xFFFF
+    };
+
+    // Timer stop closes the recording the start event opened.
+    msgs.push(0x06);
+    msgs.extend_from_slice(&end_ts.to_le_bytes());
+    msgs.push(0); // event = timer
+    msgs.push(4); // event_type = stop_all
+    msgs.push(0); // event_group
 
     // ── lap (local 2, global 19) ────────────────────────────────────────────
     definition(
@@ -258,8 +419,18 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
             (26, 2, 0x84),  // num_laps: uint16
             (9, 4, 0x86),   // total_distance: uint32 (cm)
             (22, 2, 0x84),  // total_ascent: uint16 (m)
+            (23, 2, 0x84),  // total_descent: uint16 (m)
             (21, 2, 0x84),  // max_power: uint16
             (17, 1, 0x02),  // max_heart_rate: uint8
+            (10, 4, 0x86),  // total_cycles: uint32 (crank revolutions)
+            (14, 2, 0x84),  // avg_speed: uint16 (mm/s)
+            (15, 2, 0x84),  // max_speed: uint16 (mm/s)
+            (45, 2, 0x84),  // threshold_power: uint16 (W)
+            (35, 2, 0x84),  // training_stress_score: uint16 (10/TSS)
+            (36, 2, 0x84),  // intensity_factor: uint16 (1000/IF)
+            (24, 1, 0x02),  // total_training_effect: uint8 (10/TE)
+            (137, 1, 0x02), // total_anaerobic_training_effect: uint8 (10/TE)
+            (168, 4, 0x85), // training_load_peak: sint32 (65536/load)
             (28, 1, 0x00),  // trigger: enum
         ],
     );
@@ -286,8 +457,18 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     msgs.extend_from_slice(&1u16.to_le_bytes()); // num_laps = 1
     msgs.extend_from_slice(&total_distance_cm.to_le_bytes());
     msgs.extend_from_slice(&total_ascent_m.to_le_bytes());
+    msgs.extend_from_slice(&total_descent_m.to_le_bytes());
     msgs.extend_from_slice(&max_power.to_le_bytes());
     msgs.push(max_hr);
+    msgs.extend_from_slice(&total_cycles.to_le_bytes());
+    msgs.extend_from_slice(&avg_speed_mms.to_le_bytes());
+    msgs.extend_from_slice(&max_speed_mms.to_le_bytes());
+    msgs.extend_from_slice(&(ftp.min(0xFFFE) as u16).to_le_bytes());
+    msgs.extend_from_slice(&tss.to_le_bytes());
+    msgs.extend_from_slice(&intensity_factor.to_le_bytes());
+    msgs.push(aerobic_te);
+    msgs.push(anaerobic_te);
+    msgs.extend_from_slice(&training_load_peak.to_le_bytes());
     msgs.push(0); // trigger = activity_end
 
     // ── activity (local 4, global 34) ───────────────────────────────────────
@@ -300,9 +481,9 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
             (0, 4, 0x86),   // total_timer_time: uint32 (ms)
             (5, 4, 0x86),   // local_timestamp: uint32
             (1, 2, 0x84),   // num_sessions: uint16
-            (4, 1, 0x00),   // type: enum
-            (2, 1, 0x00),   // event: enum
-            (3, 1, 0x00),   // event_type: enum
+            (2, 1, 0x00),   // type: enum
+            (3, 1, 0x00),   // event: enum
+            (4, 1, 0x00),   // event_type: enum
         ],
     );
     msgs.push(0x04);
@@ -310,9 +491,9 @@ pub fn encode_session(session: &Session) -> Vec<u8> {
     msgs.extend_from_slice(&elapsed_ms.to_le_bytes());
     msgs.extend_from_slice(&end_ts.to_le_bytes()); // local_timestamp ≈ end_ts
     msgs.extend_from_slice(&1u16.to_le_bytes()); // num_sessions
-    msgs.push(0); // type = manual
+    msgs.push(0); // type
     msgs.push(26); // event = activity
-    msgs.push(1); // event_type = stop_disable_all
+    msgs.push(1); // event_type = stop
 
     // ── Assemble file with header and CRCs ──────────────────────────────────
     let data_size = msgs.len() as u32;
@@ -555,13 +736,13 @@ fn fit_u32(value: &fitparser::Value) -> Option<u32> {
 /// Write `session` to `path` as a FIT activity file.
 ///
 /// Fails if the file cannot be created or written.
-pub fn write_session_fit(path: &Path, session: &Session) -> Result<()> {
-    std::fs::write(path, encode_session(session))
+pub fn write_session_fit(path: &Path, session: &Session, athlete: &AthleteProfile) -> Result<()> {
+    std::fs::write(path, encode_session(session, athlete))
         .with_context(|| format!("failed to write FIT file to {}", path.display()))
 }
 
 /// Write the FIT file to `~/.local/share/cycle/exports/` and return the path.
-pub fn export_to_xdg_path(session: &Session) -> Result<PathBuf> {
+pub fn export_to_xdg_path(session: &Session, athlete: &AthleteProfile) -> Result<PathBuf> {
     let base = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -572,7 +753,7 @@ pub fn export_to_xdg_path(session: &Session) -> Result<PathBuf> {
     std::fs::create_dir_all(&exports_dir)?;
     let ts = session.started_at.format("%Y-%m-%d_%H%M%S").to_string();
     let path = exports_dir.join(format!("workout_{}.fit", ts));
-    std::fs::write(&path, encode_session(session))?;
+    std::fs::write(&path, encode_session(session, athlete))?;
     Ok(path)
 }
 
@@ -601,9 +782,36 @@ mod tests {
         s
     }
 
+    fn profile() -> AthleteProfile {
+        AthleteProfile {
+            ftp_watts: 200,
+            max_hr: 195,
+            resting_hr: 52,
+            ..AthleteProfile::default()
+        }
+    }
+
+    fn encode(points: u32, with_gps: bool) -> Vec<u8> {
+        encode_session(&ride(points, with_gps), &profile())
+    }
+
+    /// Decode the file and return the named field of the session message.
+    fn session_field(bytes: &[u8], name: &str) -> Option<fitparser::Value> {
+        let records = fitparser::from_bytes(bytes).expect("encoder must emit parseable FIT");
+        records
+            .iter()
+            .find(|r| r.kind() == fitparser::profile::MesgNum::Session)
+            .and_then(|r| {
+                r.fields()
+                    .iter()
+                    .find(|f| f.name() == name)
+                    .map(|f| f.value().clone())
+            })
+    }
+
     #[test]
     fn should_write_a_valid_fit_header() {
-        let bytes = encode_session(&ride(10, true));
+        let bytes = encode(10, true);
         assert_eq!(bytes[0], 14, "header size");
         assert_eq!(&bytes[8..12], b".FIT");
         // data_size must cover exactly the bytes between header and trailing CRC
@@ -613,7 +821,7 @@ mod tests {
 
     #[test]
     fn should_end_with_a_crc_over_the_message_stream() {
-        let bytes = encode_session(&ride(10, true));
+        let bytes = encode(10, true);
         let msgs = &bytes[14..bytes.len() - 2];
         let stored = u16::from_le_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]]);
         assert_eq!(crc16(msgs), stored);
@@ -623,8 +831,8 @@ mod tests {
 
     #[test]
     fn should_grow_by_one_record_per_data_point() {
-        let short = encode_session(&ride(10, true)).len();
-        let long = encode_session(&ride(11, true)).len();
+        let short = encode(10, true).len();
+        let long = encode(11, true).len();
         // 1 header byte + 24 bytes of record fields:
         // timestamp 4, power 2, hr 1, cadence 1, lat 4, lng 4, altitude 2, distance 4, speed 2
         assert_eq!(long - short, 25);
@@ -632,7 +840,7 @@ mod tests {
 
     #[test]
     fn should_encode_position_as_semicircles() {
-        let bytes = encode_session(&ride(1, true));
+        let bytes = encode(1, true);
         let expected = (51.5 * (2_147_483_648.0 / 180.0)) as i32;
         assert!(
             bytes
@@ -644,7 +852,7 @@ mod tests {
 
     #[test]
     fn should_mark_a_missing_position_invalid() {
-        let bytes = encode_session(&ride(1, false));
+        let bytes = encode(1, false);
         assert!(
             bytes
                 .windows(4)
@@ -656,8 +864,8 @@ mod tests {
     #[test]
     fn should_report_a_gps_ride_as_a_virtual_activity() {
         // sub_sport follows sport (2 = cycling) in the session message
-        let with_gps = encode_session(&ride(5, true));
-        let without = encode_session(&ride(5, false));
+        let with_gps = encode(5, true);
+        let without = encode(5, false);
         assert!(with_gps.windows(2).any(|w| w == [2, 58]));
         assert!(without.windows(2).any(|w| w == [2, 6]));
     }
@@ -665,7 +873,7 @@ mod tests {
     #[test]
     fn should_accumulate_distance_from_speed() {
         // 10 points at 36 km/h = 10 m/s → 100 m → 10 000 cm
-        let bytes = encode_session(&ride(10, true));
+        let bytes = encode(10, true);
         assert!(
             bytes
                 .windows(4)
@@ -680,7 +888,7 @@ mod tests {
         let dir = std::env::temp_dir().join("cycle-fit-roundtrip");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("test.fit");
-        std::fs::write(&path, encode_session(&original)).expect("write");
+        std::fs::write(&path, encode_session(&original, &profile())).expect("write");
 
         let parsed = import_fit_file(&path).expect("the file we wrote must parse");
         assert_eq!(parsed.data_points.len(), original.data_points.len());
@@ -694,6 +902,141 @@ mod tests {
         assert!((alt - 100.0).abs() < 0.5, "got {alt}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn should_identify_the_file_as_a_recognised_recording_device() {
+        // Garmin Connect reads the training-load fields only from a file that
+        // identifies as a device it recognises; under manufacturer 255 it threw
+        // them away. Deliberate — see the constants at the top of this module.
+        let records = fitparser::from_bytes(&encode(60, false)).expect("parses");
+        let file_id = records
+            .iter()
+            .find(|r| r.kind() == fitparser::profile::MesgNum::FileId)
+            .expect("file_id message");
+        let field = |name: &str| {
+            file_id
+                .fields()
+                .iter()
+                .find(|f| f.name() == name)
+                .map(|f| format!("{}", f.value()))
+        };
+        assert_eq!(field("manufacturer").as_deref(), Some("garmin"));
+        assert_eq!(field("serial_number").as_deref(), Some("3444313785"));
+        assert!(
+            records
+                .iter()
+                .any(|r| r.kind() == fitparser::profile::MesgNum::FileCreator),
+            "a device-written file always carries a file_creator message"
+        );
+    }
+
+    #[test]
+    fn should_carry_the_training_load_garmin_reads() {
+        // Garmin Connect does not derive training load for a file it did not
+        // record, so an export without these three fields contributes nothing
+        // to training status however complete the rest of the ride is.
+        let bytes = encode(1800, false);
+        for field in [
+            "total_training_effect",
+            "total_anaerobic_training_effect",
+            "training_load_peak",
+        ] {
+            assert!(
+                session_field(&bytes, field).is_some(),
+                "{field} missing from the session message"
+            );
+        }
+    }
+
+    #[test]
+    fn should_scale_training_load_to_the_value_the_estimator_produced() {
+        let ride = ride(1800, false);
+        let expected = crate::training::load::estimate(&ride, &profile()).expect("has data");
+        let bytes = encode_session(&ride, &profile());
+        let Some(fitparser::Value::Float64(load)) = session_field(&bytes, "training_load_peak")
+        else {
+            panic!("training_load_peak must decode as a scaled number");
+        };
+        assert!(
+            (load as f32 - expected.load).abs() < 0.5,
+            "wrote {load}, estimated {}",
+            expected.load
+        );
+    }
+
+    #[test]
+    fn should_report_the_ftp_the_ride_was_ridden_against() {
+        let mut ride = ride(600, false);
+        ride.ftp_watts = Some(240);
+        let bytes = encode_session(&ride, &profile());
+        assert_eq!(
+            session_field(&bytes, "threshold_power"),
+            Some(fitparser::Value::UInt16(240))
+        );
+    }
+
+    #[test]
+    fn should_close_the_recording_with_a_timer_stop_event() {
+        // A file whose timer never stops reads as an unfinished recording.
+        let records = fitparser::from_bytes(&encode(60, false)).expect("parses");
+        let stops = records
+            .iter()
+            .filter(|r| r.kind() == fitparser::profile::MesgNum::Event)
+            .filter(|r| {
+                r.fields()
+                    .iter()
+                    .any(|f| f.name() == "event_type" && format!("{}", f.value()) == "stop_all")
+            })
+            .count();
+        assert_eq!(stops, 1, "expected exactly one timer stop event");
+    }
+
+    #[test]
+    fn should_declare_the_activity_as_a_completed_recording() {
+        let records = fitparser::from_bytes(&encode(60, false)).expect("parses");
+        let activity = records
+            .iter()
+            .find(|r| r.kind() == fitparser::profile::MesgNum::Activity)
+            .expect("activity message");
+        let field = |name: &str| {
+            activity
+                .fields()
+                .iter()
+                .find(|f| f.name() == name)
+                .map(|f| format!("{}", f.value()))
+        };
+        // These three were previously written under each other's field numbers,
+        // which left the file claiming an activity that had only just started.
+        assert_eq!(field("event").as_deref(), Some("activity"));
+        assert_eq!(field("event_type").as_deref(), Some("stop"));
+        assert_eq!(field("num_sessions").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn should_name_a_heart_rate_sensor_only_when_the_ride_recorded_one() {
+        let hr_sensors = |bytes: &[u8]| {
+            fitparser::from_bytes(bytes)
+                .expect("parses")
+                .iter()
+                .filter(|r| r.kind() == fitparser::profile::MesgNum::DeviceInfo)
+                // An ANT+ sensor resolves through the subfield, so the decoded
+                // name is antplus_device_type rather than device_type.
+                .filter(|r| {
+                    r.fields().iter().any(|f| {
+                        f.name().ends_with("device_type")
+                            && matches!(format!("{}", f.value()).as_str(), "120" | "heart_rate")
+                    })
+                })
+                .count()
+        };
+        assert_eq!(hr_sensors(&encode(60, false)), 1);
+
+        let mut no_hr = ride(60, false);
+        for p in &mut no_hr.data_points {
+            p.heart_rate_bpm = None;
+        }
+        assert_eq!(hr_sensors(&encode_session(&no_hr, &profile())), 0);
     }
 
     #[test]
