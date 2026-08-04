@@ -115,18 +115,8 @@ impl CycleGtkWindow {
             self.window.set_default_size(w, h);
         }
 
-        let pool_close = pool.clone();
-        let rt_close = rt_handle.clone();
-        self.window.connect_close_request(move |win| {
-            let width = win.width();
-            let height = win.height();
-            let p = pool_close.clone();
-            rt_close.spawn(async move {
-                let _ = db::set_setting(&p, "window.width", &width.to_string()).await;
-                let _ = db::set_setting(&p, "window.height", &height.to_string()).await;
-            });
-            glib::Propagation::Proceed
-        });
+        // The close handler is registered further down, once the flags that tell
+        // us whether a ride is in progress exist.
 
         let stack = adw::ViewStack::new();
 
@@ -829,6 +819,56 @@ impl CycleGtkWindow {
             );
         });
         app.add_action(&prefs_action);
+
+        // ── Window close ──────────────────────────────────────────────────────
+        // A ride exists only in memory until it ends: nothing reaches the database
+        // until `finish_session` runs. Closing the window mid-ride would therefore
+        // discard it with no warning, so confirm first. "End Workout" / "End Ride"
+        // stay the paths that save — this dialog only makes the loss deliberate.
+        //
+        // Structured workouts and route rides track their in-progress state
+        // separately, so both flags are consulted.
+        let pool_close = pool.clone();
+        let rt_close = rt_handle.clone();
+        let workout_active_close = Rc::clone(&workout_active);
+        let route_active_close = Rc::clone(&route_timer_alive);
+        self.window.connect_close_request(move |win| {
+            let width = win.width();
+            let height = win.height();
+            let p = pool_close.clone();
+            rt_close.spawn(async move {
+                let _ = db::set_setting(&p, "window.width", &width.to_string()).await;
+                let _ = db::set_setting(&p, "window.height", &height.to_string()).await;
+            });
+
+            if !workout_active_close.get() && !route_active_close.get() {
+                return glib::Propagation::Proceed;
+            }
+
+            let dialog = adw::AlertDialog::builder()
+                .heading("Discard the ride in progress?")
+                .body(
+                    "This ride has not been saved yet — closing Cycle now loses it.\n\n\
+                     To keep it, cancel and end the ride from the ride screen.",
+                )
+                .build();
+            dialog.add_response("cancel", "_Keep Riding");
+            dialog.add_response("discard", "_Discard Ride");
+            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+
+            let win_resp = win.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response == "discard" {
+                    // destroy() rather than close(): close() re-emits close-request
+                    // and would land back in this handler.
+                    win_resp.destroy();
+                }
+            });
+            dialog.present(Some(win));
+            glib::Propagation::Stop
+        });
 
         // ── GLib event polling loop ───────────────────────────────────────────
         let player_for_loop = Rc::clone(&player_rc);
