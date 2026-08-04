@@ -223,9 +223,19 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         // intervals_activities already contains the same workout — counting both would
         // inflate CTL/ATL by double-counting the same training stress.
         "ALTER TABLE sessions ADD COLUMN uploaded_to_icu INTEGER NOT NULL DEFAULT 0",
+        // Ride metrics derived from data_points_json, stored so the list views
+        // never have to read the blob back. Normalised power plus duration is
+        // enough to recover TSS and IF against any FTP in constant time, so the
+        // FTP a ride is scored at stays a read-time decision.
+        "ALTER TABLE sessions ADD COLUMN duration_secs INTEGER",
+        "ALTER TABLE sessions ADD COLUMN normalised_power REAL",
+        "ALTER TABLE sessions ADD COLUMN average_power REAL",
+        "ALTER TABLE sessions ADD COLUMN kilojoules REAL",
     ] {
         sqlx::query(col).execute(pool).await.ok();
     }
+
+    backfill_session_metrics(pool).await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS activity_streams (
@@ -436,6 +446,170 @@ pub async fn seed_workouts(pool: &SqlitePool) -> Result<()> {
 // ── Sessions ─────────────────────────────────────────────────────────────────
 
 /// Persist a completed session and return its new DB id.
+/// A ride reduced to the figures the list views actually need, read straight
+/// from columns without touching `data_points_json`.
+///
+/// A recorded second costs roughly 140–210 bytes of JSON, so an hour of riding
+/// is a half-megabyte blob. Deserialising every ride ever recorded on every page
+/// navigation is what this type exists to avoid; reach for
+/// [`load_session_records`] only when the samples themselves are needed.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    /// Identifies the ride so callers can go on to load or act on it.
+    #[allow(dead_code)]
+    pub id: i64,
+    pub started_at: DateTime<Utc>,
+    pub duration_secs: u64,
+    pub normalised_power: Option<f32>,
+    pub average_power: Option<f32>,
+    pub kilojoules: f32,
+    /// FTP at ride time; `None` for rides recorded before it was stamped.
+    pub ftp_watts: Option<u32>,
+    pub rpe: Option<u8>,
+    /// Name to file the ride under: its own title, else the workout's.
+    pub workout_name: Option<String>,
+    pub uploaded_to_icu: bool,
+    pub icu_id: Option<String>,
+}
+
+impl SessionSummary {
+    /// Training Stress Score, scored against the FTP the ride was ridden at.
+    ///
+    /// `fallback_ftp` is used only when the ride carries no stamped FTP, matching
+    /// [`Session::tss`].
+    pub fn tss(&self, fallback_ftp: u32) -> Option<f32> {
+        let ftp = self.ftp_watts.unwrap_or(fallback_ftp);
+        if ftp == 0 {
+            return None;
+        }
+        let np = self.normalised_power?;
+        let intensity = np / ftp as f32;
+        let hours = self.duration_secs as f32 / 3600.0;
+        Some(intensity.powi(2) * hours * 100.0)
+    }
+
+    /// Is this ride already represented in `intervals_activities`?
+    ///
+    /// True whether the app uploaded it directly or it came back from
+    /// Intervals.icu after a round trip through Garmin or Strava and was matched
+    /// to it. Load calculations must skip such rides, since the same training
+    /// stress arrives again through the Intervals.icu figures.
+    pub fn counted_via_intervals(&self) -> bool {
+        self.uploaded_to_icu || self.icu_id.is_some()
+    }
+}
+
+impl SessionRecord {
+    /// Reduce a fully-loaded ride to its summary, so code that has records can
+    /// share the paths written against [`SessionSummary`].
+    pub fn summary(&self) -> SessionSummary {
+        SessionSummary {
+            id: self.session.id,
+            started_at: self.session.started_at,
+            duration_secs: self.session.duration_secs(),
+            normalised_power: self.session.normalised_power(),
+            average_power: self.session.average_power(),
+            kilojoules: self.session.kilojoules(),
+            ftp_watts: self.session.ftp_watts,
+            rpe: self.session.rpe,
+            workout_name: self.workout_name.clone(),
+            uploaded_to_icu: self.uploaded_to_icu,
+            icu_id: self.session.icu_id.clone(),
+        }
+    }
+}
+
+/// Every completed ride, as summaries. Does not read `data_points_json`.
+pub async fn load_session_summaries(pool: &SqlitePool) -> Result<Vec<SessionSummary>> {
+    let rows = sqlx::query(
+        "SELECT s.id, s.started_at, s.duration_secs, s.normalised_power,
+                s.average_power, s.kilojoules, s.ftp_watts, s.rpe, s.icu_id,
+                s.uploaded_to_icu, COALESCE(s.title, w.name) AS workout_name
+         FROM sessions s
+         LEFT JOIN workouts w ON s.workout_id = w.id
+         WHERE s.ended_at IS NOT NULL
+         ORDER BY s.started_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| SessionSummary {
+            id: r.get("id"),
+            started_at: DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            duration_secs: r.get::<Option<i64>, _>("duration_secs").unwrap_or(0).max(0) as u64,
+            normalised_power: r
+                .get::<Option<f64>, _>("normalised_power")
+                .map(|v| v as f32),
+            average_power: r.get::<Option<f64>, _>("average_power").map(|v| v as f32),
+            kilojoules: r.get::<Option<f64>, _>("kilojoules").unwrap_or(0.0) as f32,
+            ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
+            rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
+            workout_name: r.get("workout_name"),
+            uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
+            icu_id: r.get("icu_id"),
+        })
+        .collect())
+}
+
+/// Fill in the metric columns for rides written before they existed. Reads the
+/// blobs once, at migration, so no later read has to.
+async fn backfill_session_metrics(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, started_at, ended_at, data_points_json
+           FROM sessions
+          WHERE duration_secs IS NULL AND ended_at IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!("Backfilling ride metrics for {} sessions", rows.len());
+    for r in rows {
+        let id: i64 = r.get("id");
+        let data_points: Vec<DataPoint> = match serde_json::from_str(r.get("data_points_json")) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("session {id}: cannot backfill metrics ({e})");
+                continue;
+            }
+        };
+        let mut session = Session::new(None);
+        session.started_at = DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        session.ended_at = r
+            .get::<Option<&str>, _>("ended_at")
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        session.data_points = data_points;
+        write_session_metrics(pool, id, &session).await?;
+    }
+    Ok(())
+}
+
+/// Recompute and store the metric columns for one ride.
+async fn write_session_metrics(pool: &SqlitePool, id: i64, session: &Session) -> Result<()> {
+    sqlx::query(
+        "UPDATE sessions
+            SET duration_secs = ?, normalised_power = ?, average_power = ?, kilojoules = ?
+          WHERE id = ?",
+    )
+    .bind(session.duration_secs() as i64)
+    .bind(session.normalised_power().map(|v| v as f64))
+    .bind(session.average_power().map(|v| v as f64))
+    .bind(session.kilojoules() as f64)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn save_session(pool: &SqlitePool, session: &Session) -> Result<i64> {
     upsert_session(pool, None, session).await
 }
@@ -451,7 +625,7 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
     let started_at = session.started_at.to_rfc3339();
     let ended_at = session.ended_at.map(|t| t.to_rfc3339());
 
-    match id {
+    let row_id = match id {
         Some(existing) => {
             sqlx::query(
                 "UPDATE sessions
@@ -469,7 +643,7 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             .bind(existing)
             .execute(pool)
             .await?;
-            Ok(existing)
+            existing
         }
         None => {
             let result = sqlx::query(
@@ -486,9 +660,14 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             .bind(session.icu_id.as_deref())
             .execute(pool)
             .await?;
-            Ok(result.last_insert_rowid())
+            result.last_insert_rowid()
         }
-    }
+    };
+
+    // Derive the list-view metrics once, here, so no read path has to reopen the
+    // blob to get them back.
+    write_session_metrics(pool, row_id, session).await?;
+    Ok(row_id)
 }
 
 /// Write a mid-ride checkpoint, inserting the row on the first call and updating
@@ -1252,18 +1431,6 @@ pub struct SessionRecord {
     /// Such sessions are excluded from local CTL calculation; they are already
     /// counted via `intervals_activities`.
     pub uploaded_to_icu: bool,
-}
-
-impl SessionRecord {
-    /// Is this ride already represented in `intervals_activities`?
-    ///
-    /// True whether the app uploaded it directly or it came back from
-    /// Intervals.icu after a round trip through Garmin or Strava and was matched
-    /// to it. Load calculations must skip such rides, since the same training
-    /// stress arrives again through the Intervals.icu figures.
-    pub fn counted_via_intervals(&self) -> bool {
-        self.uploaded_to_icu || self.session.icu_id.is_some()
-    }
 }
 
 /// Returns true if any session already has the given `started_at` timestamp — used
@@ -2418,6 +2585,83 @@ mod tests {
         assert_eq!(records[0].session.data_points.len(), 45);
     }
 
+    // ── Stored ride metrics ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_summary_reports_the_same_tss_as_the_full_ride() {
+        // The whole point of the stored columns: reading a ride without its
+        // samples must not change any number the rider sees.
+        let pool = test_pool().await;
+        let mut session = riding_session(3600);
+        session.started_at = Utc::now() - chrono::Duration::seconds(3600);
+        session.ended_at = Some(Utc::now());
+        save_session(&pool, &session).await.unwrap();
+
+        let full = load_session_records(&pool).await.unwrap();
+        let summaries = load_session_summaries(&pool).await.unwrap();
+
+        let from_blob = full[0].session.tss(250).unwrap();
+        let from_columns = summaries[0].tss(250).unwrap();
+        assert!(
+            (from_blob - from_columns).abs() < 0.5,
+            "blob said {from_blob}, columns said {from_columns}"
+        );
+        assert_eq!(summaries[0].duration_secs, full[0].session.duration_secs());
+    }
+
+    #[tokio::test]
+    async fn a_summary_scores_against_the_stamped_ftp() {
+        let pool = test_pool().await;
+        let mut session = riding_session(3600);
+        session.started_at = Utc::now() - chrono::Duration::seconds(3600);
+        session.ended_at = Some(Utc::now());
+        session.ftp_watts = Some(200);
+        save_session(&pool, &session).await.unwrap();
+
+        let summaries = load_session_summaries(&pool).await.unwrap();
+        // Ridden at 200 W FTP; the caller's 400 must not override the stamp.
+        let expected = session.tss(400).unwrap();
+        let actual = summaries[0].tss(400).unwrap();
+        assert!((expected - actual).abs() < 0.5, "{expected} vs {actual}");
+    }
+
+    #[tokio::test]
+    async fn metrics_are_backfilled_for_rides_written_before_the_columns_existed() {
+        let pool = test_pool().await;
+        let mut session = riding_session(3600);
+        session.started_at = Utc::now() - chrono::Duration::seconds(3600);
+        session.ended_at = Some(Utc::now());
+        let id = save_session(&pool, &session).await.unwrap();
+
+        // Simulate a row from before the migration.
+        sqlx::query(
+            "UPDATE sessions SET duration_secs = NULL, normalised_power = NULL,
+                                 average_power = NULL, kilojoules = NULL WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(load_session_summaries(&pool).await.unwrap()[0]
+            .normalised_power
+            .is_none());
+
+        backfill_session_metrics(&pool).await.unwrap();
+
+        let summaries = load_session_summaries(&pool).await.unwrap();
+        assert!(summaries[0].normalised_power.is_some());
+        assert_eq!(summaries[0].duration_secs, 3600);
+    }
+
+    #[tokio::test]
+    async fn summaries_leave_out_a_ride_still_in_progress() {
+        let pool = test_pool().await;
+        checkpoint_session(&pool, None, &riding_session(60))
+            .await
+            .unwrap();
+        assert!(load_session_summaries(&pool).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn session_title_survives_a_round_trip_and_names_the_activity() {
         let pool = test_pool().await;
@@ -2544,7 +2788,7 @@ mod tests {
         // The calendar hides the Intervals.icu copy, and load metrics skip the
         // local ride so the same stress is not counted twice.
         assert!(linked_icu_ids(&pool).await.unwrap().contains("icu-1"));
-        assert!(records[0].counted_via_intervals());
+        assert!(records[0].summary().counted_via_intervals());
     }
 
     #[tokio::test]
@@ -2616,7 +2860,7 @@ mod tests {
         assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 0);
         let records = load_session_records(&pool).await.unwrap();
         assert_eq!(records[0].session.icu_id, None);
-        assert!(!records[0].counted_via_intervals());
+        assert!(!records[0].summary().counted_via_intervals());
     }
 
     #[tokio::test]
@@ -2699,7 +2943,7 @@ mod tests {
         mark_session_uploaded_to_icu(&pool, id).await.unwrap();
 
         let records = load_session_records(&pool).await.unwrap();
-        assert!(records[0].counted_via_intervals());
+        assert!(records[0].summary().counted_via_intervals());
         assert_eq!(records[0].session.icu_id, None);
     }
 

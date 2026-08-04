@@ -93,21 +93,21 @@ fn compute_hr_zones(records: &[db::SessionRecord], max_hr: u32) -> [u32; 5] {
 /// `intervals_pairs` contains (date, tss) from Intervals.icu activities and is merged
 /// with the in-app session records before computing the EMAs.
 pub(crate) fn compute_load_metrics(
-    records: &[db::SessionRecord],
+    rides: &[db::SessionSummary],
     intervals_pairs: &[(NaiveDate, f32)],
     ftp: u32,
     today: NaiveDate,
 ) -> (f64, f64, f64) {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for record in records {
+    for ride in rides {
         // Skip rides Intervals.icu already accounts for — their TSS arrives
         // via intervals_pairs, so counting them here too would inflate CTL/ATL
         // by double-counting the same workout.
-        if record.counted_via_intervals() {
+        if ride.counted_via_intervals() {
             continue;
         }
-        let date = record.session.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = record.session.tss(ftp) {
+        let date = ride.started_at.with_timezone(&Local).date_naive();
+        if let Some(tss) = ride.tss(ftp) {
             *daily_tss.entry(date).or_insert(0.0) += tss;
         }
     }
@@ -148,18 +148,18 @@ pub(crate) fn compute_load_metrics(
 /// Returns `(date, ctl, atl, tsb)` for each day from 90 days ago up to `today`.
 /// EMA is warmed up from `earliest` available data even if that's further back.
 fn compute_pmc_series(
-    records: &[db::SessionRecord],
+    rides: &[db::SessionSummary],
     intervals_pairs: &[(NaiveDate, f32)],
     ftp: u32,
     today: NaiveDate,
 ) -> Vec<PmcPoint> {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for record in records {
-        if record.counted_via_intervals() {
+    for ride in rides {
+        if ride.counted_via_intervals() {
             continue;
         }
-        let date = record.session.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = record.session.tss(ftp) {
+        let date = ride.started_at.with_timezone(&Local).date_naive();
+        if let Some(tss) = ride.tss(ftp) {
             *daily_tss.entry(date).or_insert(0.0) += tss;
         }
     }
@@ -1463,13 +1463,19 @@ impl FitnessPage {
                         let ftp_val = ftp.get();
                         let today = Local::now().date_naive();
 
+                        // This page needs the samples themselves for the zone
+                        // distribution and the power curve, so it loads full
+                        // records and reduces them here rather than querying twice.
+                        let rides: Vec<db::SessionSummary> =
+                            records.iter().map(|r| r.summary()).collect();
+
                         let (ctl, atl, _) =
-                            compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
+                            compute_load_metrics(&rides, &intervals_pairs, ftp_val, today);
                         let tsb = ctl - atl;
 
                         // PMC 90-day series
                         let pmc_series =
-                            compute_pmc_series(&records, &intervals_pairs, ftp_val, today);
+                            compute_pmc_series(&rides, &intervals_pairs, ftp_val, today);
                         let has_pmc = pmc_series.len() >= 2;
                         pmc_section_r.set_visible(has_pmc);
                         if has_pmc {
@@ -1799,7 +1805,9 @@ impl FitnessPage {
                 // All DB reads + prompt assembly + the network call run off the main
                 // thread, so the click never blocks the GLib loop (CLAUDE.md §2.3).
                 rt_a.spawn(async move {
-                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let records = db::load_session_summaries(&pool_t)
+                        .await
+                        .unwrap_or_default();
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
                         .await
                         .unwrap_or_default();
@@ -1993,11 +2001,13 @@ impl FitnessPage {
                         .unwrap_or(None)
                         .unwrap_or_default();
 
+                    let all_rides: Vec<db::SessionSummary> =
+                        all_records.iter().map(|r| r.summary()).collect();
                     let (ctl_end, atl_end, _) =
-                        compute_load_metrics(&all_records, &intervals_all, ftp_val, today);
+                        compute_load_metrics(&all_rides, &intervals_all, ftp_val, today);
                     let ctl_start_date = today - Duration::days(period_days);
                     let (ctl_start, _, _) =
-                        compute_load_metrics(&all_records, &intervals_all, ftp_val, ctl_start_date);
+                        compute_load_metrics(&all_rides, &intervals_all, ftp_val, ctl_start_date);
                     let tsb_end = ctl_end - atl_end;
 
                     let mut sessions: Vec<RetroSession> = Vec::new();

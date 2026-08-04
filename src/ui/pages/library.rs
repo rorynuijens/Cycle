@@ -1050,7 +1050,7 @@ impl LibraryPage {
             crate::ui::spawn_to_main(
                 &rt_handle,
                 async move {
-                    let records = db::load_session_records(&pool_load)
+                    let records = db::load_session_summaries(&pool_load)
                         .await
                         .unwrap_or_default();
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)

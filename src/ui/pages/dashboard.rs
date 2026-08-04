@@ -167,7 +167,7 @@ impl DashboardPage {
                         let today_entry = db::load_today_entry(&pool_load, &today_str)
                             .await
                             .unwrap_or(None);
-                        let records = db::load_session_records(&pool_load)
+                        let records = db::load_session_summaries(&pool_load)
                             .await
                             .unwrap_or_default();
                         let ai_workout_name =
@@ -660,7 +660,9 @@ impl DashboardPage {
                     // Whether a workout is actually on today's calendar — the
                     // decision copy must not say "as planned" when nothing is.
                     let has_planned = today_entry.is_some();
-                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let records = db::load_session_summaries(&pool_t)
+                        .await
+                        .unwrap_or_default();
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
                         .await
                         .unwrap_or_default();
@@ -1234,7 +1236,7 @@ impl DashboardPage {
         ctl_7d: f64,
         atl_7d: f64,
         insight: &str,
-        record: Option<&db::SessionRecord>,
+        record: Option<&db::SessionSummary>,
         ftp: u32,
         on_view_fitness: Rc<dyn Fn()>,
         on_open_calendar: Rc<dyn Fn()>,
@@ -1331,18 +1333,17 @@ impl DashboardPage {
                 .build(),
             // Workout names are user/AI-supplied — markup disabled below.
             Some(r) => {
-                let local_dt = r.session.started_at.with_timezone(&Local);
+                let local_dt = r.started_at.with_timezone(&Local);
                 let title = r.workout_name.as_deref().unwrap_or("Free Ride");
-                let mins = r.session.duration_secs() as u32 / 60;
-                let power_str = match r.session.normalised_power() {
+                let mins = r.duration_secs as u32 / 60;
+                let power_str = match r.normalised_power {
                     Some(np) => format!("{} W NP", np as u32),
-                    None => match r.session.average_power() {
+                    None => match r.average_power {
                         Some(avg) => format!("{} W avg", avg as u32),
                         None => String::new(),
                     },
                 };
                 let tss_str = r
-                    .session
                     .tss(ftp)
                     .map(|t| format!(" · TSS {:.0}", t))
                     .unwrap_or_default();
@@ -1409,18 +1410,18 @@ impl DashboardPage {
 }
 
 fn compute_ctl_atl(
-    records: &[db::SessionRecord],
+    rides: &[db::SessionSummary],
     intervals_pairs: &[(NaiveDate, f32)],
     ftp: u32,
     today: NaiveDate,
 ) -> (f64, f64) {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for r in records {
+    for r in rides {
         if r.counted_via_intervals() {
             continue;
         }
-        let date = r.session.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = r.session.tss(ftp) {
+        let date = r.started_at.with_timezone(&Local).date_naive();
+        if let Some(tss) = r.tss(ftp) {
             *daily_tss.entry(date).or_insert(0.0) += tss;
         }
     }

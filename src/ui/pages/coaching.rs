@@ -620,7 +620,9 @@ impl CoachingPage {
                         .await
                         .unwrap_or(None)
                         .unwrap_or_default();
-                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let records = db::load_session_summaries(&pool_t)
+                        .await
+                        .unwrap_or_default();
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
                         .await
                         .unwrap_or_default();
@@ -643,8 +645,7 @@ impl CoachingPage {
                     let mut recent: Vec<RecentSession> = records
                         .iter()
                         .filter(|r| {
-                            r.session.started_at.with_timezone(&Local).date_naive()
-                                >= four_weeks_ago
+                            r.started_at.with_timezone(&Local).date_naive() >= four_weeks_ago
                         })
                         .map(|r| build_recent_session(r, ftp))
                         .collect();
@@ -1004,7 +1005,9 @@ impl CoachingPage {
                         .unwrap_or(None)
                         .unwrap_or_default();
                     let goals = db::load_goals(&pool_t).await.unwrap_or_default();
-                    let records = db::load_session_records(&pool_t).await.unwrap_or_default();
+                    let records = db::load_session_summaries(&pool_t)
+                        .await
+                        .unwrap_or_default();
                     let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
                         .await
                         .unwrap_or_default();
@@ -1224,18 +1227,18 @@ fn update_thumb(holder: &gtk::Box, workout: Option<&Workout>, athlete: &AthleteP
 }
 
 fn compute_ctl_atl(
-    records: &[db::SessionRecord],
+    rides: &[db::SessionSummary],
     intervals_pairs: &[(NaiveDate, f32)],
     ftp: u32,
     today: NaiveDate,
 ) -> (f64, f64) {
     let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for r in records {
+    for r in rides {
         if r.counted_via_intervals() {
             continue;
         }
-        let date = r.session.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = r.session.tss(ftp) {
+        let date = r.started_at.with_timezone(&Local).date_naive();
+        if let Some(tss) = r.tss(ftp) {
             *daily_tss.entry(date).or_insert(0.0) += tss;
         }
     }
@@ -1265,23 +1268,11 @@ fn compute_ctl_atl(
     (ctl, atl)
 }
 
-fn build_recent_session(r: &db::SessionRecord, ftp: u32) -> RecentSession {
-    let dur_secs = r.session.duration_secs();
-    let power_readings: Vec<u32> = r
-        .session
-        .data_points
-        .iter()
-        .filter_map(|dp| dp.power_watts)
-        .collect();
-    let avg_power = if power_readings.is_empty() {
-        None
-    } else {
-        let sum: u64 = power_readings.iter().map(|&p| p as u64).sum();
-        Some((sum / power_readings.len() as u64) as u32)
-    };
+fn build_recent_session(r: &db::SessionSummary, ftp: u32) -> RecentSession {
+    let dur_secs = r.duration_secs;
+    let avg_power = r.average_power.map(|w| w as u32);
     RecentSession {
         date: r
-            .session
             .started_at
             .with_timezone(&Local)
             .format("%Y-%m-%d")
@@ -1290,9 +1281,9 @@ fn build_recent_session(r: &db::SessionRecord, ftp: u32) -> RecentSession {
         sport_type: "Cycling".to_string(),
         duration_mins: (dur_secs / 60) as u32,
         avg_power,
-        tss: r.session.tss(ftp),
-        kj: r.session.kilojoules(),
-        rpe: r.session.rpe,
+        tss: r.tss(ftp),
+        kj: r.kilojoules,
+        rpe: r.rpe,
     }
 }
 
