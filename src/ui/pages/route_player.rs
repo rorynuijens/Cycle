@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::data::athlete::AthleteProfile;
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
@@ -521,7 +522,7 @@ impl RoutePlayerPage {
     pub fn start_timer(
         page: Rc<Self>,
         route: Route,
-        mass_kg: f32,
+        athlete: &AthleteProfile,
         cmd_tx: async_channel::Sender<DeviceCommand>,
         sim_capable: Rc<Cell<bool>>,
         sim_difficulty: Rc<Cell<f32>>,
@@ -536,10 +537,19 @@ impl RoutePlayerPage {
         // position and the trainer commands all wait for it.
         let started = Rc::new(Cell::new(false));
 
+        // Read once at ride start rather than at page construction, so a profile
+        // edit made between launching the app and starting the ride applies.
+        let mass_kg = athlete.weight_kg;
+        page.zone_meter.set_ftp(athlete.ftp_watts);
+
         // The route names the activity, so it appears in the calendar and history
         // as the ride it was rather than as an unstructured session.
         let mut new_session = Session::new(None);
         new_session.title = Some(route.name.clone());
+        // Stamp the executing FTP exactly as WorkoutEngine::new does. Without it a
+        // route ride scores against whatever the profile says later, and there is
+        // no way to tell an unstamped route ride from a pre-phase-1 one.
+        new_session.ftp_watts = Some(athlete.ftp_watts);
         let engine = Rc::new(RefCell::new(RouteEngine::new(route, 6.944, mass_kg)));
         let session = Rc::new(RefCell::new(new_session));
         let paused = Rc::new(Cell::new(false));

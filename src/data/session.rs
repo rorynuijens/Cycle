@@ -186,8 +186,22 @@ impl Session {
             })
     }
 
+    /// The FTP a ride should be scored against: the one stamped at ride time,
+    /// falling back to `fallback_ftp` for rides recorded before the stamp
+    /// existed (see docs/ftp-detection.md §2).
+    ///
+    /// Scoring a past ride against the *current* profile FTP would make its TSS
+    /// and zones shift retroactively every time the rider's FTP changes, which
+    /// also corrupts the detector's 28-day evidence window.
+    fn scoring_ftp(&self, fallback_ftp: u32) -> u32 {
+        self.ftp_watts.unwrap_or(fallback_ftp)
+    }
+
     /// Seconds spent in each Coggan power zone Z1–Z7, indexed Z1 = 0.
-    pub fn time_in_zones(&self, ftp: u32) -> [u32; 7] {
+    ///
+    /// `fallback_ftp` is used only when the session carries no stamped FTP.
+    pub fn time_in_zones(&self, fallback_ftp: u32) -> [u32; 7] {
+        let ftp = self.scoring_ftp(fallback_ftp);
         let mut zones = [0u32; 7];
         for p in &self.data_points {
             if let Some(w) = p.power_watts {
@@ -235,8 +249,11 @@ impl Session {
     }
 
     /// Training Stress Score.
+    ///
+    /// `fallback_ftp` is used only when the session carries no stamped FTP.
     #[allow(dead_code)]
-    pub fn tss(&self, ftp: u32) -> Option<f32> {
+    pub fn tss(&self, fallback_ftp: u32) -> Option<f32> {
+        let ftp = self.scoring_ftp(fallback_ftp);
         let np = self.normalised_power()?;
         let if_ = np / ftp as f32;
         let hours = self.duration_secs() as f32 / 3600.0;
@@ -285,7 +302,12 @@ pub struct IntervalStats {
 
 impl Session {
     /// Per-segment stats against the structured workout plan.
-    pub fn interval_analysis(&self, segments: &[Segment], ftp: u32) -> Vec<IntervalStats> {
+    ///
+    /// Targets are reconstructed from the FTP the ride was executed at, so they
+    /// match the watts the trainer actually asked for. `fallback_ftp` is used
+    /// only when the session carries no stamped FTP.
+    pub fn interval_analysis(&self, segments: &[Segment], fallback_ftp: u32) -> Vec<IntervalStats> {
+        let ftp = self.scoring_ftp(fallback_ftp);
         let mut stats = Vec::with_capacity(segments.len());
         let mut seg_start = 0u32;
 
@@ -336,8 +358,11 @@ impl Session {
 
     /// Percentage of active-segment seconds that were within ±10 % of target power.
     /// Returns `None` when the workout has no active segments or no power data.
-    pub fn compliance_pct(&self, segments: &[Segment], ftp: u32) -> Option<u8> {
-        let stats = self.interval_analysis(segments, ftp);
+    ///
+    /// `fallback_ftp` is used only when the session carries no stamped FTP.
+    pub fn compliance_pct(&self, segments: &[Segment], fallback_ftp: u32) -> Option<u8> {
+        // interval_analysis applies the stamped-FTP fallback itself.
+        let stats = self.interval_analysis(segments, fallback_ftp);
         let active: Vec<&IntervalStats> = stats.iter().filter(|s| s.is_active).collect();
         if active.is_empty() {
             return None;
@@ -777,6 +802,55 @@ mod tests {
         s.ended_at = Some(Utc::now());
         let tss = s.tss(250).expect("3600s of data yields TSS");
         assert!((tss - 100.0).abs() < 1.0, "TSS was {tss}");
+    }
+
+    // ── stamped-FTP scoring (docs/ftp-detection.md §2) ───────────────────────────
+
+    #[test]
+    fn tss_scores_against_the_stamped_ftp_not_the_current_one() {
+        // Ridden at 250 W FTP for an hour at exactly threshold → TSS 100. The
+        // rider has since raised their FTP to 300; the ride must not re-score.
+        let mut s = session_const_power(250, 3600);
+        s.started_at = Utc::now() - chrono::Duration::seconds(3600);
+        s.ended_at = Some(Utc::now());
+        s.ftp_watts = Some(250);
+        let tss = s.tss(300).expect("3600s of data yields TSS");
+        assert!((tss - 100.0).abs() < 1.0, "TSS was {tss}, expected ~100");
+    }
+
+    #[test]
+    fn tss_falls_back_to_the_passed_ftp_when_the_ride_is_unstamped() {
+        // Pre-phase-1 rides carry no stamp and must still score, using the
+        // caller's FTP rather than dropping out of history entirely.
+        let mut s = session_const_power(250, 3600);
+        s.started_at = Utc::now() - chrono::Duration::seconds(3600);
+        s.ended_at = Some(Utc::now());
+        assert_eq!(s.ftp_watts, None);
+        let tss = s.tss(250).expect("3600s of data yields TSS");
+        assert!((tss - 100.0).abs() < 1.0, "TSS was {tss}");
+    }
+
+    #[test]
+    fn time_in_zones_uses_the_stamped_ftp() {
+        // 250 W is threshold (Z4) at an FTP of 250, but only tempo (Z3) at 300.
+        // The stamp must win, so the seconds land in Z4.
+        let mut s = session_const_power(250, 10);
+        s.ftp_watts = Some(250);
+        let zones = s.time_in_zones(300);
+        assert_eq!(zones[3], 10, "expected 10 s in Z4, got {zones:?}");
+    }
+
+    #[test]
+    fn interval_targets_are_rebuilt_from_the_stamped_ftp() {
+        // A 100 % FTP segment ridden at 200 W FTP asked for 200 W. Re-reading it
+        // after the rider moves to 250 W must still report a 200 W target.
+        let segments = vec![Segment::steady(60, 100.0, "Threshold")];
+        let mut s = session_const_power(200, 60);
+        s.ftp_watts = Some(200);
+        let stats = s.interval_analysis(&segments, 250);
+        assert_eq!(stats[0].target_watts, 200);
+        // …and compliance is therefore 100 %, not a false miss.
+        assert_eq!(s.compliance_pct(&segments, 250), Some(100));
     }
 
     // ── duration_secs / kilojoules ───────────────────────────────────────────────

@@ -207,7 +207,10 @@ impl CycleGtkWindow {
         // funnel into this one closure. `segments` is None for a route ride, which
         // has no plan to compare against.
         let finish_session: FinishSession = Rc::new(move |session, name, segments| {
-            let ftp = athlete_initial.ftp_watts;
+            // The FTP the ride was actually executed at — not the profile value
+            // captured at startup, which goes stale the moment the rider edits it
+            // in Preferences and would make this re-suggest a bump already taken.
+            let ftp = session.ftp_watts.unwrap_or(athlete_initial.ftp_watts);
             summary_for_complete.update(&session, &name, &athlete_initial, segments.as_deref());
             stack_for_complete.set_visible_child_name("summary");
 
@@ -513,7 +516,7 @@ impl CycleGtkWindow {
             let sim_difficulty = Rc::clone(&sim_difficulty);
             let sim_max_grade = Rc::clone(&sim_max_grade);
             let finish_for_route = Rc::clone(&finish_session);
-            let mass_kg = athlete.weight_kg;
+            let athlete_for_route = Rc::clone(&athlete_rc);
             Rc::new(move |route: Route| {
                 timer_alive.set(false);
                 timer_started.set(false);
@@ -524,10 +527,13 @@ impl CycleGtkWindow {
                     timer_started.set(true);
                     let route_name = route.name.clone();
                     let finish = Rc::clone(&finish_for_route);
+                    // Cloned out so no borrow is held while start_timer installs
+                    // its callbacks — see CLAUDE.md §2.4.
+                    let athlete_now = athlete_for_route.borrow().clone();
                     RoutePlayerPage::start_timer(
                         Rc::clone(&route_player),
                         route,
-                        mass_kg,
+                        &athlete_now,
                         cmd_tx.clone(),
                         Rc::clone(&sim_capable),
                         Rc::clone(&sim_difficulty),
