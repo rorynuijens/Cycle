@@ -691,11 +691,21 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
         "FIT file imported"
     );
 
+    // Not every FIT file carries a session/lap end timestamp. Fall back to the
+    // last recorded second, because `duration_secs` treats a missing end as "still
+    // running" and would otherwise report the time since the ride as its length —
+    // and an unfinished ride is now how an interrupted one is recognised.
+    let ended_at = session_end.or_else(|| {
+        data_points
+            .last()
+            .map(|p| started_at + chrono::Duration::seconds(p.elapsed_secs as i64))
+    });
+
     Ok(Session {
         id: 0,
         workout_id: None,
         started_at,
-        ended_at: session_end,
+        ended_at,
         data_points,
         rpe: None,
         // Imported rides were not executed against app targets.

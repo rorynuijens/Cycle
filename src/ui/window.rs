@@ -27,6 +27,11 @@ use crate::training::engine::{EngineState, WorkoutEngine};
 type FinishSession =
     Rc<dyn Fn(crate::data::session::Session, String, Option<Vec<crate::data::workout::Segment>>)>;
 
+/// How often a ride in progress is written to disk. The trade is how much of a
+/// ride a crash can cost against how often a multi-hundred-KB blob is rewritten;
+/// 30 s keeps the worst case to half a minute of pedalling.
+const CHECKPOINT_INTERVAL_SECS: u64 = 30;
+
 pub struct CycleGtkWindow {
     pub window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -192,6 +197,12 @@ impl CycleGtkWindow {
         // Cloned so we can present the RPE dialog over the app window from inside the closure.
         let window_for_rpe = self.window.clone();
 
+        // Row id of the ride currently being checkpointed, or None before the
+        // first checkpoint has been written. Finishing a ride overwrites that row
+        // rather than inserting a second one.
+        let checkpoint_id: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
+        let checkpoint_id_complete = Rc::clone(&checkpoint_id);
+
         // The tail of finishing a ride — summary page, RPE, save, upload — is the
         // same whether it was a structured workout or a route ride, so both paths
         // funnel into this one closure. `segments` is None for a route ride, which
@@ -255,8 +266,13 @@ impl CycleGtkWindow {
                 }
             });
 
+            // Take the checkpoint row so this ride finalises the row it has been
+            // writing to all along. Cleared immediately: the ride is over, and a
+            // later checkpoint must never reuse this id.
+            let existing_row = checkpoint_id_complete.take();
+
             rt_for_complete.spawn(async move {
-                match db::save_session(&pool, &session).await {
+                match db::upsert_session(&pool, existing_row, &session).await {
                     Err(e) => {
                         tracing::error!("save_session failed: {e}");
                     }
@@ -555,6 +571,10 @@ impl CycleGtkWindow {
             on_start_route,
         );
         let library_reload = Rc::new(library_reload);
+        // The dashboard has already loaded by the time the recovery prompt is
+        // answered, so recovery refreshes it explicitly; every other page reloads
+        // on navigation anyway.
+        let dashboard_reload_recover = Rc::clone(&dashboard_reload);
 
         // ── Add all pages to stack ────────────────────────────────────────────
         stack.add_named(dashboard_page.widget(), Some("dashboard"));
@@ -820,6 +840,70 @@ impl CycleGtkWindow {
         });
         app.add_action(&prefs_action);
 
+        // ── Mid-ride checkpointing ────────────────────────────────────────────
+        // A ride otherwise lives only in memory until it ends, so a crash, a
+        // suspend or a lost session takes the whole thing. Write the ride so far
+        // to its own row every 30 s; the row carries a NULL ended_at until the
+        // ride finishes, which is what marks it recoverable at startup.
+        //
+        // Runs on the GTK main thread (it reads the engine and the route page),
+        // but only clones the session there — the write itself goes to tokio.
+        let checkpoint_engine = Rc::clone(&engine_rc);
+        let checkpoint_route = Rc::clone(&route_player_rc);
+        let checkpoint_workout_active = Rc::clone(&workout_active);
+        let checkpoint_route_active = Rc::clone(&route_timer_alive);
+        let checkpoint_pool = pool.clone();
+        let checkpoint_rt = rt_handle.clone();
+        let checkpoint_id_timer = Rc::clone(&checkpoint_id);
+        glib::timeout_add_local(Duration::from_secs(CHECKPOINT_INTERVAL_SECS), move || {
+            let snapshot = if checkpoint_workout_active.get() {
+                let engine = checkpoint_engine.borrow();
+                let session = engine.session.clone();
+                drop(engine);
+                Some(session)
+            } else if checkpoint_route_active.get() {
+                checkpoint_route.live_session_snapshot()
+            } else {
+                None
+            };
+
+            // Nothing worth writing until the rider has actually produced data —
+            // this keeps an opened-but-unridden workout out of the recovery list.
+            let Some(session) = snapshot.filter(|s| !s.data_points.is_empty()) else {
+                return glib::ControlFlow::Continue;
+            };
+
+            let existing = checkpoint_id_timer.get();
+            let pool = checkpoint_pool.clone();
+            let cleanup_pool = checkpoint_pool.clone();
+            let cleanup_rt = checkpoint_rt.clone();
+            let id_cell = Rc::clone(&checkpoint_id_timer);
+            let wa = Rc::clone(&checkpoint_workout_active);
+            let ra = Rc::clone(&checkpoint_route_active);
+            crate::ui::spawn_to_main(
+                &checkpoint_rt,
+                async move { db::checkpoint_session(&pool, existing, &session).await },
+                move |result| match result {
+                    Ok(row_id) => {
+                        if wa.get() || ra.get() {
+                            id_cell.set(Some(row_id));
+                        } else if existing.is_none() {
+                            // The ride finished while this first checkpoint was in
+                            // flight, so it wrote its own row and this one is a
+                            // duplicate that would surface as a phantom recovery.
+                            cleanup_rt.spawn(async move {
+                                if let Err(e) = db::delete_session(&cleanup_pool, row_id).await {
+                                    tracing::error!("stale checkpoint cleanup failed: {e}");
+                                }
+                            });
+                        }
+                    }
+                    Err(e) => tracing::error!("checkpoint failed: {e}"),
+                },
+            );
+            glib::ControlFlow::Continue
+        });
+
         // ── Window close ──────────────────────────────────────────────────────
         // A ride exists only in memory until it ends: nothing reaches the database
         // until `finish_session` runs. Closing the window mid-ride would therefore
@@ -846,21 +930,22 @@ impl CycleGtkWindow {
             }
 
             let dialog = adw::AlertDialog::builder()
-                .heading("Discard the ride in progress?")
+                .heading("Quit with a ride in progress?")
                 .body(
-                    "This ride has not been saved yet — closing Cycle now loses it.\n\n\
-                     To keep it, cancel and end the ride from the ride screen.",
+                    "The ride so far has been saved. Cycle will offer to recover it \
+                     the next time it starts.\n\n\
+                     To finish it properly instead, cancel and end the ride from the \
+                     ride screen.",
                 )
                 .build();
             dialog.add_response("cancel", "_Keep Riding");
-            dialog.add_response("discard", "_Discard Ride");
-            dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            dialog.add_response("quit", "_Quit");
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");
 
             let win_resp = win.clone();
             dialog.connect_response(None, move |_, response| {
-                if response == "discard" {
+                if response == "quit" {
                     // destroy() rather than close(): close() re-emits close-request
                     // and would land back in this handler.
                     win_resp.destroy();
@@ -942,6 +1027,121 @@ impl CycleGtkWindow {
             }
             glib::ControlFlow::Continue
         });
+
+        // ── Recover interrupted rides ─────────────────────────────────────────
+        // Checkpointed rows whose ended_at is still NULL are rides the app never
+        // got to finish. Runs through spawn_to_main, so the callback lands on the
+        // main loop once the window is up.
+        let recover_pool = pool.clone();
+        let recover_rt = rt_handle.clone();
+        let recover_window = self.window.clone();
+        let recover_reload = dashboard_reload_recover;
+        crate::ui::spawn_to_main(
+            &rt_handle,
+            {
+                let pool = recover_pool.clone();
+                async move { db::load_unfinished_sessions(&pool).await }
+            },
+            move |result| {
+                let records = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("could not check for interrupted rides: {e}");
+                        return;
+                    }
+                };
+                for record in records {
+                    Self::offer_recovery(
+                        &recover_window,
+                        recover_pool.clone(),
+                        recover_rt.clone(),
+                        record,
+                        Rc::clone(&recover_reload),
+                    );
+                }
+            },
+        );
+    }
+
+    /// Ask whether to keep a ride the app never finished writing.
+    ///
+    /// Keeping it stamps an end time derived from the last recorded second, so
+    /// the ride's duration reflects what was actually ridden rather than the gap
+    /// until the app was reopened.
+    fn offer_recovery(
+        window: &adw::ApplicationWindow,
+        pool: SqlitePool,
+        rt: tokio::runtime::Handle,
+        record: db::SessionRecord,
+        reload: Rc<dyn Fn()>,
+    ) {
+        let session = record.session;
+        let ridden_secs = session
+            .data_points
+            .last()
+            .map(|p| p.elapsed_secs)
+            .unwrap_or(0);
+        // A checkpoint is only written once there is data, so an empty row means
+        // something went wrong rather than a ride worth offering back.
+        if ridden_secs == 0 {
+            let pool_empty = pool.clone();
+            rt.spawn(async move {
+                let _ = db::delete_session(&pool_empty, session.id).await;
+            });
+            return;
+        }
+
+        let when = session
+            .started_at
+            .with_timezone(&chrono::Local)
+            .format("%A %-d %B, %H:%M");
+        let name = record.workout_name.as_deref().unwrap_or("Route ride");
+        let dialog = adw::AlertDialog::builder()
+            .heading("Recover the interrupted ride?")
+            .body(format!(
+                "“{name}” from {when} was still recording when Cycle closed.\n\n\
+                 {} of riding was saved.",
+                crate::training::engine::WorkoutEngine::format_duration(ridden_secs)
+            ))
+            .build();
+        dialog.add_response("discard", "_Discard");
+        dialog.add_response("keep", "_Keep Ride");
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_response_appearance("keep", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("keep"));
+        // Dismissing without choosing leaves the row untouched, so the offer
+        // comes back next launch rather than silently resolving either way.
+        dialog.set_close_response("later");
+
+        let session_id = session.id;
+        let ended_at =
+            (session.started_at + chrono::Duration::seconds(ridden_secs as i64)).to_rfc3339();
+        dialog.connect_response(None, move |_, response| {
+            let pool = pool.clone();
+            let reload = Rc::clone(&reload);
+            match response {
+                "keep" => {
+                    let ended_at = ended_at.clone();
+                    crate::ui::spawn_to_main(
+                        &rt,
+                        async move { db::finalise_session(&pool, session_id, &ended_at).await },
+                        move |r| match r {
+                            Ok(()) => reload(),
+                            Err(e) => tracing::error!("recovering ride failed: {e}"),
+                        },
+                    );
+                }
+                "discard" => {
+                    rt.spawn(async move {
+                        if let Err(e) = db::delete_session(&pool, session_id).await {
+                            tracing::error!("discarding interrupted ride failed: {e}");
+                        }
+                    });
+                }
+                _ => {}
+            }
+        });
+        dialog.present(Some(window));
     }
 
     fn make_nav_row(label: &str, icon_name: &str, page_name: &str) -> gtk::ListBoxRow {

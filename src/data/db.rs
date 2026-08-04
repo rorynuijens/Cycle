@@ -437,25 +437,126 @@ pub async fn seed_workouts(pool: &SqlitePool) -> Result<()> {
 
 /// Persist a completed session and return its new DB id.
 pub async fn save_session(pool: &SqlitePool, session: &Session) -> Result<i64> {
+    upsert_session(pool, None, session).await
+}
+
+/// Write a session, inserting a new row or overwriting an existing one.
+///
+/// `id` is `None` for a ride that has never been written and `Some` for one that
+/// is already on disk — which is how mid-ride checkpoints keep updating a single
+/// row rather than accumulating a row per checkpoint. A row whose `ended_at` is
+/// NULL is a ride that was interrupted; see [`load_unfinished_sessions`].
+pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Session) -> Result<i64> {
     let data_points_json = serde_json::to_string(&session.data_points)?;
     let started_at = session.started_at.to_rfc3339();
     let ended_at = session.ended_at.map(|t| t.to_rfc3339());
 
-    let result = sqlx::query(
-        "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json, ftp_watts,
-                               title, icu_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(session.workout_id)
-    .bind(&started_at)
-    .bind(&ended_at)
-    .bind(&data_points_json)
-    .bind(session.ftp_watts.map(|v| v as i64))
-    .bind(session.title.as_deref())
-    .bind(session.icu_id.as_deref())
-    .execute(pool)
-    .await?;
-    Ok(result.last_insert_rowid())
+    match id {
+        Some(existing) => {
+            sqlx::query(
+                "UPDATE sessions
+                    SET workout_id = ?, started_at = ?, ended_at = ?, data_points_json = ?,
+                        ftp_watts = ?, title = ?, icu_id = ?
+                  WHERE id = ?",
+            )
+            .bind(session.workout_id)
+            .bind(&started_at)
+            .bind(&ended_at)
+            .bind(&data_points_json)
+            .bind(session.ftp_watts.map(|v| v as i64))
+            .bind(session.title.as_deref())
+            .bind(session.icu_id.as_deref())
+            .bind(existing)
+            .execute(pool)
+            .await?;
+            Ok(existing)
+        }
+        None => {
+            let result = sqlx::query(
+                "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json,
+                                       ftp_watts, title, icu_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(session.workout_id)
+            .bind(&started_at)
+            .bind(&ended_at)
+            .bind(&data_points_json)
+            .bind(session.ftp_watts.map(|v| v as i64))
+            .bind(session.title.as_deref())
+            .bind(session.icu_id.as_deref())
+            .execute(pool)
+            .await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+}
+
+/// Write a mid-ride checkpoint, inserting the row on the first call and updating
+/// it thereafter. Returns the row id.
+///
+/// Unlike [`upsert_session`] this never writes `ended_at`, and its UPDATE matches
+/// only rows that are still unfinished. Both matter because a checkpoint issued
+/// just before the rider finishes can land *after* the finishing write: the
+/// `ended_at IS NULL` guard turns that late checkpoint into a no-op instead of
+/// letting it reopen a completed ride or truncate its final seconds.
+pub async fn checkpoint_session(
+    pool: &SqlitePool,
+    id: Option<i64>,
+    session: &Session,
+) -> Result<i64> {
+    let data_points_json = serde_json::to_string(&session.data_points)?;
+    let started_at = session.started_at.to_rfc3339();
+
+    match id {
+        Some(existing) => {
+            sqlx::query(
+                "UPDATE sessions
+                    SET workout_id = ?, started_at = ?, data_points_json = ?,
+                        ftp_watts = ?, title = ?
+                  WHERE id = ? AND ended_at IS NULL",
+            )
+            .bind(session.workout_id)
+            .bind(&started_at)
+            .bind(&data_points_json)
+            .bind(session.ftp_watts.map(|v| v as i64))
+            .bind(session.title.as_deref())
+            .bind(existing)
+            .execute(pool)
+            .await?;
+            Ok(existing)
+        }
+        None => {
+            let result = sqlx::query(
+                "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json,
+                                       ftp_watts, title)
+                 VALUES (?, ?, NULL, ?, ?, ?)",
+            )
+            .bind(session.workout_id)
+            .bind(&started_at)
+            .bind(&data_points_json)
+            .bind(session.ftp_watts.map(|v| v as i64))
+            .bind(session.title.as_deref())
+            .execute(pool)
+            .await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+}
+
+/// Rides that were checkpointed but never finished — the app was closed, crashed
+/// or lost power mid-session. Offered back to the rider at startup.
+pub async fn load_unfinished_sessions(pool: &SqlitePool) -> Result<Vec<SessionRecord>> {
+    load_session_records_where(pool, "s.ended_at IS NULL").await
+}
+
+/// Close out a recovered ride, stamping the end time the rider actually stopped at.
+pub async fn finalise_session(pool: &SqlitePool, id: i64, ended_at: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET ended_at = ? WHERE id = ?")
+        .bind(ended_at)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Link a session to the Intervals.icu activity that is the same ride, or pass
@@ -1177,22 +1278,48 @@ pub async fn session_exists_at(pool: &SqlitePool, started_at: &DateTime<Utc>) ->
 }
 
 /// Load all sessions, newest first, joined with workout names.
+/// Every completed ride. Rides still in progress (checkpointed but not finished)
+/// are excluded — they must not reach history, the fitness curve or the calendar
+/// until the rider has actually finished or recovered them.
 pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord>> {
-    let rows = sqlx::query(
+    load_session_records_where(pool, "s.ended_at IS NOT NULL").await
+}
+
+/// Shared body of the full-fidelity session loaders. `predicate` is a trusted
+/// literal supplied by this module only — never user input, so it is inlined
+/// rather than bound (there is no way to parameterise a WHERE clause in SQL).
+async fn load_session_records_where(
+    pool: &SqlitePool,
+    predicate: &'static str,
+) -> Result<Vec<SessionRecord>> {
+    let rows = sqlx::query(&format!(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
-         ORDER BY s.started_at DESC",
-    )
+         WHERE {predicate}
+         ORDER BY s.started_at DESC"
+    ))
     .fetch_all(pool)
     .await?;
 
     let mut records = Vec::new();
     for r in rows {
-        let data_points: Vec<DataPoint> =
-            serde_json::from_str(r.get("data_points_json")).unwrap_or_default();
+        let session_id: i64 = r.get("id");
+        // A blob that will not parse means the ride's samples are gone. Keep the
+        // row so the ride is still listed, but say so — silently substituting an
+        // empty ride makes it show 0 TSS and vanish from the fitness curve with
+        // no indication anything was lost.
+        let data_points: Vec<DataPoint> = match serde_json::from_str(r.get("data_points_json")) {
+            Ok(points) => points,
+            Err(e) => {
+                tracing::error!(
+                    "session {session_id}: data points unreadable ({e}) — treating as empty"
+                );
+                Vec::new()
+            }
+        };
 
         let started_at: DateTime<Utc> =
             DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
@@ -1206,7 +1333,7 @@ pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord
 
         records.push(SessionRecord {
             session: Session {
-                id: r.get("id"),
+                id: session_id,
                 workout_id: r.get("workout_id"),
                 started_at,
                 ended_at,
@@ -1698,7 +1825,7 @@ pub async fn load_sessions_between(
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
-         WHERE s.started_at >= ? AND s.started_at <= ?
+         WHERE s.started_at >= ? AND s.started_at <= ? AND s.ended_at IS NOT NULL
          ORDER BY s.started_at ASC",
     )
     .bind(start_utc)
@@ -2202,11 +2329,102 @@ mod tests {
         assert_eq!(points[0].target_watts, Some(230));
     }
 
+    // ── Mid-ride checkpointing ───────────────────────────────────────────────
+
+    fn riding_session(secs: u32) -> Session {
+        let mut s = Session::new(None);
+        s.ftp_watts = Some(250);
+        for i in 0..secs {
+            s.data_points.push(DataPoint {
+                elapsed_secs: i,
+                power_watts: Some(200),
+                target_watts: None,
+                heart_rate_bpm: None,
+                cadence_rpm: None,
+                speed_kmh: None,
+                lat: None,
+                lng: None,
+                altitude_m: None,
+            });
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn checkpoints_keep_updating_one_row() {
+        let pool = test_pool().await;
+        let first = checkpoint_session(&pool, None, &riding_session(30))
+            .await
+            .unwrap();
+        let second = checkpoint_session(&pool, Some(first), &riding_session(60))
+            .await
+            .unwrap();
+        assert_eq!(first, second, "a checkpoint must reuse its row");
+
+        let unfinished = load_unfinished_sessions(&pool).await.unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].session.data_points.len(), 60);
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_ride_stays_out_of_history() {
+        let pool = test_pool().await;
+        checkpoint_session(&pool, None, &riding_session(30))
+            .await
+            .unwrap();
+        assert!(
+            load_session_records(&pool).await.unwrap().is_empty(),
+            "a ride still in progress must not appear in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_overwrites_the_checkpoint_instead_of_adding_a_row() {
+        let pool = test_pool().await;
+        let row = checkpoint_session(&pool, None, &riding_session(30))
+            .await
+            .unwrap();
+
+        let mut finished = riding_session(45);
+        finished.ended_at = Some(Utc::now());
+        upsert_session(&pool, Some(row), &finished).await.unwrap();
+
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records.len(), 1, "finishing must not insert a second ride");
+        assert_eq!(records[0].session.data_points.len(), 45);
+        assert!(load_unfinished_sessions(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_late_checkpoint_cannot_reopen_a_finished_ride() {
+        // The checkpoint issued just before the rider finishes can land after the
+        // finishing write. It must not clear ended_at or roll back the last
+        // seconds of the ride.
+        let pool = test_pool().await;
+        let row = checkpoint_session(&pool, None, &riding_session(30))
+            .await
+            .unwrap();
+
+        let mut finished = riding_session(45);
+        finished.ended_at = Some(Utc::now());
+        upsert_session(&pool, Some(row), &finished).await.unwrap();
+
+        checkpoint_session(&pool, Some(row), &riding_session(31))
+            .await
+            .unwrap();
+
+        assert!(load_unfinished_sessions(&pool).await.unwrap().is_empty());
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(records[0].session.data_points.len(), 45);
+    }
+
     #[tokio::test]
     async fn session_title_survives_a_round_trip_and_names_the_activity() {
         let pool = test_pool().await;
         let mut session = Session::new(None);
         session.title = Some("Alpe d'Huez".into());
+        // A finished ride: load_session_records lists completed rides only.
+        session.ended_at = Some(Utc::now());
         save_session(&pool, &session).await.unwrap();
 
         let records = load_session_records(&pool).await.unwrap();
@@ -2490,6 +2708,7 @@ mod tests {
         let pool = test_pool().await;
         let mut session = Session::new(None);
         session.title = Some("Typo Ride".into());
+        session.ended_at = Some(Utc::now());
         let id = save_session(&pool, &session).await.unwrap();
 
         set_session_title(&pool, id, "Evening Ride").await.unwrap();

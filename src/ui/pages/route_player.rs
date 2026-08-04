@@ -88,6 +88,9 @@ pub struct RoutePlayerPage {
     /// Profile samples as (distance km, elevation m, gradient %) — rebuilt by
     /// reset_route() for each new ride. The gradient colours the trace.
     ele_pts: Rc<RefCell<Vec<(f32, f32, f32)>>>,
+    /// The ride currently being recorded, published so the checkpoint timer in
+    /// `window.rs` can persist it. `None` outside a route ride.
+    live_session: RefCell<Option<Rc<RefCell<Session>>>>,
 }
 
 impl RoutePlayerPage {
@@ -408,11 +411,22 @@ impl RoutePlayerPage {
             pause_cb,
             playhead_dist,
             ele_pts: ele_pts_rc,
+            live_session: RefCell::new(None),
         }
     }
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// A snapshot of the ride in progress, or `None` when no route ride is
+    /// running. Used by the checkpoint timer; cloned rather than lent out so no
+    /// borrow is held across the database write.
+    pub fn live_session_snapshot(&self) -> Option<Session> {
+        self.live_session
+            .borrow()
+            .as_ref()
+            .map(|s| s.borrow().clone())
     }
 
     pub fn set_readings(&self, readings: LiveReadings) {
@@ -552,6 +566,9 @@ impl RoutePlayerPage {
         new_session.ftp_watts = Some(athlete.ftp_watts);
         let engine = Rc::new(RefCell::new(RouteEngine::new(route, 6.944, mass_kg)));
         let session = Rc::new(RefCell::new(new_session));
+        // Publish it so the checkpoint timer can reach this ride. Gated on
+        // route_timer_alive there, so a finished ride is never re-written.
+        *page.live_session.borrow_mut() = Some(Rc::clone(&session));
         let paused = Rc::new(Cell::new(false));
         let elapsed_secs = Rc::new(Cell::new(0u32));
         // Grade last sent to the trainer — SIM commands go out only on a real
