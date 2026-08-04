@@ -1671,13 +1671,16 @@ impl FitnessPage {
                         *tss_week_data.borrow_mut() = week_tss.iter().map(|(_, t)| *t).collect();
                         tss_chart.queue_draw();
 
-                        // Zone distribution
+                        // Zone distribution. Each ride is bucketed against the FTP
+                        // it was ridden at, so raising FTP does not retroactively
+                        // demote past efforts into lower zones — time_in_zones
+                        // falls back to ftp_val only for rides with no stamp.
                         let mut zone_secs = [0u32; 7];
                         for record in &records {
-                            for dp in &record.session.data_points {
-                                if let Some(watts) = dp.power_watts {
-                                    zone_secs[power_zone_index(watts, ftp_val)] += 1;
-                                }
+                            for (zone, secs) in
+                                record.session.time_in_zones(ftp_val).iter().enumerate()
+                            {
+                                zone_secs[zone] += secs;
                             }
                         }
                         let has_power = zone_secs.iter().any(|&s| s > 0);
