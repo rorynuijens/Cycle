@@ -411,6 +411,28 @@ impl CycleGtkWindow {
             })
         };
 
+        // ── Resume an interrupted ride ────────────────────────────────────────
+        // Same path as starting a workout, except the engine is seeded with the
+        // recorded session instead of an empty one, and the checkpoint row is
+        // adopted so the rest of the ride keeps writing to it rather than
+        // starting a second row.
+        let on_resume_ride: Rc<dyn Fn(Workout, crate::data::session::Session, i64)> = {
+            let engine = Rc::clone(&engine_rc);
+            let player = Rc::clone(&player_rc);
+            let timer_alive = Rc::clone(&timer_alive);
+            let timer_started = Rc::clone(&timer_started);
+            let do_start = Rc::clone(&do_start);
+            let checkpoint_id = Rc::clone(&checkpoint_id);
+            Rc::new(move |workout: Workout, session, row_id: i64| {
+                timer_alive.set(false);
+                player.borrow().reset_workout(&workout);
+                engine.borrow_mut().resume_session(workout, session);
+                checkpoint_id.set(Some(row_id));
+                timer_started.set(false);
+                do_start();
+            })
+        };
+
         // ── Calendar page — built after on_library_start so "Load Now" can start workouts ──
         let toast_overlay_for_cal = self.toast_overlay.clone();
         let on_toast_cal: Rc<dyn Fn(adw::Toast)> =
@@ -1036,44 +1058,70 @@ impl CycleGtkWindow {
         let recover_rt = rt_handle.clone();
         let recover_window = self.window.clone();
         let recover_reload = dashboard_reload_recover;
+        let recover_resume = Rc::clone(&on_resume_ride);
         crate::ui::spawn_to_main(
             &rt_handle,
             {
                 let pool = recover_pool.clone();
-                async move { db::load_unfinished_sessions(&pool).await }
+                async move {
+                    let records = db::load_unfinished_sessions(&pool).await?;
+                    // Pair each ride with its plan. Resuming needs the workout, and
+                    // it may have been deleted from the library since — in which
+                    // case the ride can still be kept, just not continued.
+                    let mut paired = Vec::with_capacity(records.len());
+                    for record in records {
+                        let workout = match record.session.workout_id {
+                            Some(id) => db::load_workout_by_id(&pool, id).await.unwrap_or(None),
+                            None => None,
+                        };
+                        paired.push((record, workout));
+                    }
+                    Ok::<_, anyhow::Error>(paired)
+                }
             },
             move |result| {
-                let records = match result {
+                let paired = match result {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!("could not check for interrupted rides: {e}");
                         return;
                     }
                 };
-                for record in records {
+                for (record, workout) in paired {
                     Self::offer_recovery(
                         &recover_window,
                         recover_pool.clone(),
                         recover_rt.clone(),
                         record,
+                        workout,
                         Rc::clone(&recover_reload),
+                        Rc::clone(&recover_resume),
                     );
                 }
             },
         );
     }
 
-    /// Ask whether to keep a ride the app never finished writing.
+    /// Ask what to do with a ride the app never finished writing.
     ///
-    /// Keeping it stamps an end time derived from the last recorded second, so
-    /// the ride's duration reflects what was actually ridden rather than the gap
-    /// until the app was reopened.
+    /// Continuing puts the rider back on the workout screen at the second the
+    /// ride stopped, behind the usual ten-second power gate. Keeping it instead
+    /// files the ride as it stands, stamping an end time derived from the last
+    /// recorded second so its duration reflects what was actually ridden rather
+    /// than the gap until the app was reopened.
+    ///
+    /// `workout` is the plan the ride was following, and is `None` for a route
+    /// ride or one whose workout has since been deleted — continuing needs the
+    /// plan, so it is only offered when there is one.
+    #[allow(clippy::too_many_arguments)]
     fn offer_recovery(
         window: &adw::ApplicationWindow,
         pool: SqlitePool,
         rt: tokio::runtime::Handle,
         record: db::SessionRecord,
+        workout: Option<Workout>,
         reload: Rc<dyn Fn()>,
+        on_resume: Rc<dyn Fn(Workout, crate::data::session::Session, i64)>,
     ) {
         let session = record.session;
         let ridden_secs = session
@@ -1096,19 +1144,42 @@ impl CycleGtkWindow {
             .with_timezone(&chrono::Local)
             .format("%A %-d %B, %H:%M");
         let name = record.workout_name.as_deref().unwrap_or("Route ride");
+        let ridden = crate::training::engine::WorkoutEngine::format_duration(ridden_secs);
+        let body = match &workout {
+            Some(w) => {
+                let remaining = w.duration_secs.saturating_sub(ridden_secs);
+                format!(
+                    "“{name}” from {when} was still recording when Cycle closed.\n\n\
+                     {ridden} was saved, with {} still to ride. Continuing puts you \
+                     back on the workout with ten seconds to get going.",
+                    crate::training::engine::WorkoutEngine::format_duration(remaining)
+                )
+            }
+            None => format!(
+                "“{name}” from {when} was still recording when Cycle closed.\n\n\
+                 {ridden} of riding was saved."
+            ),
+        };
         let dialog = adw::AlertDialog::builder()
             .heading("Recover the interrupted ride?")
-            .body(format!(
-                "“{name}” from {when} was still recording when Cycle closed.\n\n\
-                 {} of riding was saved.",
-                crate::training::engine::WorkoutEngine::format_duration(ridden_secs)
-            ))
+            .body(body)
             .build();
         dialog.add_response("discard", "_Discard");
         dialog.add_response("keep", "_Keep Ride");
         dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
-        dialog.set_response_appearance("keep", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("keep"));
+        // Continuing is only possible with the plan in hand, and there is nothing
+        // left to ride once the workout has run its full length.
+        let can_continue = workout
+            .as_ref()
+            .is_some_and(|w| w.duration_secs > ridden_secs);
+        if can_continue {
+            dialog.add_response("continue", "_Continue Ride");
+            dialog.set_response_appearance("continue", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("continue"));
+        } else {
+            dialog.set_response_appearance("keep", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("keep"));
+        }
         // Dismissing without choosing leaves the row untouched, so the offer
         // comes back next launch rather than silently resolving either way.
         dialog.set_close_response("later");
@@ -1116,10 +1187,18 @@ impl CycleGtkWindow {
         let session_id = session.id;
         let ended_at =
             (session.started_at + chrono::Duration::seconds(ridden_secs as i64)).to_rfc3339();
+        let resume_session = session.clone();
         dialog.connect_response(None, move |_, response| {
             let pool = pool.clone();
             let reload = Rc::clone(&reload);
             match response {
+                "continue" => {
+                    // The row stays unfinished and is handed to the ride, which
+                    // keeps checkpointing to it and finalises it when it ends.
+                    if let Some(w) = workout.clone() {
+                        on_resume(w, resume_session.clone(), session_id);
+                    }
+                }
                 "keep" => {
                     let ended_at = ended_at.clone();
                     crate::ui::spawn_to_main(

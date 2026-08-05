@@ -40,6 +40,13 @@ pub struct WorkoutEngine {
     /// Max watts per second the ERG target may change. 0 = instant (no smoothing).
     pub erg_ramp_rate: u32,
     current_erg_target: u32,
+    /// Set by `resume_session` until the ride actually restarts. Keeps `start`
+    /// from re-stamping `started_at` over the original ride's start time.
+    resuming: bool,
+    /// Wall-clock time the ride was not being ridden for because the app was
+    /// closed. Subtracted at `stop` so the gap does not inflate the ride's
+    /// duration, and through it the TSS.
+    interruption: chrono::Duration,
 }
 
 impl WorkoutEngine {
@@ -62,18 +69,59 @@ impl WorkoutEngine {
             device_cmd_tx,
             erg_ramp_rate: 25,
             current_erg_target: 0,
+            resuming: false,
+            interruption: chrono::Duration::zero(),
         }
     }
 
     pub fn start(&mut self) {
         self.start_instant = Some(Instant::now());
-        // The session was created when the workout was selected, which can be long
-        // before the first pedal stroke. Stamp the real start so the ride's duration
-        // (and the TSS derived from it) covers only time actually ridden, and so it
-        // lines up with what a head unit or Intervals.icu records for the same ride.
-        self.session.started_at = chrono::Utc::now();
+        if self.resuming {
+            // Picking a ride back up: keep the original start time — moving it
+            // would misdate the ride and break the Intervals.icu match, which
+            // pairs on when the ride began. Instead measure the gap between where
+            // the ride left off and now, and take it back off at `stop`.
+            self.resuming = false;
+            let left_off = self.session.started_at
+                + chrono::Duration::seconds(self.pause_offset.as_secs() as i64);
+            self.interruption = (chrono::Utc::now() - left_off).max(chrono::Duration::zero());
+            tracing::info!(
+                "Workout resumed at {}s: {}",
+                self.pause_offset.as_secs(),
+                self.workout.name
+            );
+        } else {
+            // The session was created when the workout was selected, which can be long
+            // before the first pedal stroke. Stamp the real start so the ride's duration
+            // (and the TSS derived from it) covers only time actually ridden, and so it
+            // lines up with what a head unit or Intervals.icu records for the same ride.
+            self.session.started_at = chrono::Utc::now();
+            tracing::info!("Workout started: {}", self.workout.name);
+        }
         self.state = EngineState::Running;
-        tracing::info!("Workout started: {}", self.workout.name);
+    }
+
+    /// Pick up a ride that was interrupted, at the second it stopped recording.
+    ///
+    /// The engine goes back to `Idle`, so the player's usual ten-second power gate
+    /// runs before the ride restarts — the rider gets time to clip in. Elapsed
+    /// time continues from the last recorded second rather than from zero.
+    pub fn resume_session(&mut self, workout: Workout, session: Session) {
+        // Resume at the second *after* the last one recorded — starting on it
+        // would record that second twice.
+        let elapsed = session
+            .data_points
+            .last()
+            .map(|p| p.elapsed_secs + 1)
+            .unwrap_or(0);
+        self.workout = workout;
+        self.session = session;
+        self.state = EngineState::Idle;
+        self.start_instant = None;
+        self.pause_offset = Duration::from_secs(elapsed as u64);
+        self.current_erg_target = 0;
+        self.resuming = true;
+        self.interruption = chrono::Duration::zero();
     }
 
     pub fn pause(&mut self) {
@@ -126,11 +174,15 @@ impl WorkoutEngine {
         self.start_instant = None;
         self.pause_offset = Duration::ZERO;
         self.current_erg_target = 0;
+        self.resuming = false;
+        self.interruption = chrono::Duration::zero();
     }
 
     pub fn stop(&mut self) {
         self.state = EngineState::Completed;
-        self.session.ended_at = Some(chrono::Utc::now());
+        // Discount any time the ride spent interrupted, so a session picked back
+        // up an hour later is not recorded as an hour longer than it was ridden.
+        self.session.ended_at = Some(chrono::Utc::now() - self.interruption);
     }
 
     pub fn elapsed_secs(&self) -> u32 {
@@ -226,5 +278,114 @@ impl WorkoutEngine {
 
     pub fn format_duration(secs: u32) -> String {
         format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::session::DataPoint;
+
+    fn make_engine() -> WorkoutEngine {
+        // The engine sends ERG commands but the tests discard them.
+        let (cmd_tx, _cmd_rx) = async_channel::bounded(16);
+        WorkoutEngine::new(
+            Workout::sample_threshold(),
+            AthleteProfile {
+                ftp_watts: 250,
+                ..AthleteProfile::default()
+            },
+            cmd_tx,
+        )
+    }
+
+    fn ridden_for(secs: u32) -> Session {
+        let mut session = Session::new(Some(1));
+        for i in 0..secs {
+            session.data_points.push(DataPoint {
+                elapsed_secs: i,
+                power_watts: Some(200),
+                target_watts: None,
+                heart_rate_bpm: None,
+                cadence_rpm: None,
+                speed_kmh: None,
+                lat: None,
+                lng: None,
+                altitude_m: None,
+            });
+        }
+        session
+    }
+
+    #[test]
+    fn should_wait_for_the_power_gate_after_resuming() {
+        let mut engine = make_engine();
+        engine.resume_session(Workout::sample_threshold(), ridden_for(600));
+        // Idle, so the player's ten-second countdown runs before riding restarts.
+        assert_eq!(engine.state, EngineState::Idle);
+    }
+
+    #[test]
+    fn should_resume_at_the_second_after_the_last_one_recorded() {
+        let mut engine = make_engine();
+        engine.resume_session(Workout::sample_threshold(), ridden_for(600));
+        // Last recorded second is 599, so the ride picks up at 600 rather than
+        // recording 599 a second time.
+        assert_eq!(engine.elapsed_secs(), 600);
+    }
+
+    #[test]
+    fn should_keep_the_original_start_time_when_resuming() {
+        let mut engine = make_engine();
+        let mut session = ridden_for(600);
+        let original_start = chrono::Utc::now() - chrono::Duration::hours(2);
+        session.started_at = original_start;
+        engine.resume_session(Workout::sample_threshold(), session);
+        engine.start();
+        // Re-stamping would misdate the ride and break the Intervals.icu match,
+        // which pairs activities on when they began.
+        assert_eq!(engine.session.started_at, original_start);
+    }
+
+    #[test]
+    fn should_not_count_the_interruption_in_a_resumed_ride() {
+        let mut engine = make_engine();
+        let mut session = ridden_for(600);
+        // Ridden for 10 minutes, then interrupted an hour ago.
+        session.started_at = chrono::Utc::now() - chrono::Duration::minutes(70);
+        engine.resume_session(Workout::sample_threshold(), session);
+        engine.start();
+        engine.stop();
+
+        // Without discounting the gap this would read as ~70 minutes.
+        let duration = engine.session.duration_secs();
+        assert!(
+            (595..=605).contains(&duration),
+            "resumed ride reported {duration}s, expected about 600"
+        );
+    }
+
+    #[test]
+    fn should_stamp_a_fresh_start_time_for_a_ride_that_is_not_resumed() {
+        let mut engine = make_engine();
+        engine.session.started_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        engine.start();
+        let age = (chrono::Utc::now() - engine.session.started_at).num_seconds();
+        assert!(
+            age < 5,
+            "a normal start must re-stamp started_at, got {age}s"
+        );
+    }
+
+    #[test]
+    fn should_forget_a_pending_resume_when_reset_with_a_new_workout() {
+        let mut engine = make_engine();
+        engine.resume_session(Workout::sample_threshold(), ridden_for(600));
+        engine.reset_with_workout(Workout::sample_threshold());
+        assert_eq!(engine.elapsed_secs(), 0);
+        engine.start();
+        // Picking a different workout must behave like any fresh ride.
+        let age = (chrono::Utc::now() - engine.session.started_at).num_seconds();
+        assert!(age < 5, "reset must clear the resume flag, got {age}s");
     }
 }
