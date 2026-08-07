@@ -133,6 +133,14 @@ impl FitnessPage {
             .button_label("Open Preferences")
             .revealed(false)
             .build();
+        // The banner only ever shows to someone with no key yet, so its button
+        // has to take them somewhere. `app.preferences` is the same action the
+        // main menu uses.
+        api_banner.connect_button_clicked(|banner| {
+            if let Err(e) = banner.activate_action("app.preferences", None) {
+                tracing::error!("Could not open Preferences from the API key banner: {e}");
+            }
+        });
         root.append(&api_banner);
 
         // Chart-dominated page — wider clamp than the standard 900 (same
