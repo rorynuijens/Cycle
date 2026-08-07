@@ -2,50 +2,57 @@ use adw::prelude::*;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gtk::glib;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use sqlx::SqlitePool;
 
 use crate::data::athlete::AthleteProfile;
-use crate::data::db::{self, CalendarEntry, IntervalsActivity, SessionRecord, TimeOffEntry};
+use crate::data::calendar::{
+    days_in_month, first_weekday_column, group_by_date, month_bounds, month_label, totals,
+    CalendarEvent,
+};
+use crate::data::db::{self, CalendarEntry};
 use crate::data::workout::Workout;
 use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
 
 type ReloadFn = Rc<dyn Fn()>;
 
-/// A unified event shown in the calendar (past or future).
-#[derive(Clone)]
-enum CalendarEvent {
-    Scheduled(CalendarEntry),
-    Session(SessionRecord, Option<String>), // session, workout_name
-    IcuActivity(IntervalsActivity),
-    TimeOff(TimeOffEntry),
+/// Everything the calendar draws for one visible range.
+struct CalendarData {
+    /// Scheduled workouts still ahead, anywhere on the calendar — drives the
+    /// "ask the coach" banner, so it is not limited to the visible range.
+    upcoming: i64,
+    events: Vec<CalendarEvent>,
 }
 
-impl CalendarEvent {
-    fn date_str(&self) -> String {
-        match self {
-            CalendarEvent::Scheduled(e) => e.scheduled_date.clone(),
-            CalendarEvent::Session(s, _) => s
-                .session
-                .started_at
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
-                .to_string(),
-            CalendarEvent::IcuActivity(a) => a.date.format("%Y-%m-%d").to_string(),
-            CalendarEvent::TimeOff(t) => t.date.format("%Y-%m-%d").to_string(),
-        }
-    }
+/// Load one visible range off the GTK main thread (CLAUDE.md §2.3), merging the
+/// four sources into a single timeline.
+async fn load_calendar_data(
+    pool: &SqlitePool,
+    today: &str,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> anyhow::Result<CalendarData> {
+    let start_s = start.format("%Y-%m-%d").to_string();
+    let end_s = end.format("%Y-%m-%d").to_string();
 
-    #[allow(dead_code)]
-    fn is_past(&self) -> bool {
-        match self {
-            CalendarEvent::Session(_, _) | CalendarEvent::IcuActivity(_) => true,
-            CalendarEvent::TimeOff(_) => false,
-            CalendarEvent::Scheduled(_) => false,
-        }
-    }
+    let upcoming = db::count_upcoming_scheduled(pool, today).await?;
+    let cal_entries = db::load_calendar_entries_between(pool, &start_s, &end_s).await?;
+    let past_sessions = db::load_sessions_for_dates(pool, start, end).await?;
+    let icu_activities =
+        db::load_unlinked_intervals_activities_between(pool, &start_s, &end_s).await?;
+    let time_off = db::load_time_off_between(pool, &start_s, &end_s).await?;
+
+    let mut events: Vec<CalendarEvent> = Vec::new();
+    events.extend(cal_entries.into_iter().map(CalendarEvent::Scheduled));
+    events.extend(past_sessions.into_iter().map(|record| {
+        let name = record.workout_name.clone();
+        CalendarEvent::Session(record, name)
+    }));
+    events.extend(icu_activities.into_iter().map(CalendarEvent::IcuActivity));
+    events.extend(time_off.into_iter().map(CalendarEvent::TimeOff));
+
+    Ok(CalendarData { upcoming, events })
 }
 
 pub struct CalendarPage {
@@ -114,11 +121,8 @@ impl CalendarPage {
             .build();
 
         let today_local = Local::now();
-        let month_label = gtk::Label::builder()
-            .label(Self::month_label_str(
-                today_local.year(),
-                today_local.month(),
-            ))
+        let month_label_widget = gtk::Label::builder()
+            .label(month_label(today_local.year(), today_local.month()))
             .css_classes(["title-3"])
             .hexpand(true)
             .halign(gtk::Align::Center)
@@ -221,7 +225,7 @@ impl CalendarPage {
         view_toggle_box.append(&month_toggle);
 
         nav_row.append(&prev_btn);
-        nav_row.append(&month_label);
+        nav_row.append(&month_label_widget);
         nav_row.append(&next_btn);
         nav_row.append(&today_btn);
         nav_row.append(&view_toggle_box);
@@ -261,7 +265,7 @@ impl CalendarPage {
 
         let reload: Rc<dyn Fn()> = {
             let dynamic = dynamic.clone();
-            let month_label = month_label.clone();
+            let month_label_widget = month_label_widget.clone();
             let current_month = Rc::clone(&current_month);
             let current_week_start = Rc::clone(&current_week_start);
             let view_mode = Rc::clone(&view_mode);
@@ -283,40 +287,30 @@ impl CalendarPage {
                 };
                 let is_week = view_mode.get() == 1;
 
-                let (start_str, end_str, label_str) = if is_week {
+                // Dates stay typed end to end — they used to be formatted to
+                // strings here and re-parsed a few lines later, where a failed
+                // parse silently fell back to 1970 and queried the wrong range.
+                let (start_date, end_date, label_str) = if is_week {
                     let ws = *current_week_start.borrow();
                     let we = ws + Duration::days(6);
                     (
-                        ws.format("%Y-%m-%d").to_string(),
-                        we.format("%Y-%m-%d").to_string(),
+                        ws,
+                        we,
                         format!("{} – {}", ws.format("%-d %b"), we.format("%-d %b %Y")),
                     )
                 } else {
                     let (year, month) = current_month.get();
-                    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid date");
-                    let last = if month == 12 {
-                        NaiveDate::from_ymd_opt(year + 1, 1, 1)
-                    } else {
-                        NaiveDate::from_ymd_opt(year, month + 1, 1)
-                    }
-                    .expect("valid date")
-                        - Duration::days(1);
-                    (
-                        first.format("%Y-%m-%d").to_string(),
-                        last.format("%Y-%m-%d").to_string(),
-                        Self::month_label_str(year, month),
-                    )
+                    let (first, last) =
+                        month_bounds(year, month).expect("the visible month is always valid");
+                    (first, last, month_label(year, month))
                 };
 
-                month_label.set_label(&label_str);
+                month_label_widget.set_label(&label_str);
 
-                // Compute the date range (sync), then run all reads on the tokio
-                // runtime and rebuild the view on the GTK main thread so navigation
-                // never blocks the GLib loop (CLAUDE.md §2.3).
+                // Reads run on the tokio runtime and the view is rebuilt on the
+                // GTK main thread, so navigation never blocks the GLib loop
+                // (CLAUDE.md §2.3).
                 let today_str = Local::now().format("%Y-%m-%d").to_string();
-                let start_date =
-                    NaiveDate::parse_from_str(&start_str, "%Y-%m-%d").unwrap_or_default();
-                let end_date = NaiveDate::parse_from_str(&end_str, "%Y-%m-%d").unwrap_or_default();
 
                 // Per-invocation clones for the async result handler (this closure is Fn).
                 let dynamic = dynamic.clone();
@@ -329,59 +323,34 @@ impl CalendarPage {
                 let workouts = Rc::clone(&workouts);
                 let on_start_workout = Rc::clone(&on_start_workout);
                 let on_toast = Rc::clone(&on_toast);
+                let on_toast_err = Rc::clone(&on_toast);
 
                 let pool_load = pool.clone();
-                let start_s = start_str.clone();
-                let end_s = end_str.clone();
                 crate::ui::spawn_to_main(
                     &rt_handle,
                     async move {
-                        let upcoming = db::count_upcoming_scheduled(&pool_load, &today_str)
-                            .await
-                            .unwrap_or(0);
-                        let cal_entries =
-                            db::load_calendar_entries_between(&pool_load, &start_s, &end_s)
-                                .await
-                                .unwrap_or_default();
-                        let past_sessions =
-                            db::load_sessions_for_dates(&pool_load, start_date, end_date)
-                                .await
-                                .unwrap_or_default();
-                        let icu_activities = db::load_unlinked_intervals_activities_between(
-                            &pool_load, &start_s, &end_s,
-                        )
-                        .await
-                        .unwrap_or_default();
-                        let time_off = db::load_time_off_between(&pool_load, &start_s, &end_s)
-                            .await
-                            .unwrap_or_default();
-                        (
-                            upcoming,
-                            cal_entries,
-                            past_sessions,
-                            icu_activities,
-                            time_off,
-                        )
+                        load_calendar_data(&pool_load, &today_str, start_date, end_date).await
                     },
-                    move |(upcoming, cal_entries, past_sessions, icu_activities, time_off)| {
+                    move |result| {
+                        // A failed load must not redraw the month as empty — a
+                        // blank calendar reads as "nothing planned", which would
+                        // have the rider schedule over work already on the books.
+                        let CalendarData { upcoming, events } = match result {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Could not load the calendar: {e}");
+                                on_toast_err(
+                                    adw::Toast::builder()
+                                        .title("Could not load your calendar")
+                                        .timeout(5)
+                                        .build(),
+                                );
+                                return;
+                            }
+                        };
+
                         // Show coaching banner when no upcoming scheduled workouts exist.
                         coaching_banner_r.set_revealed(upcoming == 0);
-
-                        // Merge into a unified event list.
-                        let mut events: Vec<CalendarEvent> = Vec::new();
-                        for e in cal_entries {
-                            events.push(CalendarEvent::Scheduled(e));
-                        }
-                        for s in past_sessions {
-                            let name = s.workout_name.clone();
-                            events.push(CalendarEvent::Session(s, name));
-                        }
-                        for a in icu_activities {
-                            events.push(CalendarEvent::IcuActivity(a));
-                        }
-                        for t in time_off {
-                            events.push(CalendarEvent::TimeOff(t));
-                        }
 
                         while let Some(child) = dynamic.first_child() {
                             dynamic.remove(&child);
@@ -553,29 +522,15 @@ impl CalendarPage {
                     _ => {
                         on_toast_icu(
                             adw::Toast::builder()
-                                .title("No Intervals.icu API key configured — add it in Preferences")
+                                .title(
+                                    "No Intervals.icu API key configured — add it in Preferences",
+                                )
                                 .timeout(5)
                                 .build(),
                         );
                         return;
                     }
                 };
-                let athlete_id = match rt_icu
-                    .block_on(crate::data::db::get_setting(&pool_icu, "intervals.athlete_id"))
-                    .unwrap_or(None)
-                {
-                    Some(id) if !id.trim().is_empty() => id,
-                    _ => {
-                        on_toast_icu(
-                            adw::Toast::builder()
-                                .title("No Intervals.icu athlete ID configured — add it in Preferences")
-                                .timeout(5)
-                                .build(),
-                        );
-                        return;
-                    }
-                };
-
                 btn.set_sensitive(false);
 
                 let pool_s = pool_icu.clone();
@@ -585,9 +540,41 @@ impl CalendarPage {
                 let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
 
                 rt_icu.spawn(async move {
+                    // The athlete id is read here rather than on the GTK thread:
+                    // a block_on against SQLite stalls the GLib loop if the
+                    // database is busy, which it is every 30 s during a ride.
+                    let athlete_id =
+                        match crate::data::db::get_setting(&pool_s, "intervals.athlete_id").await {
+                            Ok(Some(id)) if !id.trim().is_empty() => id,
+                            Ok(_) => {
+                                let _ = tx
+                                    .send(Err("No Intervals.icu athlete ID configured — \
+                                           add it in Preferences"
+                                        .to_string()))
+                                    .await;
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::error!("Could not read the Intervals.icu athlete ID: {e}");
+                                let _ = tx
+                                    .send(Err(
+                                        "Could not read your Intervals.icu settings".to_string()
+                                    ))
+                                    .await;
+                                return;
+                            }
+                        };
+
                     let today = chrono::Local::now().date_naive();
                     let oldest = today - chrono::Duration::days(60);
-                    match crate::ai::intervals::fetch_activities(&athlete_id, &api_key, oldest, today).await {
+                    match crate::ai::intervals::fetch_activities(
+                        &athlete_id,
+                        &api_key,
+                        oldest,
+                        today,
+                    )
+                    .await
+                    {
                         Ok(acts) => {
                             let count = acts.len();
                             for a in acts {
@@ -610,12 +597,12 @@ impl CalendarPage {
                                 )
                                 .await;
                             }
-                        // A ride recorded in-app can arrive back here after a round
-                        // trip through Garmin or Strava — link the two so it is shown
-                        // and counted once.
-                        if let Err(e) = crate::data::db::reconcile_icu_links(&pool_s).await {
-                            tracing::error!("reconcile_icu_links: {e}");
-                        }
+                            // A ride recorded in-app can arrive back here after a round
+                            // trip through Garmin or Strava — link the two so it is shown
+                            // and counted once.
+                            if let Err(e) = crate::data::db::reconcile_icu_links(&pool_s).await {
+                                tracing::error!("reconcile_icu_links: {e}");
+                            }
                             let _ = tx.send(Ok(count)).await;
                         }
                         Err(e) => {
@@ -671,11 +658,6 @@ impl CalendarPage {
         rt_handle: tokio::runtime::Handle,
         reload: Rc<dyn Fn()>,
     ) {
-        let ai_suggestion_name = rt_handle
-            .block_on(db::get_setting(&pool, "ai.suggestion_workout_name"))
-            .unwrap_or(None)
-            .unwrap_or_default();
-
         let dialog = adw::AlertDialog::builder()
             .heading("Schedule Workout")
             .build();
@@ -722,27 +704,47 @@ impl CalendarPage {
             .tooltip_text("Select workout to schedule")
             .build();
 
-        let ai_matched = if !ai_suggestion_name.is_empty() {
-            workouts
-                .iter()
-                .position(|w| crate::ai::naming::names_match(&w.name, &ai_suggestion_name))
-        } else {
-            None
-        };
-        if let Some(idx) = ai_matched {
-            dropdown.set_selected(idx as u32);
-        }
-
         sel_row.append(&dropdown);
         content.append(&sel_row);
 
-        if ai_matched.is_some() {
-            content.append(
-                &gtk::Label::builder()
-                    .label(format!("AI Coach suggests: {}", ai_suggestion_name))
-                    .css_classes(["caption", "accent"])
-                    .halign(gtk::Align::Start)
-                    .build(),
+        // The coach's suggestion is read after the dialog is on screen. Reading
+        // it first meant a block_on against SQLite between the click and the
+        // dialog appearing (CLAUDE.md §2.3); the preselection just arrives a
+        // moment later instead.
+        {
+            let pool_ai = pool.clone();
+            let dropdown_ai = dropdown.clone();
+            let content_ai = content.clone();
+            let names_ai: Vec<String> = workouts.iter().map(|w| w.name.clone()).collect();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move { db::get_setting(&pool_ai, "ai.suggestion_workout_name").await },
+                move |result| {
+                    let suggestion = match result {
+                        Ok(Some(name)) if !name.trim().is_empty() => name,
+                        Ok(_) => return,
+                        Err(e) => {
+                            // Not worth a toast: the rider can still pick a
+                            // workout, they just do not get the shortcut.
+                            tracing::warn!("Could not read the coach's suggestion: {e}");
+                            return;
+                        }
+                    };
+                    let Some(idx) = names_ai
+                        .iter()
+                        .position(|n| crate::ai::naming::names_match(n, suggestion.trim()))
+                    else {
+                        return;
+                    };
+                    dropdown_ai.set_selected(idx as u32);
+                    content_ai.append(
+                        &gtk::Label::builder()
+                            .label(format!("AI Coach suggests: {}", suggestion.trim()))
+                            .css_classes(["caption", "accent"])
+                            .halign(gtk::Align::Start)
+                            .build(),
+                    );
+                },
             );
         }
 
@@ -1116,12 +1118,6 @@ impl CalendarPage {
 
     // ── Month label helper ────────────────────────────────────────────────────
 
-    fn month_label_str(year: i32, month: u32) -> String {
-        NaiveDate::from_ymd_opt(year, month, 1)
-            .map(|d| format!("{}", d.format("%B %Y")))
-            .unwrap_or_default()
-    }
-
     // ── Month summary cards ───────────────────────────────────────────────────
 
     // ── Week view ─────────────────────────────────────────────────────────────
@@ -1144,18 +1140,12 @@ impl CalendarPage {
             .spacing(6)
             .build();
 
-        // Group events by date string
-        let mut by_day: HashMap<String, Vec<&CalendarEvent>> = HashMap::new();
-        for event in events {
-            by_day.entry(event.date_str()).or_default().push(event);
-        }
-
+        let by_day = group_by_date(events);
         let today = Local::now().date_naive();
 
         for i in 0..7i64 {
             let day = week_start + Duration::days(i);
-            let date_str = day.format("%Y-%m-%d").to_string();
-            let day_events = by_day.get(&date_str).map(Vec::as_slice).unwrap_or(&[]);
+            let day_events = by_day.get(&day).map(Vec::as_slice).unwrap_or(&[]);
             let is_today = day == today;
             let is_past = day < today;
 
@@ -1448,24 +1438,45 @@ impl CalendarPage {
                             btn.connect_clicked(move |b| {
                                 let local_dt =
                                     session_det.session.started_at.with_timezone(&chrono::Local);
-                                let workout = session_det.session.workout_id.and_then(|wid| {
-                                    rt_det
-                                        .block_on(db::load_workout_by_id(&pool_det, wid))
-                                        .ok()
-                                        .flatten()
-                                });
                                 let parent = b.root().and_downcast::<gtk::Window>();
-                                super::history::show_session_detail(
-                                    &session_det.session,
-                                    &title_det,
-                                    local_dt,
-                                    ftp,
-                                    weight_kg,
-                                    workout.as_ref(),
-                                    parent.as_ref(),
-                                    pool_det.clone(),
-                                    rt_det.clone(),
-                                    Rc::clone(&rh_det),
+
+                                // The ride's workout plan is fetched off the main
+                                // thread; a block_on here stalled the GLib loop
+                                // between the click and the dialog (CLAUDE.md §2.3).
+                                let pool_w = pool_det.clone();
+                                let workout_id = session_det.session.workout_id;
+                                let session_w = session_det.clone();
+                                let title_w = title_det.clone();
+                                let pool_show = pool_det.clone();
+                                let rt_show = rt_det.clone();
+                                let rh_show = Rc::clone(&rh_det);
+                                crate::ui::spawn_to_main(
+                                    &rt_det,
+                                    async move {
+                                        match workout_id {
+                                            Some(wid) => db::load_workout_by_id(&pool_w, wid)
+                                                .await
+                                                .ok()
+                                                .flatten(),
+                                            None => None,
+                                        }
+                                    },
+                                    move |workout| {
+                                        // A missing plan is normal (route rides
+                                        // have none) — the dialog opens either way.
+                                        super::history::show_session_detail(
+                                            &session_w.session,
+                                            &title_w,
+                                            local_dt,
+                                            ftp,
+                                            weight_kg,
+                                            workout.as_ref(),
+                                            parent.as_ref(),
+                                            pool_show,
+                                            rt_show,
+                                            rh_show,
+                                        );
+                                    },
                                 );
                             });
 
@@ -1715,54 +1726,35 @@ impl CalendarPage {
         }
 
         // Group events by day-of-month
-        let mut by_day: HashMap<u32, Vec<&CalendarEvent>> = HashMap::new();
-        for event in events {
-            let day_num = match event {
-                CalendarEvent::Scheduled(e) => e.scheduled_date[8..].parse::<u32>().ok(),
-                CalendarEvent::Session(s, _name) => {
-                    let d = s.session.started_at.with_timezone(&chrono::Local).day();
-                    Some(d)
-                }
-                CalendarEvent::IcuActivity(a) => Some(a.date.day()),
-                CalendarEvent::TimeOff(t) => Some(t.date.day()),
-            };
-            if let Some(d) = day_num {
-                by_day.entry(d).or_default().push(event);
-            }
-        }
+        // Keyed on the full date, so an event from a neighbouring month can
+        // never land in this month's cell of the same day number.
+        let by_day = group_by_date(events);
 
         let today = Local::now().date_naive();
-        let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid date");
-        let start_col = first.weekday().num_days_from_monday() as i32;
-        let days_in_month = Self::days_in_month(year, month);
+        let start_col = first_weekday_column(year, month) as i32;
+        let days_in_month = days_in_month(year, month);
 
         let mut col = start_col;
         let mut row = 1i32;
         // Per-week (grid row) totals for the gutter column.
-        let mut week_done_tss = 0.0f32;
-        let mut week_planned_tss = 0.0f32;
-        let mut week_sched = 0usize;
-        let mut week_sched_done = 0usize;
+        let mut week = crate::data::calendar::LoadTotals::default();
 
         for day_num in 1..=days_in_month {
-            let date = NaiveDate::from_ymd_opt(year, month, day_num).expect("valid date");
+            let Some(date) = NaiveDate::from_ymd_opt(year, month, day_num) else {
+                continue;
+            };
             let is_today = date == today;
-            let day_events = by_day.get(&day_num).map(Vec::as_slice).unwrap_or(&[]);
+            let day_events = by_day.get(&date).map(Vec::as_slice).unwrap_or(&[]);
 
             let items: Vec<MonthCellItem> = day_events
                 .iter()
                 .map(|e| MonthCellItem::from_event(e, ftp))
                 .collect();
-            for item in &items {
-                week_done_tss += item.done_tss;
-                week_planned_tss += item.planned_tss;
-                if item.is_scheduled {
-                    week_sched += 1;
-                    if item.planned_tss == 0.0 {
-                        week_sched_done += 1;
-                    }
-                }
-            }
+            let day_totals = totals(day_events.iter().copied(), ftp);
+            week.done_tss += day_totals.done_tss;
+            week.planned_tss += day_totals.planned_tss;
+            week.scheduled += day_totals.scheduled;
+            week.scheduled_done += day_totals.scheduled_done;
 
             let cell = Self::make_day_cell(day_num, is_today, &items);
             cell.set_vexpand(true);
@@ -1820,22 +1812,8 @@ impl CalendarPage {
             grid.attach(&cell, col, row, 1, 1);
             col += 1;
             if col >= 7 || day_num == days_in_month {
-                grid.attach(
-                    &Self::week_gutter(
-                        week_done_tss,
-                        week_planned_tss,
-                        week_sched_done,
-                        week_sched,
-                    ),
-                    7,
-                    row,
-                    1,
-                    1,
-                );
-                week_done_tss = 0.0;
-                week_planned_tss = 0.0;
-                week_sched = 0;
-                week_sched_done = 0;
+                grid.attach(&Self::week_gutter(&week), 7, row, 1, 1);
+                week = crate::data::calendar::LoadTotals::default();
                 col = 0;
                 row += 1;
             }
@@ -1846,13 +1824,13 @@ impl CalendarPage {
 
     /// The weekly totals gutter: planned + completed TSS and how much of the
     /// plan got done — the summary cards, condensed to where they're relevant.
-    fn week_gutter(done_tss: f32, planned_tss: f32, sched_done: usize, sched: usize) -> gtk::Box {
+    fn week_gutter(week: &crate::data::calendar::LoadTotals) -> gtk::Box {
         let vbox = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
             .valign(gtk::Align::Center)
             .build();
-        let total = done_tss + planned_tss;
+        let total = week.total_tss();
         if total > 0.0 {
             vbox.append(
                 &gtk::Label::builder()
@@ -1862,16 +1840,16 @@ impl CalendarPage {
                     .build(),
             );
         }
-        if sched > 0 {
+        if week.scheduled > 0 {
             vbox.append(
                 &gtk::Label::builder()
-                    .label(format!("{}/{} done", sched_done, sched))
+                    .label(format!("{}/{} done", week.scheduled_done, week.scheduled))
                     .css_classes(["caption", "dim-label", "numeric"])
                     .halign(gtk::Align::Start)
                     .build(),
             );
         }
-        if total <= 0.0 && sched == 0 {
+        if week.is_empty() {
             vbox.append(
                 &gtk::Label::builder()
                     .label("—")
@@ -1959,17 +1937,6 @@ impl CalendarPage {
         frame.set_child(Some(&vbox));
         frame
     }
-
-    fn days_in_month(year: i32, month: u32) -> u32 {
-        let next = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1)
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1)
-        };
-        next.unwrap()
-            .signed_duration_since(NaiveDate::from_ymd_opt(year, month, 1).unwrap())
-            .num_days() as u32
-    }
 }
 
 // ── Month cell item ───────────────────────────────────────────────────────────
@@ -1983,11 +1950,11 @@ struct MonthCellItem {
     planned_tss: f32,
     /// Category zone colour — only scheduled workouts carry one.
     color: Option<(f64, f64, f64)>,
-    is_scheduled: bool,
 }
 
 impl MonthCellItem {
     fn from_event(event: &CalendarEvent, ftp: u32) -> Self {
+        let load = event.load(ftp);
         match event {
             CalendarEvent::Scheduled(e) => MonthCellItem {
                 label: if e.completed {
@@ -1996,22 +1963,20 @@ impl MonthCellItem {
                     e.workout_name.clone()
                 },
                 dimmed: e.completed,
-                done_tss: if e.completed { e.tss } else { 0.0 },
-                planned_tss: if e.completed { 0.0 } else { e.tss },
+                done_tss: load.done_tss,
+                planned_tss: load.planned_tss,
                 color: category_zone_rgb(&e.category),
-                is_scheduled: true,
             },
-            CalendarEvent::Session(s, name) => MonthCellItem {
+            CalendarEvent::Session(_, name) => MonthCellItem {
                 label: name
                     .as_deref()
                     .filter(|n| !n.is_empty())
                     .unwrap_or("Ride")
                     .to_string(),
                 dimmed: true,
-                done_tss: s.session.tss(ftp).unwrap_or(0.0),
-                planned_tss: 0.0,
+                done_tss: load.done_tss,
+                planned_tss: load.planned_tss,
                 color: None,
-                is_scheduled: false,
             },
             CalendarEvent::IcuActivity(a) => MonthCellItem {
                 label: if a.name.trim().is_empty() {
@@ -2020,18 +1985,16 @@ impl MonthCellItem {
                     a.name.clone()
                 },
                 dimmed: true,
-                done_tss: a.tss.unwrap_or(0.0),
-                planned_tss: 0.0,
+                done_tss: load.done_tss,
+                planned_tss: load.planned_tss,
                 color: None,
-                is_scheduled: false,
             },
             CalendarEvent::TimeOff(_) => MonthCellItem {
                 label: "Time off".to_string(),
                 dimmed: true,
-                done_tss: 0.0,
-                planned_tss: 0.0,
+                done_tss: load.done_tss,
+                planned_tss: load.planned_tss,
                 color: None,
-                is_scheduled: false,
             },
         }
     }
@@ -2074,22 +2037,3 @@ fn load_bar(done_tss: f32, planned_tss: f32, rgb: Option<(f64, f64, f64)>) -> gt
 }
 
 // ── Build time-off context string for AI prompts ──────────────────────────────
-
-/// Returns a short plain-text string listing upcoming time-off dates for AI prompts.
-#[allow(dead_code)]
-pub fn format_time_off_for_prompt(entries: &[db::TimeOffEntry]) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-    let dates: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            if e.notes.is_empty() {
-                e.date.format("%Y-%m-%d").to_string()
-            } else {
-                format!("{} ({})", e.date.format("%Y-%m-%d"), e.notes)
-            }
-        })
-        .collect();
-    format!("TIME OFF (no cycling): {}", dates.join(", "))
-}

@@ -2162,7 +2162,7 @@ pub async fn load_wellness_recent(pool: &SqlitePool, days: u32) -> Result<Vec<We
 #[derive(Debug, Clone)]
 pub struct TimeOffEntry {
     pub date: NaiveDate,
-    #[allow(dead_code)] // read by format_time_off_for_prompt when wired into AI prompts
+    /// Free text the rider typed, shown on the calendar's time-off row.
     pub notes: String,
 }
 

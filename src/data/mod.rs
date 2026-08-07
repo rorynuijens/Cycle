@@ -1,4 +1,5 @@
 pub mod athlete;
+pub mod calendar;
 pub mod db;
 pub mod dedupe;
 pub mod fit;
