@@ -18,12 +18,13 @@ use sqlx::SqlitePool;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::data::{athlete::AthleteProfile, keystore};
+use crate::data::athlete::AthleteProfile;
 use crate::training::analytics::{
     compute_hr_zones, compute_pace_curve, compute_power_curve, compute_volume_totals,
     compute_weekly_tss, compute_zone_seconds, RECENT_WINDOW_DAYS,
 };
 use crate::training::fitness::compute_pmc_series;
+use crate::ui::widgets::api_key_banner::ApiKeyBanner;
 
 use bests::BestsSection;
 use coach::CoachCard;
@@ -128,20 +129,10 @@ impl FitnessPage {
             .orientation(gtk::Orientation::Vertical)
             .build();
 
-        let api_banner = adw::Banner::builder()
-            .title("Add your Anthropic API key in Preferences → Integrations to use AI features")
-            .button_label("Open Preferences")
-            .revealed(false)
-            .build();
-        // The banner only ever shows to someone with no key yet, so its button
-        // has to take them somewhere. `app.preferences` is the same action the
-        // main menu uses.
-        api_banner.connect_button_clicked(|banner| {
-            if let Err(e) = banner.activate_action("app.preferences", None) {
-                tracing::error!("Could not open Preferences from the API key banner: {e}");
-            }
-        });
-        root.append(&api_banner);
+        let api_banner = ApiKeyBanner::new(
+            "Add your Anthropic API key in Preferences → Integrations to use AI features",
+        );
+        root.append(api_banner.widget());
 
         // Chart-dominated page — wider clamp than the standard 900 (same
         // justification as the calendar) so the PMC and curves get usable
@@ -204,12 +195,7 @@ impl FitnessPage {
             let api_banner = api_banner.clone();
             let on_toast = Rc::clone(&on_toast);
             Rc::new(move || {
-                // API key pre-flight check (local keyring — fast, stays synchronous)
-                let has_api_key = keystore::get_secret(keystore::KEY_ANTHROPIC)
-                    .unwrap_or(None)
-                    .map(|k| !k.trim().is_empty())
-                    .unwrap_or(false);
-                api_banner.set_revealed(!has_api_key);
+                api_banner.refresh();
 
                 // Load every data source off the main thread (CLAUDE.md §2.3),
                 // then hand the sections their slices once it arrives.

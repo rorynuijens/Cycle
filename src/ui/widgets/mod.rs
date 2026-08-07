@@ -1,3 +1,4 @@
+pub mod api_key_banner;
 pub mod dialog;
 pub mod fit_import;
 pub mod route_map;
