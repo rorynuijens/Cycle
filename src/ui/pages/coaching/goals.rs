@@ -9,7 +9,7 @@ use crate::data::db;
 
 /// Set after construction, because the page's reload closure is built from the
 /// sections and so cannot exist while they are being made.
-type ReloadHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+use crate::ui::ReloadHolder;
 
 pub struct GoalsSection {
     root: gtk::Box,

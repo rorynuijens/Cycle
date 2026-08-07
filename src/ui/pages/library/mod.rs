@@ -34,9 +34,7 @@ use workout_list::{RowContext, CATEGORY_ORDER};
 /// anywhere near this, and the whole file is read into memory.
 const MAX_IMPORT_BYTES: u64 = 1_048_576;
 
-/// Self-referential rebuild-callback holder — lets a closure reference itself,
-/// so edit and delete callbacks can trigger a list rebuild.
-pub type RebuildHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+pub use crate::ui::ReloadHolder as RebuildHolder;
 
 /// Draft segment list: `(duration_secs, power_low_pct, power_high_pct, label)`.
 pub type SegmentDraft = Rc<RefCell<Vec<(u32, f32, f32, String)>>>;

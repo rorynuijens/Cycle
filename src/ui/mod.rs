@@ -70,6 +70,17 @@ impl AiFailure {
 /// This is the non-blocking replacement for `rt.block_on(...)` in GTK callbacks
 /// (see CLAUDE.md §2.3): the future runs on the tokio runtime, its result is sent
 /// over an `async_channel`, and `on_done` is invoked from the GLib main context,
+/// A page's reload callback.
+pub type ReloadFn = std::rc::Rc<dyn Fn()>;
+
+/// A reload callback a page holds a reference to *inside itself*.
+///
+/// Every page hits the same problem: a row's delete or edit button has to
+/// trigger a rebuild of the list it lives in, but that rebuild closure does not
+/// exist yet when the row is built. The holder is filled in once the closure is
+/// made, and the callbacks read it when they fire.
+pub type ReloadHolder = std::rc::Rc<std::cell::RefCell<Option<ReloadFn>>>;
+
 /// so it is safe to touch widgets inside it.
 ///
 /// `on_done` runs at most once. If the task is dropped before completing (e.g. the

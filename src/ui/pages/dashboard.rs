@@ -24,7 +24,7 @@ use crate::ui::markdown::{insight_preview, to_pango};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::AiFailure;
 
-type ReloadHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+use crate::ui::ReloadHolder;
 
 /// How far ahead the briefing prompt looks for planned time off.
 const TIME_OFF_LOOKAHEAD_DAYS: i64 = 14;

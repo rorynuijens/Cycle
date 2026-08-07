@@ -1,3 +1,8 @@
+//! Detail views for a ride that has already happened.
+//!
+//! These were the History page before it was folded into the calendar, which is
+//! now their only caller: activating a completed day opens one of them.
+
 use adw::prelude::*;
 use chrono::Local;
 use libshumate::prelude::LocationExt;
@@ -19,7 +24,7 @@ use crate::training::analytics::{format_average_pace, format_distance};
 use crate::training::engine::WorkoutEngine;
 use crate::ui::widgets::zone_bar::ZoneBar;
 
-pub type ReloadHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+use crate::ui::ReloadHolder;
 
 pub fn show_intervals_detail(
     act: &db::IntervalsActivity,

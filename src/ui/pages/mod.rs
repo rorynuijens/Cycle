@@ -3,7 +3,6 @@ pub mod coaching;
 pub mod dashboard;
 pub mod devices;
 pub mod fitness;
-pub mod history;
 pub mod library;
 pub mod onboarding;
 pub mod player;
