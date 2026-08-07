@@ -493,18 +493,6 @@ pub fn show_intervals_detail(
         let spinner = spinner.clone();
         let status_label = status_label.clone();
         Rc::new(move || {
-            let athlete_id = match rt
-                .block_on(db::get_setting(&pool, "intervals.athlete_id"))
-                .unwrap_or(None)
-            {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    status_label
-                        .set_label("Intervals.icu credentials not set — configure in Preferences");
-                    status_label.set_visible(true);
-                    return;
-                }
-            };
             let api_key = match keystore::get_secret(keystore::KEY_INTERVALS_API).unwrap_or(None) {
                 Some(s) if !s.is_empty() => s,
                 _ => {
@@ -522,10 +510,32 @@ pub fn show_intervals_detail(
 
             let (tx, rx) = async_channel::bounded::<anyhow::Result<String>>(1);
             rt.spawn({
-                let athlete_id = athlete_id.clone();
                 let api_key = api_key.clone();
                 let icu_id = icu_id.clone();
+                let pool = pool.clone();
                 async move {
+                    // The athlete ID is read here, not on the GTK thread: a
+                    // block_on against SQLite stalls the GLib loop whenever the
+                    // database is busy (CLAUDE.md §2.3).
+                    let athlete_id = match db::get_setting(&pool, "intervals.athlete_id").await {
+                        Ok(Some(id)) if !id.is_empty() => id,
+                        Ok(_) => {
+                            tx.send(Err(anyhow::anyhow!(
+                                "Intervals.icu credentials not set — configure in Preferences"
+                            )))
+                            .await
+                            .ok();
+                            return;
+                        }
+                        Err(e) => {
+                            tx.send(Err(anyhow::anyhow!(
+                                "Could not read your Intervals.icu settings: {e}"
+                            )))
+                            .await
+                            .ok();
+                            return;
+                        }
+                    };
                     let r = crate::ai::intervals::fetch_combined_activity_data(
                         &athlete_id,
                         &api_key,
@@ -545,8 +555,18 @@ pub fn show_intervals_detail(
             glib::timeout_add_local(Duration::from_millis(200), move || match rx.try_recv() {
                 Ok(Ok(json)) => {
                     tracing::debug!("Intervals.icu streams loaded for {icu_id}");
-                    rt.block_on(db::save_activity_streams(&pool, &icu_id, &json))
-                        .ok();
+                    // Cache the streams in the background — this is a write of a
+                    // potentially large blob and must not block the GLib loop.
+                    rt.spawn({
+                        let pool = pool.clone();
+                        let icu_id = icu_id.clone();
+                        let json = json.clone();
+                        async move {
+                            if let Err(e) = db::save_activity_streams(&pool, &icu_id, &json).await {
+                                tracing::warn!("Could not cache activity streams: {e}");
+                            }
+                        }
+                    });
                     match ActivityStreams::from_json(&json) {
                         Some(s) => {
                             tracing::info!(
@@ -585,32 +605,43 @@ pub fn show_intervals_detail(
         })
     };
 
-    // Initial DB cache check (fast synchronous read — safe on GLib main thread).
-    // If cached data exists, display it immediately; then re-fetch in the background if GPS is
-    // absent (stale cache from before GPS support was added, or an activity whose streams
-    // endpoint returned 404 and was never retried with the map endpoint).
-    match rt_handle
-        .block_on(db::get_activity_streams(pool, &icu_id))
-        .unwrap_or(None)
+    // Initial cache check. This used to be a block_on, justified as a "fast
+    // synchronous read" — but it reads a whole stream blob, and a ride
+    // checkpoint every 30 s can have the database busy when it runs. The dialog
+    // opens straight away and fills in when the read lands (CLAUDE.md §2.3).
     {
-        Some(json) => match ActivityStreams::from_json(&json) {
-            Some(s) => {
-                let needs_gps_refresh = !s.has_gps();
-                populate_streams(s);
-                if needs_gps_refresh {
-                    // Cache has no GPS — re-fetch to pick up the map endpoint data.
-                    do_fetch();
+        let populate = Rc::clone(&populate_streams);
+        let do_fetch = Rc::clone(&do_fetch);
+        let pool_cache = pool.clone();
+        let icu_id_cache = icu_id.clone();
+        crate::ui::spawn_to_main(
+            rt_handle,
+            async move { db::get_activity_streams(&pool_cache, &icu_id_cache).await },
+            move |result| {
+                let cached = match result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Treat an unreadable cache as no cache: fetching again
+                        // is the same recovery either way.
+                        tracing::warn!("Could not read the cached activity streams: {e}");
+                        None
+                    }
+                };
+                match cached.as_deref().and_then(ActivityStreams::from_json) {
+                    Some(s) => {
+                        let needs_gps_refresh = !s.has_gps();
+                        populate(s);
+                        if needs_gps_refresh {
+                            // Cache predates GPS support, or the streams endpoint
+                            // 404'd and was never retried against the map endpoint.
+                            do_fetch();
+                        }
+                    }
+                    // Nothing cached, or the cache will not parse — fetch.
+                    None => do_fetch(),
                 }
-            }
-            None => {
-                // Corrupt cache — re-fetch.
-                do_fetch();
-            }
-        },
-        None => {
-            // Nothing cached yet — fetch on first open.
-            do_fetch();
-        }
+            },
+        );
     }
 
     // Refresh button: force a re-fetch even if data is already displayed.
@@ -691,37 +722,68 @@ pub fn show_session_detail(
     let rt_export = rt_handle.clone();
     export_btn.connect_clicked(move |btn| {
         let parent = btn.root().and_downcast::<gtk::Window>();
-        let dialog = gtk::FileDialog::builder()
-            .title("Export FIT File")
-            .accept_label("Export")
-            .initial_name(crate::data::fit::suggested_filename(
-                &session_for_export,
-                &title_export,
-            ))
-            .build();
         let session_save = session_for_export.clone();
-        // One row, read when the rider asks to export: the FTP and heart-rate
-        // limits the training-load figure in the file is scaled to.
-        let athlete = rt_export
-            .block_on(db::load_or_create_athlete(&pool_export))
-            .unwrap_or_default();
-        dialog.save(
-            parent.as_ref(),
-            None::<&gio::Cancellable>,
-            move |result| match result {
-                Ok(file) => {
-                    let Some(path) = file.path() else {
-                        tracing::error!("Export target has no local path");
+        let filename = crate::data::fit::suggested_filename(&session_for_export, &title_export);
+        let pool_a = pool_export.clone();
+
+        // The profile is read before the file chooser opens, off the GTK thread.
+        // It carries the FTP and heart-rate limits the training-load figure in
+        // the file is scaled to — and Garmin reads that figure from the file
+        // rather than recomputing it, so exporting on a default profile would
+        // publish a wrong number as fact. A failed read cancels the export.
+        crate::ui::spawn_to_main(
+            &rt_export,
+            async move { db::load_or_create_athlete(&pool_a).await },
+            move |result| {
+                let athlete = match result {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!("Could not read your profile for export: {e}");
+                        let alert = adw::AlertDialog::builder()
+                            .heading("Could not export")
+                            .body(
+                                "Your athlete profile could not be read. The file was \
+                                 not written, because its training-load figure is \
+                                 scaled to your FTP and heart-rate limits.",
+                            )
+                            .build();
+                        alert.add_response("ok", "_OK");
+                        alert.set_default_response(Some("ok"));
+                        if let Some(p) = parent.as_ref() {
+                            alert.present(Some(p));
+                        }
                         return;
-                    };
-                    match crate::data::fit::write_session_fit(&path, &session_save, &athlete) {
-                        Ok(()) => tracing::info!("Exported FIT to {}", path.display()),
-                        Err(e) => tracing::error!("FIT export failed: {e}"),
                     }
-                }
-                // The rider dismissing the file chooser is not an error.
-                Err(e) if e.matches(gtk::DialogError::Dismissed) => {}
-                Err(e) => tracing::error!("Export dialog failed: {e}"),
+                };
+
+                let dialog = gtk::FileDialog::builder()
+                    .title("Export FIT File")
+                    .accept_label("Export")
+                    .initial_name(filename)
+                    .build();
+                dialog.save(
+                    parent.as_ref(),
+                    None::<&gio::Cancellable>,
+                    move |result| match result {
+                        Ok(file) => {
+                            let Some(path) = file.path() else {
+                                tracing::error!("Export target has no local path");
+                                return;
+                            };
+                            match crate::data::fit::write_session_fit(
+                                &path,
+                                &session_save,
+                                &athlete,
+                            ) {
+                                Ok(()) => tracing::info!("Exported FIT to {}", path.display()),
+                                Err(e) => tracing::error!("FIT export failed: {e}"),
+                            }
+                        }
+                        // The rider dismissing the file chooser is not an error.
+                        Err(e) if e.matches(gtk::DialogError::Dismissed) => {}
+                        Err(e) => tracing::error!("Export dialog failed: {e}"),
+                    },
+                );
             },
         );
     });

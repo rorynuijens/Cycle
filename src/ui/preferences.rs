@@ -6,17 +6,128 @@ use std::rc::Rc;
 
 use crate::data::{athlete::AthleteProfile, db, keystore};
 
+/// The stored settings the preferences window is built around.
+struct PreferenceSettings {
+    erg_ramp_rate: f64,
+    sim_difficulty: f64,
+    sim_max_gradient: f64,
+    icu_athlete_id: String,
+    icu_upload: bool,
+    icu_sync: bool,
+}
+
+impl Default for PreferenceSettings {
+    /// What each setting means when it has never been set.
+    fn default() -> Self {
+        Self {
+            erg_ramp_rate: 25.0,
+            sim_difficulty: 100.0,
+            sim_max_gradient: 20.0,
+            icu_athlete_id: String::new(),
+            icu_upload: false,
+            icu_sync: false,
+        }
+    }
+}
+
+/// Read every setting the window shows, in one pass off the GTK main thread.
+///
+/// An unset key falls back to its default; a failed *read* does not, because
+/// the two are not the same thing — see [`show`].
+async fn load_settings(pool: &SqlitePool) -> anyhow::Result<PreferenceSettings> {
+    let defaults = PreferenceSettings::default();
+    Ok(PreferenceSettings {
+        erg_ramp_rate: db::get_setting(pool, "training.erg_ramp_rate")
+            .await?
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(defaults.erg_ramp_rate),
+        sim_difficulty: db::get_setting(pool, "training.sim_difficulty")
+            .await?
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(defaults.sim_difficulty),
+        sim_max_gradient: db::get_setting(pool, "training.sim_max_gradient")
+            .await?
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(defaults.sim_max_gradient),
+        icu_athlete_id: db::get_setting(pool, "intervals.athlete_id")
+            .await?
+            .unwrap_or_default(),
+        icu_upload: db::get_setting(pool, "intervals.upload")
+            .await?
+            .map(|v| v == "1")
+            .unwrap_or(defaults.icu_upload),
+        icu_sync: db::get_setting(pool, "intervals.sync")
+            .await?
+            .map(|v| v == "1")
+            .unwrap_or(defaults.icu_sync),
+    })
+}
+
 /// Create and present the modal preferences window.
 ///
 /// Changes apply immediately — no Save button. `on_saved` is called whenever the athlete
 /// profile changes; `on_erg_rate_changed` is called whenever the ERG ramp rate changes;
 /// `on_sim_changed` is called with `(difficulty_percent, max_gradient_percent)` whenever
 /// either SIM mode setting changes.
+///
+/// The stored settings are read before the window is built, off the GTK main
+/// thread (CLAUDE.md §2.3). They used to be read with `block_on` partway through
+/// construction, which stalls the GLib loop whenever SQLite is busy — and it is
+/// busy every 30 s during a ride, when the session checkpoint writes.
+///
+/// If the read fails the window does not open. Opening it on defaults would show
+/// the rider values that are not the ones saved, and a rider who "corrects" one
+/// of them writes the wrong value over a good one.
 pub fn show(
     parent: &adw::ApplicationWindow,
     athlete: AthleteProfile,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
+    on_saved: impl Fn(AthleteProfile) + 'static,
+    on_erg_rate_changed: impl Fn(u32) + 'static,
+    on_sim_changed: impl Fn(u32, u32) + 'static,
+) {
+    let parent = parent.clone();
+    let pool_load = pool.clone();
+    let rt_build = rt_handle.clone();
+    crate::ui::spawn_to_main(
+        &rt_handle,
+        async move { load_settings(&pool_load).await },
+        move |result| match result {
+            Ok(settings) => build_and_present(
+                &parent,
+                athlete,
+                pool,
+                rt_build,
+                settings,
+                on_saved,
+                on_erg_rate_changed,
+                on_sim_changed,
+            ),
+            Err(e) => {
+                tracing::error!("Could not read your settings: {e}");
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Could not open Preferences")
+                    .body(
+                        "Your settings could not be read. Preferences was not opened \
+                         so that nothing overwrites them.",
+                    )
+                    .build();
+                dialog.add_response("ok", "_OK");
+                dialog.set_default_response(Some("ok"));
+                dialog.present(Some(&parent));
+            }
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // preferences window wiring
+fn build_and_present(
+    parent: &adw::ApplicationWindow,
+    athlete: AthleteProfile,
+    pool: SqlitePool,
+    rt_handle: tokio::runtime::Handle,
+    settings: PreferenceSettings,
     on_saved: impl Fn(AthleteProfile) + 'static,
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
@@ -316,13 +427,7 @@ pub fn show(
         )
         .build();
 
-    let saved_ramp_rate = rt_handle
-        .block_on(db::get_setting(&pool, "training.erg_ramp_rate"))
-        .unwrap_or(None)
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(25.0);
-
-    let ramp_adj = gtk::Adjustment::new(saved_ramp_rate, 0.0, 100.0, 1.0, 5.0, 0.0);
+    let ramp_adj = gtk::Adjustment::new(settings.erg_ramp_rate, 0.0, 100.0, 1.0, 5.0, 0.0);
     let ramp_row = adw::SpinRow::new(Some(&ramp_adj), 1.0, 0);
     ramp_row.set_title("Ramp Rate");
     ramp_row.set_subtitle("Watts per second (0 = instant)");
@@ -338,24 +443,13 @@ pub fn show(
         )
         .build();
 
-    let saved_difficulty = rt_handle
-        .block_on(db::get_setting(&pool, "training.sim_difficulty"))
-        .unwrap_or(None)
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(100.0);
-    let saved_max_grade = rt_handle
-        .block_on(db::get_setting(&pool, "training.sim_max_gradient"))
-        .unwrap_or(None)
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(20.0);
-
-    let difficulty_adj = gtk::Adjustment::new(saved_difficulty, 0.0, 100.0, 5.0, 10.0, 0.0);
+    let difficulty_adj = gtk::Adjustment::new(settings.sim_difficulty, 0.0, 100.0, 5.0, 10.0, 0.0);
     let difficulty_row = adw::SpinRow::new(Some(&difficulty_adj), 5.0, 0);
     difficulty_row.set_title("Trainer Difficulty");
     difficulty_row.set_subtitle("Percentage of the real gradient sent to the trainer");
     sim_group.add(&difficulty_row);
 
-    let max_grade_adj = gtk::Adjustment::new(saved_max_grade, 5.0, 20.0, 1.0, 5.0, 0.0);
+    let max_grade_adj = gtk::Adjustment::new(settings.sim_max_gradient, 5.0, 20.0, 1.0, 5.0, 0.0);
     let max_grade_row = adw::SpinRow::new(Some(&max_grade_adj), 1.0, 0);
     max_grade_row.set_title("Maximum Gradient");
     max_grade_row.set_subtitle("Climbs steeper than this are capped (%)");
@@ -434,23 +528,13 @@ pub fn show(
         .build();
 
     // ── Intervals.icu ─────────────────────────────────────────────────────
-    let icu_athlete_id = rt_handle
-        .block_on(db::get_setting(&pool, "intervals.athlete_id"))
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let icu_athlete_id = settings.icu_athlete_id.clone();
+    // Keyring reads are fast local D-Bus calls, not database or network work.
     let icu_api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
         .unwrap_or(None)
         .unwrap_or_default();
-    let icu_upload = rt_handle
-        .block_on(db::get_setting(&pool, "intervals.upload"))
-        .unwrap_or(None)
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let icu_sync = rt_handle
-        .block_on(db::get_setting(&pool, "intervals.sync"))
-        .unwrap_or(None)
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let icu_upload = settings.icu_upload;
+    let icu_sync = settings.icu_sync;
 
     let icu_group = adw::PreferencesGroup::builder()
         .title("Intervals.icu")
@@ -905,12 +989,13 @@ pub fn show(
         let rt_s = rt_handle.clone();
         let spinner_s = sync_spinner.clone();
         let win_s = win.clone();
+        let id_row_s = icu_id_row.clone();
 
         sync_now_btn.connect_clicked(move |btn| {
-            let athlete_id = rt_s
-                .block_on(db::get_setting(&pool_s, "intervals.athlete_id"))
-                .unwrap_or(None)
-                .unwrap_or_default();
+            // Read the ID off the row rather than back out of the database: it is
+            // already on screen, it saves a blocking read on the GTK thread, and
+            // an ID just typed works without having to commit the row first.
+            let athlete_id = id_row_s.text().trim().to_string();
             let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
                 .unwrap_or(None)
                 .unwrap_or_default();
