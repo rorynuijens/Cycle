@@ -12,7 +12,8 @@
 //! rides within minutes of each other, so a narrow window costs nothing real while
 //! keeping false matches — which would hide a genuine ride — very unlikely.
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use std::collections::HashMap;
 
 use crate::data::db::IntervalsActivity;
 use crate::data::session::Session;
@@ -127,6 +128,69 @@ pub fn find_match_with<'a>(
                 .map(|s| (session.started_at - s).num_seconds().abs())
                 .unwrap_or(i64::MAX)
         })
+}
+
+/// What makes two Intervals.icu rows the same upload: same sport, started at the
+/// same wall-clock moment, lasted the same time.
+type DuplicateKey = (String, NaiveDateTime, Option<u32>);
+
+/// The key an activity groups under, or `None` when it cannot be grouped safely.
+///
+/// Unlike matching a session to an activity, there is no clock drift to allow
+/// for here — a duplicate is the *same file* reaching Intervals.icu twice, so
+/// the two agree to the second. Exact keys keep the collapse from ever merging
+/// two rides that merely started close together.
+///
+/// An activity with no start time is left ungrouped: the date alone would pair
+/// any two rides on the same day.
+fn duplicate_key(activity: &IntervalsActivity) -> Option<DuplicateKey> {
+    Some((
+        activity.sport_type.clone(),
+        activity.start_datetime_local?,
+        activity.duration_secs,
+    ))
+}
+
+/// Drop repeated uploads of the same activity, keeping one of each.
+///
+/// The same ride reaches Intervals.icu more than once when it is uploaded again
+/// — re-exporting a FIT file, or syncing from two sources. Each upload gets its
+/// own `icu_id`, so nothing downstream recognises them as one ride: the activity
+/// shows up several times in the calendar, and, worse, its TSS is counted once
+/// per copy, inflating fitness and fatigue.
+///
+/// `prefer` marks the copy to keep when there is a choice. Callers that go on to
+/// filter out session-linked activities pass their linked set, so the survivor is
+/// the copy the link removes — otherwise the ride would appear twice, once as the
+/// local session and once as the surviving orphan.
+///
+/// Input order is preserved.
+pub fn collapse_duplicates(
+    activities: Vec<IntervalsActivity>,
+    prefer: impl Fn(&IntervalsActivity) -> bool,
+) -> Vec<IntervalsActivity> {
+    let mut kept: Vec<IntervalsActivity> = Vec::with_capacity(activities.len());
+    let mut seen: HashMap<DuplicateKey, usize> = HashMap::new();
+
+    for activity in activities {
+        let Some(key) = duplicate_key(&activity) else {
+            kept.push(activity);
+            continue;
+        };
+        match seen.get(&key) {
+            Some(&i) => {
+                if prefer(&activity) && !prefer(&kept[i]) {
+                    kept[i] = activity;
+                }
+            }
+            None => {
+                seen.insert(key, kept.len());
+                kept.push(activity);
+            }
+        }
+    }
+
+    kept
 }
 
 /// Intervals.icu reports local wall-clock time with no offset, so it is read back
@@ -388,5 +452,116 @@ mod tests {
         let mut activity = activity_for(&session, "i1");
         shift_start(&mut activity, 7200);
         assert!(find_match(&session, [&activity]).is_none());
+    }
+
+    // ── Collapsing repeated uploads ───────────────────────────────────────
+
+    /// Nothing is preferred — the first copy of each ride survives.
+    fn collapse(activities: Vec<IntervalsActivity>) -> Vec<String> {
+        collapse_duplicates(activities, |_| false)
+            .into_iter()
+            .map(|a| a.icu_id)
+            .collect()
+    }
+
+    /// The same ride uploaded again: a new id, everything else identical.
+    fn reupload(activity: &IntervalsActivity, icu_id: &str) -> IntervalsActivity {
+        IntervalsActivity {
+            icu_id: icu_id.into(),
+            ..activity.clone()
+        }
+    }
+
+    #[test]
+    fn should_keep_a_ride_uploaded_only_once() {
+        let session = ride();
+        let activity = activity_for(&session, "i1");
+        assert_eq!(collapse(vec![activity]), vec!["i1"]);
+    }
+
+    #[test]
+    fn should_collapse_a_ride_uploaded_three_times() {
+        let session = ride();
+        let first = activity_for(&session, "i1");
+        let copies = vec![reupload(&first, "i2"), reupload(&first, "i3"), first];
+        assert_eq!(collapse(copies), vec!["i2"]);
+    }
+
+    #[test]
+    fn should_keep_the_copy_a_session_already_points_at() {
+        // The link is what removes the ride from the unlinked view, so the
+        // linked copy has to be the survivor or the ride shows up twice.
+        let session = ride();
+        let first = activity_for(&session, "i1");
+        let copies = vec![first.clone(), reupload(&first, "i2")];
+        let kept = collapse_duplicates(copies, |a| a.icu_id == "i2");
+        assert_eq!(
+            kept.into_iter().map(|a| a.icu_id).collect::<Vec<_>>(),
+            vec!["i2"]
+        );
+    }
+
+    #[test]
+    fn should_keep_two_different_rides_on_the_same_day() {
+        let morning = ride();
+        let first = activity_for(&morning, "i1");
+        let mut evening = reupload(&first, "i2");
+        shift_start(&mut evening, 36_000); // ten hours later
+        assert_eq!(collapse(vec![first, evening]), vec!["i1", "i2"]);
+    }
+
+    #[test]
+    fn should_keep_rides_that_started_together_but_ran_different_lengths() {
+        // Same trainer, same minute, different ride — not one upload twice.
+        let session = ride();
+        let first = activity_for(&session, "i1");
+        let mut longer = reupload(&first, "i2");
+        longer.duration_secs = Some(first.duration_secs.expect("set above") + 600);
+        assert_eq!(collapse(vec![first, longer]), vec!["i1", "i2"]);
+    }
+
+    #[test]
+    fn should_keep_a_ride_and_a_run_recorded_together() {
+        // A brick session, or a watch recording alongside the head unit.
+        let session = ride();
+        let cycling = activity_for(&session, "i1");
+        let mut running = reupload(&cycling, "i2");
+        running.sport_type = "Run".into();
+        assert_eq!(collapse(vec![cycling, running]), vec!["i1", "i2"]);
+    }
+
+    #[test]
+    fn should_not_group_activities_that_have_no_start_time() {
+        // Without a start there is nothing precise enough to group on, so these
+        // are left alone rather than merged on their date.
+        let session = ride();
+        let first = activity_for(&session, "i1");
+        let mut a = reupload(&first, "i1");
+        let mut b = reupload(&first, "i2");
+        a.start_datetime_local = None;
+        b.start_datetime_local = None;
+        assert_eq!(collapse(vec![a, b]), vec!["i1", "i2"]);
+    }
+
+    #[test]
+    fn should_leave_an_empty_history_alone() {
+        assert!(collapse(vec![]).is_empty());
+    }
+
+    #[test]
+    fn should_preserve_the_order_rides_came_in() {
+        let session = ride();
+        let first = activity_for(&session, "i1");
+        let mut second = reupload(&first, "i2");
+        shift_start(&mut second, 3600);
+        let mut third = reupload(&first, "i3");
+        shift_start(&mut third, 7200);
+        let jumbled = vec![
+            first.clone(),
+            second.clone(),
+            reupload(&first, "i1-again"),
+            third,
+        ];
+        assert_eq!(collapse(jumbled), vec!["i1", "i2", "i3"]);
     }
 }

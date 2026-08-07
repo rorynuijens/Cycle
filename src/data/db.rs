@@ -908,11 +908,16 @@ pub async fn load_unlinked_intervals_activities(
     pool: &SqlitePool,
 ) -> Result<Vec<IntervalsActivity>> {
     let linked = linked_icu_ids(pool).await?;
-    Ok(load_intervals_activities(pool)
-        .await?
-        .into_iter()
-        .filter(|a| !linked.contains(&a.icu_id))
-        .collect())
+    let activities = load_intervals_activities(pool).await?;
+    // Collapse before filtering, keeping the linked copy: a ride uploaded twice
+    // has only one of its copies linked, so filtering first would leave the
+    // other standing alongside the local session.
+    Ok(
+        crate::data::dedupe::collapse_duplicates(activities, |a| linked.contains(&a.icu_id))
+            .into_iter()
+            .filter(|a| !linked.contains(&a.icu_id))
+            .collect(),
+    )
 }
 
 /// As [`load_unlinked_intervals_activities`], for a date range.
@@ -922,9 +927,9 @@ pub async fn load_unlinked_intervals_activities_between(
     end_date: &str,
 ) -> Result<Vec<IntervalsActivity>> {
     let linked = linked_icu_ids(pool).await?;
+    let activities = load_intervals_activities_between(pool, start_date, end_date).await?;
     Ok(
-        load_intervals_activities_between(pool, start_date, end_date)
-            .await?
+        crate::data::dedupe::collapse_duplicates(activities, |a| linked.contains(&a.icu_id))
             .into_iter()
             .filter(|a| !linked.contains(&a.icu_id))
             .collect(),
@@ -1657,22 +1662,19 @@ pub async fn upsert_intervals_activity(
 
 /// Load (date, tss) pairs from Intervals.icu activities for CTL/ATL calculation.
 pub async fn load_intervals_tss_pairs(pool: &SqlitePool) -> Result<Vec<(NaiveDate, f32)>> {
-    let rows = sqlx::query(
-        "SELECT date, tss FROM intervals_activities WHERE tss IS NOT NULL ORDER BY date",
+    // Repeated uploads of one ride are collapsed first. Each copy carries the
+    // same TSS, so counting them all would credit the rider two or three times
+    // for a single session and inflate fitness and fatigue for weeks after.
+    //
+    // Session-linked activities are deliberately kept: the local ride excludes
+    // itself when it has a link, and this is the row that stands in for it.
+    let activities = load_intervals_activities(pool).await?;
+    Ok(
+        crate::data::dedupe::collapse_duplicates(activities, |_| false)
+            .into_iter()
+            .filter_map(|a| a.tss.map(|tss| (a.date, tss)))
+            .collect(),
     )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| {
-            let date_str: &str = r.get("date");
-            let tss: f64 = r.get("tss");
-            NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                .ok()
-                .map(|d| (d, tss as f32))
-        })
-        .collect())
 }
 
 /// A full Intervals.icu activity row, used for display in History and AI coaching.
@@ -1697,10 +1699,10 @@ pub struct IntervalsActivity {
 
 /// Total count of cached Intervals.icu activities.
 pub async fn count_intervals_activities(pool: &SqlitePool) -> Result<i64> {
-    let row = sqlx::query("SELECT COUNT(*) AS cnt FROM intervals_activities")
-        .fetch_one(pool)
-        .await?;
-    Ok(row.get("cnt"))
+    // Counts rides, not rows: a ride uploaded twice is still one session, and
+    // this figure goes to the AI coach as the athlete's training history.
+    let activities = load_intervals_activities(pool).await?;
+    Ok(crate::data::dedupe::collapse_duplicates(activities, |_| false).len() as i64)
 }
 
 /// Delete a single Intervals.icu activity by its icu_id.
@@ -2797,7 +2799,13 @@ mod tests {
         let session = hour_long_ride();
         save_session(&pool, &session).await.unwrap();
         insert_icu_mirror(&pool, "icu-1", &session).await;
-        insert_icu_mirror(&pool, "icu-2", &hour_long_ride()).await;
+        // A ride of its own, earlier the same day. It needs a start time of its
+        // own: two rides sharing one to the second are indistinguishable from a
+        // single ride uploaded twice, and would be collapsed as such.
+        let mut other = hour_long_ride();
+        other.started_at -= chrono::Duration::hours(4);
+        other.ended_at = Some(other.started_at + chrono::Duration::hours(1));
+        insert_icu_mirror(&pool, "icu-2", &other).await;
         reconcile_icu_links(&pool).await.unwrap();
 
         // The raw list still has both — reconciliation needs to see them.
@@ -2807,6 +2815,54 @@ mod tests {
         let unlinked = load_unlinked_intervals_activities(&pool).await.unwrap();
         assert_eq!(unlinked.len(), 1);
         assert_eq!(unlinked[0].icu_id, "icu-2");
+    }
+
+    #[tokio::test]
+    async fn a_ride_uploaded_three_times_is_still_one_ride() {
+        // Re-exporting a ride to Intervals.icu gives each upload its own id, so
+        // nothing downstream recognises the copies as one ride: it showed up
+        // three times in the calendar and its TSS was counted three times, which
+        // inflated fitness and fatigue for weeks afterwards.
+        let pool = test_pool().await;
+        let session = hour_long_ride();
+        save_session(&pool, &session).await.unwrap();
+        for icu_id in ["icu-1", "icu-2", "icu-3"] {
+            insert_icu_mirror(&pool, icu_id, &session).await;
+        }
+        reconcile_icu_links(&pool).await.unwrap();
+
+        // All three rows are still stored — reconciliation needs to see them.
+        assert_eq!(load_intervals_activities(&pool).await.unwrap().len(), 3);
+
+        // The local session covers the ride, so nothing is left to show.
+        assert!(
+            load_unlinked_intervals_activities(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the ride is already on the calendar as a local session"
+        );
+
+        // One ride, one score — not three.
+        let tss = load_intervals_tss_pairs(&pool).await.unwrap();
+        assert_eq!(tss.len(), 1, "got {tss:?}");
+        assert_eq!(tss[0].1, 80.0);
+
+        assert_eq!(count_intervals_activities(&pool).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_duplicated_ride_with_no_local_session_still_shows_once() {
+        // The same ride reaching Intervals.icu twice from elsewhere: there is no
+        // local session to stand in for it, so exactly one copy must survive.
+        let pool = test_pool().await;
+        let ride = hour_long_ride();
+        insert_icu_mirror(&pool, "icu-1", &ride).await;
+        insert_icu_mirror(&pool, "icu-2", &ride).await;
+
+        let unlinked = load_unlinked_intervals_activities(&pool).await.unwrap();
+        assert_eq!(unlinked.len(), 1);
+        assert_eq!(load_intervals_tss_pairs(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
