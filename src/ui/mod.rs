@@ -36,6 +36,34 @@ pub fn load_css() {
     }
 }
 
+/// Why an AI request produced no answer.
+///
+/// The two cases need different wording: one points at the rider's API key, the
+/// other at their database. Telling someone to check their key when the database
+/// is at fault sends them to the wrong place, and the wording is worth keeping
+/// identical across the pages that ask the coach for something.
+#[derive(Debug, Clone, Copy)]
+pub enum AiFailure {
+    /// The training history could not be read, so nothing was sent.
+    DataUnavailable,
+    /// The request was sent but did not come back with an answer.
+    Request,
+}
+
+impl AiFailure {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::DataUnavailable => {
+                "Could not read your training history, so nothing was sent to the AI Coach."
+            }
+            Self::Request => {
+                "The AI Coach couldn't complete this request. \
+                 Please check your API key and try again."
+            }
+        }
+    }
+}
+
 /// Run an async task on the tokio runtime and deliver its result to `on_done`
 /// back on the GTK main thread — without ever blocking the GLib loop.
 ///

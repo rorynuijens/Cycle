@@ -11,10 +11,116 @@ use sqlx::SqlitePool;
 
 use crate::ai::coach::{
     build_program_prompt, build_prompt, get_suggestion, parse_program_response, ProgramContext,
-    ProgramEntry, RecentSession, TrainingContext, WellnessSnapshot, WorkoutOption,
+    ProgramEntry, RecentSession, TrainingContext,
+};
+use crate::ai::context::{
+    build_recent_session, day_name_to_offset, extract_recommended_workout, format_program,
+    icu_activity_to_recent_session, strip_recommended_line, wellness_snapshots,
+    workouts_as_options, ICU_PREFIX,
 };
 use crate::data::{athlete::AthleteProfile, db, keystore, workout::Workout};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
+use crate::ui::AiFailure;
+
+/// Days of wellness history sent with a coaching prompt.
+const AI_WELLNESS_DAYS: u32 = 7;
+
+/// How far ahead the suggestion prompt looks for planned time off.
+const TIME_OFF_LOOKAHEAD_DAYS: i64 = 14;
+
+/// How far back the suggestion prompt summarises recent training.
+const RECENT_TRAINING_WEEKS: i64 = 4;
+
+/// Most recent sessions described to the coach.
+const MAX_RECENT_SESSIONS: usize = 10;
+
+/// The page's own state: the rider's goals and the last cached suggestion.
+struct CoachingData {
+    goals: Vec<db::AthleteGoal>,
+    cached_resp: String,
+    cached_name: String,
+    cached_detail: String,
+}
+
+/// Load the page's state off the GTK main thread (CLAUDE.md §2.3).
+async fn load_coaching_data(pool: &SqlitePool) -> anyhow::Result<CoachingData> {
+    Ok(CoachingData {
+        goals: db::load_goals(pool).await?,
+        cached_resp: db::get_setting(pool, "ai.suggestion_response")
+            .await?
+            .unwrap_or_default(),
+        cached_name: db::get_setting(pool, "ai.suggestion_workout_name")
+            .await?
+            .unwrap_or_default(),
+        cached_detail: db::get_setting(pool, "ai.suggestion_workout_detail")
+            .await?
+            .unwrap_or_default(),
+    })
+}
+
+/// The training history behind a "what should I ride today?" prompt.
+struct SuggestionPromptData {
+    athlete_ctx: String,
+    records: Vec<db::SessionSummary>,
+    intervals_pairs: Vec<(NaiveDate, f32)>,
+    icu_activities: Vec<db::IntervalsActivity>,
+    goals: Vec<db::AthleteGoal>,
+    icu_workouts: Vec<db::IntervalsWorkout>,
+    wellness: Vec<db::WellnessEntry>,
+    time_off: Vec<db::TimeOffEntry>,
+}
+
+/// Load the history a workout suggestion is based on.
+///
+/// The first failure aborts: a partial read would still be sent, and the coach
+/// would recommend a session having been shown a training history that is
+/// missing rides — at the rider's expense, since the request is billed.
+async fn load_suggestion_prompt_data(
+    pool: &SqlitePool,
+    today: NaiveDate,
+) -> anyhow::Result<SuggestionPromptData> {
+    let lookahead = today + CDuration::days(TIME_OFF_LOOKAHEAD_DAYS);
+    Ok(SuggestionPromptData {
+        athlete_ctx: db::get_setting(pool, "coaching.athlete_context")
+            .await?
+            .unwrap_or_default(),
+        records: db::load_session_summaries(pool).await?,
+        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
+        icu_activities: db::load_unlinked_intervals_activities(pool).await?,
+        goals: db::load_goals(pool).await?,
+        icu_workouts: db::load_intervals_workouts(pool).await?,
+        wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS).await?,
+        time_off: db::load_time_off_between(
+            pool,
+            &today.format("%Y-%m-%d").to_string(),
+            &lookahead.format("%Y-%m-%d").to_string(),
+        )
+        .await?,
+    })
+}
+
+/// The training history behind a multi-week program prompt.
+struct ProgramPromptData {
+    athlete_ctx: String,
+    goals: Vec<db::AthleteGoal>,
+    records: Vec<db::SessionSummary>,
+    intervals_pairs: Vec<(NaiveDate, f32)>,
+    icu_workouts: Vec<db::IntervalsWorkout>,
+}
+
+/// Load the history a training program is built from. Aborts on the first
+/// failure, for the same reason as [`load_suggestion_prompt_data`].
+async fn load_program_prompt_data(pool: &SqlitePool) -> anyhow::Result<ProgramPromptData> {
+    Ok(ProgramPromptData {
+        athlete_ctx: db::get_setting(pool, "coaching.athlete_context")
+            .await?
+            .unwrap_or_default(),
+        goals: db::load_goals(pool).await?,
+        records: db::load_session_summaries(pool).await?,
+        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
+        icu_workouts: db::load_intervals_workouts(pool).await?,
+    })
+}
 
 pub struct CoachingPage {
     root: gtk::Box,
@@ -383,6 +489,7 @@ impl CoachingPage {
             let thumb_holder_r = thumb_holder.clone();
             let athlete_r = Rc::clone(&athlete);
             let api_banner_r = api_banner.clone();
+            let on_toast_reload = Rc::clone(&toast_fn);
 
             Rc::new(move || {
                 // API key pre-flight check (local keyring — fast, stays synchronous)
@@ -411,27 +518,34 @@ impl CoachingPage {
                 let workouts_r = Rc::clone(&workouts_r);
                 let thumb_holder_r = thumb_holder_r.clone();
                 let athlete_r = Rc::clone(&athlete_r);
+                let on_toast_r = Rc::clone(&on_toast_reload);
 
                 crate::ui::spawn_to_main(
                     &rt,
-                    async move {
-                        let goals = db::load_goals(&pool_load).await.unwrap_or_default();
-                        let cached_resp = db::get_setting(&pool_load, "ai.suggestion_response")
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default();
-                        let cached_name = db::get_setting(&pool_load, "ai.suggestion_workout_name")
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default();
-                        let cached_detail =
-                            db::get_setting(&pool_load, "ai.suggestion_workout_detail")
-                                .await
-                                .unwrap_or(None)
-                                .unwrap_or_default();
-                        (goals, cached_resp, cached_name, cached_detail)
-                    },
-                    move |(goals, cached_resp, cached_name, cached_detail)| {
+                    async move { load_coaching_data(&pool_load).await },
+                    move |result| {
+                        // A failed load must not redraw the page as empty: an
+                        // empty goals list reads as "you have no goals", which is
+                        // a statement about the rider, not about the database.
+                        let CoachingData {
+                            goals,
+                            cached_resp,
+                            cached_name,
+                            cached_detail,
+                        } = match result {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Could not load coaching data: {e}");
+                                on_toast_r(
+                                    adw::Toast::builder()
+                                        .title("Could not load your goals")
+                                        .timeout(5)
+                                        .build(),
+                                );
+                                return;
+                            }
+                        };
+
                         while let Some(row) = goals_list.row_at_index(0) {
                             goals_list.remove(&row);
                         }
@@ -609,78 +723,54 @@ impl CoachingPage {
                 *suggested_s.borrow_mut() = None;
 
                 let (tx, rx) = async_channel::bounded::<
-                    Result<(String, Vec<db::IntervalsWorkout>), String>,
+                    Result<(String, Vec<db::IntervalsWorkout>), AiFailure>,
                 >(1);
                 let pool_t = pool_s.clone();
                 // All DB reads + prompt assembly + the network call run off the main
                 // thread (CLAUDE.md §2.3). icu_workouts is returned to the result
                 // handler so it can still match an Intervals.icu recommendation.
                 rt_s.spawn(async move {
-                    let athlete_ctx = db::get_setting(&pool_t, "coaching.athlete_context")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-                    let records = db::load_session_summaries(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let icu_activities = db::load_unlinked_intervals_activities(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let goals = db::load_goals(&pool_t).await.unwrap_or_default();
-                    let icu_workouts = db::load_intervals_workouts(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let wellness_raw = db::load_wellness_recent(&pool_t, 7)
-                        .await
-                        .unwrap_or_default();
-
                     let today = Local::now().date_naive();
+                    let SuggestionPromptData {
+                        athlete_ctx,
+                        records,
+                        intervals_pairs,
+                        icu_activities,
+                        goals,
+                        icu_workouts,
+                        wellness: wellness_raw,
+                        time_off,
+                    } = match load_suggestion_prompt_data(&pool_t, today).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("Could not read training history to suggest: {e}");
+                            let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
+                            return;
+                        }
+                    };
+
                     let m = compute_load_metrics(&records, &intervals_pairs, ftp, today);
                     let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
 
-                    let four_weeks_ago = today - CDuration::weeks(4);
+                    let since = today - CDuration::weeks(RECENT_TRAINING_WEEKS);
                     let mut recent: Vec<RecentSession> = records
                         .iter()
-                        .filter(|r| {
-                            r.started_at.with_timezone(&Local).date_naive() >= four_weeks_ago
-                        })
+                        .filter(|r| r.started_at.with_timezone(&Local).date_naive() >= since)
                         .map(|r| build_recent_session(r, ftp))
                         .collect();
 
-                    for act in icu_activities.iter().filter(|a| a.date >= four_weeks_ago) {
+                    for act in icu_activities.iter().filter(|a| a.date >= since) {
                         recent.push(icu_activity_to_recent_session(act));
                     }
                     recent.sort_by(|a, b| b.date.cmp(&a.date));
-                    recent.truncate(10);
+                    recent.truncate(MAX_RECENT_SESSIONS);
 
                     let workout_opts = workouts_as_options(&workouts_owned, &icu_workouts);
-
-                    let wellness: Vec<WellnessSnapshot> = wellness_raw
-                        .iter()
-                        .map(|w| WellnessSnapshot {
-                            date: w.date.format("%Y-%m-%d").to_string(),
-                            hrv: w.hrv,
-                            resting_hr: w.resting_hr,
-                            sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
-                            sleep_score: w.sleep_score,
-                            steps: w.steps,
-                            calories: w.calories,
-                        })
+                    let wellness = wellness_snapshots(&wellness_raw);
+                    let time_off_dates: Vec<String> = time_off
+                        .into_iter()
+                        .map(|e| e.date.format("%Y-%m-%d").to_string())
                         .collect();
-
-                    let two_weeks_out = today + CDuration::days(14);
-                    let start_str = today.format("%Y-%m-%d").to_string();
-                    let end_str = two_weeks_out.format("%Y-%m-%d").to_string();
-                    let time_off_dates: Vec<String> =
-                        db::load_time_off_between(&pool_t, &start_str, &end_str)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|e| e.date.format("%Y-%m-%d").to_string())
-                            .collect();
 
                     let ctx = TrainingContext {
                         athlete,
@@ -699,7 +789,10 @@ impl CoachingPage {
                     let result = get_suggestion(&api_key, &prompt, 1024)
                         .await
                         .map(|text| (text, icu_workouts))
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| {
+                            tracing::error!("AI coaching request failed: {e}");
+                            AiFailure::Request
+                        });
                     let _ = tx.send(result).await;
                 });
 
@@ -753,9 +846,8 @@ impl CoachingPage {
                                         action_frame_c.set_visible(true);
                                     } else {
                                         // Check Intervals.icu library
-                                        let lookup = rec_name
-                                            .strip_prefix("[Intervals.icu] ")
-                                            .unwrap_or(rec_name);
+                                        let lookup =
+                                            rec_name.strip_prefix(ICU_PREFIX).unwrap_or(rec_name);
                                         if let Some(w) = icu_workouts_c.iter().find(|w| {
                                             crate::ai::naming::names_match(&w.name, lookup)
                                         }) {
@@ -771,7 +863,7 @@ impl CoachingPage {
                                                 "Intervals.icu · {dur}{tss_str} — open \
                                                  Intervals.icu to start this workout"
                                             );
-                                            cache_name = format!("[Intervals.icu] {}", w.name);
+                                            cache_name = format!("{ICU_PREFIX}{}", w.name);
                                             cache_detail = detail.clone();
                                             title_c.set_label(&format!(
                                                 "Recommended: {} [Intervals.icu]",
@@ -810,13 +902,7 @@ impl CoachingPage {
                                     .await;
                                 });
                             }
-                            Err(e) => {
-                                tracing::error!("AI suggestion request failed: {e}");
-                                response_c.set_text(
-                                    "The AI Coach couldn't complete this request. \
-                                     Please check your API key and try again.",
-                                );
-                            }
+                            Err(failure) => response_c.set_text(failure.message()),
                         }
                     }
                     spinner_c.stop();
@@ -993,27 +1079,27 @@ impl CoachingPage {
                 *entries_b.borrow_mut() = Vec::new();
 
                 let (tx, rx) = async_channel::bounded::<
-                    Result<(String, Vec<db::IntervalsWorkout>), String>,
+                    Result<(String, Vec<db::IntervalsWorkout>), AiFailure>,
                 >(1);
                 let pool_t = pool_b.clone();
                 // All DB reads + prompt assembly + the network call run off the main
                 // thread (CLAUDE.md §2.3). icu_workouts is returned to the result
                 // handler so it can format the program with Intervals.icu workouts.
                 rt_b.spawn(async move {
-                    let athlete_ctx = db::get_setting(&pool_t, "coaching.athlete_context")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-                    let goals = db::load_goals(&pool_t).await.unwrap_or_default();
-                    let records = db::load_session_summaries(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let icu_workouts = db::load_intervals_workouts(&pool_t)
-                        .await
-                        .unwrap_or_default();
+                    let ProgramPromptData {
+                        athlete_ctx,
+                        goals,
+                        records,
+                        intervals_pairs,
+                        icu_workouts,
+                    } = match load_program_prompt_data(&pool_t).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("Could not read training history to plan: {e}");
+                            let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
+                            return;
+                        }
+                    };
 
                     let today = Local::now().date_naive();
                     let m = compute_load_metrics(&records, &intervals_pairs, ftp, today);
@@ -1036,7 +1122,10 @@ impl CoachingPage {
                     let result = get_suggestion(&api_key, &prompt, 2048)
                         .await
                         .map(|text| (text, icu_workouts))
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| {
+                            tracing::error!("AI coaching request failed: {e}");
+                            AiFailure::Request
+                        });
                     let _ = tx.send(result).await;
                 });
 
@@ -1067,13 +1156,7 @@ impl CoachingPage {
                                     sched_btn_c.set_visible(true);
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("AI program build failed: {e}");
-                                label_c.set_text(
-                                    "The AI Coach couldn't complete this request. \
-                                     Please check your API key and try again.",
-                                );
-                            }
+                            Err(failure) => label_c.set_text(failure.message()),
                         }
                     }
                     spinner_c.stop();
@@ -1224,173 +1307,4 @@ fn update_thumb(holder: &gtk::Box, workout: Option<&Workout>, athlete: &AthleteP
         holder.append(graph.widget());
     }
     holder.set_visible(workout.is_some());
-}
-
-fn build_recent_session(r: &db::SessionSummary, ftp: u32) -> RecentSession {
-    let dur_secs = r.duration_secs;
-    let avg_power = r.average_power.map(|w| w as u32);
-    RecentSession {
-        date: r
-            .started_at
-            .with_timezone(&Local)
-            .format("%Y-%m-%d")
-            .to_string(),
-        name: r.workout_name.clone(),
-        sport_type: "Cycling".to_string(),
-        duration_mins: (dur_secs / 60) as u32,
-        avg_power,
-        tss: r.tss(ftp),
-        kj: r.kilojoules,
-        rpe: r.rpe,
-    }
-}
-
-fn icu_activity_to_recent_session(a: &db::IntervalsActivity) -> RecentSession {
-    let sport = normalize_sport_type(&a.sport_type);
-    // Use activity name when available; fall back to sport type rather than nothing
-    let activity_name = if a.name.is_empty() {
-        None
-    } else {
-        Some(a.name.clone())
-    };
-    let is_cycling = sport == "Cycling";
-    RecentSession {
-        date: a.date.format("%Y-%m-%d").to_string(),
-        name: activity_name,
-        sport_type: sport,
-        duration_mins: a.duration_secs.map(|s| s / 60).unwrap_or(0),
-        // Only pass power for cycling — running power (Stryd etc.) uses different units
-        avg_power: if is_cycling { a.average_watts } else { None },
-        tss: a.tss,
-        kj: if is_cycling {
-            a.average_watts
-                .and_then(|w| a.duration_secs.map(|d| w as f32 * d as f32 / 1000.0))
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        },
-        rpe: None,
-    }
-}
-
-/// Map the raw sport_type string from Intervals.icu / Garmin / Strava to a clean label.
-pub(crate) fn normalize_sport_type(raw: &str) -> String {
-    match raw {
-        "" | "Ride" | "VirtualRide" | "Cycling" | "IndoorCycling" | "MountainBiking" => "Cycling",
-        "Run" | "VirtualRun" | "TrailRun" => "Run",
-        "Walk" | "Walking" => "Walk",
-        "Hike" | "Hiking" => "Hike",
-        "Swim" | "Swimming" | "OpenWaterSwim" => "Swim",
-        "WeightTraining" | "Strength" | "StrengthTraining" => "Strength Training",
-        "Yoga" => "Yoga",
-        "Rowing" | "IndoorRowing" => "Rowing",
-        "Elliptical" => "Elliptical",
-        "NordicSki" | "BackcountrySki" => "Ski",
-        "Workout" | "Crossfit" | "HIIT" => "Cross Training",
-        other => other,
-    }
-    .to_string()
-}
-
-fn workouts_as_options(
-    workouts: &[Workout],
-    icu_workouts: &[db::IntervalsWorkout],
-) -> Vec<WorkoutOption> {
-    let mut opts: Vec<WorkoutOption> = workouts
-        .iter()
-        .map(|w| WorkoutOption {
-            name: w.name.clone(),
-            duration_mins: w.duration_secs / 60,
-            tss: w.tss,
-            category: w.category.label().to_string(),
-        })
-        .collect();
-
-    for w in icu_workouts {
-        opts.push(WorkoutOption {
-            name: format!("[Intervals.icu] {}", w.name),
-            duration_mins: w.duration_secs.map(|s| s / 60).unwrap_or(60),
-            tss: w.tss.unwrap_or(0.0),
-            category: "Intervals.icu".to_string(),
-        });
-    }
-    opts
-}
-
-fn extract_recommended_workout(text: &str) -> Option<String> {
-    crate::ai::naming::extract_marker_value(text, "RECOMMENDED_WORKOUT:")
-}
-
-fn strip_recommended_line(text: &str) -> String {
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with("RECOMMENDED_WORKOUT:"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_end()
-        .to_string()
-}
-
-fn format_program(
-    entries: &[ProgramEntry],
-    workouts: &[Workout],
-    icu_workouts: &[db::IntervalsWorkout],
-) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut current_week = 0u32;
-    for entry in entries {
-        if entry.week != current_week {
-            current_week = entry.week;
-            if !lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines.push(format!("## Week {}", current_week));
-        }
-        let duration_note = workouts
-            .iter()
-            .find(|w| crate::ai::naming::names_match(&w.name, &entry.workout_name))
-            .map(|w| format!(" ({} min)", w.duration_secs / 60))
-            .or_else(|| {
-                let lookup = entry
-                    .workout_name
-                    .strip_prefix("[Intervals.icu] ")
-                    .unwrap_or(&entry.workout_name);
-                icu_workouts
-                    .iter()
-                    .find(|w| crate::ai::naming::names_match(&w.name, lookup))
-                    .and_then(|w| w.duration_secs)
-                    .map(|s| format!(" ({} min) [Intervals.icu]", s / 60))
-            })
-            .unwrap_or_default();
-        lines.push(format!(
-            "- {} — {}{}",
-            capitalize_first(&entry.day),
-            entry.workout_name,
-            duration_note
-        ));
-    }
-    lines.join("\n")
-}
-
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-    }
-}
-
-fn day_name_to_offset(day: &str) -> u32 {
-    match day.to_lowercase().as_str() {
-        "monday" => 0,
-        "tuesday" => 1,
-        "wednesday" => 2,
-        "thursday" => 3,
-        "friday" => 4,
-        "saturday" => 5,
-        "sunday" => 6,
-        _ => 0,
-    }
 }

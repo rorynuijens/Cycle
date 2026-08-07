@@ -505,6 +505,10 @@ impl CycleGtkWindow {
         let on_open_calendar: Rc<dyn Fn()> = Rc::new(move || {
             stack_for_cal_nav.set_visible_child_name("calendar");
         });
+        let toast_overlay_for_dash = self.toast_overlay.clone();
+        let toast_fn_dash: Rc<dyn Fn(adw::Toast)> =
+            Rc::new(move |toast| toast_overlay_for_dash.add_toast(toast));
+
         let (dashboard_page, dashboard_reload) = DashboardPage::new(
             pool.clone(),
             rt_handle.clone(),
@@ -512,6 +516,7 @@ impl CycleGtkWindow {
             Rc::clone(&on_library_start),
             on_view_fitness,
             on_open_calendar,
+            toast_fn_dash,
         );
 
         // ── Route player page ─────────────────────────────────────────────────

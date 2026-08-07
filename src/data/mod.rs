@@ -6,5 +6,6 @@ pub mod import;
 pub mod keystore;
 pub mod route;
 pub mod session;
+pub mod sport;
 pub mod streams;
 pub mod workout;

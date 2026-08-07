@@ -8,6 +8,7 @@ use std::rc::Rc;
 use sqlx::SqlitePool;
 
 use crate::ai::coach::{build_fitness_prompt, get_suggestion, FitnessContext, WellnessSnapshot};
+use crate::ai::context::parse_ai_sections;
 use crate::ai::retrospective::{
     build_retrospective_prompt, RetroPeriod, RetroSession, RetrospectiveContext,
 };
@@ -24,40 +25,13 @@ use crate::training::fitness::{
     compute_load_metrics, compute_pmc_series, tsb_status_text, PmcPoint, TsbBand,
 };
 use crate::ui::markdown::to_pango;
-use crate::ui::pages::coaching::normalize_sport_type;
+use crate::ui::AiFailure;
 
 /// How far back the performance-management chart plots.
 const PMC_WINDOW_DAYS: i64 = 90;
 
 /// How many weeks the training-stress bar chart shows.
 const TSS_WEEKS: i64 = 6;
-
-/// Why an AI request produced no answer.
-///
-/// The two cases need different wording: one points at the rider's API key, the
-/// other at their database, and telling them to check the key when the database
-/// is the problem sends them to the wrong place.
-#[derive(Debug, Clone, Copy)]
-enum AiFailure {
-    /// The training history could not be read, so nothing was sent.
-    DataUnavailable,
-    /// The request was sent but did not come back with an answer.
-    Request,
-}
-
-impl AiFailure {
-    fn message(self) -> &'static str {
-        match self {
-            Self::DataUnavailable => {
-                "Could not read your training history, so nothing was sent to the AI Coach."
-            }
-            Self::Request => {
-                "The AI Coach couldn't complete this request. \
-                 Please check your API key and try again."
-            }
-        }
-    }
-}
 
 /// Everything the page's charts are drawn from, loaded in one pass.
 struct FitnessData {
@@ -1888,7 +1862,7 @@ impl FitnessPage {
                     }
                     for act in &icu_acts {
                         if act.date >= start_date && act.date <= today {
-                            let sport = normalize_sport_type(&act.sport_type);
+                            let sport = crate::data::sport::normalize_sport_type(&act.sport_type);
                             let is_cycling = sport == "Cycling";
                             sessions.push(RetroSession {
                                 date: act.date.format("%Y-%m-%d").to_string(),
@@ -2240,57 +2214,6 @@ fn populate_ai_content(container: &gtk::Box, fallback_label: &gtk::Label, text: 
 
         container.append(&section_box);
     }
-}
-
-/// Parse AI text into (heading, body) pairs by detecting lines like "1. **Heading**:" or "1. Heading:".
-/// Returns empty vec if no numbered sections are detected.
-fn parse_ai_sections(text: &str) -> Vec<(String, String)> {
-    let mut sections: Vec<(String, String)> = Vec::new();
-    let mut current_heading = String::new();
-    let mut current_body: Vec<&str> = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // Detect lines like "1. **Training Load Summary**:" or "2. Trend"
-        // Allow up to 100 chars to accommodate markdown decoration in the heading
-        let is_section_head = trimmed.len() < 100
-            && trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
-            && trimmed.contains(". ")
-            && !trimmed.starts_with("0.");
-
-        if is_section_head {
-            if !current_heading.is_empty() {
-                let body = current_body.join("\n").trim().to_string();
-                if !body.is_empty() {
-                    sections.push((current_heading.clone(), body));
-                }
-                current_body.clear();
-            }
-            // Extract the heading text after "N. ", strip trailing colon
-            let label = trimmed
-                .split_once(". ")
-                .map(|x| x.1)
-                .unwrap_or(trimmed)
-                .trim_end_matches(':')
-                .to_string();
-            current_heading = label;
-        } else if !current_heading.is_empty() {
-            current_body.push(trimmed);
-        }
-    }
-    if !current_heading.is_empty() {
-        let body = current_body.join("\n").trim().to_string();
-        if !body.is_empty() {
-            sections.push((current_heading, body));
-        }
-    }
-
-    // Need at least 2 sections to be worth showing structured
-    if sections.len() < 2 {
-        return Vec::new();
-    }
-
-    sections
 }
 
 /// Build one retrospective period's content area for the Coach card stack.

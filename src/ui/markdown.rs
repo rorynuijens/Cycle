@@ -209,9 +209,73 @@ fn single_star_close(s: &str) -> Option<usize> {
     None
 }
 
+/// Longest preview shown for an AI insight, in characters.
+const PREVIEW_MAX_CHARS: usize = 120;
+
+/// First sentence of an AI insight as plain text, for a one-line preview.
+///
+/// Returns an empty string when there is nothing to preview. Truncation counts
+/// characters and cuts on a character boundary — the models answer in the
+/// rider's own language, and slicing by byte would panic mid-codepoint.
+pub fn insight_preview(insight: &str) -> String {
+    if insight.is_empty() {
+        return String::new();
+    }
+    let plain = strip_markdown(insight);
+    let first_sentence = plain
+        .split(['.', '\n'])
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if first_sentence.is_empty() {
+        String::new()
+    } else if first_sentence.chars().count() > PREVIEW_MAX_CHARS {
+        let cut = first_sentence
+            .char_indices()
+            .nth(PREVIEW_MAX_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(first_sentence.len());
+        format!("{}…", &first_sentence[..cut])
+    } else {
+        format!("{}.", first_sentence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_preview_nothing_for_an_empty_insight() {
+        assert_eq!(insight_preview(""), "");
+        assert_eq!(insight_preview("   \n  "), "");
+    }
+
+    #[test]
+    fn should_preview_the_first_sentence_with_markdown_stripped() {
+        assert_eq!(
+            insight_preview("**Form is good.** You can push on."),
+            "Form is good."
+        );
+    }
+
+    #[test]
+    fn should_truncate_a_long_sentence_with_an_ellipsis() {
+        let long = "a".repeat(200);
+        let out = insight_preview(&long);
+        assert_eq!(out.chars().count(), PREVIEW_MAX_CHARS + 1, "120 plus the …");
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn should_cut_on_a_character_boundary_not_a_byte_boundary() {
+        // Multi-byte text would panic if the cut were taken by byte offset.
+        let long = "é".repeat(200);
+        let out = insight_preview(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), PREVIEW_MAX_CHARS + 1);
+    }
 
     #[test]
     fn bold_renders_correctly() {

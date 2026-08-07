@@ -9,9 +9,10 @@ use sqlx::SqlitePool;
 
 use crate::ai::briefing::{
     build_briefing_prompt, parse_alternative_workout, parse_briefing_decision, BriefingContext,
-    BriefingDecision, PlannedWorkout,
+    BriefingDecision,
 };
-use crate::ai::coach::{get_suggestion, WellnessSnapshot, WorkoutOption};
+use crate::ai::coach::get_suggestion;
+use crate::ai::context::{resolve_planned_workout, wellness_snapshots, workouts_as_options};
 use crate::data::{
     athlete::AthleteProfile,
     db::{self},
@@ -19,10 +20,148 @@ use crate::data::{
     workout::Workout,
 };
 use crate::training::fitness::compute_load_metrics;
-use crate::ui::markdown::{strip_markdown, to_pango};
+use crate::ui::markdown::{insight_preview, to_pango};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
+use crate::ui::AiFailure;
 
 type ReloadHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// How far ahead the briefing prompt looks for planned time off.
+const TIME_OFF_LOOKAHEAD_DAYS: i64 = 14;
+
+/// How far back the briefing syncs activities from Intervals.icu.
+const ICU_SYNC_DAYS: i64 = 30;
+
+/// How far back the briefing syncs wellness entries from Intervals.icu.
+const ICU_WELLNESS_SYNC_DAYS: i64 = 7;
+
+/// Everything the dashboard's cards are drawn from, loaded in one pass.
+struct DashboardData {
+    today_entry: Option<db::TodayEntry>,
+    records: Vec<db::SessionSummary>,
+    /// The cached AI suggestion resolved against the library, when today is open.
+    suggested_workout: Option<Workout>,
+    ai_workout_detail: String,
+    ai_fitness_insight: String,
+    intervals_pairs: Vec<(chrono::NaiveDate, f32)>,
+    first_use_done: bool,
+}
+
+/// Load the dashboard's data off the GTK main thread (CLAUDE.md §2.3).
+async fn load_dashboard_data(pool: &SqlitePool, today: &str) -> anyhow::Result<DashboardData> {
+    let today_entry = db::load_today_entry(pool, today).await?;
+    let ai_workout_name = db::get_setting(pool, "ai.suggestion_workout_name")
+        .await?
+        .unwrap_or_default();
+
+    // The suggestion only matters on an empty day — with a workout scheduled,
+    // the plan wins and the suggestion hides.
+    let suggested_workout = if today_entry.is_none() && !ai_workout_name.trim().is_empty() {
+        db::load_workouts(pool)
+            .await?
+            .into_iter()
+            // Case-insensitive — the AI may return different casing.
+            .find(|w| crate::ai::naming::names_match(&w.name, ai_workout_name.trim()))
+    } else {
+        None
+    };
+
+    Ok(DashboardData {
+        today_entry,
+        records: db::load_session_summaries(pool).await?,
+        suggested_workout,
+        ai_workout_detail: db::get_setting(pool, "ai.suggestion_workout_detail")
+            .await?
+            .unwrap_or_default(),
+        ai_fitness_insight: db::get_setting(pool, "ai.fitness_insight")
+            .await?
+            .unwrap_or_default(),
+        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
+        first_use_done: db::get_setting(pool, "first_use_complete")
+            .await?
+            .map(|v| v == "1")
+            .unwrap_or(false),
+    })
+}
+
+/// Put `name` on today's calendar in place of whatever was there.
+///
+/// Used when the rider accepts the coach's alternative suggestion.
+async fn swap_todays_workout(pool: &SqlitePool, name: &str, today: &str) -> anyhow::Result<()> {
+    let workouts = db::load_workouts(pool).await?;
+    // Case-insensitive match — the AI may return a different casing.
+    let alt = workouts
+        .iter()
+        .find(|w| crate::ai::naming::names_match(&w.name, name))
+        .ok_or_else(|| anyhow::anyhow!("workout '{name}' is not in the library"))?;
+
+    // Clear the day first so it reflects what was actually chosen.
+    if let Some(entry) = db::load_today_entry(pool, today).await? {
+        db::delete_today_calendar_entry(pool, entry.workout.id, today).await?;
+    }
+    db::schedule_workout(pool, alt.id, today).await?;
+    Ok(())
+}
+
+/// Read today's cached briefing: `(text, date it was written for, whether a
+/// workout is on the calendar)`.
+async fn load_cached_briefing(
+    pool: &SqlitePool,
+    today: &str,
+) -> anyhow::Result<(String, String, bool)> {
+    Ok((
+        db::get_setting(pool, "ai.morning_briefing_text")
+            .await?
+            .unwrap_or_default(),
+        db::get_setting(pool, "ai.morning_briefing_date")
+            .await?
+            .unwrap_or_default(),
+        db::load_today_entry(pool, today).await?.is_some(),
+    ))
+}
+
+/// The training history behind the morning briefing prompt.
+struct BriefingPromptData {
+    today_entry: Option<db::TodayEntry>,
+    records: Vec<db::SessionSummary>,
+    intervals_pairs: Vec<(chrono::NaiveDate, f32)>,
+    wellness: Vec<db::WellnessEntry>,
+    workouts: Vec<Workout>,
+    athlete_context: String,
+    cached_suggestion_name: String,
+    time_off: Vec<db::TimeOffEntry>,
+}
+
+/// Load the history the morning briefing is written from.
+///
+/// The first failure aborts: a partial read would still be sent, and the coach
+/// would tell the rider how their day looks having been shown a training history
+/// that is missing rides — at the rider's expense, since the request is billed.
+async fn load_briefing_prompt_data(
+    pool: &SqlitePool,
+    today: chrono::NaiveDate,
+) -> anyhow::Result<BriefingPromptData> {
+    let lookahead = today + Duration::days(TIME_OFF_LOOKAHEAD_DAYS);
+    Ok(BriefingPromptData {
+        today_entry: db::load_today_entry(pool, &today.format("%Y-%m-%d").to_string()).await?,
+        records: db::load_session_summaries(pool).await?,
+        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
+        wellness: db::load_wellness_recent(pool, 1).await?,
+        workouts: db::load_workouts(pool).await?,
+        athlete_context: db::get_setting(pool, "coaching.athlete_context")
+            .await?
+            .unwrap_or_default(),
+        cached_suggestion_name: db::get_setting(pool, "ai.suggestion_workout_name")
+            .await?
+            .unwrap_or_default(),
+        time_off: db::load_time_off_between(
+            pool,
+            &today.format("%Y-%m-%d").to_string(),
+            &lookahead.format("%Y-%m-%d").to_string(),
+        )
+        .await?,
+    })
+}
 
 pub struct DashboardPage {
     root: gtk::Box,
@@ -37,6 +176,7 @@ impl DashboardPage {
         on_start: Rc<dyn Fn(Workout)>,
         on_view_fitness: Rc<dyn Fn()>,
         on_open_calendar: Rc<dyn Fn()>,
+        on_toast: Rc<dyn Fn(adw::Toast)>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -101,6 +241,7 @@ impl DashboardPage {
             rt_handle.clone(),
             Rc::clone(&athlete),
             Rc::clone(&reload_holder),
+            Rc::clone(&on_toast),
         );
         inner.append(&briefing_card);
 
@@ -128,6 +269,7 @@ impl DashboardPage {
             let on_view_fitness = Rc::clone(&on_view_fitness);
             let on_open_calendar = Rc::clone(&on_open_calendar);
             let reload_holder = Rc::clone(&reload_holder);
+            let on_toast_reload = Rc::clone(&on_toast);
 
             Rc::new(move || {
                 let now = Local::now();
@@ -168,55 +310,17 @@ impl DashboardPage {
                 let today_for_card = today_str.clone();
                 let pool_ob = pool.clone();
                 let rt_ob = rt_handle.clone();
+                let on_toast_r = Rc::clone(&on_toast_reload);
 
                 crate::ui::spawn_to_main(
                     &rt_handle,
-                    async move {
-                        let today_entry = db::load_today_entry(&pool_load, &today_str)
-                            .await
-                            .unwrap_or(None);
-                        let records = db::load_session_summaries(&pool_load)
-                            .await
-                            .unwrap_or_default();
-                        let ai_workout_name =
-                            db::get_setting(&pool_load, "ai.suggestion_workout_name")
-                                .await
-                                .unwrap_or(None)
-                                .unwrap_or_default();
-                        // The suggestion only matters on an empty day — with a
-                        // workout scheduled, the plan wins and the suggestion hides.
-                        let suggested_workout = if today_entry.is_none()
-                            && !ai_workout_name.trim().is_empty()
-                        {
-                            db::load_workouts(&pool_load)
-                                .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                // Case-insensitive — the AI may return different casing
-                                .find(|w| {
-                                    crate::ai::naming::names_match(&w.name, ai_workout_name.trim())
-                                })
-                        } else {
-                            None
-                        };
-                        let ai_workout_detail =
-                            db::get_setting(&pool_load, "ai.suggestion_workout_detail")
-                                .await
-                                .unwrap_or(None)
-                                .unwrap_or_default();
-                        let ai_fitness_insight = db::get_setting(&pool_load, "ai.fitness_insight")
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default();
-                        let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
-                            .await
-                            .unwrap_or_default();
-                        let first_use_done = db::get_setting(&pool_load, "first_use_complete")
-                            .await
-                            .unwrap_or(None)
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        (
+                    async move { load_dashboard_data(&pool_load, &today_str).await },
+                    move |result| {
+                        // A failed load must not redraw the dashboard as empty:
+                        // with no rides and no load it would show the welcome
+                        // wizard, telling a rider with years of history that they
+                        // are new here.
+                        let DashboardData {
                             today_entry,
                             records,
                             suggested_workout,
@@ -224,17 +328,20 @@ impl DashboardPage {
                             ai_fitness_insight,
                             intervals_pairs,
                             first_use_done,
-                        )
-                    },
-                    move |(
-                        today_entry,
-                        records,
-                        suggested_workout,
-                        ai_workout_detail,
-                        ai_fitness_insight,
-                        intervals_pairs,
-                        first_use_done,
-                    )| {
+                        } = match result {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Could not load dashboard data: {e}");
+                                on_toast_r(
+                                    adw::Toast::builder()
+                                        .title("Could not load your dashboard")
+                                        .timeout(5)
+                                        .build(),
+                                );
+                                return;
+                            }
+                        };
+
                         // Compute TSB for readiness + 7-day trend
                         let now =
                             compute_load_metrics(&records, &intervals_pairs, ftp, today_naive);
@@ -346,6 +453,7 @@ impl DashboardPage {
         rt_handle: tokio::runtime::Handle,
         athlete: Rc<RefCell<AthleteProfile>>,
         reload_holder: ReloadHolder,
+        on_toast: Rc<dyn Fn(adw::Toast)>,
     ) -> adw::PreferencesGroup {
         let today_str = Local::now().date_naive().format("%Y-%m-%d").to_string();
 
@@ -445,6 +553,7 @@ impl DashboardPage {
             let rh = Rc::clone(&reload_holder);
             let alt_name = Rc::clone(&pending_alt_name);
             let today = today_str.clone();
+            let on_toast_alt = Rc::clone(&on_toast);
             use_workout_btn.connect_clicked(move |btn| {
                 let name = match alt_name.borrow().clone() {
                     Some(n) if !n.is_empty() => n,
@@ -454,45 +563,28 @@ impl DashboardPage {
                 let rh = Rc::clone(&rh);
                 let today = today.clone();
                 let btn = btn.clone();
+                let on_toast_swap = Rc::clone(&on_toast_alt);
                 crate::ui::spawn_to_main(
                     &rt_u,
-                    async move {
-                        let workouts = match db::load_workouts(&pool_u).await {
-                            Ok(w) => w,
-                            Err(e) => {
-                                tracing::error!("load_workouts for alt swap: {e}");
-                                return None;
-                            }
-                        };
-                        // Case-insensitive match — the AI may return a different casing
-                        let Some(found) = workouts
-                            .iter()
-                            .find(|w| crate::ai::naming::names_match(&w.name, &name))
-                        else {
-                            tracing::warn!("Alternative workout '{name}' not found in library");
-                            return None;
-                        };
-                        let alt = found.clone();
-                        // Swap the calendar entry so today reflects what was actually done
-                        if let Ok(Some(entry)) = db::load_today_entry(&pool_u, &today).await {
-                            if let Err(e) =
-                                db::delete_today_calendar_entry(&pool_u, entry.workout.id, &today)
-                                    .await
-                            {
-                                tracing::error!("delete_today_calendar_entry (swap): {e}");
-                            }
-                        }
-                        if let Err(e) = db::schedule_workout(&pool_u, alt.id, &today).await {
-                            tracing::error!("schedule_workout (alt swap): {e}");
-                        }
-                        Some(alt)
-                    },
-                    move |result| {
-                        if result.is_some() {
+                    async move { swap_todays_workout(&pool_u, &name, &today).await },
+                    move |result| match result {
+                        Ok(()) => {
                             btn.set_visible(false);
                             if let Some(reload) = rh.borrow().as_ref() {
                                 reload();
                             }
+                        }
+                        // The rider pressed a button and something has to happen.
+                        // Previously this path only logged, so a missing workout
+                        // or a failed write left the button sitting there.
+                        Err(e) => {
+                            tracing::error!("Could not swap in the alternative workout: {e}");
+                            on_toast_swap(
+                                adw::Toast::builder()
+                                    .title("Could not switch to that workout")
+                                    .timeout(5)
+                                    .build(),
+                            );
                         }
                     },
                 );
@@ -584,13 +676,12 @@ impl DashboardPage {
 
                 // Channel carries (briefing_text, planned_name_for_align, has_planned).
                 let (tx, rx) =
-                    async_channel::bounded::<Result<(String, Option<String>, bool), String>>(1);
+                    async_channel::bounded::<Result<(String, Option<String>, bool), AiFailure>>(1);
 
                 let pool_t = pool_g.clone();
                 // Read at click time, not at card-build time — the briefing is
                 // written against the rider's current FTP and HR range.
                 let athlete_t = athlete_g.borrow().clone();
-                let today_t = today_g.clone();
 
                 // All network and DB work happens in the tokio runtime — the GTK main
                 // thread is never blocked, so the UI stays responsive even with no internet.
@@ -603,8 +694,8 @@ impl DashboardPage {
                     // Sync intervals.icu — errors are non-fatal; we just skip stale data.
                     if !icu_api_key.trim().is_empty() && !icu_athlete_id.trim().is_empty() {
                         let today = chrono::Local::now().date_naive();
-                        let thirty_ago = today - chrono::Duration::days(30);
-                        let seven_ago = today - chrono::Duration::days(7);
+                        let thirty_ago = today - Duration::days(ICU_SYNC_DAYS);
+                        let seven_ago = today - Duration::days(ICU_WELLNESS_SYNC_DAYS);
 
                         if let Ok(acts) = crate::ai::intervals::fetch_activities(
                             &icu_athlete_id,
@@ -665,93 +756,47 @@ impl DashboardPage {
                         }
                     }
 
-                    let today_entry = db::load_today_entry(&pool_t, &today_t)
-                        .await
-                        .unwrap_or(None);
-                    // Whether a workout is actually on today's calendar — the
-                    // decision copy must not say "as planned" when nothing is.
-                    let has_planned = today_entry.is_some();
-                    let records = db::load_session_summaries(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let wellness_raw = db::load_wellness_recent(&pool_t, 1)
-                        .await
-                        .unwrap_or_default();
-                    let workouts = db::load_workouts(&pool_t).await.unwrap_or_default();
-                    let athlete_context = db::get_setting(&pool_t, "coaching.athlete_context")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-
-                    let ftp = athlete_t.ftp_watts;
                     let today_naive = chrono::Local::now().date_naive();
-                    let m = compute_load_metrics(&records, &intervals_pairs, ftp, today_naive);
-                    let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
-
-                    let today_wellness = wellness_raw.first().map(|w| WellnessSnapshot {
-                        date: w.date.format("%Y-%m-%d").to_string(),
-                        hrv: w.hrv,
-                        resting_hr: w.resting_hr,
-                        sleep_hours: w.sleep_secs.map(|s| s as f32 / 3600.0),
-                        sleep_score: w.sleep_score,
-                        steps: w.steps,
-                        calories: w.calories,
-                    });
-
-                    // If no workout is scheduled today, fall back to the cached AI coaching
-                    // suggestion so the Morning Brief and Coaching tab stay in sync.
-                    let planned_workout = if let Some(e) = today_entry {
-                        Some(PlannedWorkout {
-                            name: e.workout.name.clone(),
-                            duration_mins: e.workout.duration_secs / 60,
-                            tss: e.workout.tss,
-                            category: e.workout.category.label().to_string(),
-                        })
-                    } else {
-                        let cached_name = db::get_setting(&pool_t, "ai.suggestion_workout_name")
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default();
-                        if !cached_name.trim().is_empty() {
-                            workouts
-                                .iter()
-                                .find(|w| crate::ai::naming::names_match(&w.name, &cached_name))
-                                .map(|w| PlannedWorkout {
-                                    name: w.name.clone(),
-                                    duration_mins: w.duration_secs / 60,
-                                    tss: w.tss,
-                                    category: w.category.label().to_string(),
-                                })
-                        } else {
-                            None
+                    let BriefingPromptData {
+                        today_entry,
+                        records,
+                        intervals_pairs,
+                        wellness,
+                        workouts,
+                        athlete_context,
+                        cached_suggestion_name,
+                        time_off,
+                    } = match load_briefing_prompt_data(&pool_t, today_naive).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("Could not read training history to brief: {e}");
+                            let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
+                            return;
                         }
                     };
 
-                    let workout_options: Vec<WorkoutOption> = workouts
-                        .iter()
-                        .map(|w| WorkoutOption {
-                            name: w.name.clone(),
-                            duration_mins: w.duration_secs / 60,
-                            tss: w.tss,
-                            category: w.category.label().to_string(),
-                        })
-                        .collect();
+                    // Whether a workout is actually on today's calendar — the
+                    // decision copy must not say "as planned" when nothing is.
+                    let has_planned = today_entry.is_some();
 
+                    let ftp = athlete_t.ftp_watts;
+                    let m = compute_load_metrics(&records, &intervals_pairs, ftp, today_naive);
+                    let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
+
+                    let today_wellness = wellness_snapshots(&wellness).into_iter().next();
+
+                    let planned_workout = resolve_planned_workout(
+                        today_entry.as_ref().map(|e| &e.workout),
+                        &cached_suggestion_name,
+                        &workouts,
+                    );
                     let planned_name_for_align = planned_workout.as_ref().map(|p| p.name.clone());
 
-                    let two_weeks_out = today_naive + chrono::Duration::days(14);
-                    let start_str = today_naive.format("%Y-%m-%d").to_string();
-                    let end_str = two_weeks_out.format("%Y-%m-%d").to_string();
-                    let time_off_dates: Vec<String> =
-                        db::load_time_off_between(&pool_t, &start_str, &end_str)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|e| e.date.format("%Y-%m-%d").to_string())
-                            .collect();
+                    let workout_options = workouts_as_options(&workouts, &[]);
+                    let time_off_dates: Vec<String> = time_off
+                        .into_iter()
+                        .map(|e| e.date.format("%Y-%m-%d").to_string())
+                        .collect();
 
                     let ctx = BriefingContext {
                         athlete: athlete_t,
@@ -769,7 +814,10 @@ impl DashboardPage {
                     let r = get_suggestion(&api_key, &prompt, 1200)
                         .await
                         .map(|text| (text, planned_name_for_align, has_planned))
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| {
+                            tracing::error!("AI morning briefing failed: {e}");
+                            AiFailure::Request
+                        });
                     let _ = tx.send(r).await;
                 });
 
@@ -865,8 +913,12 @@ impl DashboardPage {
                                     }
                                 });
                             }
-                            Err(e) => {
-                                tracing::error!("Morning briefing API error: {e}");
+                            Err(failure) => {
+                                // Previously this only logged, leaving the card
+                                // blank with no explanation for the rider.
+                                text_l.set_text(failure.message());
+                                text_l.set_visible(true);
+                                content_r.set_visible(true);
                             }
                         }
                     }
@@ -893,22 +945,19 @@ impl DashboardPage {
             let generate_btn_c = generate_btn.clone();
             crate::ui::spawn_to_main(
                 &rt_handle,
-                async move {
-                    let cached_text = db::get_setting(&pool_cache, "ai.morning_briefing_text")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-                    let cached_date = db::get_setting(&pool_cache, "ai.morning_briefing_date")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
-                    let has_planned = db::load_today_entry(&pool_cache, &today_q)
-                        .await
-                        .unwrap_or(None)
-                        .is_some();
-                    (cached_text, cached_date, has_planned)
-                },
-                move |(cached_text, cached_date, has_planned)| {
+                async move { load_cached_briefing(&pool_cache, &today_q).await },
+                move |result| {
+                    // On a failed read, do nothing at all. Falling through to the
+                    // auto-generate branch would bill the rider for a briefing
+                    // because the database hiccupped, and overwrite the good one
+                    // already cached for today.
+                    let (cached_text, cached_date, has_planned) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Could not read the cached briefing: {e}");
+                            return;
+                        }
+                    };
                     if !cached_text.is_empty() && cached_date == today_c {
                         let decision = parse_briefing_decision(&cached_text);
                         let alt = parse_alternative_workout(&cached_text);
@@ -1269,7 +1318,7 @@ impl DashboardPage {
             // AI text may contain markup-significant characters (& etc.)
             .use_markup(false)
             .build();
-        let preview = Self::insight_preview(insight);
+        let preview = insight_preview(insight);
         if !preview.is_empty() {
             form_row.set_subtitle(&preview);
         }
@@ -1385,31 +1434,5 @@ impl DashboardPage {
         list.append(&last_row);
 
         list
-    }
-
-    /// First sentence of the AI fitness insight, markdown stripped, ≤120 chars.
-    fn insight_preview(insight: &str) -> String {
-        if insight.is_empty() {
-            return String::new();
-        }
-        let plain = strip_markdown(insight);
-        let first_sentence = plain
-            .split(['.', '\n'])
-            .find(|s| !s.trim().is_empty())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if first_sentence.is_empty() {
-            String::new()
-        } else if first_sentence.chars().count() > 120 {
-            let cut = first_sentence
-                .char_indices()
-                .nth(120)
-                .map(|(i, _)| i)
-                .unwrap_or(first_sentence.len());
-            format!("{}…", &first_sentence[..cut])
-        } else {
-            format!("{}.", first_sentence)
-        }
     }
 }
