@@ -8,8 +8,8 @@ use std::rc::Rc;
 use sqlx::SqlitePool;
 
 use crate::ai::briefing::{
-    build_briefing_prompt, parse_alternative_workout, parse_briefing_decision, BriefingContext,
-    BriefingDecision,
+    build_briefing_prompt, parse_alternative_workout, parse_briefing_decision, resolve_decision,
+    BriefingContext, BriefingDecision,
 };
 use crate::ai::coach::get_suggestion;
 use crate::ai::context::{resolve_planned_workout, wellness_snapshots, workouts_as_options};
@@ -103,12 +103,12 @@ async fn swap_todays_workout(pool: &SqlitePool, name: &str, today: &str) -> anyh
     Ok(())
 }
 
-/// Read today's cached briefing: `(text, date it was written for, whether a
-/// workout is on the calendar)`.
+/// Read today's cached briefing: `(text, date it was written for, the name of
+/// the workout on today's calendar if there is one)`.
 async fn load_cached_briefing(
     pool: &SqlitePool,
     today: &str,
-) -> anyhow::Result<(String, String, bool)> {
+) -> anyhow::Result<(String, String, Option<String>)> {
     Ok((
         db::get_setting(pool, "ai.morning_briefing_text")
             .await?
@@ -116,7 +116,9 @@ async fn load_cached_briefing(
         db::get_setting(pool, "ai.morning_briefing_date")
             .await?
             .unwrap_or_default(),
-        db::load_today_entry(pool, today).await?.is_some(),
+        db::load_today_entry(pool, today)
+            .await?
+            .map(|e| e.workout.name),
     ))
 }
 
@@ -837,8 +839,11 @@ impl DashboardPage {
                     if let Ok(result) = rx.recv().await {
                         match result {
                             Ok((text, planned_name_for_align, has_planned)) => {
-                                let decision = parse_briefing_decision(&text);
-                                let alt = parse_alternative_workout(&text);
+                                let (decision, alt) = resolve_decision(
+                                    parse_briefing_decision(&text),
+                                    parse_alternative_workout(&text),
+                                    planned_name_for_align.as_deref(),
+                                );
                                 *alt_name_c.borrow_mut() = alt.clone();
                                 Self::apply_briefing(
                                     &text_l,
@@ -951,7 +956,7 @@ impl DashboardPage {
                     // auto-generate branch would bill the rider for a briefing
                     // because the database hiccupped, and overwrite the good one
                     // already cached for today.
-                    let (cached_text, cached_date, has_planned) = match result {
+                    let (cached_text, cached_date, planned_name) = match result {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::error!("Could not read the cached briefing: {e}");
@@ -959,8 +964,14 @@ impl DashboardPage {
                         }
                     };
                     if !cached_text.is_empty() && cached_date == today_c {
-                        let decision = parse_briefing_decision(&cached_text);
-                        let alt = parse_alternative_workout(&cached_text);
+                        // Reconcile against the plan: a cached "modify" naming
+                        // the workout already scheduled is agreement, not a swap.
+                        let (decision, alt) = resolve_decision(
+                            parse_briefing_decision(&cached_text),
+                            parse_alternative_workout(&cached_text),
+                            planned_name.as_deref(),
+                        );
+                        let has_planned = planned_name.is_some();
                         *pending_alt_c.borrow_mut() = alt.clone();
                         Self::apply_briefing(
                             &text_label_c,

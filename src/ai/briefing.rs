@@ -68,6 +68,31 @@ pub fn parse_alternative_workout(text: &str) -> Option<String> {
     crate::ai::naming::extract_marker_value(text, "ALTERNATIVE_WORKOUT:")
 }
 
+/// Reconcile a parsed decision with what is actually planned for today.
+///
+/// A model asked to pick an alternative will sometimes name the workout that is
+/// already scheduled — "replace Endurance 60 with Endurance 60". That is a
+/// no-op dressed up as a change: the rider is offered a Replace button that
+/// swaps a workout for itself. Treat it as agreement with the plan, which is
+/// what the model actually meant.
+///
+/// Returns the decision to act on and the alternative worth offering.
+pub fn resolve_decision(
+    decision: BriefingDecision,
+    alternative: Option<String>,
+    planned_name: Option<&str>,
+) -> (BriefingDecision, Option<String>) {
+    if decision != BriefingDecision::Modify {
+        return (decision, alternative);
+    }
+    match (&alternative, planned_name) {
+        (Some(alt), Some(planned)) if crate::ai::naming::names_match(alt, planned) => {
+            (BriefingDecision::Proceed, None)
+        }
+        _ => (decision, alternative),
+    }
+}
+
 pub fn build_briefing_prompt(ctx: &BriefingContext) -> String {
     let today_str = chrono::Local::now()
         .date_naive()
@@ -113,10 +138,22 @@ pub fn build_briefing_prompt(ctx: &BriefingContext) -> String {
         None => "No workout scheduled for today.".to_string(),
     };
 
-    let options_str = if ctx.workout_options.is_empty() {
+    // The planned workout must not appear in its own list of alternatives —
+    // offered both as the plan and as the replacement, the model will sometimes
+    // pick it, producing "swap Endurance 60 for Endurance 60".
+    let alternatives: Vec<&WorkoutOption> = ctx
+        .workout_options
+        .iter()
+        .filter(|w| match &ctx.planned_workout {
+            Some(p) => !crate::ai::naming::names_match(&w.name, &p.name),
+            None => true,
+        })
+        .collect();
+
+    let options_str = if alternatives.is_empty() {
         "  No alternatives in library.".to_string()
     } else {
-        ctx.workout_options
+        alternatives
             .iter()
             .map(|w| {
                 format!(
@@ -220,8 +257,8 @@ Provide a morning briefing with these sections:
 
 1. **Readiness**: 2 sentences combining TSB and today's wellness signals into one clear picture.
 2. **Recommendation**: Proceed, Modify, Rest, or Time Off — one sentence of reasoning.
-   - Proceed: the planned workout is appropriate
-   - Modify: swap to a lighter workout (cite the exact alternative name)
+   - Proceed: the planned workout is appropriate — use this whenever the plan already fits, rather than "modifying" to an equivalent session
+   - Modify: swap to a genuinely different workout, lighter than the plan (cite the exact alternative name, which must come from the alternatives list above and must not be the planned workout)
    - Rest: skip training — active recovery only
    - Time Off: today is a scheduled time off day — recommend one non-cycling activity (walk, yoga, swim, etc.) and skip all workout fueling sections
 3. **Pre-workout fueling** (skip if Rest or Time Off): specific Turkish foods with gram quantities and timing.
@@ -359,7 +396,115 @@ mod tests {
         assert!(parse_alternative_workout("ALTERNATIVE_WORKOUT:   \n").is_none());
     }
 
+    // ── resolve_decision ─────────────────────────────────────────────────────────
+
+    fn planned(name: &str) -> PlannedWorkout {
+        PlannedWorkout {
+            name: name.into(),
+            duration_mins: 60,
+            tss: 60.0,
+            category: "Endurance".into(),
+        }
+    }
+
+    #[test]
+    fn should_treat_replacing_a_workout_with_itself_as_proceeding() {
+        // The model sometimes names the planned workout as the alternative;
+        // offering a Replace button that swaps a session for itself is nonsense.
+        let (decision, alt) = resolve_decision(
+            BriefingDecision::Modify,
+            Some("Endurance 60".into()),
+            Some("Endurance 60"),
+        );
+        assert_eq!(decision, BriefingDecision::Proceed);
+        assert_eq!(alt, None, "no Replace button should be offered");
+    }
+
+    #[test]
+    fn should_treat_a_differently_cased_self_swap_as_proceeding() {
+        let (decision, _) = resolve_decision(
+            BriefingDecision::Modify,
+            Some("endurance 60".into()),
+            Some("Endurance 60"),
+        );
+        assert_eq!(decision, BriefingDecision::Proceed);
+    }
+
+    #[test]
+    fn should_keep_a_genuine_modification() {
+        let (decision, alt) = resolve_decision(
+            BriefingDecision::Modify,
+            Some("Recovery Spin".into()),
+            Some("Endurance 60"),
+        );
+        assert_eq!(decision, BriefingDecision::Modify);
+        assert_eq!(alt.as_deref(), Some("Recovery Spin"));
+    }
+
+    #[test]
+    fn should_keep_a_modification_when_nothing_is_planned() {
+        // With an open day there is nothing to be a no-op against.
+        let (decision, alt) =
+            resolve_decision(BriefingDecision::Modify, Some("Recovery Spin".into()), None);
+        assert_eq!(decision, BriefingDecision::Modify);
+        assert_eq!(alt.as_deref(), Some("Recovery Spin"));
+    }
+
+    #[test]
+    fn should_leave_proceed_and_rest_untouched() {
+        let (d, _) = resolve_decision(BriefingDecision::Proceed, None, Some("Endurance 60"));
+        assert_eq!(d, BriefingDecision::Proceed);
+        let (d, _) = resolve_decision(BriefingDecision::Rest, None, Some("Endurance 60"));
+        assert_eq!(d, BriefingDecision::Rest);
+    }
+
     // ── build_briefing_prompt ────────────────────────────────────────────────────
+
+    #[test]
+    fn should_not_offer_the_planned_workout_as_its_own_alternative() {
+        let mut c = ctx();
+        c.planned_workout = Some(planned("Endurance 60"));
+        c.workout_options = vec![
+            WorkoutOption {
+                name: "Endurance 60".into(),
+                duration_mins: 60,
+                tss: 60.0,
+                category: "Endurance".into(),
+            },
+            WorkoutOption {
+                name: "Recovery Spin".into(),
+                duration_mins: 30,
+                tss: 20.0,
+                category: "Recovery".into(),
+            },
+        ];
+        let prompt = build_briefing_prompt(&c);
+        let alternatives = prompt
+            .split("ALTERNATIVE WORKOUTS FOR MODIFICATION:")
+            .nth(1)
+            .expect("prompt lists alternatives");
+        assert!(
+            alternatives.contains("Recovery Spin"),
+            "a real alternative is still offered"
+        );
+        assert!(
+            !alternatives.contains("- Endurance 60 ("),
+            "the planned workout must not be its own alternative:\n{alternatives}"
+        );
+    }
+
+    #[test]
+    fn should_say_there_are_no_alternatives_when_only_the_planned_workout_exists() {
+        let mut c = ctx();
+        c.planned_workout = Some(planned("Endurance 60"));
+        c.workout_options = vec![WorkoutOption {
+            name: "Endurance 60".into(),
+            duration_mins: 60,
+            tss: 60.0,
+            category: "Endurance".into(),
+        }];
+        assert!(build_briefing_prompt(&c).contains("No alternatives in library."));
+    }
 
     #[test]
     fn prompt_includes_decision_instructions_and_athlete_data() {
