@@ -14,7 +14,11 @@ use crate::ai::retrospective::{
 use crate::data::{
     athlete::{power_zone_index, AthleteProfile, ZONE_COLORS},
     db, keystore,
-    streams::ActivityStreams,
+};
+use crate::training::analytics::{
+    build_wellness_series, compute_hr_zones, compute_pace_curve, compute_power_curve,
+    compute_volume_totals, compute_weekly_tss, compute_zone_seconds, format_pace_display,
+    CURVE_DURATIONS, PACE_DISTANCES, PACE_LABELS, RECENT_WINDOW_DAYS, WELLNESS_WINDOW_DAYS,
 };
 use crate::training::fitness::{
     compute_load_metrics, compute_pmc_series, tsb_status_text, PmcPoint, TsbBand,
@@ -22,73 +26,131 @@ use crate::training::fitness::{
 use crate::ui::markdown::to_pango;
 use crate::ui::pages::coaching::normalize_sport_type;
 
-/// Standard race distances used for the pace curve, in metres.
-const PACE_DISTANCES: [f32; 8] = [
-    400.0, 800.0, 1609.0, 3000.0, 5000.0, 10000.0, 21097.5, 42195.0,
-];
-const PACE_LABELS: [&str; 8] = [
-    "400 m", "800 m", "1 mi", "3 km", "5 km", "10 km", "Half", "Full",
-];
 /// How far back the performance-management chart plots.
 const PMC_WINDOW_DAYS: i64 = 90;
 
-fn hr_zone_index(bpm: u32, max_hr: u32) -> usize {
-    if max_hr == 0 {
-        return 0;
-    }
-    match (bpm as f64 / max_hr as f64 * 100.0) as u32 {
-        0..=60 => 0,
-        61..=70 => 1,
-        71..=80 => 2,
-        81..=90 => 3,
-        _ => 4,
-    }
+/// How many weeks the training-stress bar chart shows.
+const TSS_WEEKS: i64 = 6;
+
+/// Why an AI request produced no answer.
+///
+/// The two cases need different wording: one points at the rider's API key, the
+/// other at their database, and telling them to check the key when the database
+/// is the problem sends them to the wrong place.
+#[derive(Debug, Clone, Copy)]
+enum AiFailure {
+    /// The training history could not be read, so nothing was sent.
+    DataUnavailable,
+    /// The request was sent but did not come back with an answer.
+    Request,
 }
 
-fn format_pace_display(sec_per_km: u32) -> String {
-    format!("{}:{:02}", sec_per_km / 60, sec_per_km % 60)
-}
-
-/// Compute best pace (sec/km) per standard distance from cached run streams.
-/// Returns `Vec<(all_time, thirty_day)>` with 0 = no data for that distance.
-fn compute_pace_curve(
-    run_streams: &[(NaiveDate, String)],
-    cutoff_30d: NaiveDate,
-) -> Vec<(u32, u32)> {
-    let mut all_time = vec![0u32; PACE_DISTANCES.len()];
-    let mut month = vec![0u32; PACE_DISTANCES.len()];
-    for (date, json) in run_streams {
-        let is_recent = *date >= cutoff_30d;
-        if let Some(streams) = ActivityStreams::from_json(json) {
-            for (i, &dist) in PACE_DISTANCES.iter().enumerate() {
-                if let Some(elapsed) = streams.best_time_for_distance(dist) {
-                    let pace = (elapsed as f32 * 1000.0 / dist).round() as u32;
-                    if pace > 0 {
-                        if all_time[i] == 0 || pace < all_time[i] {
-                            all_time[i] = pace;
-                        }
-                        if is_recent && (month[i] == 0 || pace < month[i]) {
-                            month[i] = pace;
-                        }
-                    }
-                }
+impl AiFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::DataUnavailable => {
+                "Could not read your training history, so nothing was sent to the AI Coach."
+            }
+            Self::Request => {
+                "The AI Coach couldn't complete this request. \
+                 Please check your API key and try again."
             }
         }
     }
-    all_time.into_iter().zip(month).collect()
 }
 
-/// Compute seconds spent in each of 5 HR zones from local session data points.
-fn compute_hr_zones(records: &[db::SessionRecord], max_hr: u32) -> [u32; 5] {
-    let mut zones = [0u32; 5];
-    for record in records {
-        for dp in &record.session.data_points {
-            if let Some(bpm) = dp.heart_rate_bpm {
-                zones[hr_zone_index(bpm, max_hr)] += 1;
-            }
-        }
-    }
-    zones
+/// Everything the page's charts are drawn from, loaded in one pass.
+struct FitnessData {
+    records: Vec<db::SessionRecord>,
+    intervals_pairs: Vec<(NaiveDate, f32)>,
+    icu_activities: Vec<db::IntervalsActivity>,
+    wellness: Vec<db::WellnessEntry>,
+    run_streams: Vec<(NaiveDate, String)>,
+    cached_insight: String,
+}
+
+/// Load the page's data off the GTK main thread (CLAUDE.md §2.3).
+///
+/// Every query hits the same local database, so the first failure aborts the
+/// whole load rather than leaving the page part-drawn from stale data.
+async fn load_fitness_data(pool: &SqlitePool) -> anyhow::Result<FitnessData> {
+    Ok(FitnessData {
+        records: db::load_session_records(pool).await?,
+        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
+        icu_activities: db::load_unlinked_intervals_activities(pool).await?,
+        wellness: db::load_wellness_recent(pool, WELLNESS_WINDOW_DAYS as u32).await?,
+        run_streams: db::load_run_activity_streams(pool).await?,
+        cached_insight: db::get_setting(pool, "ai.fitness_insight")
+            .await?
+            .unwrap_or_default(),
+    })
+}
+
+/// Days of wellness history sent with the "Analyse Fitness" prompt.
+const AI_WELLNESS_DAYS: u32 = 7;
+
+/// The training history behind the "Analyse Fitness" prompt.
+struct FitnessPromptData {
+    records: Vec<db::SessionSummary>,
+    intervals_pairs: Vec<(NaiveDate, f32)>,
+    icu_count: usize,
+    wellness: Vec<db::WellnessEntry>,
+    athlete_context: String,
+}
+
+/// Load the history the fitness analysis is based on.
+///
+/// Unlike the chart data, a partial read here is not a cosmetic problem: the
+/// prompt would still be sent, and the AI would confidently analyse a training
+/// history that is missing rides. The first failure aborts the request.
+async fn load_fitness_prompt_data(pool: &SqlitePool) -> anyhow::Result<FitnessPromptData> {
+    Ok(FitnessPromptData {
+        records: db::load_session_summaries(pool).await?,
+        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
+        icu_count: db::count_intervals_activities(pool).await? as usize,
+        wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS).await?,
+        athlete_context: db::get_setting(pool, "coaching.athlete_context")
+            .await?
+            .unwrap_or_default(),
+    })
+}
+
+/// The training history behind a retrospective prompt.
+struct RetroPromptData {
+    /// Sessions inside the retrospective period.
+    records: Vec<db::SessionRecord>,
+    icu_acts: Vec<db::IntervalsActivity>,
+    intervals_all: Vec<(NaiveDate, f32)>,
+    wellness: Vec<db::WellnessEntry>,
+    /// All sessions ever — the fitness trend needs history from before the period.
+    all_records: Vec<db::SessionRecord>,
+    athlete_context: String,
+}
+
+/// Load the history a retrospective is based on. Aborts on the first failure,
+/// for the same reason as [`load_fitness_prompt_data`].
+async fn load_retro_prompt_data(
+    pool: &SqlitePool,
+    start_utc: &str,
+    end_utc: &str,
+    start_date: NaiveDate,
+    today: NaiveDate,
+) -> anyhow::Result<RetroPromptData> {
+    Ok(RetroPromptData {
+        records: db::load_sessions_between(pool, start_utc, end_utc).await?,
+        icu_acts: db::load_unlinked_intervals_activities(pool).await?,
+        intervals_all: db::load_intervals_tss_pairs(pool).await?,
+        wellness: db::load_wellness_between(
+            pool,
+            &start_date.format("%Y-%m-%d").to_string(),
+            &today.format("%Y-%m-%d").to_string(),
+        )
+        .await?,
+        all_records: db::load_session_records(pool).await?,
+        athlete_context: db::get_setting(pool, "coaching.athlete_context")
+            .await?
+            .unwrap_or_default(),
+    })
 }
 
 pub struct FitnessPage {
@@ -102,6 +164,7 @@ impl FitnessPage {
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
         athlete: Rc<RefCell<AthleteProfile>>,
+        on_toast: Rc<dyn Fn(adw::Toast)>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -520,7 +583,7 @@ impl FitnessPage {
         load_section.append(&tss_value_row);
 
         // ── Power Curve ───────────────────────────────────────────────────────
-        const CURVE_DURATIONS: [usize; 10] = [5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600];
+        // Durations come from `analytics::CURVE_DURATIONS`; these are their labels.
         const CURVE_LABELS: [&str; 10] = [
             "5s", "10s", "30s", "1m", "2m", "5m", "10m", "20m", "30m", "60m",
         ];
@@ -1214,6 +1277,7 @@ impl FitnessPage {
             let pmc_chart_r = pmc_chart.clone();
             let volume_section_r = volume_section.clone();
             let api_banner_r = api_banner.clone();
+            let on_toast_reload = Rc::clone(&on_toast);
             Rc::new(move || {
                 // API key pre-flight check (local keyring — fast, stays synchronous)
                 let has_api_key = keystore::get_secret(keystore::KEY_ANTHROPIC)
@@ -1226,6 +1290,7 @@ impl FitnessPage {
                 // update the charts and cards once the data arrives. Clone the widget
                 // handles the callback needs (cheap refcount bumps).
                 let pool_load = pool.clone();
+                let on_toast_r = Rc::clone(&on_toast_reload);
                 let icu_indicator_r = icu_indicator_r.clone();
                 let athlete = Rc::clone(&athlete);
                 let pmc_data_r = Rc::clone(&pmc_data_r);
@@ -1291,43 +1356,32 @@ impl FitnessPage {
 
                 crate::ui::spawn_to_main(
                     &rt_handle,
-                    async move {
-                        let records = db::load_session_records(&pool_load)
-                            .await
-                            .unwrap_or_default();
-                        let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
-                            .await
-                            .unwrap_or_default();
-                        let icu_activities = db::load_unlinked_intervals_activities(&pool_load)
-                            .await
-                            .unwrap_or_default();
-                        let wellness = db::load_wellness_recent(&pool_load, 14)
-                            .await
-                            .unwrap_or_default();
-                        let run_streams = db::load_run_activity_streams(&pool_load)
-                            .await
-                            .unwrap_or_default();
-                        let cached_insight = db::get_setting(&pool_load, "ai.fitness_insight")
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default();
-                        (
+                    async move { load_fitness_data(&pool_load).await },
+                    move |result| {
+                        // A failed load must not redraw the page as empty — an
+                        // empty chart is indistinguishable from "you have never
+                        // ridden". Say so instead, and leave the last good view up.
+                        let FitnessData {
                             records,
                             intervals_pairs,
                             icu_activities,
                             wellness,
                             run_streams,
                             cached_insight,
-                        )
-                    },
-                    move |(
-                        records,
-                        intervals_pairs,
-                        icu_activities,
-                        wellness,
-                        run_streams,
-                        cached_insight,
-                    )| {
+                        } = match result {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Could not load fitness data: {e}");
+                                on_toast_r(
+                                    adw::Toast::builder()
+                                        .title("Could not load your fitness data")
+                                        .timeout(5)
+                                        .build(),
+                                );
+                                return;
+                            }
+                        };
+
                         if !icu_activities.is_empty() {
                             icu_indicator_r.set_label(&format!(
                                 "Includes {} activities synced from Intervals.icu",
@@ -1401,19 +1455,20 @@ impl FitnessPage {
                         wellness_flow.set_visible(has_wellness);
 
                         if has_wellness {
-                            let hrv_series = build_14day_series(&wellness, today, |e| e.hrv);
-                            let rhr_series = build_14day_series(&wellness, today, |e| {
+                            let hrv_series = build_wellness_series(&wellness, today, |e| e.hrv);
+                            let rhr_series = build_wellness_series(&wellness, today, |e| {
                                 e.resting_hr.map(|v| v as f32)
                             });
-                            let sleep_series = build_14day_series(&wellness, today, |e| {
+                            let sleep_series = build_wellness_series(&wellness, today, |e| {
                                 e.sleep_secs.map(|s| s as f32 / 3600.0)
                             });
-                            let score_series = build_14day_series(&wellness, today, |e| {
+                            let score_series = build_wellness_series(&wellness, today, |e| {
                                 e.sleep_score.map(|v| v as f32)
                             });
-                            let steps_series =
-                                build_14day_series(&wellness, today, |e| e.steps.map(|v| v as f32));
-                            let cal_series = build_14day_series(&wellness, today, |e| {
+                            let steps_series = build_wellness_series(&wellness, today, |e| {
+                                e.steps.map(|v| v as f32)
+                            });
+                            let cal_series = build_wellness_series(&wellness, today, |e| {
                                 e.calories.map(|v| v as f32)
                             });
 
@@ -1474,74 +1529,23 @@ impl FitnessPage {
                         }
 
                         // Volume
-                        let week_start =
-                            today - Duration::days(today.weekday().num_days_from_monday() as i64);
-                        let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                            .expect("day 1 of any calendar month is always valid");
+                        let volume = compute_volume_totals(&records, &icu_activities, today);
 
-                        let mut wk_kj = 0.0f32;
-                        let mut wk_secs = 0u64;
-                        let mut mo_kj = 0.0f32;
+                        volume_section_r.set_visible(volume.activity_count > 0);
+                        week_kj_label.set_label(&format!("{:.0} kJ", volume.week_kj));
+                        week_hrs_label
+                            .set_label(&format!("{:.1} h", volume.week_secs as f32 / 3600.0));
+                        month_kj_label.set_label(&format!("{:.0} kJ", volume.month_kj));
+                        total_sessions_label.set_label(&volume.activity_count.to_string());
 
-                        for record in &records {
-                            let date = record.session.started_at.with_timezone(&Local).date_naive();
-                            let kj = record.session.kilojoules();
-                            let dur = record.session.duration_secs();
-                            if date >= week_start {
-                                wk_kj += kj;
-                                wk_secs += dur;
-                            }
-                            if date >= month_start {
-                                mo_kj += kj;
-                            }
-                        }
-                        for act in &icu_activities {
-                            let kj = act
-                                .average_watts
-                                .and_then(|w| {
-                                    act.duration_secs.map(|d| w as f32 * d as f32 / 1000.0)
-                                })
-                                .unwrap_or(0.0);
-                            let dur = act.duration_secs.unwrap_or(0) as u64;
-                            if act.date >= week_start {
-                                wk_kj += kj;
-                                wk_secs += dur;
-                            }
-                            if act.date >= month_start {
-                                mo_kj += kj;
-                            }
-                        }
-
-                        let has_sessions = !records.is_empty() || !icu_activities.is_empty();
-                        volume_section_r.set_visible(has_sessions);
-                        week_kj_label.set_label(&format!("{:.0} kJ", wk_kj));
-                        week_hrs_label.set_label(&format!("{:.1} h", wk_secs as f32 / 3600.0));
-                        month_kj_label.set_label(&format!("{:.0} kJ", mo_kj));
-                        total_sessions_label
-                            .set_label(&(records.len() + icu_activities.len()).to_string());
-
-                        // Weekly TSS chart (last 6 weeks, oldest → newest)
-                        let mut week_tss: Vec<(String, f32)> = Vec::with_capacity(6);
-                        for i in (0..6i64).rev() {
-                            let ws = week_start - Duration::weeks(i);
-                            let we = ws + Duration::days(6);
-                            let tss_sessions: f32 = records
-                                .iter()
-                                .filter(|r| {
-                                    let d = r.session.started_at.with_timezone(&Local).date_naive();
-                                    d >= ws && d <= we
-                                })
-                                .filter_map(|r| r.session.tss(ftp_val))
-                                .sum();
-                            let tss_icu: f32 = intervals_pairs
-                                .iter()
-                                .filter(|(d, _)| *d >= ws && *d <= we)
-                                .map(|(_, t)| *t)
-                                .sum();
-                            let tss = tss_sessions + tss_icu;
-                            let iso_week = ws.iso_week().week();
-                            week_tss.push((format!("W{iso_week}"), tss));
-                        }
+                        // Weekly TSS chart (oldest → newest)
+                        let week_tss = compute_weekly_tss(
+                            &records,
+                            &intervals_pairs,
+                            ftp_val,
+                            today,
+                            TSS_WEEKS,
+                        );
 
                         for (i, (label_text, tss_val)) in week_tss.iter().enumerate() {
                             week_header_labels[i].set_label(label_text);
@@ -1554,18 +1558,8 @@ impl FitnessPage {
                         *tss_week_data.borrow_mut() = week_tss.iter().map(|(_, t)| *t).collect();
                         tss_chart.queue_draw();
 
-                        // Zone distribution. Each ride is bucketed against the FTP
-                        // it was ridden at, so raising FTP does not retroactively
-                        // demote past efforts into lower zones — time_in_zones
-                        // falls back to ftp_val only for rides with no stamp.
-                        let mut zone_secs = [0u32; 7];
-                        for record in &records {
-                            for (zone, secs) in
-                                record.session.time_in_zones(ftp_val).iter().enumerate()
-                            {
-                                zone_secs[zone] += secs;
-                            }
-                        }
+                        // Zone distribution
+                        let zone_secs = compute_zone_seconds(&records, ftp_val);
                         let has_power = zone_secs.iter().any(|&s| s > 0);
                         zone_section.set_visible(has_power);
                         if has_power {
@@ -1574,43 +1568,26 @@ impl FitnessPage {
                         }
 
                         // Power curve
-                        let cutoff_30d = today - Duration::days(30);
-                        let mut all_time_peaks = vec![0u32; CURVE_DURATIONS.len()];
-                        let mut month_peaks = vec![0u32; CURVE_DURATIONS.len()];
-                        for record in &records {
-                            let date = record.session.started_at.with_timezone(&Local).date_naive();
-                            let is_recent = date >= cutoff_30d;
-                            for (i, &dur) in CURVE_DURATIONS.iter().enumerate() {
-                                if let Some(peak) = record.session.peak_power_for_duration(dur) {
-                                    if peak > all_time_peaks[i] {
-                                        all_time_peaks[i] = peak;
-                                    }
-                                    if is_recent && peak > month_peaks[i] {
-                                        month_peaks[i] = peak;
-                                    }
-                                }
-                            }
-                        }
-                        let has_curve = all_time_peaks.iter().any(|&p| p > 0);
+                        let recent_cutoff = today - Duration::days(RECENT_WINDOW_DAYS);
+                        let power_curve = compute_power_curve(&records, recent_cutoff);
+                        let has_curve = power_curve.iter().any(|&(a, _)| a > 0);
                         curve_section_r.set_visible(has_curve);
                         if has_curve {
-                            *curve_data_r.borrow_mut() = all_time_peaks
-                                .iter()
-                                .zip(month_peaks.iter())
-                                .map(|(&a, &m)| (a, m))
-                                .collect();
-                            for (lbl, &peak) in curve_w_labels_r.iter().zip(all_time_peaks.iter()) {
-                                if peak > 0 {
-                                    lbl.set_label(&format!("{}W", peak));
+                            for (lbl, &(all_time, _)) in
+                                curve_w_labels_r.iter().zip(power_curve.iter())
+                            {
+                                if all_time > 0 {
+                                    lbl.set_label(&format!("{}W", all_time));
                                 } else {
                                     lbl.set_label("—");
                                 }
                             }
+                            *curve_data_r.borrow_mut() = power_curve;
                             curve_chart_r.queue_draw();
                         }
 
                         // Pace curve (running activities with cached streams)
-                        let pace_curve = compute_pace_curve(&run_streams, cutoff_30d);
+                        let pace_curve = compute_pace_curve(&run_streams, recent_cutoff);
                         let has_pace = pace_curve.iter().any(|&(a, _)| a > 0);
                         pace_section_r.set_visible(has_pace);
                         if has_pace {
@@ -1686,26 +1663,25 @@ impl FitnessPage {
                 label_a.set_text("Asking the AI Coach to analyse your fitness metrics…");
                 label_a.remove_css_class("dim-label");
 
-                let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+                let (tx, rx) = async_channel::bounded::<Result<String, AiFailure>>(1);
                 let pool_t = pool_a.clone();
                 // All DB reads + prompt assembly + the network call run off the main
                 // thread, so the click never blocks the GLib loop (CLAUDE.md §2.3).
                 rt_a.spawn(async move {
-                    let records = db::load_session_summaries(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let icu_count =
-                        db::count_intervals_activities(&pool_t).await.unwrap_or(0) as usize;
-                    let wellness_raw = db::load_wellness_recent(&pool_t, 7)
-                        .await
-                        .unwrap_or_default();
-                    let athlete_context = db::get_setting(&pool_t, "coaching.athlete_context")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
+                    let FitnessPromptData {
+                        records,
+                        intervals_pairs,
+                        icu_count,
+                        wellness: wellness_raw,
+                        athlete_context,
+                    } = match load_fitness_prompt_data(&pool_t).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("Could not read training history to analyse: {e}");
+                            let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
+                            return;
+                        }
+                    };
 
                     let today = Local::now().date_naive();
                     let m = compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
@@ -1738,9 +1714,10 @@ impl FitnessPage {
                     };
                     let prompt = build_fitness_prompt(&ctx);
 
-                    let result = get_suggestion(&api_key, &prompt, 1024)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let result = get_suggestion(&api_key, &prompt, 1024).await.map_err(|e| {
+                        tracing::error!("AI fitness analysis failed: {e}");
+                        AiFailure::Request
+                    });
                     let _ = tx.send(result).await;
                 });
 
@@ -1760,13 +1737,7 @@ impl FitnessPage {
                                         .await;
                                 });
                             }
-                            Err(e) => {
-                                tracing::error!("AI fitness analysis failed: {e}");
-                                label_c.set_text(
-                                    "The AI Coach couldn't complete this request. \
-                                     Please check your API key and try again.",
-                                );
-                            }
+                            Err(failure) => label_c.set_text(failure.message()),
                         }
                     }
                     spinner_c.stop();
@@ -1789,9 +1760,15 @@ impl FitnessPage {
             crate::ui::spawn_to_main(
                 &rt_handle,
                 async move {
+                    // A missing cache entry is normal; a failed read is not, but
+                    // it costs the rider nothing here — the card just shows its
+                    // prompt to generate one. Log it and carry on.
                     db::get_setting(&pool_load, &cache_key_load)
                         .await
-                        .unwrap_or(None)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("Could not read cached retrospective: {e}");
+                            None
+                        })
                         .unwrap_or_default()
                 },
                 move |cached| {
@@ -1860,32 +1837,32 @@ impl FitnessPage {
                 ));
                 label_r.remove_css_class("dim-label");
 
-                let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+                let (tx, rx) = async_channel::bounded::<Result<String, AiFailure>>(1);
                 let pool_t = pool_r.clone();
                 // All DB reads + prompt assembly + the network call run off the main
                 // thread, so the click never blocks the GLib loop (CLAUDE.md §2.3).
                 rt_r.spawn(async move {
-                    let records = db::load_sessions_between(&pool_t, &start_utc, &end_utc)
-                        .await
-                        .unwrap_or_default();
-                    let icu_acts = db::load_unlinked_intervals_activities(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let intervals_all = db::load_intervals_tss_pairs(&pool_t)
-                        .await
-                        .unwrap_or_default();
-                    let wellness_raw = db::load_wellness_between(
-                        &pool_t,
-                        &start_date.format("%Y-%m-%d").to_string(),
-                        &today.format("%Y-%m-%d").to_string(),
+                    let RetroPromptData {
+                        records,
+                        icu_acts,
+                        intervals_all,
+                        wellness: wellness_raw,
+                        all_records,
+                        athlete_context,
+                    } = match load_retro_prompt_data(
+                        &pool_t, &start_utc, &end_utc, start_date, today,
                     )
                     .await
-                    .unwrap_or_default();
-                    let all_records = db::load_session_records(&pool_t).await.unwrap_or_default();
-                    let athlete_context = db::get_setting(&pool_t, "coaching.athlete_context")
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default();
+                    {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!(
+                                "Could not read training history for retrospective: {e}"
+                            );
+                            let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
+                            return;
+                        }
+                    };
 
                     let all_rides: Vec<db::SessionSummary> =
                         all_records.iter().map(|r| r.summary()).collect();
@@ -1964,9 +1941,10 @@ impl FitnessPage {
                     };
                     let prompt = build_retrospective_prompt(&ctx);
 
-                    let r = get_suggestion(&api_key, &prompt, 1500)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let r = get_suggestion(&api_key, &prompt, 1500).await.map_err(|e| {
+                        tracing::error!("AI retrospective failed: {e}");
+                        AiFailure::Request
+                    });
                     let _ = tx.send(r).await;
                 });
 
@@ -1986,13 +1964,7 @@ impl FitnessPage {
                                     let _ = db::set_setting(&pool_c, &key_c, &text).await;
                                 });
                             }
-                            Err(e) => {
-                                tracing::error!("AI retrospective failed: {e}");
-                                label_c.set_text(
-                                    "The AI Coach couldn't complete this request. \
-                                     Please check your API key and try again.",
-                                );
-                            }
+                            Err(failure) => label_c.set_text(failure.message()),
                         }
                     }
                     spinner_c.stop();
@@ -2025,26 +1997,6 @@ impl FitnessPage {
 }
 
 /// Build a 14-element series aligned to [today-13 .. today], 0.0 = no data.
-fn build_14day_series(
-    wellness: &[db::WellnessEntry],
-    today: NaiveDate,
-    extractor: impl Fn(&db::WellnessEntry) -> Option<f32>,
-) -> Vec<f32> {
-    let mut vals = vec![0.0f32; 14];
-    for entry in wellness {
-        let days_ago = (today - entry.date).num_days();
-        if (0..14).contains(&days_ago) {
-            let idx = (13 - days_ago) as usize;
-            if let Some(v) = extractor(entry) {
-                if v > 0.0 {
-                    vals[idx] = v;
-                }
-            }
-        }
-    }
-    vals
-}
-
 /// Update one wellness card: value label, trend label, sparkline data, and redraw.
 /// `fmt` is a format string fragment like `"{:.0}"` or `"{:.1}"`.
 /// `higher_is_better` controls whether above-average gets `success` or `warning`.

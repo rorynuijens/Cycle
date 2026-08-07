@@ -471,8 +471,16 @@ impl CycleGtkWindow {
         );
 
         // ── Fitness page ──────────────────────────────────────────────────────
-        let (fitness_page, fitness_reload) =
-            FitnessPage::new(pool.clone(), rt_handle.clone(), Rc::clone(&athlete_rc));
+        let toast_overlay_for_fitness = self.toast_overlay.clone();
+        let toast_fn_fitness: Rc<dyn Fn(adw::Toast)> =
+            Rc::new(move |toast| toast_overlay_for_fitness.add_toast(toast));
+
+        let (fitness_page, fitness_reload) = FitnessPage::new(
+            pool.clone(),
+            rt_handle.clone(),
+            Rc::clone(&athlete_rc),
+            toast_fn_fitness,
+        );
 
         // ── Coaching page ─────────────────────────────────────────────────────
         let toast_overlay_for_coaching = self.toast_overlay.clone();
