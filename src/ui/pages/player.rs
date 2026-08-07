@@ -204,7 +204,7 @@ impl PlayerPage {
         inner.append(&secondary_grid);
 
         // ── Workout power profile graph (absorbs spare height) ───────────────
-        let graph = WorkoutGraph::new(workout, athlete);
+        let graph = WorkoutGraph::new(workout, athlete.ftp_watts);
         graph.widget().set_vexpand(true);
         inner.append(graph.widget());
 
@@ -440,7 +440,9 @@ impl PlayerPage {
     }
 
     /// Reset all UI for a new workout without rebuilding the widget tree.
-    pub fn reset_workout(&self, workout: &Workout) {
+    pub fn reset_workout(&self, workout: &Workout, ftp_watts: u32) {
+        self.graph.set_ftp(ftp_watts);
+        self.zone_meter.set_ftp(ftp_watts);
         self.workout_name_label.set_label(&workout.name);
         self.cancel_btn.set_visible(true);
         self.countdown_banner
@@ -630,7 +632,7 @@ impl PlayerPage {
 
                 let snapshot = eng.tick(readings);
                 let session = eng.session.clone();
-                let ftp = eng.athlete.ftp_watts;
+                let ftp = eng.athlete.borrow().ftp_watts;
                 (snapshot, session, ftp)
             };
 
@@ -726,6 +728,9 @@ impl PlayerPage {
     /// Update the live session totals strip from the current in-progress session.
     pub fn update_session_totals(&self, session: &Session, ftp: u32) {
         self.zone_meter.set_ftp(ftp);
+        // The page outlives any one ride, so the graph's FTP scale has to track
+        // the profile rather than keep the value it was built with.
+        self.graph.set_ftp(ftp);
         match session.average_power() {
             Some(p) => self.avg_power_total.set_label(&format!("{} W", p as u32)),
             None => self.avg_power_total.set_label("—"),

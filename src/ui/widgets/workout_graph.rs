@@ -2,7 +2,7 @@ use adw::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::data::athlete::AthleteProfile;
+use crate::data::athlete::{power_zone_index, ZONE_COLORS};
 use crate::data::workout::Workout;
 
 /// Custom Cairo-drawn workout profile graph.
@@ -12,14 +12,17 @@ use crate::data::workout::Workout;
 pub struct WorkoutGraph {
     drawing_area: gtk::DrawingArea,
     workout: Rc<RefCell<Workout>>,
-    #[allow(dead_code)]
-    athlete: Rc<AthleteProfile>,
+    /// FTP the vertical scale and zone colours are derived from. Held as the
+    /// bare number, not a profile: taking a whole `AthleteProfile` here invited
+    /// callers to synthesise one from `default()` just to carry an FTP, which
+    /// would quietly drop any field added to the profile later.
+    ftp_watts: Rc<RefCell<u32>>,
     playhead_secs: Rc<RefCell<u32>>,
     power_trace: Rc<RefCell<Vec<Option<u32>>>>,
 }
 
 impl WorkoutGraph {
-    pub fn new(workout: &Workout, athlete: &AthleteProfile) -> Self {
+    pub fn new(workout: &Workout, ftp_watts: u32) -> Self {
         let drawing_area = gtk::DrawingArea::builder()
             .content_width(600)
             .content_height(120)
@@ -28,12 +31,14 @@ impl WorkoutGraph {
             .build();
 
         let workout_rc = Rc::new(RefCell::new(workout.clone()));
-        let athlete_rc = Rc::new(athlete.clone());
+        // Guard the divisions in `draw` — an FTP of 0 would otherwise scale
+        // every bar to NaN and blank the graph.
+        let ftp_rc = Rc::new(RefCell::new(ftp_watts.max(1)));
         let playhead = Rc::new(RefCell::new(0u32));
         let power_trace = Rc::new(RefCell::new(Vec::<Option<u32>>::new()));
 
         let wo = Rc::clone(&workout_rc);
-        let at = Rc::clone(&athlete_rc);
+        let ftp = Rc::clone(&ftp_rc);
         let ph = Rc::clone(&playhead);
         let tr = Rc::clone(&power_trace);
 
@@ -44,7 +49,7 @@ impl WorkoutGraph {
                 width,
                 height,
                 &wo.borrow(),
-                &at,
+                *ftp.borrow(),
                 *ph.borrow(),
                 &tr.borrow(),
             );
@@ -53,10 +58,23 @@ impl WorkoutGraph {
         Self {
             drawing_area,
             workout: workout_rc,
-            athlete: athlete_rc,
+            ftp_watts: ftp_rc,
             playhead_secs: playhead,
             power_trace,
         }
+    }
+
+    /// Rescale the graph to a new FTP — call after the rider edits their
+    /// profile so an already-built graph does not keep the old scale.
+    ///
+    /// A no-op when the value is unchanged, so per-tick callers pay nothing.
+    pub fn set_ftp(&self, ftp_watts: u32) {
+        let ftp = ftp_watts.max(1);
+        if *self.ftp_watts.borrow() == ftp {
+            return;
+        }
+        *self.ftp_watts.borrow_mut() = ftp;
+        self.drawing_area.queue_draw();
     }
 
     pub fn widget(&self) -> &gtk::DrawingArea {
@@ -95,7 +113,7 @@ impl WorkoutGraph {
         width: i32,
         height: i32,
         workout: &Workout,
-        athlete: &AthleteProfile,
+        ftp_watts: u32,
         playhead_secs: u32,
         power_trace: &[Option<u32>],
     ) {
@@ -106,8 +124,9 @@ impl WorkoutGraph {
         let fg = widget.color();
         let (fg_r, fg_g, fg_b) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
         let total_secs = workout.duration_secs as f64;
+        let ftp = ftp_watts as f64;
         // Scale: 125% FTP fills the graph vertically
-        let max_watts = athlete.ftp_watts as f64 * 1.25;
+        let max_watts = ftp * 1.25;
 
         // ── Segment bars ─────────────────────────────────────────────────────
         let mut elapsed = 0u32;
@@ -115,16 +134,12 @@ impl WorkoutGraph {
             let x_start = (elapsed as f64 / total_secs) * w;
             let x_width = (segment.duration_secs as f64 / total_secs) * w;
 
-            let y_low = h
-                - (segment.power_low_pct as f64 / 100.0 * athlete.ftp_watts as f64 / max_watts) * h;
-            let y_high = h
-                - (segment.power_high_pct as f64 / 100.0 * athlete.ftp_watts as f64 / max_watts)
-                    * h;
+            let y_low = h - (segment.power_low_pct as f64 / 100.0 * ftp / max_watts) * h;
+            let y_high = h - (segment.power_high_pct as f64 / 100.0 * ftp / max_watts) * h;
 
             let mid_pct = (segment.power_low_pct + segment.power_high_pct) / 2.0;
-            let zone =
-                athlete.power_zone((mid_pct as f64 / 100.0 * athlete.ftp_watts as f64) as u32);
-            let (r, g, b) = zone.rgb();
+            let mid_watts = (mid_pct as f64 / 100.0 * ftp) as u32;
+            let (r, g, b) = ZONE_COLORS[power_zone_index(mid_watts, ftp_watts)];
 
             let past = (elapsed + segment.duration_secs) as f64 / total_secs
                 < playhead_secs as f64 / total_secs;
@@ -147,7 +162,7 @@ impl WorkoutGraph {
         }
 
         // ── FTP reference line (dashed) ──────────────────────────────────────
-        let ftp_y = h - (athlete.ftp_watts as f64 / max_watts) * h;
+        let ftp_y = h - (ftp / max_watts) * h;
         cr.set_source_rgba(fg_r, fg_g, fg_b, 0.25);
         cr.set_line_width(1.0);
         cr.set_dash(&[4.0, 4.0], 0.0);

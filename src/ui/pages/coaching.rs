@@ -1217,7 +1217,7 @@ fn update_thumb(holder: &gtk::Box, workout: Option<&Workout>, athlete: &AthleteP
         holder.remove(&child);
     }
     if let Some(w) = workout {
-        let graph = WorkoutGraph::new(w, athlete);
+        let graph = WorkoutGraph::new(w, athlete.ftp_watts);
         graph.widget().set_content_width(120);
         graph.widget().set_content_height(56);
         graph.widget().set_valign(gtk::Align::Center);

@@ -123,6 +123,13 @@ impl CycleGtkWindow {
         // The close handler is registered further down, once the flags that tell
         // us whether a ride is in progress exist.
 
+        // ── The athlete profile: one cell, shared by every page ───────────────
+        // Preferences writes here and nowhere else. Anything that needs FTP,
+        // weight or HR must borrow at the point of use rather than capture a
+        // copy — a captured copy silently keeps the value it had at startup, so
+        // pages disagree with each other the moment the rider edits the profile.
+        let athlete_rc = Rc::new(RefCell::new(athlete));
+
         let stack = adw::ViewStack::new();
 
         // ── Nav icons — bundled in the app gresource, so they always resolve
@@ -139,14 +146,18 @@ impl CycleGtkWindow {
             saved_devices,
         )));
 
-        let mut engine = WorkoutEngine::new(workout.clone(), athlete.clone(), cmd_tx.clone());
+        let mut engine =
+            WorkoutEngine::new(workout.clone(), Rc::clone(&athlete_rc), cmd_tx.clone());
         engine.erg_ramp_rate = rt_handle
             .block_on(db::get_setting(&pool, "training.erg_ramp_rate"))
             .unwrap_or(None)
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(25);
         let engine_rc = Rc::new(RefCell::new(engine));
-        let player_rc = Rc::new(RefCell::new(PlayerPage::new(&workout, &athlete)));
+        let player_rc = Rc::new(RefCell::new(PlayerPage::new(
+            &workout,
+            &athlete_rc.borrow(),
+        )));
 
         // ── Header resume button — created here so on_complete and do_start can ref it ──
         // Only visible while a workout is running and the user has navigated away
@@ -186,7 +197,7 @@ impl CycleGtkWindow {
         let summary_for_complete = summary_page.clone();
         let pool_for_complete = pool.clone();
         let rt_for_complete = rt_handle.clone();
-        let athlete_initial = athlete.clone();
+        let athlete_for_complete = Rc::clone(&athlete_rc);
         let workout_active_complete = Rc::clone(&workout_active);
         let start_btn_complete = start_btn.clone();
         let engine_for_complete = Rc::clone(&engine_rc);
@@ -208,11 +219,15 @@ impl CycleGtkWindow {
         // funnel into this one closure. `segments` is None for a route ride, which
         // has no plan to compare against.
         let finish_session: FinishSession = Rc::new(move |session, name, segments| {
-            // The FTP the ride was actually executed at — not the profile value
-            // captured at startup, which goes stale the moment the rider edits it
-            // in Preferences and would make this re-suggest a bump already taken.
-            let ftp = session.ftp_watts.unwrap_or(athlete_initial.ftp_watts);
-            summary_for_complete.update(&session, &name, &athlete_initial, segments.as_deref());
+            // Borrowed, not captured: the profile must be whatever it is now, so
+            // the summary and the FIT export it feeds carry the rider's current
+            // weight and HR range rather than the values held at startup. The
+            // borrow is dropped before the summary page can emit any signal.
+            let athlete_now = athlete_for_complete.borrow().clone();
+            // The FTP the ride was actually executed at — the stamped value wins
+            // over the profile, so a bump taken mid-ride is not re-suggested.
+            let ftp = session.ftp_watts.unwrap_or(athlete_now.ftp_watts);
+            summary_for_complete.update(&session, &name, &athlete_now, segments.as_deref());
             stack_for_complete.set_visible_child_name("summary");
 
             // FTP auto-suggestion based on 20-minute best power
@@ -357,7 +372,8 @@ impl CycleGtkWindow {
             engine_for_complete
                 .borrow_mut()
                 .reset_with_workout(workout.clone());
-            player_for_complete.borrow().reset_workout(&workout);
+            let ftp = engine_for_complete.borrow().athlete.borrow().ftp_watts;
+            player_for_complete.borrow().reset_workout(&workout, ftp);
             let name = workout.name.clone();
             let segments = workout.segments.clone();
             finish_for_workout(session, name, Some(segments));
@@ -405,7 +421,8 @@ impl CycleGtkWindow {
             Rc::new(move |workout: Workout| {
                 timer_alive.set(false); // stop any running timer on its next tick
                 engine.borrow_mut().reset_with_workout(workout.clone());
-                player.borrow().reset_workout(&workout);
+                let ftp = engine.borrow().athlete.borrow().ftp_watts;
+                player.borrow().reset_workout(&workout, ftp);
                 timer_started.set(false);
                 do_start();
             })
@@ -425,7 +442,8 @@ impl CycleGtkWindow {
             let checkpoint_id = Rc::clone(&checkpoint_id);
             Rc::new(move |workout: Workout, session, row_id: i64| {
                 timer_alive.set(false);
-                player.borrow().reset_workout(&workout);
+                let ftp = engine.borrow().athlete.borrow().ftp_watts;
+                player.borrow().reset_workout(&workout, ftp);
                 engine.borrow_mut().resume_session(workout, session);
                 checkpoint_id.set(Some(row_id));
                 timer_started.set(false);
@@ -447,23 +465,14 @@ impl CycleGtkWindow {
             rt_handle.clone(),
             workouts.clone(),
             Rc::clone(&on_library_start),
-            athlete.ftp_watts,
-            athlete.weight_kg,
+            Rc::clone(&athlete_rc),
             on_toast_cal,
             on_go_to_coaching,
         );
 
-        // ── Shared athlete ref — used by fitness + coaching pages ─────────────
-        let ftp_for_fitness = Rc::new(Cell::new(athlete.ftp_watts));
-        let athlete_rc = Rc::new(RefCell::new(athlete.clone()));
-
         // ── Fitness page ──────────────────────────────────────────────────────
-        let (fitness_page, fitness_reload) = FitnessPage::new(
-            pool.clone(),
-            rt_handle.clone(),
-            Rc::clone(&ftp_for_fitness),
-            Rc::clone(&athlete_rc),
-        );
+        let (fitness_page, fitness_reload) =
+            FitnessPage::new(pool.clone(), rt_handle.clone(), Rc::clone(&athlete_rc));
 
         // ── Coaching page ─────────────────────────────────────────────────────
         let toast_overlay_for_coaching = self.toast_overlay.clone();
@@ -491,7 +500,7 @@ impl CycleGtkWindow {
         let (dashboard_page, dashboard_reload) = DashboardPage::new(
             pool.clone(),
             rt_handle.clone(),
-            athlete.clone(),
+            Rc::clone(&athlete_rc),
             Rc::clone(&on_library_start),
             on_view_fitness,
             on_open_calendar,
@@ -505,7 +514,10 @@ impl CycleGtkWindow {
             total_distance_m: 0.0,
             total_gain_m: 0.0,
         };
-        let route_player_rc = Rc::new(RoutePlayerPage::new(&blank_route, athlete.ftp_watts));
+        let route_player_rc = Rc::new(RoutePlayerPage::new(
+            &blank_route,
+            athlete_rc.borrow().ftp_watts,
+        ));
         let route_timer_alive = Rc::new(Cell::new(false));
         let route_timer_started = Rc::new(Cell::new(false));
 
@@ -589,7 +601,7 @@ impl CycleGtkWindow {
             Rc::clone(&on_library_start),
             calendar_icon,
             on_toast_lib,
-            athlete.ftp_watts,
+            Rc::clone(&athlete_rc),
             on_start_route,
         );
         let library_reload = Rc::new(library_reload);
@@ -830,14 +842,13 @@ impl CycleGtkWindow {
         let pool_for_prefs = pool.clone();
         let rt_for_prefs = rt_handle.clone();
         let window_for_prefs = self.window.clone();
+        let athlete_for_prefs = Rc::clone(&athlete_rc);
         let sim_difficulty_for_prefs = Rc::clone(&sim_difficulty);
         let sim_max_grade_for_prefs = Rc::clone(&sim_max_grade);
         let prefs_action = gio::SimpleAction::new("preferences", None);
         prefs_action.connect_activate(move |_, _| {
-            let current_athlete = engine_for_prefs.borrow().athlete.clone();
-            let engine_on_save = Rc::clone(&engine_for_prefs);
-            let ftp_cell = Rc::clone(&ftp_for_fitness);
-            let athlete_for_pages = Rc::clone(&athlete_rc);
+            let current_athlete = athlete_for_prefs.borrow().clone();
+            let athlete_on_save = Rc::clone(&athlete_for_prefs);
             let engine_for_erg = Rc::clone(&engine_for_prefs);
             let sim_difficulty_prefs = Rc::clone(&sim_difficulty_for_prefs);
             let sim_max_grade_prefs = Rc::clone(&sim_max_grade_for_prefs);
@@ -846,10 +857,10 @@ impl CycleGtkWindow {
                 current_athlete,
                 pool_for_prefs.clone(),
                 rt_for_prefs.clone(),
+                // One write, one reader set: every page and the running engine
+                // share this cell, so there is nothing else to keep in step.
                 move |new_athlete| {
-                    ftp_cell.set(new_athlete.ftp_watts);
-                    *athlete_for_pages.borrow_mut() = new_athlete.clone();
-                    engine_on_save.borrow_mut().athlete = new_athlete;
+                    *athlete_on_save.borrow_mut() = new_athlete;
                 },
                 move |rate| {
                     engine_for_erg.borrow_mut().erg_ramp_rate = rate;

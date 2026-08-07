@@ -491,8 +491,8 @@ impl SummaryPage {
             .map(|segs| segs.iter().map(|s| s.duration_secs).sum())
             .unwrap_or(0);
         if let (Some(segs), true) = (segments, total_secs > 0) {
-            // Synthetic workout/athlete carry just what the graph draws:
-            // the segment profile and the FTP scale.
+            // Synthetic workout carries just what the graph draws: the segment
+            // profile. The FTP scale is passed alongside it.
             let workout = Workout {
                 id: 0,
                 name: String::new(),
@@ -502,11 +502,7 @@ impl SummaryPage {
                 category: WorkoutCategory::Custom,
                 segments: segs.to_vec(),
             };
-            let athlete = AthleteProfile {
-                ftp_watts: ftp.max(1),
-                ..AthleteProfile::default()
-            };
-            let graph = WorkoutGraph::new(&workout, &athlete);
+            let graph = WorkoutGraph::new(&workout, ftp);
             graph.widget().set_content_height(160);
 
             let mut trace: Vec<Option<u32>> = vec![None; total_secs as usize];

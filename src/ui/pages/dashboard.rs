@@ -33,7 +33,7 @@ impl DashboardPage {
     pub fn new(
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
-        athlete: AthleteProfile,
+        athlete: Rc<RefCell<AthleteProfile>>,
         on_start: Rc<dyn Fn(Workout)>,
         on_view_fitness: Rc<dyn Fn()>,
         on_open_calendar: Rc<dyn Fn()>,
@@ -99,7 +99,7 @@ impl DashboardPage {
         let briefing_card = Self::build_briefing_card(
             pool.clone(),
             rt_handle.clone(),
-            athlete.clone(),
+            Rc::clone(&athlete),
             Rc::clone(&reload_holder),
         );
         inner.append(&briefing_card);
@@ -123,7 +123,7 @@ impl DashboardPage {
             let briefing_card = briefing_card.clone();
             let pool = pool.clone();
             let rt_handle = rt_handle.clone();
-            let athlete = athlete.clone();
+            let athlete = Rc::clone(&athlete);
             let on_start = Rc::clone(&on_start);
             let on_view_fitness = Rc::clone(&on_view_fitness);
             let on_open_calendar = Rc::clone(&on_open_calendar);
@@ -131,14 +131,20 @@ impl DashboardPage {
 
             Rc::new(move || {
                 let now = Local::now();
-                let ftp = athlete.ftp_watts;
+                // Read the profile fresh on every reload — reload runs on each
+                // navigation to the dashboard, so an FTP or name edit in
+                // Preferences shows up as soon as the rider comes back here.
+                let (ftp, name) = {
+                    let a = athlete.borrow();
+                    (a.ftp_watts, a.name.clone())
+                };
 
                 let salutation = match now.hour() {
                     5..=11 => "Good morning",
                     12..=17 => "Good afternoon",
                     _ => "Good evening",
                 };
-                greeting_label.set_label(&format!("{}, {}", salutation, athlete.name));
+                greeting_label.set_label(&format!("{}, {}", salutation, name));
 
                 let today_naive = now.date_naive();
                 let weekday = today_naive.format("%A, %-d %B %Y").to_string();
@@ -152,7 +158,9 @@ impl DashboardPage {
                 let dynamic_top = dynamic_top.clone();
                 let dynamic = dynamic.clone();
                 let briefing_card = briefing_card.clone();
-                let athlete_cb = athlete.clone();
+                // Snapshot for the deferred UI build: taken now, at reload time,
+                // so it is current. An `Rc` cannot cross `spawn_to_main`.
+                let athlete_cb = athlete.borrow().clone();
                 let on_start = Rc::clone(&on_start);
                 let on_view_fitness = Rc::clone(&on_view_fitness);
                 let on_open_calendar = Rc::clone(&on_open_calendar);
@@ -335,7 +343,7 @@ impl DashboardPage {
     fn build_briefing_card(
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
-        athlete: AthleteProfile,
+        athlete: Rc<RefCell<AthleteProfile>>,
         reload_holder: ReloadHolder,
     ) -> adw::PreferencesGroup {
         let today_str = Local::now().date_naive().format("%Y-%m-%d").to_string();
@@ -541,7 +549,7 @@ impl DashboardPage {
         {
             let pool_g = pool.clone();
             let rt_g = rt_handle.clone();
-            let athlete_g = athlete.clone();
+            let athlete_g = Rc::clone(&athlete);
             let text_label_g = text_label.clone();
             let action_row_g = action_row.clone();
             let content_row_g = content_row.clone();
@@ -578,7 +586,9 @@ impl DashboardPage {
                     async_channel::bounded::<Result<(String, Option<String>, bool), String>>(1);
 
                 let pool_t = pool_g.clone();
-                let athlete_t = athlete_g.clone();
+                // Read at click time, not at card-build time — the briefing is
+                // written against the rider's current FTP and HR range.
+                let athlete_t = athlete_g.borrow().clone();
                 let today_t = today_g.clone();
 
                 // All network and DB work happens in the tokio runtime — the GTK main
@@ -1182,7 +1192,7 @@ impl DashboardPage {
             .css_classes(["card"])
             .build();
 
-        let graph = WorkoutGraph::new(workout, athlete);
+        let graph = WorkoutGraph::new(workout, athlete.ftp_watts);
         graph.widget().set_content_height(72);
         graph.widget().set_margin_top(12);
         graph.widget().set_margin_start(12);

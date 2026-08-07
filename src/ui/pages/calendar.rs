@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use sqlx::SqlitePool;
 
+use crate::data::athlete::AthleteProfile;
 use crate::data::db::{self, CalendarEntry, IntervalsActivity, SessionRecord, TimeOffEntry};
 use crate::data::workout::Workout;
 use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
@@ -60,8 +61,7 @@ impl CalendarPage {
         rt_handle: tokio::runtime::Handle,
         workouts: Vec<Workout>,
         on_start_workout: Rc<dyn Fn(Workout)>,
-        ftp: u32,
-        weight_kg: f32,
+        athlete: Rc<RefCell<AthleteProfile>>,
         on_toast: Rc<dyn Fn(adw::Toast)>,
         on_go_to_coaching: Rc<dyn Fn()>,
     ) -> (Self, Rc<dyn Fn()>) {
@@ -272,8 +272,15 @@ impl CalendarPage {
             let on_start_workout = Rc::clone(&on_start_workout);
             let on_toast = Rc::clone(&on_toast);
             let coaching_banner_r = coaching_banner.clone();
+            let athlete = Rc::clone(&athlete);
 
             Rc::new(move || {
+                // Fresh each render: TSS on every row is scaled by FTP, so a
+                // profile edit must not leave the calendar showing old numbers.
+                let (ftp, weight_kg) = {
+                    let a = athlete.borrow();
+                    (a.ftp_watts, a.weight_kg)
+                };
                 let is_week = view_mode.get() == 1;
 
                 let (start_str, end_str, label_str) = if is_week {

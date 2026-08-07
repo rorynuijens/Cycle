@@ -46,7 +46,7 @@ impl LibraryPage {
         on_start: Rc<dyn Fn(Workout)>,
         calendar_icon: &'static str,
         on_toast: Rc<dyn Fn(adw::Toast)>,
-        ftp: u32,
+        athlete: Rc<RefCell<AthleteProfile>>,
         on_start_route: Rc<dyn Fn(Route)>,
     ) -> (Self, impl Fn() + 'static) {
         // Per-workout recommendations need CTL/TSB and the athlete's goals, all
@@ -497,8 +497,12 @@ impl LibraryPage {
             let fitness_ctx = Rc::clone(&fitness_ctx);
             let filter_chips = Rc::clone(&filter_chips);
             let search_entry = search_entry.clone();
+            let athlete = Rc::clone(&athlete);
 
             Rc::new(move || {
+                // Every thumbnail and target wattage in the list is scaled by
+                // FTP, so read it per rebuild rather than capturing it once.
+                let ftp = athlete.borrow().ftp_watts;
                 // Snapshot the current fitness context for this rebuild pass.
                 let ctx = fitness_ctx.borrow();
                 let ctl = ctx.ctl;
@@ -608,11 +612,7 @@ impl LibraryPage {
 
                         // The workout's own shape is its best label: a mini
                         // zone-coloured profile, same motif as player/summary.
-                        let thumb_athlete = AthleteProfile {
-                            ftp_watts: ftp.max(1),
-                            ..AthleteProfile::default()
-                        };
-                        let thumb = WorkoutGraph::new(workout, &thumb_athlete);
+                        let thumb = WorkoutGraph::new(workout, ftp);
                         thumb.widget().set_content_width(84);
                         thumb.widget().set_content_height(42);
                         thumb.widget().set_hexpand(false);
@@ -977,6 +977,7 @@ impl LibraryPage {
             let pool_new = pool.clone();
             let rt_new = rt_handle.clone();
             let on_toast_new = Rc::clone(&on_toast);
+            let athlete_new = Rc::clone(&athlete);
 
             new_workout_btn.connect_clicked(move |btn| {
                 let parent = btn.root().and_downcast::<gtk::Window>();
@@ -984,7 +985,7 @@ impl LibraryPage {
                     parent.as_ref(),
                     pool_new.clone(),
                     rt_new.clone(),
-                    ftp,
+                    athlete_new.borrow().ftp_watts,
                     Rc::clone(&workouts_new),
                     Rc::clone(&rebuild_new),
                     Rc::clone(&on_toast_new),
@@ -1047,6 +1048,7 @@ impl LibraryPage {
             let pool_load = pool.clone();
             let fitness_ctx_load = Rc::clone(&fitness_ctx);
             let rebuild_load = Rc::clone(&rebuild);
+            let ftp = athlete.borrow().ftp_watts;
             crate::ui::spawn_to_main(
                 &rt_handle,
                 async move {
@@ -1173,7 +1175,6 @@ fn show_workout_detail(
     calendar_icon: &'static str,
     parent: Option<&gtk::Window>,
 ) {
-    use crate::data::athlete::AthleteProfile;
     use crate::ui::widgets::workout_graph::WorkoutGraph;
 
     let win = adw::Window::builder()
@@ -1313,11 +1314,7 @@ fn show_workout_detail(
             .css_classes(["heading"])
             .build(),
     );
-    let athlete = AthleteProfile {
-        ftp_watts: ftp,
-        ..AthleteProfile::default()
-    };
-    let graph = WorkoutGraph::new(&workout, &athlete);
+    let graph = WorkoutGraph::new(&workout, ftp);
     let graph_widget = graph.widget().clone();
     graph_widget.set_accessible_role(gtk::AccessibleRole::Img);
     graph_widget.update_property(&[gtk::accessible::Property::Label("Workout power profile")]);
@@ -1603,7 +1600,6 @@ fn show_workout_editor(
     on_toast: Rc<dyn Fn(adw::Toast)>,
     existing: Option<Workout>,
 ) {
-    use crate::data::athlete::AthleteProfile;
     use crate::ui::widgets::workout_graph::WorkoutGraph;
 
     // Extract what we need up-front so `existing` doesn't need to reach into closures.
@@ -1708,15 +1704,10 @@ fn show_workout_editor(
     // Draft segment state — list of (duration_secs, power_low_pct, power_high_pct, label)
     let draft: SegmentDraft = Rc::new(RefCell::new(initial_segments));
 
-    let preview_athlete = AthleteProfile {
-        ftp_watts: ftp,
-        ..AthleteProfile::default()
-    };
     let preview_workout = build_draft_workout(&draft.borrow(), "Custom Workout");
 
     // Live preview graph — defined early so rebuild_segments can update it.
-    let graph_for_update: Rc<WorkoutGraph> =
-        Rc::new(WorkoutGraph::new(&preview_workout, &preview_athlete));
+    let graph_for_update: Rc<WorkoutGraph> = Rc::new(WorkoutGraph::new(&preview_workout, ftp));
 
     // Track added expander rows so we can remove only our rows from PreferencesGroup.
     let added_rows: Rc<RefCell<Vec<adw::ExpanderRow>>> = Rc::new(RefCell::new(Vec::new()));

@@ -5,6 +5,8 @@ use crate::data::{
 };
 use crate::devices::manager::DeviceCommand;
 use async_channel::Sender;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +33,9 @@ pub struct EngineSnapshot {
 
 pub struct WorkoutEngine {
     pub workout: Workout,
-    pub athlete: AthleteProfile,
+    /// Shared with the rest of the app rather than owned, so an FTP edit in
+    /// Preferences reaches the ERG targets of a ride already in progress.
+    pub athlete: Rc<RefCell<AthleteProfile>>,
     pub session: Session,
     pub state: EngineState,
     start_instant: Option<Instant>,
@@ -52,13 +56,13 @@ pub struct WorkoutEngine {
 impl WorkoutEngine {
     pub fn new(
         workout: Workout,
-        athlete: AthleteProfile,
+        athlete: Rc<RefCell<AthleteProfile>>,
         device_cmd_tx: Sender<DeviceCommand>,
     ) -> Self {
         let mut session = Session::new(Some(workout.id));
         // Stamp the FTP the ride is executed at — FTP detection needs it to
         // interpret targets after the profile FTP changes.
-        session.ftp_watts = Some(athlete.ftp_watts);
+        session.ftp_watts = Some(athlete.borrow().ftp_watts);
         Self {
             session,
             workout,
@@ -169,7 +173,7 @@ impl WorkoutEngine {
         let workout_id = Some(workout.id);
         self.workout = workout;
         self.session = Session::new(workout_id);
-        self.session.ftp_watts = Some(self.athlete.ftp_watts);
+        self.session.ftp_watts = Some(self.athlete.borrow().ftp_watts);
         self.state = EngineState::Idle;
         self.start_instant = None;
         self.pause_offset = Duration::ZERO;
@@ -205,7 +209,8 @@ impl WorkoutEngine {
         // points distinguish "no target" from "target of 0 W" for FTP detection.
         let (target_watts, seg_remaining, planned_target) =
             if let Some(seg) = self.workout.segments.get(seg_idx) {
-                let target = seg.target_power_at(seg_elapsed, self.athlete.ftp_watts);
+                let ftp = self.athlete.borrow().ftp_watts;
+                let target = seg.target_power_at(seg_elapsed, ftp);
                 let remaining = seg.duration_secs.saturating_sub(seg_elapsed);
                 (target, remaining, Some(target))
             } else {
@@ -291,12 +296,50 @@ mod tests {
         let (cmd_tx, _cmd_rx) = async_channel::bounded(16);
         WorkoutEngine::new(
             Workout::sample_threshold(),
-            AthleteProfile {
+            Rc::new(RefCell::new(AthleteProfile {
                 ftp_watts: 250,
                 ..AthleteProfile::default()
-            },
+            })),
             cmd_tx,
         )
+    }
+
+    /// Build an engine alongside the profile cell it shares, so a test can edit
+    /// the profile the way Preferences does and see what the engine makes of it.
+    fn engine_with_athlete() -> (WorkoutEngine, Rc<RefCell<AthleteProfile>>) {
+        let (cmd_tx, _cmd_rx) = async_channel::bounded(16);
+        let athlete = Rc::new(RefCell::new(AthleteProfile {
+            ftp_watts: 250,
+            ..AthleteProfile::default()
+        }));
+        let engine = WorkoutEngine::new(Workout::sample_threshold(), Rc::clone(&athlete), cmd_tx);
+        (engine, athlete)
+    }
+
+    #[test]
+    fn should_scale_targets_to_a_new_ftp_without_rebuilding_the_engine() {
+        let (mut engine, athlete) = engine_with_athlete();
+        engine.start();
+        let before = engine.tick(LiveReadings::default()).target_power_watts;
+        assert!(before > 0, "sample workout should open with a real target");
+
+        // Exactly what saving Preferences does — one write to the shared cell.
+        athlete.borrow_mut().ftp_watts = 500;
+
+        let after = engine.tick(LiveReadings::default()).target_power_watts;
+        assert_eq!(
+            after,
+            before * 2,
+            "doubling FTP should double the ERG target for the same segment"
+        );
+    }
+
+    #[test]
+    fn should_stamp_a_resumed_ride_with_the_ftp_in_force_when_it_restarts() {
+        let (mut engine, athlete) = engine_with_athlete();
+        athlete.borrow_mut().ftp_watts = 300;
+        engine.reset_with_workout(Workout::sample_threshold());
+        assert_eq!(engine.session.ftp_watts, Some(300));
     }
 
     fn ridden_for(secs: u32) -> Session {

@@ -2,7 +2,7 @@ use adw::prelude::*;
 use async_channel;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gtk::glib;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -222,7 +222,6 @@ impl FitnessPage {
     pub fn new(
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
-        ftp: Rc<Cell<u32>>,
         athlete: Rc<RefCell<AthleteProfile>>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
@@ -661,14 +660,14 @@ impl FitnessPage {
         )]);
 
         let curve_data_draw = Rc::clone(&curve_data);
-        let ftp_for_curve = Rc::clone(&ftp);
+        let athlete_for_curve = Rc::clone(&athlete);
         curve_chart.set_draw_func(move |widget, cr, width, height| {
             let data = curve_data_draw.borrow();
             let max_w = data.iter().map(|&(a, _)| a).max().unwrap_or(0);
             if max_w == 0 {
                 return;
             }
-            let ftp_val = ftp_for_curve.get();
+            let ftp_val = athlete_for_curve.borrow().ftp_watts;
             let fg = widget.color();
             let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
             let w = width as f64;
@@ -1310,12 +1309,12 @@ impl FitnessPage {
         root.append(&scroll);
 
         // ── Reload closure ────────────────────────────────────────────────────
-        let ftp_for_reload = Rc::clone(&ftp);
+        let athlete_for_reload = Rc::clone(&athlete);
         let reload: Rc<dyn Fn()> = {
             let pool = pool.clone();
             let rt_handle = rt_handle.clone();
             let tss_week_data = Rc::clone(&tss_week_data);
-            let ftp = ftp_for_reload;
+            let athlete = athlete_for_reload;
             let analyse_label_r = analyse_label.clone();
             let ai_content_r = ai_content.clone();
             let icu_indicator_r = icu_indicator.clone();
@@ -1349,7 +1348,7 @@ impl FitnessPage {
                 // handles the callback needs (cheap refcount bumps).
                 let pool_load = pool.clone();
                 let icu_indicator_r = icu_indicator_r.clone();
-                let ftp = Rc::clone(&ftp);
+                let athlete = Rc::clone(&athlete);
                 let pmc_data_r = Rc::clone(&pmc_data_r);
                 let pmc_section_r = pmc_section_r.clone();
                 let pmc_chart_r = pmc_chart_r.clone();
@@ -1460,7 +1459,7 @@ impl FitnessPage {
                             icu_indicator_r.set_visible(false);
                         }
 
-                        let ftp_val = ftp.get();
+                        let ftp_val = athlete.borrow().ftp_watts;
                         let today = Local::now().date_naive();
 
                         // This page needs the samples themselves for the zone
@@ -1771,7 +1770,7 @@ impl FitnessPage {
         {
             let pool_a = pool.clone();
             let rt_a = rt_handle.clone();
-            let ftp_a = Rc::clone(&ftp);
+
             let athlete_a = Rc::clone(&athlete);
             let tss_week_a = Rc::clone(&tss_week_data);
             let label_a = analyse_label.clone();
@@ -1792,7 +1791,7 @@ impl FitnessPage {
                 };
 
                 // Read the !Send shared state on the main thread before spawning.
-                let ftp_val = ftp_a.get();
+                let ftp_val = athlete_a.borrow().ftp_watts;
                 let week_tss = tss_week_a.borrow().clone();
                 let athlete = athlete_a.borrow().clone();
 
@@ -1924,7 +1923,7 @@ impl FitnessPage {
             let pool_r = pool.clone();
             let rt_r = rt_handle.clone();
             let athlete_r = Rc::clone(&athlete);
-            let ftp_r = Rc::clone(&ftp);
+
             let weekly = (weekly_content.clone(), weekly_label.clone());
             let monthly = (monthly_content.clone(), monthly_label.clone());
             let spinner_r = retro_spinner.clone();
@@ -1965,7 +1964,7 @@ impl FitnessPage {
                     .to_rfc3339();
 
                 // Read !Send shared state on the main thread before spawning.
-                let ftp_val = ftp_r.get();
+                let ftp_val = athlete_r.borrow().ftp_watts;
                 let athlete = athlete_r.borrow().clone();
 
                 generate_btn.set_sensitive(false);

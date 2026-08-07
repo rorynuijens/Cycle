@@ -66,6 +66,11 @@ impl AthleteProfile {
     }
 
     /// Return the Coggan power zone (1–7) for a given instantaneous wattage.
+    ///
+    /// Drawing code wants a colour rather than a zone and goes through the
+    /// `power_zone_index` / `ZONE_COLORS` pair instead, so at present only the
+    /// tests exercise this — it stays as the named-zone half of the API.
+    #[allow(dead_code)]
     pub fn power_zone(&self, watts: u32) -> PowerZone {
         let pct = (watts as f32 / self.ftp_watts as f32) * 100.0;
         match pct as u32 {
