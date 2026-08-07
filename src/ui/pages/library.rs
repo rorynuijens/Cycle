@@ -11,7 +11,7 @@ use crate::data::db;
 use crate::data::import::{parse_erg, parse_zwo};
 use crate::data::route::Route;
 use crate::data::workout::{Workout, WorkoutCategory};
-use crate::training::fitness::TsbBand;
+use crate::training::recommend::workout_fit;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_color::{category_zone_rgb, zone_swatch};
 use libshumate::prelude::LocationExt;
@@ -29,6 +29,38 @@ struct FitnessContext {
     ctl: f64,
     tsb: f64,
     goals: Rc<Vec<String>>,
+}
+
+/// The same data as [`FitnessContext`], but owned outright so it can cross
+/// threads — `FitnessContext` holds an `Rc`, which cannot.
+struct FitnessSnapshot {
+    ctl: f64,
+    tsb: f64,
+    goals: Vec<String>,
+}
+
+/// Load the fitness context the per-workout recommendations are judged against.
+async fn load_fitness_context(pool: &SqlitePool, ftp: u32) -> anyhow::Result<FitnessSnapshot> {
+    let records = db::load_session_summaries(pool).await?;
+    let intervals_pairs = db::load_intervals_tss_pairs(pool).await?;
+    // Lower-cased once here — `workout_fit` matches goals as plain substrings.
+    let goals: Vec<String> = db::load_goals(pool)
+        .await?
+        .into_iter()
+        .map(|g| g.description.to_lowercase())
+        .collect();
+
+    let metrics = crate::training::fitness::compute_load_metrics(
+        &records,
+        &intervals_pairs,
+        ftp,
+        Local::now().date_naive(),
+    );
+    Ok(FitnessSnapshot {
+        ctl: metrics.ctl,
+        tsb: metrics.tsb(),
+        goals,
+    })
 }
 
 /// Draft segment list: `(duration_secs, power_low_pct, power_high_pct, label)`.
@@ -242,8 +274,19 @@ impl LibraryPage {
 
                 crate::ui::spawn_to_main(
                     &rt_handle,
-                    async move { db::load_routes(&pool_load).await.unwrap_or_default() },
-                    move |routes| {
+                    async move { db::load_routes(&pool_load).await },
+                    move |result| {
+                        // A failed read leaves the previous list on screen: an
+                        // empty Routes section reads as "you have saved none",
+                        // which is a claim about the rider's library.
+                        let routes = match result {
+                            Ok(routes) => routes,
+                            Err(e) => {
+                                tracing::error!("Could not load your saved routes: {e}");
+                                return;
+                            }
+                        };
+
                         while let Some(child) = routes_container.first_child() {
                             routes_container.remove(&child);
                         }
@@ -620,9 +663,8 @@ impl LibraryPage {
                         thumb.widget().set_valign(gtk::Align::Center);
                         row.add_prefix(thumb.widget());
 
-                        let (is_rec, _, _) =
-                            workout_fitness_context(workout, ctl, tsb, &goal_descriptions);
-                        if is_rec {
+                        let fit = workout_fit(workout, ctl, tsb, &goal_descriptions);
+                        if fit.recommended {
                             let star = gtk::Image::builder()
                                 .icon_name("starred-symbolic")
                                 .css_classes(["success"])
@@ -1052,33 +1094,23 @@ impl LibraryPage {
             let ftp = athlete.borrow().ftp_watts;
             crate::ui::spawn_to_main(
                 &rt_handle,
-                async move {
-                    let records = db::load_session_summaries(&pool_load)
-                        .await
-                        .unwrap_or_default();
-                    let intervals_pairs = db::load_intervals_tss_pairs(&pool_load)
-                        .await
-                        .unwrap_or_default();
-                    let goals: Vec<String> = db::load_goals(&pool_load)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|g| g.description.to_lowercase())
-                        .collect();
-                    (records, intervals_pairs, goals)
-                },
-                move |(records, intervals_pairs, goals)| {
-                    let today = Local::now().date_naive();
-                    let m = crate::training::fitness::compute_load_metrics(
-                        &records,
-                        &intervals_pairs,
-                        ftp,
-                        today,
-                    );
+                async move { load_fitness_context(&pool_load, ftp).await },
+                move |result| {
+                    // On failure the page keeps its neutral context, which shows
+                    // "No training data yet" rather than a confident but wrong
+                    // recommendation. No toast: the list itself is fine, only the
+                    // per-workout advice is missing.
+                    let snapshot = match result {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
+                            tracing::error!("Could not load your fitness context: {e}");
+                            return;
+                        }
+                    };
                     *fitness_ctx_load.borrow_mut() = FitnessContext {
-                        ctl: m.ctl,
-                        tsb: m.tsb(),
-                        goals: Rc::new(goals),
+                        ctl: snapshot.ctl,
+                        tsb: snapshot.tsb,
+                        goals: Rc::new(snapshot.goals),
                     };
                     rebuild_load();
                 },
@@ -1272,19 +1304,19 @@ fn show_workout_detail(
     inner.append(&stats_group);
 
     // ── For You ───────────────────────────────────────────────────────────
-    let (is_rec, form_text, reason_text) = workout_fitness_context(&workout, ctl, tsb, &goals);
+    let fit = workout_fit(&workout, ctl, tsb, &goals);
     let fitness_group = adw::PreferencesGroup::builder().title("For You").build();
     let for_you_row = adw::ActionRow::builder()
-        .title(&form_text)
-        .subtitle(&reason_text)
+        .title(&fit.form_text)
+        .subtitle(&fit.rationale)
         .build();
     let for_you_icon = gtk::Image::builder()
-        .icon_name(if is_rec {
+        .icon_name(if fit.recommended {
             "starred-symbolic"
         } else {
             "dialog-information-symbolic"
         })
-        .css_classes(if is_rec {
+        .css_classes(if fit.recommended {
             ["success"].as_slice()
         } else {
             ["dim-label"].as_slice()
@@ -2123,133 +2155,10 @@ fn show_workout_editor(
 /// `is_recommended` drives the star badge in the list row and the detail dialog.
 /// `form_label` describes current fitness state (e.g. "Fresh (form +18)").
 /// `reason` explains the recommendation or gives a tip.
-fn workout_fitness_context(
-    workout: &Workout,
-    ctl: f64,
-    tsb: f64,
-    goals: &[String],
-) -> (bool, String, String) {
-    if ctl < 1.0 {
-        return (
-            false,
-            "No training data yet".into(),
-            "Record a few sessions to unlock personalised recommendations.".into(),
-        );
-    }
-
-    // Same bands as the Fitness page and the coach — see training/fitness.rs.
-    let band = TsbBand::of(tsb);
-    let form_text = format!("{} (form {:+.0})", band.short_label(), tsb);
-
-    // Fatigue overrides goal-based matching — recovery first
-    if band.is_fatigued() {
-        let rec = matches!(
-            workout.category,
-            WorkoutCategory::Recovery | WorkoutCategory::Endurance
-        );
-        return (
-            rec,
-            form_text,
-            if rec {
-                "Easy aerobic work is the most productive choice when you're this fatigued.".into()
-            } else {
-                "You're carrying significant fatigue — a recovery or easy endurance session would serve you better right now.".into()
-            },
-        );
-    }
-
-    // Goal keyword matching
-    let goals_text = goals.join(" ");
-    let has = |keywords: &[&str]| keywords.iter().any(|kw| goals_text.contains(kw));
-
-    let wants_base = has(&["base", "aerobic", "zone 2", "endurance", "foundation"]);
-    let wants_ftp = has(&["ftp", "threshold", "time trial", "tt"]);
-    let wants_race = has(&["race", "event", "competition", "racing"]);
-    let wants_power = has(&["power", "sprint", "vo2", "climbing", "intervals"]);
-
-    if wants_base {
-        let rec = matches!(
-            workout.category,
-            WorkoutCategory::Recovery | WorkoutCategory::Endurance | WorkoutCategory::Tempo
-        );
-        return (
-            rec,
-            form_text,
-            if rec {
-                "Aligns with your aerobic base goal — Z1–Z3 work builds the engine.".into()
-            } else {
-                format!(
-                    "Your goal targets aerobic base; {} work is above the ideal intensity range for base building.",
-                    workout.category.label()
-                )
-            },
-        );
-    }
-
-    if wants_ftp || wants_race {
-        let rec = matches!(
-            workout.category,
-            WorkoutCategory::SweetSpot | WorkoutCategory::Threshold | WorkoutCategory::Vo2Max
-        );
-        return (
-            rec,
-            form_text,
-            if rec {
-                if wants_race {
-                    "Solid race-preparation work at the right intensity.".into()
-                } else {
-                    "Directly targets the FTP gains in your goal.".into()
-                }
-            } else {
-                "Your goal calls for threshold-range work, but any training contributes.".into()
-            },
-        );
-    }
-
-    if wants_power {
-        let rec = matches!(
-            workout.category,
-            WorkoutCategory::Vo2Max | WorkoutCategory::Anaerobic | WorkoutCategory::Threshold
-        );
-        return (
-            rec,
-            form_text,
-            if rec {
-                "Targets the power output in your goal.".into()
-            } else {
-                "Your power goal favours high-intensity work, though a broad base helps too.".into()
-            },
-        );
-    }
-
-    // No goals — use freshness
-    if band.is_fresh() {
-        let rec = matches!(
-            workout.category,
-            WorkoutCategory::Threshold | WorkoutCategory::Vo2Max | WorkoutCategory::Anaerobic
-        );
-        return (
-            rec,
-            form_text,
-            if rec {
-                "You're well rested — a great time for a quality hard session.".into()
-            } else {
-                "You're fresh. Any training works; your form suits hard efforts particularly well."
-                    .into()
-            },
-        );
-    }
-
-    (
-        false,
-        form_text,
-        "Add a training goal in the Coaching tab to get targeted recommendations.".into(),
-    )
-}
-
-/// Build a `Workout` from the editor's draft tuple list.
+/// Build a `Workout` from the editor's draft tuple list
+/// `(duration_secs, power_low_pct, power_high_pct, label)`.
 fn build_draft_workout(segs: &[(u32, f32, f32, String)], name: &str) -> Workout {
-    use crate::data::workout::{Segment, WorkoutCategory};
+    use crate::data::workout::Segment;
     let segments: Vec<Segment> = segs
         .iter()
         .map(|(dur, lo, hi, lbl)| Segment {
@@ -2264,24 +2173,7 @@ fn build_draft_workout(segs: &[(u32, f32, f32, String)], name: &str) -> Workout 
             cadence_target: None,
         })
         .collect();
-    let duration_secs: u32 = segments.iter().map(|s| s.duration_secs).sum();
-    let tss: f32 = segments
-        .iter()
-        .map(|s| {
-            let mid = (s.power_low_pct + s.power_high_pct) / 2.0;
-            let if_ = mid / 100.0;
-            (s.duration_secs as f32 / 3600.0) * if_ * if_ * 100.0
-        })
-        .sum();
-    Workout {
-        id: 0,
-        name: name.to_string(),
-        description: String::new(),
-        duration_secs,
-        tss,
-        category: WorkoutCategory::Custom,
-        segments,
-    }
+    Workout::from_segments(name, "", WorkoutCategory::Custom, segments)
 }
 
 /// Copy a loaded GPX into the library directory and record it, so the route can

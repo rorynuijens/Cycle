@@ -15,6 +15,31 @@ pub struct Workout {
 }
 
 impl Workout {
+    /// Build a workout from its segments, deriving duration and TSS.
+    ///
+    /// TSS is summed per segment from the intensity factor at the segment's
+    /// mid-point: `hours × IF² × 100`. A ramp is scored at its average, which
+    /// slightly understates it — IF² is convex — but matches how the rest of
+    /// the app reports planned load.
+    pub fn from_segments(
+        name: &str,
+        description: &str,
+        category: WorkoutCategory,
+        segments: Vec<Segment>,
+    ) -> Self {
+        let duration_secs = segments.iter().map(|s| s.duration_secs).sum();
+        let tss = segments.iter().map(Segment::tss_contribution).sum();
+        Self {
+            id: 0,
+            name: name.to_string(),
+            description: description.to_string(),
+            duration_secs,
+            tss,
+            category,
+            segments,
+        }
+    }
+
     /// Weighted average % of FTP across all segments.
     #[allow(dead_code)]
     pub fn average_ftp_percent(&self) -> f32 {
@@ -90,6 +115,16 @@ impl Segment {
             label: Some(label.into()),
             cadence_target: None,
         }
+    }
+
+    /// This segment's share of the workout's Training Stress Score.
+    ///
+    /// `hours × IF² × 100`, with the intensity factor taken at the segment's
+    /// mid-point power.
+    pub fn tss_contribution(&self) -> f32 {
+        let mid_pct = (self.power_low_pct + self.power_high_pct) / 2.0;
+        let intensity = mid_pct / 100.0;
+        (self.duration_secs as f32 / 3600.0) * intensity * intensity * 100.0
     }
 
     pub fn is_ramp(&self) -> bool {
@@ -1164,22 +1199,60 @@ fn chain(parts: &[Vec<Segment>]) -> Vec<Segment> {
 }
 
 fn mk(name: &str, desc: &str, cat: WorkoutCategory, segs: Vec<Segment>) -> Workout {
-    let duration_secs: u32 = segs.iter().map(|s| s.duration_secs).sum();
-    let tss: f32 = segs
-        .iter()
-        .map(|s| {
-            let mid = (s.power_low_pct + s.power_high_pct) / 2.0;
-            let if_ = mid / 100.0;
-            (s.duration_secs as f32 / 3600.0) * if_ * if_ * 100.0
-        })
-        .sum();
-    Workout {
-        id: 0,
-        name: name.into(),
-        description: desc.into(),
-        duration_secs,
-        tss,
-        category: cat,
-        segments: segs,
+    Workout::from_segments(name, desc, cat, segs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_score_an_hour_at_ftp_as_one_hundred_tss() {
+        let seg = Segment::steady(3600, 100.0, "Threshold");
+        assert!((seg.tss_contribution() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn should_score_an_hour_at_half_ftp_as_a_quarter_of_that() {
+        // TSS goes with the square of intensity, not with intensity.
+        let seg = Segment::steady(3600, 50.0, "Recovery");
+        assert!((seg.tss_contribution() - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn should_score_a_ramp_at_its_midpoint() {
+        let ramp = Segment::ramp(3600, 50.0, 150.0, "Warmup");
+        let steady = Segment::steady(3600, 100.0, "Same average");
+        assert!((ramp.tss_contribution() - steady.tss_contribution()).abs() < 0.01);
+    }
+
+    #[test]
+    fn should_score_a_zero_length_segment_as_nothing() {
+        assert_eq!(Segment::steady(0, 100.0, "Empty").tss_contribution(), 0.0);
+    }
+
+    #[test]
+    fn should_sum_duration_and_tss_across_segments() {
+        let w = Workout::from_segments(
+            "Test",
+            "",
+            WorkoutCategory::Threshold,
+            vec![
+                Segment::steady(1800, 100.0, "On"),
+                Segment::steady(1800, 50.0, "Off"),
+            ],
+        );
+        assert_eq!(w.duration_secs, 3600);
+        // Half an hour at FTP (50) plus half an hour at half FTP (12.5).
+        assert!((w.tss - 62.5).abs() < 0.01, "{}", w.tss);
+        assert_eq!(w.id, 0, "an unsaved workout has no id yet");
+    }
+
+    #[test]
+    fn should_build_an_empty_workout_without_dividing_by_zero() {
+        let w = Workout::from_segments("Empty", "", WorkoutCategory::Custom, Vec::new());
+        assert_eq!(w.duration_secs, 0);
+        assert_eq!(w.tss, 0.0);
+        assert_eq!(w.average_ftp_percent(), 0.0);
     }
 }
