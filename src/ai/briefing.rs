@@ -75,17 +75,10 @@ pub fn build_briefing_prompt(ctx: &BriefingContext) -> String {
         .to_string();
     let is_today_time_off = ctx.time_off_dates.contains(&today_str);
 
-    let tsb_desc = if ctx.tsb > 10.0 {
-        "very fresh — training stress is low"
-    } else if ctx.tsb > 0.0 {
-        "good form — ready to train"
-    } else if ctx.tsb > -10.0 {
-        "moderate fatigue — normal training range"
-    } else if ctx.tsb > -20.0 {
-        "elevated fatigue — consider modifying"
-    } else {
-        "significant fatigue — rest is recommended"
-    };
+    // Same thresholds the Fitness page shows the rider — see training/fitness.rs.
+    // This table used to run 15 points fresher than the page, so the briefing
+    // could call a Form of +3 "good form" while the page called it fatigue.
+    let tsb_desc = crate::training::fitness::TsbBand::of(ctx.tsb).prompt_description();
 
     let wellness_str = match &ctx.today_wellness {
         Some(w) => {

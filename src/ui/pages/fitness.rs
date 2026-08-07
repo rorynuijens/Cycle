@@ -3,7 +3,6 @@ use async_channel;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gtk::glib;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use sqlx::SqlitePool;
@@ -17,6 +16,9 @@ use crate::data::{
     db, keystore,
     streams::ActivityStreams,
 };
+use crate::training::fitness::{
+    compute_load_metrics, compute_pmc_series, tsb_status_text, PmcPoint, TsbBand,
+};
 use crate::ui::markdown::to_pango;
 use crate::ui::pages::coaching::normalize_sport_type;
 
@@ -27,8 +29,8 @@ const PACE_DISTANCES: [f32; 8] = [
 const PACE_LABELS: [&str; 8] = [
     "400 m", "800 m", "1 mi", "3 km", "5 km", "10 km", "Half", "Full",
 ];
-
-type PmcPoint = (NaiveDate, f64, f64, f64);
+/// How far back the performance-management chart plots.
+const PMC_WINDOW_DAYS: i64 = 90;
 
 fn hr_zone_index(bpm: u32, max_hr: u32) -> usize {
     if max_hr == 0 {
@@ -87,129 +89,6 @@ fn compute_hr_zones(records: &[db::SessionRecord], max_hr: u32) -> [u32; 5] {
         }
     }
     zones
-}
-
-/// Compute CTL, ATL, and CTL-4-weeks-ago in one EMA pass.
-/// `intervals_pairs` contains (date, tss) from Intervals.icu activities and is merged
-/// with the in-app session records before computing the EMAs.
-pub(crate) fn compute_load_metrics(
-    rides: &[db::SessionSummary],
-    intervals_pairs: &[(NaiveDate, f32)],
-    ftp: u32,
-    today: NaiveDate,
-) -> (f64, f64, f64) {
-    let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for ride in rides {
-        // Skip rides Intervals.icu already accounts for — their TSS arrives
-        // via intervals_pairs, so counting them here too would inflate CTL/ATL
-        // by double-counting the same workout.
-        if ride.counted_via_intervals() {
-            continue;
-        }
-        let date = ride.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = ride.tss(ftp) {
-            *daily_tss.entry(date).or_insert(0.0) += tss;
-        }
-    }
-    for &(date, tss) in intervals_pairs {
-        *daily_tss.entry(date).or_insert(0.0) += tss;
-    }
-
-    let Some(earliest) = daily_tss.keys().min().copied() else {
-        return (0.0, 0.0, 0.0);
-    };
-
-    let ctl_alpha = 1.0_f64 - (-1.0_f64 / 42.0).exp();
-    let atl_alpha = 1.0_f64 - (-1.0_f64 / 7.0).exp();
-    let four_wk_ago = today - Duration::weeks(4);
-
-    let mut ctl = 0.0_f64;
-    let mut atl = 0.0_f64;
-    let mut ctl_4wk_ago = 0.0_f64;
-    let mut date = earliest;
-    loop {
-        let tss = daily_tss.get(&date).copied().unwrap_or(0.0) as f64;
-        ctl += ctl_alpha * (tss - ctl);
-        atl += atl_alpha * (tss - atl);
-        if date == four_wk_ago {
-            ctl_4wk_ago = ctl;
-        }
-        if date == today {
-            break;
-        }
-        match date.succ_opt() {
-            Some(next) => date = next,
-            None => break,
-        }
-    }
-    (ctl, atl, ctl_4wk_ago)
-}
-
-/// Returns `(date, ctl, atl, tsb)` for each day from 90 days ago up to `today`.
-/// EMA is warmed up from `earliest` available data even if that's further back.
-fn compute_pmc_series(
-    rides: &[db::SessionSummary],
-    intervals_pairs: &[(NaiveDate, f32)],
-    ftp: u32,
-    today: NaiveDate,
-) -> Vec<PmcPoint> {
-    let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for ride in rides {
-        if ride.counted_via_intervals() {
-            continue;
-        }
-        let date = ride.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = ride.tss(ftp) {
-            *daily_tss.entry(date).or_insert(0.0) += tss;
-        }
-    }
-    for &(date, tss) in intervals_pairs {
-        *daily_tss.entry(date).or_insert(0.0) += tss;
-    }
-
-    let Some(earliest) = daily_tss.keys().min().copied() else {
-        return Vec::new();
-    };
-
-    let ctl_alpha = 1.0_f64 - (-1.0_f64 / 42.0).exp();
-    let atl_alpha = 1.0_f64 - (-1.0_f64 / 7.0).exp();
-    let window_start = today - Duration::days(90);
-
-    let mut ctl = 0.0_f64;
-    let mut atl = 0.0_f64;
-    let mut series = Vec::new();
-    let mut date = earliest;
-    loop {
-        let tss = daily_tss.get(&date).copied().unwrap_or(0.0) as f64;
-        ctl += ctl_alpha * (tss - ctl);
-        atl += atl_alpha * (tss - atl);
-        if date >= window_start {
-            series.push((date, ctl, atl, ctl - atl));
-        }
-        if date == today {
-            break;
-        }
-        match date.succ_opt() {
-            Some(next) => date = next,
-            None => break,
-        }
-    }
-    series
-}
-
-/// Plain-language reading of the TSB value — the hero's headline phrase.
-fn tsb_status_text(tsb: f64) -> &'static str {
-    if tsb > 25.0 {
-        "Very fresh — consider adding volume"
-    } else if tsb > 5.0 {
-        "Fresh — ready for quality work"
-    } else if tsb > -10.0 {
-        "Normal training fatigue"
-    } else if tsb > -30.0 {
-        "Elevated fatigue — consider easier days"
-    } else {
-        "High fatigue — prioritise rest"
-    }
 }
 
 pub struct FitnessPage {
@@ -356,7 +235,7 @@ impl FitnessPage {
                 let h = height as f64;
                 let n = data.len();
 
-                let all_vals: Vec<f64> = data.iter().flat_map(|&(_, c, a, s)| [c, a, s]).collect();
+                let all_vals: Vec<f64> = data.iter().flat_map(|p| [p.ctl, p.atl, p.tsb]).collect();
                 let y_min = all_vals
                     .iter()
                     .cloned()
@@ -389,8 +268,8 @@ impl FitnessPage {
                 {
                     cr.new_path();
                     cr.move_to(x_at(0), zero_y);
-                    for (i, &(_, _, _, s)) in data.iter().enumerate() {
-                        cr.line_to(x_at(i), y_at(s));
+                    for (i, point) in data.iter().enumerate() {
+                        cr.line_to(x_at(i), y_at(point.tsb));
                     }
                     cr.line_to(x_at(n - 1), zero_y);
                     cr.close_path();
@@ -402,7 +281,7 @@ impl FitnessPage {
                 let draw_series = |field_idx: usize| {
                     let vals: Vec<f64> = data
                         .iter()
-                        .map(|&(_, c, a, _)| if field_idx == 1 { c } else { a })
+                        .map(|p| if field_idx == 1 { p.ctl } else { p.atl })
                         .collect();
                     cr.move_to(x_at(0), y_at(vals[0]));
                     for (i, &v) in vals.iter().enumerate().skip(1) {
@@ -424,8 +303,8 @@ impl FitnessPage {
                 draw_series(1);
 
                 // Mark today on the CTL line
-                if let Some(&(_, ctl_last, _, _)) = data.last() {
-                    cr.arc(x_at(n - 1), y_at(ctl_last), 3.5, 0.0, std::f64::consts::TAU);
+                if let Some(last) = data.last() {
+                    cr.arc(x_at(n - 1), y_at(last.ctl), 3.5, 0.0, std::f64::consts::TAU);
                     cr.fill().ok();
                 }
 
@@ -434,14 +313,14 @@ impl FitnessPage {
                 cr.set_font_size(10.0);
                 let axis_y = h - pad_b + 4.0;
                 let label_y = h - 4.0;
-                for (i, &(date, _, _, _)) in data.iter().enumerate() {
-                    if date.day() == 1 {
+                for (i, point) in data.iter().enumerate() {
+                    if point.date.day() == 1 {
                         let x = x_at(i);
                         cr.set_line_width(1.0);
                         cr.move_to(x, axis_y - 4.0);
                         cr.line_to(x, axis_y);
                         cr.stroke().ok();
-                        let label = date.format("%b").to_string();
+                        let label = point.date.format("%b").to_string();
                         cr.move_to(x + 2.0, label_y);
                         cr.show_text(&label).ok();
                     }
@@ -1468,13 +1347,17 @@ impl FitnessPage {
                         let rides: Vec<db::SessionSummary> =
                             records.iter().map(|r| r.summary()).collect();
 
-                        let (ctl, atl, _) =
-                            compute_load_metrics(&rides, &intervals_pairs, ftp_val, today);
-                        let tsb = ctl - atl;
+                        let m = compute_load_metrics(&rides, &intervals_pairs, ftp_val, today);
+                        let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
 
                         // PMC 90-day series
-                        let pmc_series =
-                            compute_pmc_series(&rides, &intervals_pairs, ftp_val, today);
+                        let pmc_series = compute_pmc_series(
+                            &rides,
+                            &intervals_pairs,
+                            ftp_val,
+                            today,
+                            PMC_WINDOW_DAYS,
+                        );
                         let has_pmc = pmc_series.len() >= 2;
                         pmc_section_r.set_visible(has_pmc);
                         if has_pmc {
@@ -1499,9 +1382,10 @@ impl FitnessPage {
                         // deep fatigue warrants attention
                         tsb_label.remove_css_class("success");
                         tsb_label.remove_css_class("warning");
-                        if has_load && tsb > 5.0 {
+                        let band = TsbBand::of(tsb);
+                        if has_load && band.is_fresh() {
                             tsb_label.add_css_class("success");
-                        } else if has_load && tsb < -10.0 {
+                        } else if has_load && band.is_fatigued() {
                             tsb_label.add_css_class("warning");
                         }
 
@@ -1824,9 +1708,9 @@ impl FitnessPage {
                         .unwrap_or_default();
 
                     let today = Local::now().date_naive();
-                    let (ctl, atl, ctl_4wk_ago) =
-                        compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
-                    let tsb = ctl - atl;
+                    let m = compute_load_metrics(&records, &intervals_pairs, ftp_val, today);
+                    let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
+                    let ctl_4wk_ago = m.ctl_4wk_ago;
 
                     let wellness: Vec<WellnessSnapshot> = wellness_raw
                         .iter()
@@ -2005,12 +1889,12 @@ impl FitnessPage {
 
                     let all_rides: Vec<db::SessionSummary> =
                         all_records.iter().map(|r| r.summary()).collect();
-                    let (ctl_end, atl_end, _) =
-                        compute_load_metrics(&all_rides, &intervals_all, ftp_val, today);
+                    let end = compute_load_metrics(&all_rides, &intervals_all, ftp_val, today);
+                    let (ctl_end, atl_end, tsb_end) = (end.ctl, end.atl, end.tsb());
                     let ctl_start_date = today - Duration::days(period_days);
-                    let (ctl_start, _, _) =
-                        compute_load_metrics(&all_rides, &intervals_all, ftp_val, ctl_start_date);
-                    let tsb_end = ctl_end - atl_end;
+                    let ctl_start =
+                        compute_load_metrics(&all_rides, &intervals_all, ftp_val, ctl_start_date)
+                            .ctl;
 
                     let mut sessions: Vec<RetroSession> = Vec::new();
                     for r in &records {

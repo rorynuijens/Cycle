@@ -11,6 +11,7 @@ use crate::data::db;
 use crate::data::import::{parse_erg, parse_zwo};
 use crate::data::route::Route;
 use crate::data::workout::{Workout, WorkoutCategory};
+use crate::training::fitness::TsbBand;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_color::{category_zone_rgb, zone_swatch};
 use libshumate::prelude::LocationExt;
@@ -1068,15 +1069,15 @@ impl LibraryPage {
                 },
                 move |(records, intervals_pairs, goals)| {
                     let today = Local::now().date_naive();
-                    let (ctl, atl, _) = crate::ui::pages::fitness::compute_load_metrics(
+                    let m = crate::training::fitness::compute_load_metrics(
                         &records,
                         &intervals_pairs,
                         ftp,
                         today,
                     );
                     *fitness_ctx_load.borrow_mut() = FitnessContext {
-                        ctl,
-                        tsb: ctl - atl,
+                        ctl: m.ctl,
+                        tsb: m.tsb(),
                         goals: Rc::new(goals),
                     };
                     rebuild_load();
@@ -2136,16 +2137,12 @@ fn workout_fitness_context(
         );
     }
 
-    let form_text = if tsb > 15.0 {
-        format!("Fresh (form {:+.0})", tsb)
-    } else if tsb < -10.0 {
-        format!("Fatigued (form {:+.0})", tsb)
-    } else {
-        format!("Normal (form {:+.0})", tsb)
-    };
+    // Same bands as the Fitness page and the coach — see training/fitness.rs.
+    let band = TsbBand::of(tsb);
+    let form_text = format!("{} (form {:+.0})", band.short_label(), tsb);
 
     // Fatigue overrides goal-based matching — recovery first
-    if tsb < -10.0 {
+    if band.is_fatigued() {
         let rec = matches!(
             workout.category,
             WorkoutCategory::Recovery | WorkoutCategory::Endurance
@@ -2226,7 +2223,7 @@ fn workout_fitness_context(
     }
 
     // No goals — use freshness
-    if tsb > 15.0 {
+    if band.is_fresh() {
         let rec = matches!(
             workout.category,
             WorkoutCategory::Threshold | WorkoutCategory::Vo2Max | WorkoutCategory::Anaerobic

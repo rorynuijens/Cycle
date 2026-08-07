@@ -1,9 +1,8 @@
 use adw::prelude::*;
 use async_channel;
-use chrono::{Duration, Local, NaiveDate, Timelike};
+use chrono::{Duration, Local, Timelike};
 use gtk::glib;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use sqlx::SqlitePool;
@@ -19,6 +18,7 @@ use crate::data::{
     keystore,
     workout::Workout,
 };
+use crate::training::fitness::compute_load_metrics;
 use crate::ui::markdown::{strip_markdown, to_pango};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 
@@ -236,12 +236,13 @@ impl DashboardPage {
                         first_use_done,
                     )| {
                         // Compute TSB for readiness + 7-day trend
-                        let (ctl, atl) =
-                            compute_ctl_atl(&records, &intervals_pairs, ftp, today_naive);
-                        let tsb = ctl - atl;
+                        let now =
+                            compute_load_metrics(&records, &intervals_pairs, ftp, today_naive);
+                        let (ctl, atl) = (now.ctl, now.atl);
+                        let tsb = now.tsb();
                         let week_ago = today_naive - Duration::days(7);
-                        let (ctl_7d, atl_7d) =
-                            compute_ctl_atl(&records, &intervals_pairs, ftp, week_ago);
+                        let then = compute_load_metrics(&records, &intervals_pairs, ftp, week_ago);
+                        let (ctl_7d, atl_7d) = (then.ctl, then.atl);
 
                         while let Some(child) = dynamic_top.first_child() {
                             dynamic_top.remove(&child);
@@ -687,8 +688,8 @@ impl DashboardPage {
 
                     let ftp = athlete_t.ftp_watts;
                     let today_naive = chrono::Local::now().date_naive();
-                    let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today_naive);
-                    let tsb = ctl - atl;
+                    let m = compute_load_metrics(&records, &intervals_pairs, ftp, today_naive);
+                    let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
 
                     let today_wellness = wellness_raw.first().map(|w| WellnessSnapshot {
                         date: w.date.format("%Y-%m-%d").to_string(),
@@ -1257,15 +1258,9 @@ impl DashboardPage {
             .build();
 
         // ── Form row: readiness in plain words, numbers as quiet pills ───────
-        let message = if tsb > 5.0 {
-            "Fresh — ready to train hard"
-        } else if tsb > -10.0 {
-            "Normal training fatigue — moderate effort is fine"
-        } else if tsb > -20.0 {
-            "Elevated fatigue — consider an easier session"
-        } else {
-            "Very fatigued — rest is the priority"
-        };
+        // The same sentence the Fitness page leads with — this row is the same
+        // statement about the same number, so it must not word it differently.
+        let message = crate::training::fitness::tsb_status_text(tsb);
 
         let form_row = adw::ActionRow::builder()
             .title(message)
@@ -1417,46 +1412,4 @@ impl DashboardPage {
             format!("{}.", first_sentence)
         }
     }
-}
-
-fn compute_ctl_atl(
-    rides: &[db::SessionSummary],
-    intervals_pairs: &[(NaiveDate, f32)],
-    ftp: u32,
-    today: NaiveDate,
-) -> (f64, f64) {
-    let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for r in rides {
-        if r.counted_via_intervals() {
-            continue;
-        }
-        let date = r.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = r.tss(ftp) {
-            *daily_tss.entry(date).or_insert(0.0) += tss;
-        }
-    }
-    for &(date, tss) in intervals_pairs {
-        *daily_tss.entry(date).or_insert(0.0) += tss;
-    }
-    let Some(earliest) = daily_tss.keys().min().copied() else {
-        return (0.0, 0.0);
-    };
-    let ctl_alpha = 1.0_f64 - (-1.0_f64 / 42.0).exp();
-    let atl_alpha = 1.0_f64 - (-1.0_f64 / 7.0).exp();
-    let mut ctl = 0.0_f64;
-    let mut atl = 0.0_f64;
-    let mut date = earliest;
-    loop {
-        let tss = daily_tss.get(&date).copied().unwrap_or(0.0) as f64;
-        ctl += ctl_alpha * (tss - ctl);
-        atl += atl_alpha * (tss - atl);
-        if date == today {
-            break;
-        }
-        match date.succ_opt() {
-            Some(next) => date = next,
-            None => break,
-        }
-    }
-    (ctl, atl)
 }

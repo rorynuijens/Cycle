@@ -193,15 +193,8 @@ pub struct RecentSession {
 }
 
 pub fn build_prompt(ctx: &TrainingContext) -> String {
-    let form_desc = if ctx.tsb > 25.0 {
-        "very fresh (risk of detraining if sustained)"
-    } else if ctx.tsb > 5.0 {
-        "optimal form — good time for quality work"
-    } else if ctx.tsb > -10.0 {
-        "moderate fatigue — normal training range"
-    } else {
-        "significant fatigue — recovery priority"
-    };
+    // Same thresholds the Fitness page shows the rider — see training/fitness.rs.
+    let form_desc = crate::training::fitness::TsbBand::of(ctx.tsb).prompt_description();
 
     let has_cross_training = ctx
         .recent_sessions

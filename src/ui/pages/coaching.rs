@@ -1,9 +1,9 @@
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::training::fitness::compute_load_metrics;
 use crate::ui::markdown::to_pango;
 
 use chrono::{Datelike, Duration as CDuration, Local, NaiveDate};
@@ -638,8 +638,8 @@ impl CoachingPage {
                         .unwrap_or_default();
 
                     let today = Local::now().date_naive();
-                    let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today);
-                    let tsb = ctl - atl;
+                    let m = compute_load_metrics(&records, &intervals_pairs, ftp, today);
+                    let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
 
                     let four_weeks_ago = today - CDuration::weeks(4);
                     let mut recent: Vec<RecentSession> = records
@@ -1016,8 +1016,8 @@ impl CoachingPage {
                         .unwrap_or_default();
 
                     let today = Local::now().date_naive();
-                    let (ctl, atl) = compute_ctl_atl(&records, &intervals_pairs, ftp, today);
-                    let tsb = ctl - atl;
+                    let m = compute_load_metrics(&records, &intervals_pairs, ftp, today);
+                    let (ctl, tsb) = (m.ctl, m.tsb());
 
                     let workout_opts = workouts_as_options(&workouts_owned, &icu_workouts);
 
@@ -1224,48 +1224,6 @@ fn update_thumb(holder: &gtk::Box, workout: Option<&Workout>, athlete: &AthleteP
         holder.append(graph.widget());
     }
     holder.set_visible(workout.is_some());
-}
-
-fn compute_ctl_atl(
-    rides: &[db::SessionSummary],
-    intervals_pairs: &[(NaiveDate, f32)],
-    ftp: u32,
-    today: NaiveDate,
-) -> (f64, f64) {
-    let mut daily_tss: HashMap<NaiveDate, f32> = HashMap::new();
-    for r in rides {
-        if r.counted_via_intervals() {
-            continue;
-        }
-        let date = r.started_at.with_timezone(&Local).date_naive();
-        if let Some(tss) = r.tss(ftp) {
-            *daily_tss.entry(date).or_insert(0.0) += tss;
-        }
-    }
-    for &(date, tss) in intervals_pairs {
-        *daily_tss.entry(date).or_insert(0.0) += tss;
-    }
-    let Some(earliest) = daily_tss.keys().min().copied() else {
-        return (0.0, 0.0);
-    };
-    let ctl_alpha = 1.0_f64 - (-1.0_f64 / 42.0).exp();
-    let atl_alpha = 1.0_f64 - (-1.0_f64 / 7.0).exp();
-    let mut ctl = 0.0_f64;
-    let mut atl = 0.0_f64;
-    let mut date = earliest;
-    loop {
-        let tss = daily_tss.get(&date).copied().unwrap_or(0.0) as f64;
-        ctl += ctl_alpha * (tss - ctl);
-        atl += atl_alpha * (tss - atl);
-        if date == today {
-            break;
-        }
-        match date.succ_opt() {
-            Some(next) => date = next,
-            None => break,
-        }
-    }
-    (ctl, atl)
 }
 
 fn build_recent_session(r: &db::SessionSummary, ftp: u32) -> RecentSession {
