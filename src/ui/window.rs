@@ -326,8 +326,24 @@ impl CycleGtkWindow {
                                 // Loaded fresh rather than captured at startup so the
                                 // export carries the FTP and heart-rate limits in
                                 // force now, which is what training load is scaled to.
-                                let profile =
-                                    db::load_or_create_athlete(&pool).await.unwrap_or_default();
+                                //
+                                // A failed read cancels the upload. Falling back to a
+                                // default profile would send a file whose training-load
+                                // figure is scaled to FTP 200, and Intervals.icu and
+                                // Garmin both read that figure out of the file rather
+                                // than recomputing it — so a wrong number would stick.
+                                // The ride is already saved locally and can be uploaded
+                                // again by hand.
+                                let profile = match db::load_or_create_athlete(&pool).await {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Could not read the athlete profile; \
+                                             skipping the Intervals.icu upload: {e}"
+                                        );
+                                        return;
+                                    }
+                                };
                                 let fit_bytes =
                                     crate::data::fit::encode_session(&session, &profile);
                                 match crate::ai::intervals::upload_fit_activity(

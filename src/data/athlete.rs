@@ -124,17 +124,28 @@ impl PowerZone {
         }
     }
 
-    /// RGB tuple for Cairo drawing — all values in 0.0–1.0 range.
-    pub fn rgb(&self) -> (f64, f64, f64) {
+    /// Position in the zone order, 0 = Z1 … 6 = Z7. Indexes [`ZONE_COLORS`].
+    pub fn index(&self) -> usize {
         match self {
-            Self::ActiveRecovery => (0.34, 0.89, 0.53),
-            Self::Endurance => (0.47, 0.68, 0.93),
-            Self::Tempo => (0.97, 0.89, 0.36),
-            Self::Threshold => (1.00, 0.64, 0.28),
-            Self::Vo2Max => (1.00, 0.48, 0.39),
-            Self::Anaerobic => (0.84, 0.20, 0.20),
-            Self::Neuromuscular => (0.60, 0.10, 0.60),
+            Self::ActiveRecovery => 0,
+            Self::Endurance => 1,
+            Self::Tempo => 2,
+            Self::Threshold => 3,
+            Self::Vo2Max => 4,
+            Self::Anaerobic => 5,
+            Self::Neuromuscular => 6,
         }
+    }
+
+    /// RGB tuple for Cairo drawing — all values in 0.0–1.0 range.
+    ///
+    /// Reads [`ZONE_COLORS`] rather than repeating it: the drawing code works
+    /// from zone indices, and two hand-written copies of the palette would
+    /// eventually disagree about what Z4 looks like. Like [`Self::label`], this
+    /// is the named-zone half of the API and currently only tests reach it.
+    #[allow(dead_code)]
+    pub fn rgb(&self) -> (f64, f64, f64) {
+        ZONE_COLORS[self.index()]
     }
 }
 
@@ -207,6 +218,20 @@ mod tests {
     #[test]
     fn should_return_z7_neuromuscular_above_150_percent_ftp() {
         assert_eq!(athlete_ftp(200).power_zone(350), PowerZone::Neuromuscular);
+    }
+
+    #[test]
+    fn should_keep_the_named_zones_and_the_index_in_step() {
+        // The UI colours by index; the domain names zones by enum. If these two
+        // ever disagree, a ride is drawn in one zone's colour and described as
+        // another's.
+        let athlete = athlete_ftp(200);
+        for watts in [0, 110, 112, 180, 182, 225, 270, 350] {
+            let by_index = power_zone_index(watts, 200);
+            let by_name = athlete.power_zone(watts).index();
+            assert_eq!(by_name, by_index, "at {watts} W");
+            assert_eq!(athlete.power_zone(watts).rgb(), ZONE_COLORS[by_index]);
+        }
     }
 
     // ── power_zone_index (0-based, f64 maths) ───────────────────────────────────

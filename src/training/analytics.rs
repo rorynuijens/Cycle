@@ -70,6 +70,27 @@ pub fn format_pace_display(sec_per_km: u32) -> String {
     format!("{}:{:02}", sec_per_km / 60, sec_per_km % 60)
 }
 
+/// Format a distance in metres for display, in km once past a kilometre.
+pub fn format_distance(distance_m: f32) -> String {
+    if distance_m >= 1000.0 {
+        format!("{:.2} km", distance_m / 1000.0)
+    } else {
+        format!("{:.0} m", distance_m)
+    }
+}
+
+/// Average pace over a distance, as `m:ss/km`.
+///
+/// Returns an em dash when there is nothing to divide by — a zero-length or
+/// instantaneous activity has no meaningful pace.
+pub fn format_average_pace(distance_m: f32, duration_secs: u32) -> String {
+    if distance_m < 1.0 || duration_secs == 0 {
+        return "—".to_string();
+    }
+    let sec_per_km = (duration_secs as f32 / (distance_m / 1000.0)) as u32;
+    format!("{}/km", format_pace_display(sec_per_km))
+}
+
 /// Seconds spent in each of the 5 heart-rate zones across local sessions.
 pub fn compute_hr_zones(records: &[SessionRecord], max_hr: u32) -> [u32; 5] {
     let mut zones = [0u32; 5];
@@ -378,6 +399,35 @@ mod tests {
         assert_eq!(format_pace_display(59), "0:59");
         assert_eq!(format_pace_display(245), "4:05");
         assert_eq!(format_pace_display(600), "10:00");
+    }
+
+    // ── distance and pace formatting ─────────────────────────────────────────
+
+    #[test]
+    fn should_show_short_distances_in_metres_and_long_ones_in_kilometres() {
+        assert_eq!(format_distance(0.0), "0 m");
+        assert_eq!(format_distance(999.0), "999 m");
+        assert_eq!(format_distance(1000.0), "1.00 km");
+        assert_eq!(format_distance(5432.0), "5.43 km");
+    }
+
+    #[test]
+    fn should_compute_average_pace_per_kilometre() {
+        // 10 km in 50 minutes is 5:00/km.
+        assert_eq!(format_average_pace(10_000.0, 3000), "5:00/km");
+        // 5 km in 22:30 is 4:30/km.
+        assert_eq!(format_average_pace(5_000.0, 1350), "4:30/km");
+    }
+
+    #[test]
+    fn should_refuse_to_pace_an_activity_with_nothing_to_divide_by() {
+        assert_eq!(format_average_pace(0.0, 3000), "—");
+        assert_eq!(format_average_pace(10_000.0, 0), "—");
+        assert_eq!(
+            format_average_pace(0.5, 60),
+            "—",
+            "sub-metre is not a distance"
+        );
     }
 
     // ── week/month boundaries ────────────────────────────────────────────────

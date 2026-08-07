@@ -2,6 +2,8 @@ pub mod dialog;
 pub mod fit_import;
 pub mod route_map;
 pub mod rpe_dialog;
+pub mod sparkline;
 pub mod workout_graph;
+pub mod zone_bar;
 pub mod zone_color;
 pub mod zone_meter;

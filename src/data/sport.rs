@@ -17,7 +17,9 @@ pub fn normalize_sport_type(raw: &str) -> String {
     match raw.to_lowercase().as_str() {
         "" | "ride" | "virtualride" | "cycling" | "indoorcycling" | "mountainbiking"
         | "mountainbikeride" | "gravelride" | "ebikeride" | "handcycle" | "velomobile" => "Cycling",
-        "run" | "virtualrun" | "trailrun" | "treadmillrun" => "Run",
+        // Snowshoe and ultra walk/run are foot sports: they are paced in
+        // minutes per kilometre, not scored in watts, so they belong here.
+        "run" | "virtualrun" | "trailrun" | "treadmillrun" | "snowshoe" | "ultrawalkrun" => "Run",
         "walk" | "walking" => "Walk",
         "hike" | "hiking" => "Hike",
         "swim" | "swimming" | "openwaterswim" => "Swim",
@@ -35,6 +37,14 @@ pub fn normalize_sport_type(raw: &str) -> String {
 /// True when `raw` names a cycling activity of any kind.
 pub fn is_cycling(raw: &str) -> bool {
     normalize_sport_type(raw) == "Cycling"
+}
+
+/// True when `raw` names a running activity of any kind.
+///
+/// Callers use this to decide whether to show pace and distance rather than
+/// power — a foot sport is not meaningfully described in watts.
+pub fn is_run(raw: &str) -> bool {
+    normalize_sport_type(raw) == "Run"
 }
 
 #[cfg(test)]
@@ -82,6 +92,29 @@ mod tests {
     #[test]
     fn should_preserve_the_original_casing_of_an_unknown_sport() {
         assert_eq!(normalize_sport_type("KiteSurfing"), "KiteSurfing");
+    }
+
+    #[test]
+    fn should_fold_foot_sports_into_running() {
+        // Each is paced rather than scored in watts, so the history view shows
+        // them the same way.
+        for raw in ["Run", "VirtualRun", "TrailRun", "Snowshoe", "UltraWalkRun"] {
+            assert!(is_run(raw), "for {raw}");
+            assert_eq!(normalize_sport_type(raw), "Run", "for {raw}");
+        }
+    }
+
+    #[test]
+    fn should_not_treat_walking_as_running() {
+        // A walk is a walk — it has its own label and its own pace expectations.
+        assert!(!is_run("Walk"));
+        assert_eq!(normalize_sport_type("Walk"), "Walk");
+    }
+
+    #[test]
+    fn should_not_treat_cycling_as_running() {
+        assert!(!is_run("Ride"));
+        assert!(!is_run("GravelRide"));
     }
 
     #[test]

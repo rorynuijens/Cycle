@@ -9,65 +9,17 @@ use glib;
 use gtk::gio;
 use sqlx::SqlitePool;
 
+use crate::data::athlete::power_zone_index;
 use crate::data::db;
 use crate::data::keystore;
+use crate::data::sport::is_run;
 use crate::data::streams::ActivityStreams;
 use crate::data::workout::Workout;
+use crate::training::analytics::{format_average_pace, format_distance};
 use crate::training::engine::WorkoutEngine;
+use crate::ui::widgets::zone_bar::ZoneBar;
 
 pub type ReloadHolder = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
-
-fn zone_color(i: usize) -> (f64, f64, f64) {
-    use crate::data::athlete::PowerZone;
-    match i {
-        0 => PowerZone::ActiveRecovery.rgb(),
-        1 => PowerZone::Endurance.rgb(),
-        2 => PowerZone::Tempo.rgb(),
-        3 => PowerZone::Threshold.rgb(),
-        4 => PowerZone::Vo2Max.rgb(),
-        5 => PowerZone::Anaerobic.rgb(),
-        _ => PowerZone::Neuromuscular.rgb(),
-    }
-}
-
-fn zone_index(watts: u32, ftp: u32) -> usize {
-    if ftp == 0 {
-        return 0;
-    }
-    let pct = (watts as f64 / ftp as f64) * 100.0;
-    match pct as u32 {
-        0..=55 => 0,
-        56..=75 => 1,
-        76..=90 => 2,
-        91..=105 => 3,
-        106..=120 => 4,
-        121..=150 => 5,
-        _ => 6,
-    }
-}
-
-fn is_run(sport_type: &str) -> bool {
-    matches!(
-        sport_type.to_lowercase().as_str(),
-        "run" | "virtualrun" | "trailrun" | "snowshoe" | "ultrawalkrun"
-    )
-}
-
-fn format_distance(distance_m: f32) -> String {
-    if distance_m >= 1000.0 {
-        format!("{:.2} km", distance_m / 1000.0)
-    } else {
-        format!("{:.0} m", distance_m)
-    }
-}
-
-fn format_pace(distance_m: f32, duration_secs: u32) -> String {
-    if distance_m < 1.0 || duration_secs == 0 {
-        return "—".to_string();
-    }
-    let pace_secs_per_km = (duration_secs as f32 / (distance_m / 1000.0)) as u32;
-    format!("{}:{:02}/km", pace_secs_per_km / 60, pace_secs_per_km % 60)
-}
 
 pub fn show_intervals_detail(
     act: &db::IntervalsActivity,
@@ -188,7 +140,7 @@ pub fn show_intervals_detail(
             stats_group.add(&make_row("Distance", format_distance(dist)));
         }
         if let (Some(dist), Some(dur)) = (act.distance_m, act.duration_secs) {
-            stats_group.add(&make_row("Avg Pace", format_pace(dist, dur)));
+            stats_group.add(&make_row("Avg Pace", format_average_pace(dist, dur)));
         }
         if let Some(cad) = act.average_cadence {
             stats_group.add(&make_row("Avg Cadence", format!("{:.0} spm", cad)));
@@ -1015,7 +967,7 @@ pub fn show_session_detail(
     let mut zone_secs = [0u32; 7];
     for dp in &session.data_points {
         if let Some(watts) = dp.power_watts {
-            zone_secs[zone_index(watts, ftp)] += 1;
+            zone_secs[power_zone_index(watts, ftp)] += 1;
         }
     }
     let has_power = zone_secs.iter().any(|&s| s > 0);
@@ -1033,32 +985,10 @@ pub fn show_session_detail(
                 .build(),
         );
 
-        let zone_bar = gtk::DrawingArea::builder()
-            .content_height(20)
-            .hexpand(true)
-            .build();
-        let zs = zone_secs;
-        zone_bar.set_draw_func(move |_widget, cr, width, height| {
-            let total: u32 = zs.iter().sum();
-            if total == 0 {
-                return;
-            }
-            let w = width as f64;
-            let h = height as f64;
-            let mut x = 0.0f64;
-            for (i, &secs) in zs.iter().enumerate() {
-                if secs == 0 {
-                    continue;
-                }
-                let seg_w = (secs as f64 / total as f64) * w;
-                let (r, g, b) = zone_color(i);
-                cr.set_source_rgba(r, g, b, 0.85);
-                cr.rectangle(x, 0.0, seg_w, h);
-                cr.fill().ok();
-                x += seg_w;
-            }
-        });
-        zone_section.append(&zone_bar);
+        let zone_bar =
+            ZoneBar::new("Power zone distribution bar: proportional time in zones Z1 through Z7");
+        zone_bar.set_seconds(&zone_secs);
+        zone_section.append(zone_bar.widget());
 
         let zone_legend = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)

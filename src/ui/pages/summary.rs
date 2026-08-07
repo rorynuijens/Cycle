@@ -8,6 +8,7 @@ use crate::data::session::Session;
 use crate::data::workout::{Segment, Workout, WorkoutCategory};
 use crate::training::engine::WorkoutEngine;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
+use crate::ui::widgets::zone_bar::ZoneBar;
 use crate::ui::widgets::zone_meter::ZONE_LABELS;
 
 #[derive(Clone)]
@@ -36,8 +37,7 @@ pub struct SummaryPage {
     last_athlete: Rc<RefCell<AthleteProfile>>,
     export_banner: adw::Banner,
     zone_section: gtk::Box,
-    zone_seconds: Rc<RefCell<[u32; 7]>>,
-    zone_bar: gtk::DrawingArea,
+    zone_bar: ZoneBar,
     zone_legend: gtk::Box,
     compliance_section: gtk::Box,
     compliance_group: adw::PreferencesGroup,
@@ -182,34 +182,8 @@ impl SummaryPage {
         inner.append(&ride_row);
 
         // ── Zone breakdown ────────────────────────────────────────────────────
-        let zone_seconds: Rc<RefCell<[u32; 7]>> = Rc::new(RefCell::new([0u32; 7]));
-        let zone_bar = gtk::DrawingArea::builder()
-            .content_height(20)
-            .hexpand(true)
-            .build();
-
-        let zones_ref = Rc::clone(&zone_seconds);
-        zone_bar.set_draw_func(move |_widget, cr, width, height| {
-            let zones = zones_ref.borrow();
-            let total: u32 = zones.iter().sum();
-            if total == 0 {
-                return;
-            }
-            let w = width as f64;
-            let h = height as f64;
-            let mut x = 0.0f64;
-            for (i, &secs) in zones.iter().enumerate() {
-                if secs == 0 {
-                    continue;
-                }
-                let seg_w = (secs as f64 / total as f64) * w;
-                let (r, g, b) = ZONE_COLORS[i];
-                cr.set_source_rgba(r, g, b, 0.85);
-                cr.rectangle(x, 0.0, seg_w, h);
-                cr.fill().ok();
-                x += seg_w;
-            }
-        });
+        let zone_bar =
+            ZoneBar::new("Power zone distribution bar: proportional time in zones Z1 through Z7");
 
         // Legend rebuilt per session: only the zones actually ridden, with
         // their time — an evenly-spaced Z1–Z7 row under a proportional bar
@@ -232,7 +206,7 @@ impl SummaryPage {
                 .css_classes(["heading"])
                 .build(),
         );
-        zone_section.append(&zone_bar);
+        zone_section.append(zone_bar.widget());
         zone_section.append(&zone_legend);
         inner.append(&zone_section);
 
@@ -353,7 +327,6 @@ impl SummaryPage {
             last_athlete,
             export_banner,
             zone_section,
-            zone_seconds,
             zone_bar,
             zone_legend,
             compliance_section,
@@ -523,8 +496,7 @@ impl SummaryPage {
         let has_power = zone_secs.iter().any(|&s| s > 0);
         self.zone_section.set_visible(has_power);
         if has_power {
-            *self.zone_seconds.borrow_mut() = zone_secs;
-            self.zone_bar.queue_draw();
+            self.zone_bar.set_seconds(&zone_secs);
 
             // Legend: only the zones actually ridden, with their time.
             while let Some(child) = self.zone_legend.first_child() {
