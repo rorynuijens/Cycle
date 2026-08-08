@@ -51,7 +51,15 @@ fn main() -> glib::ExitCode {
                 .application_id(APP_ID)
                 .flags(gio::ApplicationFlags::empty())
                 .build();
-            let msg = format!("Cycle could not open its database.\n\n{e}\n\nCheck that ~/.local/share/cycle/ is writable.");
+            // `{e:#}` prints anyhow's whole context chain: a refused schema version
+            // or a failed migration step explains itself in the outer message, and
+            // the cause underneath it is what makes the difference diagnosable.
+            // The path is resolved rather than written out, because it differs
+            // between a flatpak install and a development build.
+            let msg = format!(
+                "Cycle could not open its database.\n\n{e:#}\n\nDatabase location:\n{}",
+                data::paths::data_dir().display()
+            );
             app.connect_activate(move |app| {
                 let dialog = adw::AlertDialog::builder()
                     .heading("Database Error")

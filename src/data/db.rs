@@ -53,204 +53,14 @@ fn xdg_data_path() -> Result<std::path::PathBuf> {
     Ok(crate::data::paths::data_dir().join("cycle.db"))
 }
 
+/// Bring the schema up to date, then fill in anything derived that is missing.
+///
+/// Schema shape lives in [`crate::data::migrate`]; this function adds only the
+/// data backfills, which are separate because they read and rewrite rows rather
+/// than change the schema, and are safe to repeat.
 async fn migrate(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS athletes (
-            id          INTEGER PRIMARY KEY,
-            name        TEXT    NOT NULL,
-            weight_kg   REAL    NOT NULL DEFAULT 70.0,
-            ftp_watts   INTEGER NOT NULL DEFAULT 200,
-            max_hr      INTEGER NOT NULL DEFAULT 185,
-            resting_hr  INTEGER NOT NULL DEFAULT 55
-        );
-
-        CREATE TABLE IF NOT EXISTS workouts (
-            id              INTEGER PRIMARY KEY,
-            name            TEXT    NOT NULL,
-            description     TEXT    NOT NULL DEFAULT '',
-            duration_secs   INTEGER NOT NULL,
-            tss             REAL    NOT NULL DEFAULT 0,
-            category        TEXT    NOT NULL DEFAULT 'Custom',
-            segments_json   TEXT    NOT NULL DEFAULT '[]'
-        );
-
-        CREATE TABLE IF NOT EXISTS sessions (
-            id               INTEGER PRIMARY KEY,
-            workout_id       INTEGER REFERENCES workouts(id),
-            started_at       TEXT    NOT NULL,
-            ended_at         TEXT,
-            data_points_json TEXT    NOT NULL DEFAULT '[]'
-        );
-
-        CREATE TABLE IF NOT EXISTS calendar_entries (
-            id             INTEGER PRIMARY KEY,
-            workout_id     INTEGER NOT NULL REFERENCES workouts(id),
-            scheduled_date TEXT    NOT NULL,
-            completed      INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS saved_devices (
-            address      TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            transport    TEXT NOT NULL DEFAULT 'ble',
-            last_seen    TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS settings (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL DEFAULT ''
-        );
-
-        -- GPX routes kept in the library. The file itself lives under
-        -- <data>/cycle/routes/; this table holds what the list needs so the page
-        -- does not have to parse every GPX on every load.
-        CREATE TABLE IF NOT EXISTS routes (
-            id               INTEGER PRIMARY KEY,
-            name             TEXT    NOT NULL,
-            file_name        TEXT    NOT NULL UNIQUE,
-            distance_m       REAL    NOT NULL DEFAULT 0,
-            elevation_gain_m REAL    NOT NULL DEFAULT 0,
-            added_at         TEXT    NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS ftp_history (
-            id        INTEGER PRIMARY KEY,
-            date      TEXT    NOT NULL,
-            ftp_watts INTEGER NOT NULL,
-            source    TEXT    NOT NULL DEFAULT 'manual',
-            note      TEXT    NOT NULL DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS athlete_goals (
-            id          INTEGER PRIMARY KEY,
-            description TEXT NOT NULL,
-            created_at  TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS intervals_activities (
-            id            INTEGER PRIMARY KEY,
-            icu_id        TEXT    UNIQUE NOT NULL,
-            date          TEXT    NOT NULL,
-            name          TEXT    NOT NULL DEFAULT '',
-            tss           REAL,
-            duration_secs INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS intervals_workouts (
-            id            INTEGER PRIMARY KEY,
-            icu_id        TEXT    UNIQUE NOT NULL,
-            name          TEXT    NOT NULL,
-            description   TEXT    NOT NULL DEFAULT '',
-            duration_secs INTEGER,
-            tss           REAL
-        );
-
-        CREATE TABLE IF NOT EXISTS wellness_entries (
-            date         TEXT PRIMARY KEY,
-            hrv          REAL,
-            resting_hr   INTEGER,
-            sleep_secs   INTEGER,
-            sleep_score  INTEGER,
-            steps        INTEGER,
-            calories     INTEGER
-        );
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Additive columns added after initial release — safe to ignore if they already exist.
-    sqlx::query("ALTER TABLE saved_devices ADD COLUMN erg_enabled INTEGER NOT NULL DEFAULT 1")
-        .execute(pool)
-        .await
-        .ok();
-
-    sqlx::query("ALTER TABLE saved_devices ADD COLUMN device_type TEXT NOT NULL DEFAULT 'unknown'")
-        .execute(pool)
-        .await
-        .ok();
-
-    sqlx::query("ALTER TABLE sessions ADD COLUMN rpe INTEGER")
-        .execute(pool)
-        .await
-        .ok();
-
-    sqlx::query("ALTER TABLE sessions ADD COLUMN ftp_watts INTEGER")
-        .execute(pool)
-        .await
-        .ok();
-
-    // Activity name — the route name for a GPX ride, or a name the rider typed.
-    sqlx::query("ALTER TABLE sessions ADD COLUMN title TEXT")
-        .execute(pool)
-        .await
-        .ok();
-
-    // Link to the same ride as it exists on Intervals.icu, so a ride that made the
-    // round trip through Garmin or Strava is not shown or counted twice.
-    sqlx::query("ALTER TABLE sessions ADD COLUMN icu_id TEXT")
-        .execute(pool)
-        .await
-        .ok();
-
-    // Set when the rider unlinks a ride from Intervals.icu, so the matcher does not
-    // simply pair them again on the next sync.
-    sqlx::query("ALTER TABLE sessions ADD COLUMN icu_link_rejected INTEGER NOT NULL DEFAULT 0")
-        .execute(pool)
-        .await
-        .ok();
-
-    for col in [
-        "ALTER TABLE intervals_activities ADD COLUMN average_watts REAL",
-        "ALTER TABLE intervals_activities ADD COLUMN normalized_watts REAL",
-        "ALTER TABLE intervals_activities ADD COLUMN max_watts INTEGER",
-        "ALTER TABLE intervals_activities ADD COLUMN average_hr REAL",
-        "ALTER TABLE intervals_activities ADD COLUMN sport_type TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE intervals_activities ADD COLUMN max_hr INTEGER",
-        "ALTER TABLE intervals_activities ADD COLUMN start_datetime_local TEXT",
-        "ALTER TABLE intervals_activities ADD COLUMN distance_m REAL",
-        "ALTER TABLE intervals_activities ADD COLUMN elevation_gain_m REAL",
-        "ALTER TABLE intervals_activities ADD COLUMN average_cadence REAL",
-        // Tracks whether this in-app session was successfully uploaded to Intervals.icu.
-        // Sessions marked as uploaded are excluded from local CTL calculation because
-        // intervals_activities already contains the same workout — counting both would
-        // inflate CTL/ATL by double-counting the same training stress.
-        "ALTER TABLE sessions ADD COLUMN uploaded_to_icu INTEGER NOT NULL DEFAULT 0",
-        // Ride metrics derived from data_points_json, stored so the list views
-        // never have to read the blob back. Normalised power plus duration is
-        // enough to recover TSS and IF against any FTP in constant time, so the
-        // FTP a ride is scored at stays a read-time decision.
-        "ALTER TABLE sessions ADD COLUMN duration_secs INTEGER",
-        "ALTER TABLE sessions ADD COLUMN normalised_power REAL",
-        "ALTER TABLE sessions ADD COLUMN average_power REAL",
-        "ALTER TABLE sessions ADD COLUMN kilojoules REAL",
-    ] {
-        sqlx::query(col).execute(pool).await.ok();
-    }
-
+    crate::data::migrate::run(pool).await?;
     backfill_session_metrics(pool).await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS activity_streams (
-            icu_id       TEXT PRIMARY KEY,
-            streams_json TEXT NOT NULL,
-            fetched_at   TEXT NOT NULL
-         )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS time_off_entries (
-            date  TEXT PRIMARY KEY,
-            notes TEXT NOT NULL DEFAULT ''
-         )",
-    )
-    .execute(pool)
-    .await?;
-
-    tracing::info!("Database migrations complete");
     Ok(())
 }
 
@@ -2361,7 +2171,8 @@ mod tests {
     #[tokio::test]
     async fn migrate_is_idempotent() {
         let pool = test_pool().await;
-        // Running migrations a second time must not error (CREATE IF NOT EXISTS + ignored ALTERs).
+        // Schema steps run once and are recorded; the backfill is guarded on the
+        // column it fills. See crate::data::migrate for the schema-side tests.
         migrate(&pool).await.expect("re-running migration is safe");
     }
 

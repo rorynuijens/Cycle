@@ -5,6 +5,7 @@ pub mod dedupe;
 pub mod fit;
 pub mod import;
 pub mod keystore;
+pub mod migrate;
 pub mod paths;
 pub mod route;
 pub mod session;
