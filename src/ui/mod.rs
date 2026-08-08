@@ -64,12 +64,6 @@ impl AiFailure {
     }
 }
 
-/// Run an async task on the tokio runtime and deliver its result to `on_done`
-/// back on the GTK main thread — without ever blocking the GLib loop.
-///
-/// This is the non-blocking replacement for `rt.block_on(...)` in GTK callbacks
-/// (see CLAUDE.md §2.3): the future runs on the tokio runtime, its result is sent
-/// over an `async_channel`, and `on_done` is invoked from the GLib main context,
 /// A page's reload callback.
 pub type ReloadFn = std::rc::Rc<dyn Fn()>;
 
@@ -81,6 +75,39 @@ pub type ReloadFn = std::rc::Rc<dyn Fn()>;
 /// made, and the callbacks read it when they fire.
 pub type ReloadHolder = std::rc::Rc<std::cell::RefCell<Option<ReloadFn>>>;
 
+/// Banner text for the sensors that have stopped reporting mid-ride, or `None`
+/// while everything is still live.
+///
+/// Both ride pages raise the same banner off the same
+/// [`ReadingsTracker::stale_sensors`](crate::data::session::ReadingsTracker::stale_sensors)
+/// list, so the wording lives here rather than being written out twice.
+pub fn dropout_banner_text(stale: &[&'static str]) -> Option<String> {
+    // Sentence-case only the first name; the rest read as a mid-sentence list.
+    fn lead(name: &str) -> String {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    }
+
+    let joined = match stale {
+        [] => return None,
+        [one] => lead(one),
+        [first, second] => format!("{} and {}", lead(first), second),
+        [first, middle @ .., last] => {
+            format!("{}, {} and {}", lead(first), middle.join(", "), last)
+        }
+    };
+    Some(format!("{joined} dropped out — searching…"))
+}
+
+/// Run an async task on the tokio runtime and deliver its result to `on_done`
+/// back on the GTK main thread — without ever blocking the GLib loop.
+///
+/// This is the non-blocking replacement for `rt.block_on(...)` in GTK callbacks
+/// (see CLAUDE.md §2.3): the future runs on the tokio runtime, its result is sent
+/// over an `async_channel`, and `on_done` is invoked from the GLib main context,
 /// so it is safe to touch widgets inside it.
 ///
 /// `on_done` runs at most once. If the task is dropped before completing (e.g. the
@@ -102,4 +129,46 @@ pub fn spawn_to_main<T, Fut>(
             on_done(value);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_show_no_banner_when_every_sensor_is_live() {
+        assert_eq!(dropout_banner_text(&[]), None);
+    }
+
+    #[test]
+    fn should_sentence_case_a_single_dropped_sensor() {
+        assert_eq!(
+            dropout_banner_text(&["power"]).unwrap(),
+            "Power dropped out — searching…"
+        );
+    }
+
+    #[test]
+    fn should_join_two_dropped_sensors_with_and() {
+        assert_eq!(
+            dropout_banner_text(&["power", "cadence"]).unwrap(),
+            "Power and cadence dropped out — searching…"
+        );
+    }
+
+    #[test]
+    fn should_join_three_dropped_sensors_with_a_comma_list() {
+        assert_eq!(
+            dropout_banner_text(&["power", "heart rate", "cadence"]).unwrap(),
+            "Power, heart rate and cadence dropped out — searching…"
+        );
+    }
+
+    #[test]
+    fn should_sentence_case_a_multi_word_sensor_name() {
+        assert_eq!(
+            dropout_banner_text(&["heart rate"]).unwrap(),
+            "Heart rate dropped out — searching…"
+        );
+    }
 }

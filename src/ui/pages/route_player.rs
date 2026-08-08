@@ -55,6 +55,10 @@ pub struct RoutePlayerPage {
     root: gtk::Box,
     /// Shown during the pre-start countdown — hides once the ride begins.
     countdown_banner: adw::Banner,
+    /// Raised mid-ride when a sensor stops reporting. A dropout used to show up
+    /// only as a chip quietly leaving the row above, which is far too easy to
+    /// miss while riding hard.
+    dropout_banner: adw::Banner,
     /// Consecutive seconds of power data seen while waiting to start.
     power_countdown: Rc<Cell<u32>>,
     /// Callback wired by `start_timer` for the countdown banner's "Start now" button.
@@ -118,6 +122,9 @@ impl RoutePlayerPage {
             });
         }
         root.append(&countdown_banner);
+
+        let dropout_banner = adw::Banner::builder().revealed(false).build();
+        root.append(&dropout_banner);
 
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -386,6 +393,7 @@ impl RoutePlayerPage {
         Self {
             root,
             countdown_banner,
+            dropout_banner,
             power_countdown: Rc::new(Cell::new(0)),
             start_now_cb,
             route_name_label,
@@ -491,6 +499,21 @@ impl RoutePlayerPage {
         }
     }
 
+    /// Raise or clear the dropout banner for the sensors that have gone quiet.
+    ///
+    /// Driven by sensor staleness rather than by BLE connection events, so it
+    /// also catches a device that is still nominally connected but has stopped
+    /// sending — which looks identical to the rider.
+    pub fn set_stale_sensors(&self, stale: &[&'static str]) {
+        match crate::ui::dropout_banner_text(stale) {
+            Some(title) => {
+                self.dropout_banner.set_title(&title);
+                self.dropout_banner.set_revealed(true);
+            }
+            None => self.dropout_banner.set_revealed(false),
+        }
+    }
+
     /// Reset the page for a new route.
     pub fn reset_route(&self, route: &Route) {
         self.route_name_label.set_label(&route.name);
@@ -498,6 +521,7 @@ impl RoutePlayerPage {
         self.countdown_banner
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
+        self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
         let total_dist_km = route.total_distance_m / 1000.0;
         self.dist_remaining_label
@@ -660,11 +684,13 @@ impl RoutePlayerPage {
             // has gone quiet must not have its last value recorded all ride.
             let now = std::time::Instant::now();
             let readings = readings_rc.borrow().current(now);
-            for sensor in readings_rc.borrow().stale_sensors(now) {
-                if stale_warned.borrow_mut().insert(sensor) {
+            let stale = readings_rc.borrow().stale_sensors(now);
+            for sensor in &stale {
+                if stale_warned.borrow_mut().insert(*sensor) {
                     tracing::warn!("{sensor} sensor stopped reporting — dropping it from the ride");
                 }
             }
+            page.set_stale_sensors(&stale);
 
             if paused.get() {
                 return glib::ControlFlow::Continue;

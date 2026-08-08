@@ -82,6 +82,15 @@ pub fn start_polling(
                     } else {
                         player_for_loop.borrow().remove_connected_device(&address);
                         route_player_for_loop.remove_connected_device(&address);
+                        // Losing a device matters more mid-ride than gaining one,
+                        // so it gets the longer of the two timeouts. Without this
+                        // a dropout was announced only by a chip disappearing.
+                        toast_overlay_for_loop.add_toast(
+                            adw::Toast::builder()
+                                .title(format!("Disconnected: {}", display_name))
+                                .timeout(6)
+                                .build(),
+                        );
                     }
                 }
                 DeviceEvent::Error(e) => {

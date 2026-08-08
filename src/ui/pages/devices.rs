@@ -73,6 +73,9 @@ struct PageCtx {
     scanning: Rc<Cell<bool>>,
     scan_generation: Rc<Cell<u32>>,
     auto_reconnect: Rc<Cell<bool>>,
+    /// Auto-reconnect scans since the last successful connection. Drives the
+    /// backoff in [`reconnect_delay`] and is reset whenever anything connects.
+    reconnect_attempts: Rc<Cell<u32>>,
 }
 
 pub struct DevicesPage {
@@ -159,6 +162,7 @@ impl DevicesPage {
             scanning: Rc::new(Cell::new(false)),
             scan_generation: Rc::new(Cell::new(0)),
             auto_reconnect,
+            reconnect_attempts: Rc::new(Cell::new(0)),
         };
 
         let ctx_scan = ctx.clone();
@@ -306,6 +310,10 @@ impl DevicesPage {
         refresh_strip(&self.ctx);
 
         if connected {
+            // Something came back, so the next dropout starts from a short delay
+            // rather than inheriting a backoff grown during an earlier outage.
+            self.ctx.reconnect_attempts.set(0);
+
             let (display_name, transport, kind, erg_enabled) = {
                 let entries = self.ctx.entries.borrow();
                 let e = &entries[&address];
@@ -346,6 +354,20 @@ impl DevicesPage {
                     let _ = self.ctx.cmd_tx.try_send(DeviceCommand::StopScan);
                     finish_scan(&self.ctx);
                 }
+            }
+        } else {
+            // A saved device dropping out is the one case where reconnecting
+            // matters most and nothing was watching for it: auto-reconnect only
+            // fires from `on_discovered`, which needs a scan running, and no
+            // scan runs during a ride. Start one so the existing path can work.
+            let was_saved = self
+                .ctx
+                .entries
+                .borrow()
+                .get(&address)
+                .is_some_and(|e| e.saved);
+            if was_saved {
+                schedule_reconnect_scan(&self.ctx);
             }
         }
     }
@@ -504,6 +526,43 @@ fn set_slot(slot: &SetupSlot, name: &str, status: &str, connected: bool) {
 
 // ── Scanning ─────────────────────────────────────────────────────────────────
 
+/// How long to wait before the `attempt`-th consecutive auto-reconnect scan.
+///
+/// The first is immediate — a trainer that browned out is usually back within
+/// seconds — and later ones back off so a device that is off for the evening is
+/// not hunted continuously. Returns `None` once we give up, which keeps a radio
+/// scan from running for the rest of a long ride; the banner stays up and the
+/// Scan button still works.
+fn reconnect_delay(attempt: u32) -> Option<Duration> {
+    const SCHEDULE_SECS: [u64; 5] = [0, 30, 60, 120, 300];
+    SCHEDULE_SECS
+        .get(attempt as usize)
+        .copied()
+        .map(Duration::from_secs)
+}
+
+/// Queue the next auto-reconnect scan, if there is one left to run.
+fn schedule_reconnect_scan(ctx: &PageCtx) {
+    if !ctx.auto_reconnect.get() || ctx.scanning.get() {
+        return;
+    }
+    let attempt = ctx.reconnect_attempts.get();
+    let Some(delay) = reconnect_delay(attempt) else {
+        tracing::info!("auto-reconnect gave up after {attempt} scans — use Scan to retry");
+        return;
+    };
+    ctx.reconnect_attempts.set(attempt + 1);
+
+    let ctx = ctx.clone();
+    glib::timeout_add_local_once(delay, move || {
+        // Conditions are rechecked at fire time: the device may have come back
+        // on its own, or the rider may have switched auto-reconnect off.
+        if ctx.auto_reconnect.get() && has_missing_saved(&ctx) {
+            begin_scan(&ctx);
+        }
+    });
+}
+
 fn begin_scan(ctx: &PageCtx) {
     if ctx.scanning.get() {
         return;
@@ -534,6 +593,11 @@ fn begin_scan(ctx: &PageCtx) {
             ctx_timeout
                 .add_group
                 .set_description(Some(ADD_DESC_NOTHING_FOUND));
+        }
+        // A saved device still missing means this scan did not do its job — try
+        // again after the backoff rather than leaving the rider stranded.
+        if has_missing_saved(&ctx_timeout) {
+            schedule_reconnect_scan(&ctx_timeout);
         }
     });
 }
@@ -979,4 +1043,43 @@ fn signal_text(rssi: Option<i16>) -> Option<&'static str> {
         r if r >= -80 => "Fair signal",
         _ => "Weak signal",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_retry_immediately_on_the_first_dropout() {
+        // A trainer that browned out is usually back within seconds.
+        assert_eq!(reconnect_delay(0), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn should_back_off_between_successive_reconnect_scans() {
+        let delays: Vec<u64> = (0..5)
+            .map(|a| {
+                reconnect_delay(a)
+                    .expect("first five attempts are scheduled")
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(delays, vec![0, 30, 60, 120, 300]);
+        // Strictly increasing, so a device that is off for the evening is not
+        // hunted at a constant rate.
+        assert!(delays.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn should_give_up_after_the_last_scheduled_attempt() {
+        assert_eq!(reconnect_delay(5), None);
+        assert_eq!(reconnect_delay(99), None);
+    }
+
+    #[test]
+    fn should_keep_total_reconnect_effort_under_ten_minutes() {
+        // Bounded so a radio scan cannot run for the rest of a long ride.
+        let total: u64 = (0..).map_while(reconnect_delay).map(|d| d.as_secs()).sum();
+        assert_eq!(total, 510);
+    }
 }

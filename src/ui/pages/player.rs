@@ -33,6 +33,10 @@ pub struct PlayerPage {
     zone_meter: ZoneMeter,
     /// Shown during the pre-start countdown — hides once the engine starts.
     countdown_banner: adw::Banner,
+    /// Raised mid-ride when a sensor stops reporting. A dropout used to show up
+    /// only as a chip quietly leaving the row above, which is far too easy to
+    /// miss while riding hard.
+    dropout_banner: adw::Banner,
     /// Horizontal pill row listing connected BLE devices.
     devices_section: gtk::Box,
     devices_flow: gtk::Box,
@@ -87,6 +91,10 @@ impl PlayerPage {
         });
 
         root.append(&countdown_banner);
+
+        // ── Dropout banner (mid-ride) ────────────────────────────────────────
+        let dropout_banner = adw::Banner::builder().revealed(false).build();
+        root.append(&dropout_banner);
 
         // ── Cockpit layout ───────────────────────────────────────────────────
         // Everything the rider needs mid-effort is visible at once — no scroll.
@@ -351,6 +359,7 @@ impl PlayerPage {
             interval_caption,
             zone_meter,
             countdown_banner,
+            dropout_banner,
             devices_section,
             devices_flow,
             graph,
@@ -383,6 +392,21 @@ impl PlayerPage {
         self.last_readings
             .borrow_mut()
             .merge(readings, std::time::Instant::now());
+    }
+
+    /// Raise or clear the dropout banner for the sensors that have gone quiet.
+    ///
+    /// Driven by sensor staleness rather than by BLE connection events, so it
+    /// also catches a device that is still nominally connected but has stopped
+    /// sending — which looks identical to the rider.
+    pub fn set_stale_sensors(&self, stale: &[&'static str]) {
+        match crate::ui::dropout_banner_text(stale) {
+            Some(title) => {
+                self.dropout_banner.set_title(&title);
+                self.dropout_banner.set_revealed(true);
+            }
+            None => self.dropout_banner.set_revealed(false),
+        }
     }
 
     /// Add a connected-device chip to the status row.
@@ -448,6 +472,7 @@ impl PlayerPage {
         self.countdown_banner
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
+        self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
         self.graph.set_workout(workout);
         self.zone_meter.set_power(None);
@@ -606,11 +631,13 @@ impl PlayerPage {
             // quiet must not have its last value recorded for the rest of the ride.
             let now = std::time::Instant::now();
             let readings = last_readings_rc.borrow().current(now);
-            for sensor in last_readings_rc.borrow().stale_sensors(now) {
-                if stale_warned.borrow_mut().insert(sensor) {
+            let stale = last_readings_rc.borrow().stale_sensors(now);
+            for sensor in &stale {
+                if stale_warned.borrow_mut().insert(*sensor) {
                     tracing::warn!("{sensor} sensor stopped reporting — dropping it from the ride");
                 }
             }
+            page_clone.borrow().set_stale_sensors(&stale);
 
             let (snapshot, session, ftp) = {
                 let mut eng = engine_clone.borrow_mut();
