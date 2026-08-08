@@ -6,7 +6,7 @@
 use chrono::{Duration as CDuration, NaiveDate};
 use sqlx::SqlitePool;
 
-use crate::data::db;
+use crate::data::{ai_cache, db, settings};
 
 /// Days of wellness history sent with a coaching prompt.
 const AI_WELLNESS_DAYS: u32 = 7;
@@ -24,17 +24,12 @@ pub struct CoachingData {
 
 /// Load the page's state off the GTK main thread (CLAUDE.md §2.3).
 pub async fn load_coaching_data(pool: &SqlitePool) -> anyhow::Result<CoachingData> {
+    let cached = ai_cache::load_suggestion(pool).await?;
     Ok(CoachingData {
         goals: db::load_goals(pool).await?,
-        cached_resp: db::get_setting(pool, "ai.suggestion_response")
-            .await?
-            .unwrap_or_default(),
-        cached_name: db::get_setting(pool, "ai.suggestion_workout_name")
-            .await?
-            .unwrap_or_default(),
-        cached_detail: db::get_setting(pool, "ai.suggestion_workout_detail")
-            .await?
-            .unwrap_or_default(),
+        cached_resp: cached.response,
+        cached_name: cached.workout_name,
+        cached_detail: cached.workout_detail,
     })
 }
 
@@ -61,9 +56,7 @@ pub async fn load_suggestion_prompt_data(
 ) -> anyhow::Result<SuggestionPromptData> {
     let lookahead = today + CDuration::days(TIME_OFF_LOOKAHEAD_DAYS);
     Ok(SuggestionPromptData {
-        athlete_ctx: db::get_setting(pool, "coaching.athlete_context")
-            .await?
-            .unwrap_or_default(),
+        athlete_ctx: settings::coaching_context(pool).await?,
         records: db::load_session_summaries(pool).await?,
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
         icu_activities: db::load_unlinked_intervals_activities(pool).await?,
@@ -92,9 +85,7 @@ pub struct ProgramPromptData {
 /// failure, for the same reason as [`load_suggestion_prompt_data`].
 pub async fn load_program_prompt_data(pool: &SqlitePool) -> anyhow::Result<ProgramPromptData> {
     Ok(ProgramPromptData {
-        athlete_ctx: db::get_setting(pool, "coaching.athlete_context")
-            .await?
-            .unwrap_or_default(),
+        athlete_ctx: settings::coaching_context(pool).await?,
         goals: db::load_goals(pool).await?,
         records: db::load_session_summaries(pool).await?,
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,

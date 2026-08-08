@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use sqlx::SqlitePool;
 
+use crate::data::settings;
 use crate::data::{athlete::AthleteProfile, db, workout::Workout};
 use crate::training::engine::WorkoutEngine;
 use crate::ui::pages::route_player::RoutePlayerPage;
@@ -312,21 +313,14 @@ pub fn finish_session_closure(
                     // Intervals.icu upload — send the full FIT file so Intervals.icu gets
                     // time-series data (power curve, HR, cadence) and can sync it to
                     // Garmin Connect with complete activity data.
-                    let upload_enabled = db::get_setting(&pool, "intervals.upload")
-                        .await
-                        .unwrap_or(None)
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                    if upload_enabled {
+                    let intervals = settings::load_intervals(&pool).await.unwrap_or_default();
+                    if intervals.upload {
                         let api_key = crate::data::keystore::get_secret(
                             crate::data::keystore::KEY_INTERVALS_API,
                         )
                         .unwrap_or(None)
                         .unwrap_or_default();
-                        let athlete_id = db::get_setting(&pool, "intervals.athlete_id")
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default();
+                        let athlete_id = intervals.athlete_id;
                         if !api_key.trim().is_empty() && !athlete_id.trim().is_empty() {
                             // Loaded fresh rather than captured at startup so the
                             // export carries the FTP and heart-rate limits in

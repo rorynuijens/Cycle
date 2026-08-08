@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::data::settings;
 use crate::data::{athlete::AthleteProfile, db};
 
 /// How long an FTP edit must settle before it is written to the FTP history.
@@ -237,9 +238,8 @@ fn connect_context(
     crate::ui::spawn_to_main(
         rt_handle,
         async move {
-            db::get_setting(&pool_preview, "coaching.athlete_context")
+            settings::coaching_context(&pool_preview)
                 .await
-                .unwrap_or(None)
                 .unwrap_or_default()
         },
         move |ctx| row.set_subtitle(&context_preview(&ctx)),
@@ -355,9 +355,8 @@ fn show_context_editor(
     crate::ui::spawn_to_main(
         &rt_handle,
         async move {
-            db::get_setting(&pool_load, "coaching.athlete_context")
+            settings::coaching_context(&pool_load)
                 .await
-                .unwrap_or(None)
                 .unwrap_or_default()
         },
         move |current| {
@@ -457,13 +456,13 @@ fn show_context_editor(
                     .trim()
                     .to_string();
 
-                let pool = pool.clone();
                 let ctx = text.clone();
-                rt_save.spawn(async move {
-                    if let Err(e) = db::set_setting(&pool, "coaching.athlete_context", &ctx).await {
-                        tracing::error!("save coaching.athlete_context failed: {e}");
-                    }
-                });
+                crate::ui::spawn_write(
+                    &rt_save,
+                    &pool,
+                    "your training context",
+                    |pool| async move { settings::set_coaching_context(&pool, &ctx).await },
+                );
 
                 preview_row.set_subtitle(&context_preview(&text));
                 win_save.add_toast(

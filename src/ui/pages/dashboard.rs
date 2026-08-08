@@ -14,9 +14,10 @@ use crate::ai::briefing::{
 use crate::ai::coach::get_suggestion;
 use crate::ai::context::{resolve_planned_workout, wellness_snapshots, workouts_as_options};
 use crate::data::{
+    ai_cache,
     athlete::AthleteProfile,
     db::{self},
-    keystore,
+    keystore, settings,
     workout::Workout,
 };
 use crate::training::fitness::compute_load_metrics;
@@ -50,9 +51,8 @@ struct DashboardData {
 /// Load the dashboard's data off the GTK main thread (CLAUDE.md §2.3).
 async fn load_dashboard_data(pool: &SqlitePool, today: &str) -> anyhow::Result<DashboardData> {
     let today_entry = db::load_today_entry(pool, today).await?;
-    let ai_workout_name = db::get_setting(pool, "ai.suggestion_workout_name")
-        .await?
-        .unwrap_or_default();
+    let cached = ai_cache::load_suggestion(pool).await?;
+    let ai_workout_name = cached.workout_name.clone();
 
     // The suggestion only matters on an empty day — with a workout scheduled,
     // the plan wins and the suggestion hides.
@@ -70,17 +70,10 @@ async fn load_dashboard_data(pool: &SqlitePool, today: &str) -> anyhow::Result<D
         today_entry,
         records: db::load_session_summaries(pool).await?,
         suggested_workout,
-        ai_workout_detail: db::get_setting(pool, "ai.suggestion_workout_detail")
-            .await?
-            .unwrap_or_default(),
-        ai_fitness_insight: db::get_setting(pool, "ai.fitness_insight")
-            .await?
-            .unwrap_or_default(),
+        ai_workout_detail: cached.workout_detail,
+        ai_fitness_insight: ai_cache::fitness_insight(pool).await?.unwrap_or_default(),
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
-        first_use_done: db::get_setting(pool, "first_use_complete")
-            .await?
-            .map(|v| v == "1")
-            .unwrap_or(false),
+        first_use_done: settings::first_use_complete(pool).await?,
     })
 }
 
@@ -103,19 +96,14 @@ async fn swap_todays_workout(pool: &SqlitePool, name: &str, today: &str) -> anyh
     Ok(())
 }
 
-/// Read today's cached briefing: `(text, date it was written for, the name of
-/// the workout on today's calendar if there is one)`.
+/// Read today's cached briefing, and the name of the workout on today's
+/// calendar if there is one.
 async fn load_cached_briefing(
     pool: &SqlitePool,
     today: &str,
-) -> anyhow::Result<(String, String, Option<String>)> {
+) -> anyhow::Result<(Option<ai_cache::Briefing>, Option<String>)> {
     Ok((
-        db::get_setting(pool, "ai.morning_briefing_text")
-            .await?
-            .unwrap_or_default(),
-        db::get_setting(pool, "ai.morning_briefing_date")
-            .await?
-            .unwrap_or_default(),
+        ai_cache::briefing(pool).await?,
         db::load_today_entry(pool, today)
             .await?
             .map(|e| e.workout.name),
@@ -150,10 +138,8 @@ async fn load_briefing_prompt_data(
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
         wellness: db::load_wellness_recent(pool, 1).await?,
         workouts: db::load_workouts(pool).await?,
-        athlete_context: db::get_setting(pool, "coaching.athlete_context")
-            .await?
-            .unwrap_or_default(),
-        cached_suggestion_name: db::get_setting(pool, "ai.suggestion_workout_name")
+        athlete_context: settings::coaching_context(pool).await?,
+        cached_suggestion_name: ai_cache::suggestion_workout_name(pool)
             .await?
             .unwrap_or_default(),
         time_off: db::load_time_off_between(
@@ -688,9 +674,9 @@ impl DashboardPage {
                 // All network and DB work happens in the tokio runtime — the GTK main
                 // thread is never blocked, so the UI stays responsive even with no internet.
                 rt_g.spawn(async move {
-                    let icu_athlete_id = db::get_setting(&pool_t, "intervals.athlete_id")
+                    let icu_athlete_id = settings::load_intervals(&pool_t)
                         .await
-                        .unwrap_or(None)
+                        .map(|s| s.athlete_id)
                         .unwrap_or_default();
 
                     // Sync intervals.icu — errors are non-fatal; we just skip stale data.
@@ -867,19 +853,10 @@ impl DashboardPage {
                                 };
                                 // Cache the result and persist aligned suggestion
                                 rt_c.spawn(async move {
-                                    let _ =
-                                        db::set_setting(&pool_c, "ai.morning_briefing_text", &text)
-                                            .await;
-                                    let _ = db::set_setting(
-                                        &pool_c,
-                                        "ai.morning_briefing_date",
-                                        &today_c,
-                                    )
-                                    .await;
+                                    let _ = ai_cache::save_briefing(&pool_c, &text, &today_c).await;
                                     if !suggest_name.is_empty() {
-                                        let _ = db::set_setting(
+                                        let _ = ai_cache::set_suggestion_workout_name(
                                             &pool_c,
-                                            "ai.suggestion_workout_name",
                                             &suggest_name,
                                         )
                                         .await;
@@ -909,10 +886,8 @@ impl DashboardPage {
                                                     })
                                             })
                                             .unwrap_or_default();
-                                        let _ = db::set_setting(
-                                            &pool_c,
-                                            "ai.suggestion_workout_detail",
-                                            &detail,
+                                        let _ = ai_cache::set_suggestion_workout_detail(
+                                            &pool_c, &detail,
                                         )
                                         .await;
                                     }
@@ -956,14 +931,15 @@ impl DashboardPage {
                     // auto-generate branch would bill the rider for a briefing
                     // because the database hiccupped, and overwrite the good one
                     // already cached for today.
-                    let (cached_text, cached_date, planned_name) = match result {
+                    let (cached, planned_name) = match result {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::error!("Could not read the cached briefing: {e}");
                             return;
                         }
                     };
-                    if !cached_text.is_empty() && cached_date == today_c {
+                    if let Some(cached_text) = cached.filter(|b| b.is_for(&today_c)).map(|b| b.text)
+                    {
                         // Reconcile against the plan: a cached "modify" naming
                         // the workout already scheduled is agreement, not a swap.
                         let (decision, alt) = resolve_decision(

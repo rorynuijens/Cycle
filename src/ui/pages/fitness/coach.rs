@@ -15,6 +15,7 @@ use crate::ai::context::parse_ai_sections;
 use crate::ai::retrospective::{
     build_retrospective_prompt, RetroPeriod, RetroSession, RetrospectiveContext,
 };
+use crate::data::ai_cache;
 use crate::data::db::{self, WellnessEntry};
 use crate::data::{athlete::AthleteProfile, keystore};
 use crate::training::fitness::compute_load_metrics;
@@ -28,14 +29,6 @@ use super::data::{
 /// Shown when the rider has no Anthropic key configured.
 const NO_API_KEY: &str = "No API key configured. Enter your Anthropic API key in \
                           Preferences → Integrations.";
-
-/// Where each period's most recent retrospective is cached.
-fn cache_key(period: RetroPeriod) -> &'static str {
-    match period {
-        RetroPeriod::Weekly => "ai.weekly_retrospective",
-        RetroPeriod::Monthly => "ai.monthly_retrospective",
-    }
-}
 
 /// How many days each retrospective looks back over.
 fn period_days(period: RetroPeriod) -> i64 {
@@ -348,7 +341,6 @@ impl CoachCard {
         output: &AiOutput,
     ) {
         let pool = pool.clone();
-        let key = cache_key(period);
         let output = output.clone();
         crate::ui::spawn_to_main(
             rt_handle,
@@ -356,32 +348,19 @@ impl CoachCard {
                 // A missing cache entry is normal; a failed read is not, but it
                 // costs the rider nothing here — the card just shows its prompt
                 // to generate one. Log it and carry on.
-                db::get_setting(&pool, key)
+                ai_cache::retrospective(&pool, period)
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!("Could not read cached retrospective: {e}");
                         None
                     })
-                    .unwrap_or_default()
             },
             move |cached| {
-                if !cached.is_empty() {
-                    output.set_text(&cached);
+                if let Some(text) = cached {
+                    output.set_text(&text);
                 }
             },
         );
-    }
-
-    /// Write a finished answer back to the cache so it survives a restart.
-    fn cache(pool: &SqlitePool, rt_handle: &tokio::runtime::Handle, key: &str, text: &str) {
-        let pool = pool.clone();
-        let key = key.to_string();
-        let text = text.to_string();
-        rt_handle.spawn(async move {
-            if let Err(e) = db::set_setting(&pool, &key, &text).await {
-                tracing::error!("Could not cache AI output: {e}");
-            }
-        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -468,7 +447,15 @@ impl CoachCard {
                     match result {
                         Ok(text) => {
                             output.set_text(&text);
-                            Self::cache(&pool, &rt_handle, "ai.fitness_insight", &text);
+                            let cached = text.clone();
+                            crate::ui::spawn_write(
+                                &rt_handle,
+                                &pool,
+                                "the fitness insight",
+                                move |pool| async move {
+                                    ai_cache::set_fitness_insight(&pool, &cached).await
+                                },
+                            );
                         }
                         Err(failure) => output.set_status(failure.message()),
                     }
@@ -606,7 +593,15 @@ impl CoachCard {
                     match result {
                         Ok(text) => {
                             output.set_text(&text);
-                            Self::cache(&pool, &rt_handle, cache_key(period), &text);
+                            let cached = text.clone();
+                            crate::ui::spawn_write(
+                                &rt_handle,
+                                &pool,
+                                "the retrospective",
+                                move |pool| async move {
+                                    ai_cache::set_retrospective(&pool, period, &cached).await
+                                },
+                            );
                         }
                         Err(failure) => output.set_status(failure.message()),
                     }
@@ -684,14 +679,6 @@ fn retro_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn should_cache_each_period_separately() {
-        assert_ne!(
-            cache_key(RetroPeriod::Weekly),
-            cache_key(RetroPeriod::Monthly)
-        );
-    }
 
     #[test]
     fn should_look_back_a_week_and_a_month() {

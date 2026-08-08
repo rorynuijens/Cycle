@@ -15,11 +15,6 @@
 //! Cached AI output also lives in the settings table but is not a setting; it
 //! has its own module, [`super::ai_cache`].
 
-// This module lands ahead of its callers, so every accessor is briefly unused.
-// The call-site migration removes this allow, at which point clippy names
-// anything that never got wired up.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use sqlx::SqlitePool;
 

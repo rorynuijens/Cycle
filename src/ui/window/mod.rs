@@ -16,6 +16,7 @@ use super::pages::{
     fitness::FitnessPage, library::LibraryPage, player::PlayerPage, route_player::RoutePlayerPage,
     summary::SummaryPage,
 };
+use crate::data::settings::{self, TrainingSettings, WindowSettings};
 use crate::data::{
     athlete::AthleteProfile,
     db::{self, SavedDevice},
@@ -104,20 +105,28 @@ impl CycleGtkWindow {
         workout: Workout,
         workouts: Vec<Workout>,
     ) {
-        // Restore last window size (saved on close)
-        let saved_w = rt_handle
-            .block_on(db::get_setting(&pool, "window.width"))
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<i32>().ok());
-        let saved_h = rt_handle
-            .block_on(db::get_setting(&pool, "window.height"))
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<i32>().ok());
-        if let (Some(w), Some(h)) = (saved_w, saved_h) {
+        // Restore last window size (saved on close). A read that fails is not
+        // the same as a size never recorded, so say so rather than letting an
+        // unreadable database look like a first run.
+        let saved = rt_handle
+            .block_on(settings::load_window(&pool))
+            .unwrap_or_else(|e| {
+                tracing::error!("Could not read the saved window size: {e}");
+                WindowSettings::default()
+            });
+        if let Some((w, h)) = saved.size() {
             self.window.set_default_size(w, h);
         }
+
+        // Read once, here, and used again by the SIM setup further down. Both
+        // used to read the same keys separately, each with its own copy of the
+        // defaults — which agreed only by coincidence.
+        let training = rt_handle
+            .block_on(settings::load_training(&pool))
+            .unwrap_or_else(|e| {
+                tracing::error!("Could not read your training settings: {e}");
+                TrainingSettings::default()
+            });
 
         // The close handler is registered further down, once the flags that tell
         // us whether a ride is in progress exist.
@@ -147,11 +156,7 @@ impl CycleGtkWindow {
 
         let mut engine =
             WorkoutEngine::new(workout.clone(), Rc::clone(&athlete_rc), cmd_tx.clone());
-        engine.erg_ramp_rate = rt_handle
-            .block_on(db::get_setting(&pool, "training.erg_ramp_rate"))
-            .unwrap_or(None)
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(25);
+        engine.erg_ramp_rate = training.erg_ramp_rate;
         let engine_rc = Rc::new(RefCell::new(engine));
         let player_rc = Rc::new(RefCell::new(PlayerPage::new(
             &workout,
@@ -395,21 +400,8 @@ impl CycleGtkWindow {
         // SIM feel settings — read live by the ride loop so a change in
         // Preferences applies mid-ride. Difficulty is stored as a percentage
         // and held here as a 0.0–1.0 scale factor.
-        let sim_difficulty = Rc::new(Cell::new(
-            rt_handle
-                .block_on(db::get_setting(&pool, "training.sim_difficulty"))
-                .unwrap_or(None)
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(100.0)
-                / 100.0,
-        ));
-        let sim_max_grade = Rc::new(Cell::new(
-            rt_handle
-                .block_on(db::get_setting(&pool, "training.sim_max_gradient"))
-                .unwrap_or(None)
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(20.0),
-        ));
+        let sim_difficulty = Rc::new(Cell::new(training.sim_difficulty_pct / 100.0));
+        let sim_max_grade = Rc::new(Cell::new(training.sim_max_gradient_pct));
         let trainer_addr: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // on_start_route: called from the library when the user clicks "Ride this Route"

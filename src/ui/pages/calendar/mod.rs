@@ -551,27 +551,24 @@ impl CalendarPage {
                     // The athlete id is read here rather than on the GTK thread:
                     // a block_on against SQLite stalls the GLib loop if the
                     // database is busy, which it is every 30 s during a ride.
-                    let athlete_id =
-                        match crate::data::db::get_setting(&pool_s, "intervals.athlete_id").await {
-                            Ok(Some(id)) if !id.trim().is_empty() => id,
-                            Ok(_) => {
-                                let _ = tx
-                                    .send(Err("No Intervals.icu athlete ID configured — \
+                    let athlete_id = match crate::data::settings::load_intervals(&pool_s).await {
+                        Ok(s) if !s.athlete_id.trim().is_empty() => s.athlete_id,
+                        Ok(_) => {
+                            let _ = tx
+                                .send(Err("No Intervals.icu athlete ID configured — \
                                            add it in Preferences"
-                                        .to_string()))
-                                    .await;
-                                return;
-                            }
-                            Err(e) => {
-                                tracing::error!("Could not read the Intervals.icu athlete ID: {e}");
-                                let _ = tx
-                                    .send(Err(
-                                        "Could not read your Intervals.icu settings".to_string()
-                                    ))
-                                    .await;
-                                return;
-                            }
-                        };
+                                    .to_string()))
+                                .await;
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::error!("Could not read the Intervals.icu athlete ID: {e}");
+                            let _ = tx
+                                .send(Err("Could not read your Intervals.icu settings".to_string()))
+                                .await;
+                            return;
+                        }
+                    };
 
                     let today = chrono::Local::now().date_naive();
                     let oldest = today - chrono::Duration::days(60);

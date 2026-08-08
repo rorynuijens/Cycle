@@ -18,7 +18,7 @@ use crate::ai::context::{
     build_recent_session, extract_recommended_workout, icu_activity_to_recent_session,
     strip_recommended_line, wellness_snapshots, workouts_as_options, ICU_PREFIX,
 };
-use crate::data::{athlete::AthleteProfile, db, keystore, workout::Workout};
+use crate::data::{ai_cache, athlete::AthleteProfile, db, keystore, workout::Workout};
 use crate::training::fitness::compute_load_metrics;
 use crate::ui::markdown::to_pango;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
@@ -602,18 +602,17 @@ fn cache_suggestion(
     name: String,
     detail: String,
 ) {
-    let pool = pool.clone();
-    rt_handle.spawn(async move {
-        for (key, value) in [
-            ("ai.suggestion_response", response),
-            ("ai.suggestion_workout_name", name),
-            ("ai.suggestion_workout_detail", detail),
-        ] {
-            if let Err(e) = db::set_setting(&pool, key, &value).await {
-                tracing::error!("Could not cache {key}: {e}");
-            }
-        }
-    });
+    let suggestion = ai_cache::CachedSuggestion {
+        response,
+        workout_name: name,
+        workout_detail: detail,
+    };
+    crate::ui::spawn_write(
+        rt_handle,
+        pool,
+        "the coach's suggestion",
+        move |pool| async move { ai_cache::save_suggestion(&pool, &suggestion).await },
+    );
 }
 
 #[cfg(test)]

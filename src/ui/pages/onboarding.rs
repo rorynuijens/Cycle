@@ -3,6 +3,7 @@ use sqlx::SqlitePool;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use crate::data::settings;
 use crate::data::{db, keystore};
 
 /// Show the first-use setup wizard as a modal `adw::Dialog`.
@@ -174,8 +175,8 @@ pub fn show(
     if let Ok(Some(v)) = keystore::get_secret(keystore::KEY_INTERVALS_API) {
         icu_key_row.set_text(&v);
     }
-    if let Ok(Some(v)) = rt_handle.block_on(db::get_setting(&pool, "intervals.athlete_id")) {
-        icu_id_row.set_text(&v);
+    if let Ok(intervals) = rt_handle.block_on(settings::load_intervals(&pool)) {
+        icu_id_row.set_text(&intervals.athlete_id);
     }
 
     icu_group.add(&icu_key_row);
@@ -364,7 +365,7 @@ pub fn show(
             }
             let p = pool_i.clone();
             rt_i.spawn(async move {
-                let _ = db::set_setting(&p, "intervals.athlete_id", &id).await;
+                let _ = settings::set_intervals_athlete_id(&p, &id).await;
             });
             nav.push(&ai_page);
         });
@@ -387,7 +388,7 @@ pub fn show(
             let p = pool_f.clone();
             let rt = rt_f.clone();
             rt.spawn(async move {
-                let _ = db::set_setting(&p, "first_use_complete", "1").await;
+                let _ = settings::mark_first_use_complete(&p).await;
             });
             dialog_f.close();
             on_complete_f();

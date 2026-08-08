@@ -3,7 +3,6 @@
 mod athlete;
 mod data;
 mod integrations;
-mod settings;
 mod training;
 
 use adw::prelude::*;
@@ -11,8 +10,7 @@ use sqlx::SqlitePool;
 use std::rc::Rc;
 
 use crate::data::athlete::AthleteProfile;
-
-use settings::{load_settings, PreferenceSettings};
+use crate::data::settings::{self, IntervalsSettings, TrainingSettings};
 
 /// Create and present the modal preferences window.
 ///
@@ -43,14 +41,20 @@ pub fn show(
     let rt_build = rt_handle.clone();
     crate::ui::spawn_to_main(
         &rt_handle,
-        async move { load_settings(&pool_load).await },
+        async move {
+            Ok::<_, anyhow::Error>((
+                settings::load_training(&pool_load).await?,
+                settings::load_intervals(&pool_load).await?,
+            ))
+        },
         move |result| match result {
-            Ok(settings) => build_and_present(
+            Ok((training_settings, intervals_settings)) => build_and_present(
                 &parent,
                 athlete,
                 pool,
                 rt_build,
-                settings,
+                training_settings,
+                intervals_settings,
                 on_saved,
                 on_erg_rate_changed,
                 on_sim_changed,
@@ -78,7 +82,8 @@ fn build_and_present(
     athlete: AthleteProfile,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
-    settings: PreferenceSettings,
+    training_settings: TrainingSettings,
+    intervals_settings: IntervalsSettings,
     on_saved: impl Fn(AthleteProfile) + 'static,
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
@@ -98,7 +103,7 @@ fn build_and_present(
         Rc::new(on_saved),
     ));
     win.add(&training::build(
-        &settings,
+        &training_settings,
         pool.clone(),
         rt_handle.clone(),
         on_erg_rate_changed,
@@ -106,7 +111,7 @@ fn build_and_present(
     ));
     win.add(&integrations::build(
         &win,
-        &settings,
+        &intervals_settings,
         pool.clone(),
         rt_handle.clone(),
     ));

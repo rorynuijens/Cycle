@@ -8,10 +8,10 @@ use chrono::{Duration, Local};
 use gtk::glib;
 use sqlx::SqlitePool;
 
+use crate::data::settings::{self, IntervalsSettings};
 use crate::data::{db, keystore};
+use crate::ui::spawn_write;
 use crate::ui::widgets::api_key_row::ApiKeyRow;
-
-use super::settings::PreferenceSettings;
 
 /// How far back "Sync Now" pulls activities.
 const ACTIVITY_SYNC_DAYS: i64 = 90;
@@ -38,25 +38,10 @@ fn sync_summary(activities: usize, wellness: usize) -> String {
     }
 }
 
-/// Store a boolean Intervals.icu toggle.
-fn save_flag(
-    pool: &SqlitePool,
-    rt_handle: &tokio::runtime::Handle,
-    key: &'static str,
-    enabled: bool,
-) {
-    let pool = pool.clone();
-    rt_handle.spawn(async move {
-        if let Err(e) = db::set_setting(&pool, key, if enabled { "1" } else { "0" }).await {
-            tracing::error!("save {key} failed: {e}");
-        }
-    });
-}
-
 /// Build the Integrations page.
 pub fn build(
     win: &adw::PreferencesWindow,
-    settings: &PreferenceSettings,
+    intervals: &IntervalsSettings,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
 ) -> adw::PreferencesPage {
@@ -78,7 +63,7 @@ pub fn build(
         .title("Athlete ID")
         .show_apply_button(true)
         .build();
-    id_row.set_text(&settings.icu_athlete_id);
+    id_row.set_text(&intervals.athlete_id);
     icu_group.add(&id_row);
 
     let icu_key = ApiKeyRow::new(win, "API Key", keystore::KEY_INTERVALS_API);
@@ -87,14 +72,14 @@ pub fn build(
     let upload_row = adw::SwitchRow::builder()
         .title("Upload sessions")
         .subtitle("Automatically upload completed workouts to Intervals.icu")
-        .active(settings.icu_upload)
+        .active(intervals.upload)
         .build();
     icu_group.add(&upload_row);
 
     let sync_row = adw::SwitchRow::builder()
         .title("Sync activities")
         .subtitle("Include Intervals.icu activities in training load (CTL/ATL/TSB)")
-        .active(settings.icu_sync)
+        .active(intervals.sync)
         .build();
     icu_group.add(&sync_row);
 
@@ -155,26 +140,38 @@ pub fn build(
         let rt_handle = rt_handle.clone();
         id_row.connect_apply(move |row| {
             let value = row.text().trim().to_string();
-            let pool = pool.clone();
-            rt_handle.spawn(async move {
-                if let Err(e) = db::set_setting(&pool, "intervals.athlete_id", &value).await {
-                    tracing::error!("save intervals.athlete_id failed: {e}");
-                }
-            });
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the Intervals.icu athlete ID",
+                |pool| async move { settings::set_intervals_athlete_id(&pool, &value).await },
+            );
         });
     }
     {
         let pool = pool.clone();
         let rt_handle = rt_handle.clone();
         upload_row.connect_active_notify(move |row| {
-            save_flag(&pool, &rt_handle, "intervals.upload", row.is_active())
+            let on = row.is_active();
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the upload setting",
+                move |pool| async move { settings::set_intervals_upload(&pool, on).await },
+            );
         });
     }
     {
         let pool = pool.clone();
         let rt_handle = rt_handle.clone();
         sync_row.connect_active_notify(move |row| {
-            save_flag(&pool, &rt_handle, "intervals.sync", row.is_active())
+            let on = row.is_active();
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the sync setting",
+                move |pool| async move { settings::set_intervals_sync(&pool, on).await },
+            );
         });
     }
 
@@ -240,9 +237,9 @@ fn connect_library(
         crate::ui::spawn_to_main(
             &rt_handle,
             async move {
-                db::get_setting(&pool_id, "intervals.athlete_id")
+                settings::load_intervals(&pool_id)
                     .await
-                    .unwrap_or(None)
+                    .map(|s| s.athlete_id)
                     .unwrap_or_default()
             },
             move |athlete_id| {

@@ -6,6 +6,7 @@ use chrono::{Datelike, Duration, Local, NaiveDate};
 use sqlx::SqlitePool;
 use std::rc::Rc;
 
+use crate::data::ai_cache;
 use crate::data::db::{self, CalendarEntry};
 use crate::data::workout::Workout;
 use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
@@ -78,7 +79,7 @@ pub fn show_schedule_dialog(
         let names_ai: Vec<String> = workouts.iter().map(|w| w.name.clone()).collect();
         crate::ui::spawn_to_main(
             &rt_handle,
-            async move { db::get_setting(&pool_ai, "ai.suggestion_workout_name").await },
+            async move { ai_cache::suggestion_workout_name(&pool_ai).await },
             move |result| {
                 let suggestion = match result {
                     Ok(Some(name)) if !name.trim().is_empty() => name,

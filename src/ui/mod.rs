@@ -131,6 +131,32 @@ pub fn spawn_to_main<T, Fut>(
     });
 }
 
+/// Run a database write on the tokio runtime, logging a failure rather than
+/// surfacing it.
+///
+/// Settings writes from the UI are fire-and-forget: the value is already showing
+/// in the widget the rider is looking at, and usually already applied to the
+/// running engine, so a failed write earns a log line rather than a dialog.
+/// `what` completes the sentence "Could not save …".
+///
+/// Several pages had each grown their own copy of this.
+pub fn spawn_write<F, Fut>(
+    rt: &tokio::runtime::Handle,
+    pool: &sqlx::SqlitePool,
+    what: &'static str,
+    write: F,
+) where
+    F: FnOnce(sqlx::SqlitePool) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    let pool = pool.clone();
+    rt.spawn(async move {
+        if let Err(e) = write(pool).await {
+            tracing::error!("Could not save {what}: {e}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,29 +7,12 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 use std::rc::Rc;
 
-use crate::data::db;
-
-use super::settings::PreferenceSettings;
-
-/// Store a numeric training setting, logging rather than surfacing a failure —
-/// the value is already applied to the running engine either way.
-fn save_setting(
-    pool: &SqlitePool,
-    rt_handle: &tokio::runtime::Handle,
-    key: &'static str,
-    value: u32,
-) {
-    let pool = pool.clone();
-    rt_handle.spawn(async move {
-        if let Err(e) = db::set_setting(&pool, key, &value.to_string()).await {
-            tracing::error!("save {key} failed: {e}");
-        }
-    });
-}
+use crate::data::settings::{self, TrainingSettings};
+use crate::ui::spawn_write;
 
 /// Build the Training page.
 pub fn build(
-    settings: &PreferenceSettings,
+    settings: &TrainingSettings,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
     on_erg_rate_changed: impl Fn(u32) + 'static,
@@ -47,7 +30,7 @@ pub fn build(
              Lower values feel smoother; set to 0 for an instant step change.",
         )
         .build();
-    let ramp_adj = gtk::Adjustment::new(settings.erg_ramp_rate, 0.0, 100.0, 1.0, 5.0, 0.0);
+    let ramp_adj = gtk::Adjustment::new(settings.erg_ramp_rate as f64, 0.0, 100.0, 1.0, 5.0, 0.0);
     let ramp_row = adw::SpinRow::new(Some(&ramp_adj), 1.0, 0);
     ramp_row.set_title("Ramp Rate");
     ramp_row.set_subtitle("Watts per second (0 = instant)");
@@ -61,13 +44,27 @@ pub fn build(
              Lower the difficulty if steep climbs force you out of gears.",
         )
         .build();
-    let difficulty_adj = gtk::Adjustment::new(settings.sim_difficulty, 0.0, 100.0, 5.0, 10.0, 0.0);
+    let difficulty_adj = gtk::Adjustment::new(
+        settings.sim_difficulty_pct as f64,
+        0.0,
+        100.0,
+        5.0,
+        10.0,
+        0.0,
+    );
     let difficulty_row = adw::SpinRow::new(Some(&difficulty_adj), 5.0, 0);
     difficulty_row.set_title("Trainer Difficulty");
     difficulty_row.set_subtitle("Percentage of the real gradient sent to the trainer");
     sim_group.add(&difficulty_row);
 
-    let max_grade_adj = gtk::Adjustment::new(settings.sim_max_gradient, 5.0, 20.0, 1.0, 5.0, 0.0);
+    let max_grade_adj = gtk::Adjustment::new(
+        settings.sim_max_gradient_pct as f64,
+        5.0,
+        20.0,
+        1.0,
+        5.0,
+        0.0,
+    );
     let max_grade_row = adw::SpinRow::new(Some(&max_grade_adj), 1.0, 0);
     max_grade_row.set_title("Maximum Gradient");
     max_grade_row.set_subtitle("Climbs steeper than this are capped (%)");
@@ -80,7 +77,12 @@ pub fn build(
         ramp_row.connect_value_notify(move |row| {
             let rate = row.value() as u32;
             on_erg_rate_changed(rate);
-            save_setting(&pool, &rt_handle, "training.erg_ramp_rate", rate);
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the ERG ramp rate",
+                move |pool| async move { settings::set_erg_ramp_rate(&pool, rate).await },
+            );
         });
     }
 
@@ -92,8 +94,22 @@ pub fn build(
         let rt_handle = rt_handle.clone();
         Rc::new(move |difficulty, max_gradient| {
             on_sim_changed(difficulty, max_gradient);
-            save_setting(&pool, &rt_handle, "training.sim_difficulty", difficulty);
-            save_setting(&pool, &rt_handle, "training.sim_max_gradient", max_gradient);
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the SIM difficulty",
+                move |pool| async move {
+                    settings::set_sim_difficulty_pct(&pool, difficulty as f32).await
+                },
+            );
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the maximum gradient",
+                move |pool| async move {
+                    settings::set_sim_max_gradient_pct(&pool, max_gradient as f32).await
+                },
+            );
         })
     };
 

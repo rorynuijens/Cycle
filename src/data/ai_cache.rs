@@ -10,10 +10,6 @@
 //! The morning briefing is the clearest case: it is stored alongside the date it
 //! was written for precisely so a stale one can be recognised and replaced.
 
-// As with `super::settings`: lands ahead of its callers, and the allow comes off
-// with the call-site migration.
-#![allow(dead_code)]
-
 use anyhow::Result;
 use sqlx::SqlitePool;
 
@@ -100,6 +96,13 @@ pub async fn suggestion_workout_name(pool: &SqlitePool) -> Result<Option<String>
 /// happens independently of a full suggestion being generated.
 pub async fn set_suggestion_workout_name(pool: &SqlitePool, name: &str) -> Result<()> {
     db::set_setting(pool, keys::SUGGESTION_WORKOUT_NAME, name).await
+}
+
+/// The description belongs to whichever workout the name names, so it is
+/// rewritten whenever the name is — otherwise a card ends up titled with one
+/// workout and described with another.
+pub async fn set_suggestion_workout_detail(pool: &SqlitePool, detail: &str) -> Result<()> {
+    db::set_setting(pool, keys::SUGGESTION_WORKOUT_DETAIL, detail).await
 }
 
 // ── Fitness insight ──────────────────────────────────────────────────────────

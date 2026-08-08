@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use sqlx::SqlitePool;
 
-use crate::data::db;
+use crate::data::{ai_cache, db, settings};
 use crate::training::analytics::WELLNESS_WINDOW_DAYS;
 
 /// Everything the page's charts are drawn from, loaded in one pass.
@@ -30,9 +30,7 @@ pub async fn load_fitness_data(pool: &SqlitePool) -> anyhow::Result<FitnessData>
         icu_activities: db::load_unlinked_intervals_activities(pool).await?,
         wellness: db::load_wellness_recent(pool, WELLNESS_WINDOW_DAYS as u32).await?,
         run_streams: db::load_run_activity_streams(pool).await?,
-        cached_insight: db::get_setting(pool, "ai.fitness_insight")
-            .await?
-            .unwrap_or_default(),
+        cached_insight: ai_cache::fitness_insight(pool).await?.unwrap_or_default(),
     })
 }
 
@@ -59,9 +57,7 @@ pub async fn load_fitness_prompt_data(pool: &SqlitePool) -> anyhow::Result<Fitne
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
         icu_count: db::count_intervals_activities(pool).await? as usize,
         wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS).await?,
-        athlete_context: db::get_setting(pool, "coaching.athlete_context")
-            .await?
-            .unwrap_or_default(),
+        athlete_context: settings::coaching_context(pool).await?,
     })
 }
 
@@ -97,8 +93,6 @@ pub async fn load_retro_prompt_data(
         )
         .await?,
         all_records: db::load_session_records(pool).await?,
-        athlete_context: db::get_setting(pool, "coaching.athlete_context")
-            .await?
-            .unwrap_or_default(),
+        athlete_context: settings::coaching_context(pool).await?,
     })
 }

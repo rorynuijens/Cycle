@@ -7,7 +7,8 @@ use std::rc::Rc;
 
 use sqlx::SqlitePool;
 
-use crate::data::{athlete::AthleteProfile, db};
+use crate::data::athlete::AthleteProfile;
+use crate::data::settings;
 use crate::training::engine::WorkoutEngine;
 
 /// Register the app-wide actions and their accelerators.
@@ -101,11 +102,12 @@ pub fn connect_close(
     window.connect_close_request(move |win| {
         let width = win.width();
         let height = win.height();
-        let p = pool_close.clone();
-        rt_close.spawn(async move {
-            let _ = db::set_setting(&p, "window.width", &width.to_string()).await;
-            let _ = db::set_setting(&p, "window.height", &height.to_string()).await;
-        });
+        crate::ui::spawn_write(
+            &rt_close,
+            &pool_close,
+            "the window size",
+            move |pool| async move { settings::set_window_size(&pool, width, height).await },
+        );
 
         if !workout_active_close.get() && !route_active_close.get() {
             return glib::Propagation::Proceed;

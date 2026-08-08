@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 use crate::data::athlete::power_zone_index;
 use crate::data::db;
 use crate::data::keystore;
+use crate::data::settings;
 use crate::data::sport::is_run;
 use crate::data::streams::ActivityStreams;
 use crate::data::workout::Workout;
@@ -474,8 +475,8 @@ pub fn show_intervals_detail(
                     // The athlete ID is read here, not on the GTK thread: a
                     // block_on against SQLite stalls the GLib loop whenever the
                     // database is busy (CLAUDE.md §2.3).
-                    let athlete_id = match db::get_setting(&pool, "intervals.athlete_id").await {
-                        Ok(Some(id)) if !id.is_empty() => id,
+                    let athlete_id = match settings::load_intervals(&pool).await {
+                        Ok(s) if !s.athlete_id.is_empty() => s.athlete_id,
                         Ok(_) => {
                             tx.send(Err(anyhow::anyhow!(
                                 "Intervals.icu credentials not set — configure in Preferences"
