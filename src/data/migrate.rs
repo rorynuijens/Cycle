@@ -55,6 +55,13 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     }
 
     if found == 0 {
+        // A database that already holds tables is being adopted, not created, and
+        // the baseline may still add columns to it. Snapshot first; `snapshot`
+        // returns None, and writes nothing, for a database that is genuinely new.
+        crate::data::backup::snapshot(pool, &format!("v{BASELINE_VERSION}"))
+            .await
+            .context("refusing to touch the schema without a snapshot first")?;
+
         // Every statement here is idempotent, so this needs no transaction: a run
         // interrupted halfway leaves the version at 0 and simply repeats next time.
         establish_baseline(pool)
@@ -82,12 +89,25 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
 }
 
 /// Apply one migration and record it, both or neither.
+///
+/// The snapshot lives here rather than at the call site so that adding a
+/// migration cannot forget it: a schema change without a copy of what it is
+/// about to change is the case this whole module exists to prevent.
 async fn apply(pool: &SqlitePool, migration: &Migration) -> Result<()> {
     tracing::info!(
         "Applying schema v{} ({})",
         migration.version,
         migration.name
     );
+    crate::data::backup::snapshot(pool, &format!("v{}", migration.version))
+        .await
+        .with_context(|| {
+            format!(
+                "refusing to apply schema v{} without a snapshot first",
+                migration.version
+            )
+        })?;
+
     let mut tx = pool.begin().await?;
     for statement in migration.statements {
         sqlx::query(statement)
