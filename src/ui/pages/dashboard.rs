@@ -813,7 +813,7 @@ impl DashboardPage {
                     };
                     let prompt = build_briefing_prompt(&ctx);
 
-                    let r = get_suggestion(&api_key, &prompt, 1200)
+                    let r = get_suggestion(&api_key, &prompt, 1600)
                         .await
                         .map(|text| (text, planned_name_for_align, has_planned))
                         .map_err(|e| {

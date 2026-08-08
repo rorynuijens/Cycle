@@ -419,7 +419,7 @@ impl SuggestionCard {
                         .collect(),
                 };
 
-                let result = get_suggestion(&api_key, &build_prompt(&ctx), 1024)
+                let result = get_suggestion(&api_key, &build_prompt(&ctx), 1400)
                     .await
                     .map(|text| (text, icu_workouts))
                     .map_err(|e| {

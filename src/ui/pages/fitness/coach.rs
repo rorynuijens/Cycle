@@ -449,7 +449,7 @@ impl CoachCard {
                     wellness: wellness_snapshots(&wellness),
                 };
 
-                let result = get_suggestion(&api_key, &build_fitness_prompt(&ctx), 1024)
+                let result = get_suggestion(&api_key, &build_fitness_prompt(&ctx), 1400)
                     .await
                     .map_err(|e| {
                         tracing::error!("AI fitness analysis failed: {e}");
@@ -588,7 +588,7 @@ impl CoachCard {
                     athlete_context,
                 };
 
-                let result = get_suggestion(&api_key, &build_retrospective_prompt(&ctx), 1500)
+                let result = get_suggestion(&api_key, &build_retrospective_prompt(&ctx), 2048)
                     .await
                     .map_err(|e| {
                         tracing::error!("AI retrospective failed: {e}");

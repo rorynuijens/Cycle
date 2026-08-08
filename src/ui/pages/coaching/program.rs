@@ -317,7 +317,7 @@ impl ProgramSection {
                     num_weeks,
                 };
 
-                let result = get_suggestion(&api_key, &build_program_prompt(&ctx), 2048)
+                let result = get_suggestion(&api_key, &build_program_prompt(&ctx), 2800)
                     .await
                     .map(|text| (text, icu_workouts))
                     .map_err(|e| {

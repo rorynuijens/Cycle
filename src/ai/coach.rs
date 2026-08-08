@@ -544,7 +544,27 @@ pub fn parse_program_response(text: &str) -> Vec<ProgramEntry> {
 struct ClaudeRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    /// Sent explicitly rather than left out. Sonnet 5 runs adaptive thinking
+    /// when this field is absent — where Sonnet 4.6 ran without it — and
+    /// `max_tokens` caps thinking and answer *together*. A coach reply budgeted
+    /// at 1024 tokens could then be spent reasoning, and the rider would get a
+    /// truncated answer, or none at all.
+    thinking: Thinking,
     messages: Vec<ClaudeMessage<'a>>,
+}
+
+/// The request's thinking setting. Only the disabled form is constructed here;
+/// turning thinking on means raising every caller's `max_tokens` to match.
+#[derive(Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl Thinking {
+    fn disabled() -> Self {
+        Self { kind: "disabled" }
+    }
 }
 
 #[derive(Serialize)]
@@ -565,7 +585,9 @@ struct ContentBlock {
     text: Option<String>,
 }
 
-const CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+/// Sonnet 5 — the like-for-like successor to the Sonnet 4.6 this app was built
+/// against, keeping the Sonnet price tier the rider pays for on their own key.
+const CLAUDE_MODEL: &str = "claude-sonnet-5";
 
 /// POST to the Claude API and return the text response.
 pub async fn get_suggestion(api_key: &str, prompt: &str, max_tokens: u32) -> Result<String> {
@@ -578,6 +600,7 @@ pub async fn get_suggestion(api_key: &str, prompt: &str, max_tokens: u32) -> Res
     let body = ClaudeRequest {
         model: CLAUDE_MODEL,
         max_tokens,
+        thinking: Thinking::disabled(),
         messages: vec![ClaudeMessage {
             role: "user",
             content: prompt,
@@ -615,6 +638,46 @@ pub async fn get_suggestion(api_key: &str, prompt: &str, max_tokens: u32) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Request shape ────────────────────────────────────────────────────────
+
+    fn request_json() -> serde_json::Value {
+        serde_json::to_value(ClaudeRequest {
+            model: CLAUDE_MODEL,
+            max_tokens: 1024,
+            thinking: Thinking::disabled(),
+            messages: vec![ClaudeMessage {
+                role: "user",
+                content: "hello",
+            }],
+        })
+        .expect("request serialises")
+    }
+
+    #[test]
+    fn should_send_thinking_disabled_so_the_token_budget_is_all_answer() {
+        // Left out, Sonnet 5 thinks by default and spends the same max_tokens
+        // doing it — which is how a coach reply comes back truncated or empty.
+        assert_eq!(request_json()["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn should_request_a_current_model() {
+        // Guards the swap away from Sonnet 4.6; `-4-` catches a slip back to
+        // any 4.x id without pinning this test to one specific model name.
+        assert!(
+            !CLAUDE_MODEL.contains("-4-"),
+            "CLAUDE_MODEL is still on a 4.x model: {CLAUDE_MODEL}"
+        );
+    }
+
+    #[test]
+    fn should_send_the_prompt_as_a_single_user_message() {
+        let json = request_json();
+        assert_eq!(json["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["messages"][0]["content"], "hello");
+    }
 
     fn goal(desc: &str) -> AthleteGoal {
         AthleteGoal {
