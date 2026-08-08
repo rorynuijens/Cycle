@@ -50,13 +50,7 @@ pub async fn open() -> Result<SqlitePool> {
 }
 
 fn xdg_data_path() -> Result<std::path::PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(home).join(".local/share")
-        });
-    Ok(base.join("cycle").join("cycle.db"))
+    Ok(crate::data::paths::data_dir().join("cycle.db"))
 }
 
 async fn migrate(pool: &SqlitePool) -> Result<()> {
@@ -975,13 +969,7 @@ pub struct SavedRoute {
 
 /// Directory holding saved GPX files, created on first use.
 pub fn routes_dir() -> Result<std::path::PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(home).join(".local/share")
-        });
-    let dir = base.join("cycle").join("routes");
+    let dir = crate::data::paths::data_dir().join("routes");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

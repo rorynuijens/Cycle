@@ -753,13 +753,7 @@ pub fn write_session_fit(path: &Path, session: &Session, athlete: &AthleteProfil
 
 /// Write the FIT file to `~/.local/share/cycle/exports/` and return the path.
 pub fn export_to_xdg_path(session: &Session, athlete: &AthleteProfile) -> Result<PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(home).join(".local/share")
-        });
-    let exports_dir = base.join("cycle").join("exports");
+    let exports_dir = crate::data::paths::data_dir().join("exports");
     std::fs::create_dir_all(&exports_dir)?;
     let ts = session.started_at.format("%Y-%m-%d_%H%M%S").to_string();
     let path = exports_dir.join(format!("workout_{}.fit", ts));
