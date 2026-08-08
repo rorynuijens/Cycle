@@ -50,16 +50,9 @@ pub async fn snapshot(pool: &SqlitePool, label: &str) -> Result<Option<PathBuf>>
     let dir = db_path.parent().unwrap_or(Path::new(".")).to_owned();
     let target = dir.join(snapshot_name(&file_name, label, Local::now()));
 
-    // VACUUM INTO refuses to overwrite, which is the behaviour we want: a name
-    // collision means something is wrong, and silently replacing a snapshot is
-    // the opposite of the point.
-    sqlx::query(&format!(
-        "VACUUM INTO {}",
-        quote_sql_string(&target.to_string_lossy())
-    ))
-    .execute(pool)
-    .await
-    .with_context(|| format!("could not snapshot the database to {}", target.display()))?;
+    vacuum_into(pool, &target)
+        .await
+        .with_context(|| format!("could not snapshot the database to {}", target.display()))?;
 
     tracing::info!("Database snapshot written: {}", target.display());
 
@@ -72,8 +65,24 @@ pub async fn snapshot(pool: &SqlitePool, label: &str) -> Result<Option<PathBuf>>
     Ok(Some(target))
 }
 
+/// Write a complete, consistent copy of the database to `target`.
+///
+/// `VACUUM INTO` refuses to overwrite an existing file, which is the behaviour
+/// wanted in both callers: a name collision means something unexpected is going
+/// on, and silently replacing a copy of somebody's history is the opposite of
+/// the point.
+pub(crate) async fn vacuum_into(pool: &SqlitePool, target: &Path) -> Result<()> {
+    sqlx::query(&format!(
+        "VACUUM INTO {}",
+        quote_sql_string(&target.to_string_lossy())
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// The file backing the `main` database, or `None` when it is in memory.
-async fn main_db_path(pool: &SqlitePool) -> Result<Option<PathBuf>> {
+pub(crate) async fn main_db_path(pool: &SqlitePool) -> Result<Option<PathBuf>> {
     let rows = sqlx::query("PRAGMA database_list")
         .fetch_all(pool)
         .await

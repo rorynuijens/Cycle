@@ -12,4 +12,5 @@ pub mod route;
 pub mod session;
 pub mod sport;
 pub mod streams;
+pub mod transfer;
 pub mod workout;

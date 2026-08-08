@@ -1,6 +1,7 @@
-//! The preferences window: three pages, each writing through as it changes.
+//! The preferences window: four pages, each writing through as it changes.
 
 mod athlete;
+mod data;
 mod integrations;
 mod settings;
 mod training;
@@ -103,7 +104,13 @@ fn build_and_present(
         on_erg_rate_changed,
         on_sim_changed,
     ));
-    win.add(&integrations::build(&win, &settings, pool, rt_handle));
+    win.add(&integrations::build(
+        &win,
+        &settings,
+        pool.clone(),
+        rt_handle.clone(),
+    ));
+    win.add(&data::build(&win, parent, pool, rt_handle));
 
     win.present();
 }
