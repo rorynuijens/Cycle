@@ -1,3 +1,4 @@
+pub mod ai_cache;
 pub mod athlete;
 pub mod backup;
 pub mod calendar;
@@ -10,6 +11,7 @@ pub mod migrate;
 pub mod paths;
 pub mod route;
 pub mod session;
+pub mod settings;
 pub mod sport;
 pub mod streams;
 pub mod transfer;
