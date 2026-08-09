@@ -10,6 +10,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 
 use crate::data::session::{LiveReadings, ReadingSource};
+use crate::devices::ant::AntDevice;
 use crate::devices::ftms::{
     compute_cadence_rpm, parse_csc_measurement, parse_cycling_power_measurement,
     parse_hr_measurement, parse_indoor_bike_data, request_control_command, set_simulation_command,
@@ -253,10 +254,24 @@ impl DeviceManager {
 
                         DeviceCommand::Connect { address } => {
                             // ANT+ devices are handled by the ANT thread, not btleplug.
-                            if address.starts_with("ant:") {
-                                let _ = ant_tx.send(crate::devices::ant::AntCommand::Connect);
-                                ant_connected = true;
-                                continue;
+                            match crate::devices::ant::classify_address(&address) {
+                                Some(AntDevice::Trainer) => {
+                                    let _ = ant_tx
+                                        .send(crate::devices::ant::AntCommand::ConnectTrainer);
+                                    ant_connected = true;
+                                    continue;
+                                }
+                                Some(AntDevice::HeartRate) => {
+                                    // Broadcast-only: live the moment it is heard, and
+                                    // the ANT thread has already said so.
+                                    tracing::debug!("Connect: {address} is broadcast-only");
+                                    continue;
+                                }
+                                Some(AntDevice::Unknown) => {
+                                    tracing::warn!("Connect: unknown ANT+ address {address}");
+                                    continue;
+                                }
+                                None => {}
                             }
                             // BlueZ removes Connect() from the D-Bus interface while a
                             // scan is active — stop scanning before attempting to connect.
@@ -607,10 +622,25 @@ impl DeviceManager {
                         }
 
                         DeviceCommand::Disconnect { address } => {
-                            if address.starts_with("ant:") {
-                                let _ = ant_tx.send(crate::devices::ant::AntCommand::Disconnect);
-                                ant_connected = false;
-                                continue;
+                            // Each ANT+ device comes down on its own — dropping one
+                            // must not take the rest of the stick with it.
+                            match crate::devices::ant::classify_address(&address) {
+                                Some(AntDevice::Trainer) => {
+                                    let _ = ant_tx
+                                        .send(crate::devices::ant::AntCommand::DisconnectTrainer);
+                                    ant_connected = false;
+                                    continue;
+                                }
+                                Some(AntDevice::HeartRate) => {
+                                    let _ =
+                                        ant_tx.send(crate::devices::ant::AntCommand::DisconnectHr);
+                                    continue;
+                                }
+                                Some(AntDevice::Unknown) => {
+                                    tracing::warn!("Disconnect: unknown ANT+ address {address}");
+                                    continue;
+                                }
+                                None => {}
                             }
                             if trainer_address.as_deref() == Some(address.as_str()) {
                                 if let Some(ref p) = trainer {

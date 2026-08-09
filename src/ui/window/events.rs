@@ -6,6 +6,7 @@
 
 use gtk::glib;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -29,6 +30,11 @@ pub fn start_polling(
     trainer_addr: Rc<RefCell<Option<String>>>,
     sim_capable: Rc<Cell<bool>>,
 ) {
+    // Last connection state announced per address. A device driver that repeats
+    // itself must not be able to toast the rider twice, or — worse — drive the
+    // Devices page into restarting a scan on every repeat.
+    let mut last_connection: HashMap<String, bool> = HashMap::new();
+
     glib::timeout_add_local(POLL_INTERVAL, move || {
         while let Ok(event) = event_rx.try_recv() {
             match event {
@@ -52,6 +58,9 @@ pub fn start_polling(
                     connected,
                     device_type,
                 } => {
+                    if last_connection.insert(address.clone(), connected) == Some(connected) {
+                        continue; // nothing changed — no toast, no rescan
+                    }
                     let display_name = devices_for_loop.borrow().display_name_for(&address);
                     devices_for_loop.borrow_mut().on_connection_changed(
                         address.clone(),
