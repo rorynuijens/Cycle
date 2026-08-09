@@ -114,6 +114,11 @@ pub fn reload_closure(
                             .margin_end(18)
                             .build();
                         let entry = adw::EntryRow::builder().title("Name").build();
+                        // AdwEntryRow only emits `apply` — which is what Enter is
+                        // routed to — when the apply button is enabled. Without
+                        // this, connect_apply below never fires and Enter does
+                        // nothing but leave the dialog open.
+                        entry.set_show_apply_button(true);
                         entry.set_text(&current_name);
                         group.add(&entry);
                         toolbar.set_content(Some(&group));
