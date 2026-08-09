@@ -217,87 +217,91 @@ fn connect_library(
     let rt_handle = rt_handle.clone();
     let spinner = spinner.clone();
     let lib_row = lib_row.clone();
-    let win = win.clone();
 
-    button.connect_clicked(move |btn| {
-        let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
-            .unwrap_or(None)
-            .unwrap_or_default();
+    // Weak: this button lives inside the preferences window (CLAUDE.md §2.4).
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |btn| {
+            let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
+                .unwrap_or(None)
+                .unwrap_or_default();
 
-        // Read the athlete ID off the main thread (CLAUDE.md §2.3); the
-        // credential check, spinner and sync all follow on arrival.
-        let pool_id = pool.clone();
-        let pool_sync = pool.clone();
-        let rt_sync = rt_handle.clone();
-        let spinner = spinner.clone();
-        let lib_row = lib_row.clone();
-        let win = win.clone();
-        let btn = btn.clone();
+            // Read the athlete ID off the main thread (CLAUDE.md §2.3); the
+            // credential check, spinner and sync all follow on arrival.
+            let pool_id = pool.clone();
+            let pool_sync = pool.clone();
+            let rt_sync = rt_handle.clone();
+            let spinner = spinner.clone();
+            let lib_row = lib_row.clone();
+            let win = win.clone();
+            let btn = btn.clone();
 
-        crate::ui::spawn_to_main(
-            &rt_handle,
-            async move {
-                settings::load_intervals(&pool_id)
-                    .await
-                    .map(|s| s.athlete_id)
-                    .unwrap_or_default()
-            },
-            move |athlete_id| {
-                if api_key.trim().is_empty() || athlete_id.trim().is_empty() {
-                    win.add_toast(
-                        adw::Toast::builder()
-                            .title("Set your Intervals.icu API key and Athlete ID above first")
-                            .timeout(5)
-                            .build(),
-                    );
-                    return;
-                }
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move {
+                    settings::load_intervals(&pool_id)
+                        .await
+                        .map(|s| s.athlete_id)
+                        .unwrap_or_default()
+                },
+                move |athlete_id| {
+                    if api_key.trim().is_empty() || athlete_id.trim().is_empty() {
+                        win.add_toast(
+                            adw::Toast::builder()
+                                .title("Set your Intervals.icu API key and Athlete ID above first")
+                                .timeout(5)
+                                .build(),
+                        );
+                        return;
+                    }
 
-                btn.set_sensitive(false);
-                spinner.set_visible(true);
-                spinner.start();
+                    btn.set_sensitive(false);
+                    spinner.set_visible(true);
+                    spinner.start();
 
-                let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
-                let pool_task = pool_sync.clone();
-                rt_sync.spawn(async move {
-                    let result = sync_workout_library(&pool_task, &athlete_id, &api_key).await;
-                    let _ = tx.send(result).await;
-                });
+                    let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
+                    let pool_task = pool_sync.clone();
+                    rt_sync.spawn(async move {
+                        let result = sync_workout_library(&pool_task, &athlete_id, &api_key).await;
+                        let _ = tx.send(result).await;
+                    });
 
-                let btn = btn.clone();
-                let spinner = spinner.clone();
-                let lib_row = lib_row.clone();
-                let win = win.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(result) = rx.recv().await {
-                        match result {
-                            Ok(count) => {
-                                lib_row.set_subtitle(&library_subtitle(count as i64));
-                                win.add_toast(
-                                    adw::Toast::builder()
-                                        .title("Workout library synced")
-                                        .timeout(3)
-                                        .build(),
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!("Intervals.icu library sync failed: {e}");
-                                win.add_toast(
-                                    adw::Toast::builder()
-                                        .title("Library sync failed — check your credentials")
-                                        .timeout(5)
-                                        .build(),
-                                );
+                    let btn = btn.clone();
+                    let spinner = spinner.clone();
+                    let lib_row = lib_row.clone();
+                    let win = win.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Ok(result) = rx.recv().await {
+                            match result {
+                                Ok(count) => {
+                                    lib_row.set_subtitle(&library_subtitle(count as i64));
+                                    win.add_toast(
+                                        adw::Toast::builder()
+                                            .title("Workout library synced")
+                                            .timeout(3)
+                                            .build(),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!("Intervals.icu library sync failed: {e}");
+                                    win.add_toast(
+                                        adw::Toast::builder()
+                                            .title("Library sync failed — check your credentials")
+                                            .timeout(5)
+                                            .build(),
+                                    );
+                                }
                             }
                         }
-                    }
-                    spinner.stop();
-                    spinner.set_visible(false);
-                    btn.set_sensitive(true);
-                });
-            },
-        );
-    });
+                        spinner.stop();
+                        spinner.set_visible(false);
+                        btn.set_sensitive(true);
+                    });
+                },
+            );
+        }
+    ));
 }
 
 /// Replace the stored workout library with what Intervals.icu currently has.
@@ -345,61 +349,65 @@ fn connect_activity_sync(
     let rt_handle = rt_handle.clone();
     let spinner = spinner.clone();
     let id_row = id_row.clone();
-    let win = win.clone();
 
-    button.connect_clicked(move |btn| {
-        // Read the ID off the row rather than back out of the database: it is
-        // already on screen, it saves a blocking read on the GTK thread, and an
-        // ID just typed works without having to commit the row first.
-        let athlete_id = id_row.text().trim().to_string();
-        let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
-            .unwrap_or(None)
-            .unwrap_or_default();
+    // Weak: this button lives inside the preferences window (CLAUDE.md §2.4).
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |btn| {
+            // Read the ID off the row rather than back out of the database: it is
+            // already on screen, it saves a blocking read on the GTK thread, and an
+            // ID just typed works without having to commit the row first.
+            let athlete_id = id_row.text().trim().to_string();
+            let api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
+                .unwrap_or(None)
+                .unwrap_or_default();
 
-        if athlete_id.is_empty() || api_key.trim().is_empty() {
-            win.add_toast(
-                adw::Toast::builder()
-                    .title("Set your Athlete ID and API key first")
-                    .timeout(3)
-                    .build(),
-            );
-            return;
-        }
-
-        btn.set_sensitive(false);
-        spinner.set_visible(true);
-        spinner.start();
-
-        let (tx, rx) = async_channel::bounded::<Result<(usize, usize), String>>(1);
-        let pool_task = pool.clone();
-        rt_handle.spawn(async move {
-            let _ = tx
-                .send(sync_activities(&pool_task, &athlete_id, &api_key).await)
-                .await;
-        });
-
-        let btn = btn.clone();
-        let spinner = spinner.clone();
-        let win = win.clone();
-        glib::MainContext::default().spawn_local(async move {
-            if let Ok(result) = rx.recv().await {
-                let toast = match result {
-                    Ok((activities, wellness)) => adw::Toast::builder()
-                        .title(sync_summary(activities, wellness))
-                        .timeout(4)
+            if athlete_id.is_empty() || api_key.trim().is_empty() {
+                win.add_toast(
+                    adw::Toast::builder()
+                        .title("Set your Athlete ID and API key first")
+                        .timeout(3)
                         .build(),
-                    Err(e) => adw::Toast::builder()
-                        .title(format!("Sync failed: {e}"))
-                        .timeout(5)
-                        .build(),
-                };
-                win.add_toast(toast);
+                );
+                return;
             }
-            spinner.stop();
-            spinner.set_visible(false);
-            btn.set_sensitive(true);
-        });
-    });
+
+            btn.set_sensitive(false);
+            spinner.set_visible(true);
+            spinner.start();
+
+            let (tx, rx) = async_channel::bounded::<Result<(usize, usize), String>>(1);
+            let pool_task = pool.clone();
+            rt_handle.spawn(async move {
+                let _ = tx
+                    .send(sync_activities(&pool_task, &athlete_id, &api_key).await)
+                    .await;
+            });
+
+            let btn = btn.clone();
+            let spinner = spinner.clone();
+            let win = win.clone();
+            glib::MainContext::default().spawn_local(async move {
+                if let Ok(result) = rx.recv().await {
+                    let toast = match result {
+                        Ok((activities, wellness)) => adw::Toast::builder()
+                            .title(sync_summary(activities, wellness))
+                            .timeout(4)
+                            .build(),
+                        Err(e) => adw::Toast::builder()
+                            .title(format!("Sync failed: {e}"))
+                            .timeout(5)
+                            .build(),
+                    };
+                    win.add_toast(toast);
+                }
+                spinner.stop();
+                spinner.set_visible(false);
+                btn.set_sensitive(true);
+            });
+        }
+    ));
 }
 
 /// Pull activities and wellness, returning how many of each were stored.

@@ -58,56 +58,60 @@ fn export_row(
         .build();
     row.add_suffix(&button);
 
-    let win = win.clone();
-    button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Export Training History")
-            .accept_label("Export")
-            .initial_name(transfer::suggested_export_name(chrono::Local::now()))
-            .build();
-        dialog.set_filters(Some(&db_filters()));
+    // Weak: this button lives inside the preferences window (CLAUDE.md §2.4).
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Export Training History")
+                .accept_label("Export")
+                .initial_name(transfer::suggested_export_name(chrono::Local::now()))
+                .build();
+            dialog.set_filters(Some(&db_filters()));
 
-        let win_parent = win.clone();
-        let win_cb = win.clone();
-        let pool = pool.clone();
-        let rt_handle = rt_handle.clone();
-        dialog.save(
-            Some(&win_parent),
-            gtk::gio::Cancellable::NONE,
-            move |result| {
-                // A cancelled chooser is not a failure worth reporting.
-                let Ok(file) = result else { return };
-                let Some(path) = file.path() else {
-                    toast(&win_cb, "That location cannot be written to.");
-                    return;
-                };
-                // The chooser removes a file the rider agreed to replace, and
-                // VACUUM INTO will not write over one — so a leftover here is
-                // stale and ours to clear.
-                let _ = std::fs::remove_file(&path);
+            let win_parent = win.clone();
+            let win_cb = win.clone();
+            let pool = pool.clone();
+            let rt_handle = rt_handle.clone();
+            dialog.save(
+                Some(&win_parent),
+                gtk::gio::Cancellable::NONE,
+                move |result| {
+                    // A cancelled chooser is not a failure worth reporting.
+                    let Ok(file) = result else { return };
+                    let Some(path) = file.path() else {
+                        toast(&win_cb, "That location cannot be written to.");
+                        return;
+                    };
+                    // The chooser removes a file the rider agreed to replace, and
+                    // VACUUM INTO will not write over one — so a leftover here is
+                    // stale and ours to clear.
+                    let _ = std::fs::remove_file(&path);
 
-                let win_done = win_cb.clone();
-                let shown = path.clone();
-                crate::ui::spawn_to_main(
-                    &rt_handle,
-                    async move { transfer::export(&pool, &path).await },
-                    move |result| match result {
-                        Ok(()) => {
-                            let name = shown
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            toast(&win_done, &format!("Exported to {name}"));
-                        }
-                        Err(e) => {
-                            tracing::error!("History export failed: {e:#}");
-                            toast(&win_done, "Your history could not be exported.");
-                        }
-                    },
-                );
-            },
-        );
-    });
+                    let win_done = win_cb.clone();
+                    let shown = path.clone();
+                    crate::ui::spawn_to_main(
+                        &rt_handle,
+                        async move { transfer::export(&pool, &path).await },
+                        move |result| match result {
+                            Ok(()) => {
+                                let name = shown
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                toast(&win_done, &format!("Exported to {name}"));
+                            }
+                            Err(e) => {
+                                tracing::error!("History export failed: {e:#}");
+                                toast(&win_done, "Your history could not be exported.");
+                            }
+                        },
+                    );
+                },
+            );
+        }
+    ));
 
     row
 }
@@ -134,64 +138,68 @@ fn import_row(
         .build();
     row.add_suffix(&button);
 
-    let win = win.clone();
     let parent = parent.clone();
-    button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Import Training History")
-            .accept_label("Open")
-            .build();
-        dialog.set_filters(Some(&db_filters()));
+    // Weak: this button lives inside the preferences window (CLAUDE.md §2.4).
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Import Training History")
+                .accept_label("Open")
+                .build();
+            dialog.set_filters(Some(&db_filters()));
 
-        let win_parent = win.clone();
-        let win_cb = win.clone();
-        let parent = parent.clone();
-        let pool = pool.clone();
-        let rt_handle = rt_handle.clone();
-        dialog.open(
-            Some(&win_parent),
-            gtk::gio::Cancellable::NONE,
-            move |result| {
-                let Ok(file) = result else { return };
-                let Some(path) = file.path() else {
-                    toast(&win_cb, "That file cannot be read.");
-                    return;
-                };
+            let win_parent = win.clone();
+            let win_cb = win.clone();
+            let parent = parent.clone();
+            let pool = pool.clone();
+            let rt_handle = rt_handle.clone();
+            dialog.open(
+                Some(&win_parent),
+                gtk::gio::Cancellable::NONE,
+                move |result| {
+                    let Ok(file) = result else { return };
+                    let Some(path) = file.path() else {
+                        toast(&win_cb, "That file cannot be read.");
+                        return;
+                    };
 
-                // Nothing is touched until the file has been read and the rider
-                // has seen what is in it.
-                let win_done = win_cb.clone();
-                let parent_done = parent.clone();
-                let pool_done = pool.clone();
-                let rt_done = rt_handle.clone();
-                let candidate = path.clone();
-                crate::ui::spawn_to_main(
-                    &rt_handle,
-                    async move { transfer::inspect(&path).await },
-                    move |result| match result {
-                        Ok(summary) => confirm_import(
-                            &win_done,
-                            &parent_done,
-                            pool_done,
-                            rt_done,
-                            candidate,
-                            summary,
-                        ),
-                        Err(e) => {
-                            tracing::warn!("Rejected import candidate: {e:#}");
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("This file cannot be imported")
-                                .body(format!("{e}"))
-                                .build();
-                            dialog.add_response("ok", "_OK");
-                            dialog.set_default_response(Some("ok"));
-                            dialog.present(Some(&win_done));
-                        }
-                    },
-                );
-            },
-        );
-    });
+                    // Nothing is touched until the file has been read and the rider
+                    // has seen what is in it.
+                    let win_done = win_cb.clone();
+                    let parent_done = parent.clone();
+                    let pool_done = pool.clone();
+                    let rt_done = rt_handle.clone();
+                    let candidate = path.clone();
+                    crate::ui::spawn_to_main(
+                        &rt_handle,
+                        async move { transfer::inspect(&path).await },
+                        move |result| match result {
+                            Ok(summary) => confirm_import(
+                                &win_done,
+                                &parent_done,
+                                pool_done,
+                                rt_done,
+                                candidate,
+                                summary,
+                            ),
+                            Err(e) => {
+                                tracing::warn!("Rejected import candidate: {e:#}");
+                                let dialog = adw::AlertDialog::builder()
+                                    .heading("This file cannot be imported")
+                                    .body(format!("{e}"))
+                                    .build();
+                                dialog.add_response("ok", "_OK");
+                                dialog.set_default_response(Some("ok"));
+                                dialog.present(Some(&win_done));
+                            }
+                        },
+                    );
+                },
+            );
+        }
+    ));
 
     row
 }

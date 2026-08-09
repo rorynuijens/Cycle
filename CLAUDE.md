@@ -259,6 +259,37 @@ glib::timeout_add_local(Duration::from_secs(1), move || {
 // that could re-enter the borrow (e.g. via signal emissions)
 ```
 
+**Never capture a dialog or window strongly in a handler attached to a widget
+inside it.** A signal handler holds a strong reference to everything it
+captures, and the dialog already owns the widget the handler is on. That is a
+reference cycle, and GTK has no cycle collector: the dialog and everything it
+captured are leaked for the life of the process, once per open.
+
+```rust
+// WRONG — save_btn is inside dialog, so dialog is never freed
+let dialog_save = dialog.clone();
+save_btn.connect_clicked(move |_| { dialog_save.close(); });
+
+// CORRECT — weak capture, upgraded only for the duration of the callback
+save_btn.connect_clicked(glib::clone!(
+    #[weak]
+    dialog,
+    move |_| { dialog.close(); }
+));
+```
+
+Note the syntax: glib 0.20 replaced the old `clone!(@weak x => move || …)`
+form with the attribute form above. `#[weak]` defaults to returning
+`Default::default()` if the object is already gone, which is what you want for
+a handler returning `()`.
+
+The rule applies to any object that outlives the handler by owning it — an
+`adw::Dialog`, an `adw::Window`, the `adw::PreferencesWindow` (rebuilt on every
+open), and to closures reached *through* an `Rc<dyn Fn>` that a child widget
+calls. It does not apply to a transient `adw::AlertDialog` capturing the window
+it is presented on: the host releases the alert when it closes, which breaks
+that cycle on its own.
+
 ### 2.5 Naming conventions
 
 ```rust

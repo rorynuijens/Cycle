@@ -131,49 +131,57 @@ impl ApiKeyRow {
 
         // Remove — clear the key and return to entry mode.
         let (status, entry, cancel, stored) = self.handles();
-        let win_remove = win.clone();
-        remove.connect_clicked(move |_| {
-            stored.borrow_mut().clear();
-            entry.set_text("");
-            status.set_visible(false);
-            entry.set_visible(true);
-            cancel.set_visible(false);
-            win_remove.add_toast(
-                adw::Toast::builder()
-                    .title("API key removed")
-                    .timeout(3)
-                    .build(),
-            );
-            if let Err(e) = keystore::delete_secret(keystore_key) {
-                tracing::error!("Could not clear {keystore_key}: {e}");
+        // Weak: this row lives inside the preferences window (CLAUDE.md §2.4).
+        remove.connect_clicked(glib::clone!(
+            #[weak]
+            win,
+            move |_| {
+                stored.borrow_mut().clear();
+                entry.set_text("");
+                status.set_visible(false);
+                entry.set_visible(true);
+                cancel.set_visible(false);
+                win.add_toast(
+                    adw::Toast::builder()
+                        .title("API key removed")
+                        .timeout(3)
+                        .build(),
+                );
+                if let Err(e) = keystore::delete_secret(keystore_key) {
+                    tracing::error!("Could not clear {keystore_key}: {e}");
+                }
             }
-        });
+        ));
 
         // Apply — store the key and switch to view mode.
         let (status, entry, cancel, stored) = self.handles();
-        let win_apply = win.clone();
-        self.entry.connect_apply(move |row| {
-            let key = row.text().trim().to_string();
-            if key.is_empty() {
-                return;
+        // Weak: this row lives inside the preferences window (CLAUDE.md §2.4).
+        self.entry.connect_apply(glib::clone!(
+            #[weak]
+            win,
+            move |row| {
+                let key = row.text().trim().to_string();
+                if key.is_empty() {
+                    return;
+                }
+                status.set_subtitle(&key_subtitle(&key));
+                status.set_visible(true);
+                entry.set_visible(false);
+                cancel.set_visible(false);
+                win.add_toast(
+                    adw::Toast::builder()
+                        .title("API key saved")
+                        .timeout(3)
+                        .build(),
+                );
+                match keystore::set_secret(keystore_key, &key) {
+                    // Never log the key itself (CLAUDE.md §5.6).
+                    Ok(()) => tracing::debug!("{keystore_key} saved (not logged)"),
+                    Err(e) => tracing::error!("Could not save {keystore_key}: {e}"),
+                }
+                *stored.borrow_mut() = key;
             }
-            status.set_subtitle(&key_subtitle(&key));
-            status.set_visible(true);
-            entry.set_visible(false);
-            cancel.set_visible(false);
-            win_apply.add_toast(
-                adw::Toast::builder()
-                    .title("API key saved")
-                    .timeout(3)
-                    .build(),
-            );
-            match keystore::set_secret(keystore_key, &key) {
-                // Never log the key itself (CLAUDE.md §5.6).
-                Ok(()) => tracing::debug!("{keystore_key} saved (not logged)"),
-                Err(e) => tracing::error!("Could not save {keystore_key}: {e}"),
-            }
-            *stored.borrow_mut() = key;
-        });
+        ));
     }
 
     /// Fresh handles on the same widgets, for moving into a callback.

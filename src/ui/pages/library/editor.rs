@@ -200,8 +200,12 @@ pub fn show_workout_editor(
     }
 
     // ── Cancel / Save ─────────────────────────────────────────────────────
-    let win_cancel = win.clone();
-    cancel_btn.connect_clicked(move |_| win_cancel.close());
+    // Weak: both buttons live inside this window (CLAUDE.md §2.4).
+    cancel_btn.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |_| win.close()
+    ));
 
     {
         let draft_save = Rc::clone(&draft);
@@ -212,115 +216,118 @@ pub fn show_workout_editor(
         let workouts_save = workouts_list;
         let rebuild_save = rebuild;
         let on_toast_save = on_toast;
-        let win_save = win.clone();
         // existing_id is Copy (Option<i64>), captured directly by the move closure
 
-        save_btn.connect_clicked(move |_| {
-            let name = name_save.text().trim().to_string();
-            if name.is_empty() {
-                on_toast_save(
-                    adw::Toast::builder()
-                        .title("Workout name is required")
-                        .timeout(3)
-                        .build(),
-                );
-                return;
-            }
-            let segs = draft_save.borrow().clone();
-            if segs.is_empty() {
-                on_toast_save(
-                    adw::Toast::builder()
-                        .title("Add at least one segment")
-                        .timeout(3)
-                        .build(),
-                );
-                return;
-            }
-            let desc = desc_save.text().trim().to_string();
-            let mut workout = build_draft_workout(&segs, &name);
-            workout.description = desc;
+        save_btn.connect_clicked(glib::clone!(
+            #[weak]
+            win,
+            move |_| {
+                let name = name_save.text().trim().to_string();
+                if name.is_empty() {
+                    on_toast_save(
+                        adw::Toast::builder()
+                            .title("Workout name is required")
+                            .timeout(3)
+                            .build(),
+                    );
+                    return;
+                }
+                let segs = draft_save.borrow().clone();
+                if segs.is_empty() {
+                    on_toast_save(
+                        adw::Toast::builder()
+                            .title("Add at least one segment")
+                            .timeout(3)
+                            .build(),
+                    );
+                    return;
+                }
+                let desc = desc_save.text().trim().to_string();
+                let mut workout = build_draft_workout(&segs, &name);
+                workout.description = desc;
 
-            // Clone per-invocation state for the async result handler (this closure is Fn).
-            let pool_save = pool_save.clone();
-            let workouts_save = Rc::clone(&workouts_save);
-            let rebuild_save = rebuild_save.clone();
-            let on_toast_save = Rc::clone(&on_toast_save);
-            let win_save = win_save.clone();
+                // Clone per-invocation state for the async result handler (this closure is Fn).
+                let pool_save = pool_save.clone();
+                let workouts_save = Rc::clone(&workouts_save);
+                let rebuild_save = rebuild_save.clone();
+                let on_toast_save = Rc::clone(&on_toast_save);
+                let win_save = win.clone();
 
-            if let Some(id) = existing_id {
-                workout.id = id;
-                crate::ui::spawn_to_main(
-                    &rt_save,
-                    async move {
-                        match db::update_workout(&pool_save, &workout).await {
-                            Ok(()) => Ok(workout),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    },
-                    move |res| match res {
-                        Ok(workout) => {
-                            let mut wl = workouts_save.borrow_mut();
-                            if let Some(pos) = wl.iter().position(|w| w.id == id) {
-                                wl[pos] = workout;
+                if let Some(id) = existing_id {
+                    workout.id = id;
+                    crate::ui::spawn_to_main(
+                        &rt_save,
+                        async move {
+                            match db::update_workout(&pool_save, &workout).await {
+                                Ok(()) => Ok(workout),
+                                Err(e) => Err(e.to_string()),
                             }
-                            drop(wl);
-                            rebuild_save();
-                            on_toast_save(
-                                adw::Toast::builder()
-                                    .title("Workout updated")
-                                    .timeout(3)
-                                    .build(),
-                            );
-                            win_save.close();
-                        }
-                        Err(e) => {
-                            tracing::error!("update_workout failed: {e}");
-                            on_toast_save(
-                                adw::Toast::builder()
-                                    .title("Failed to update workout")
-                                    .timeout(4)
-                                    .build(),
-                            );
-                        }
-                    },
-                );
-            } else {
-                crate::ui::spawn_to_main(
-                    &rt_save,
-                    async move {
-                        match db::save_workout(&pool_save, &workout).await {
-                            Ok(id) => {
-                                workout.id = id;
-                                Ok(workout)
+                        },
+                        move |res| match res {
+                            Ok(workout) => {
+                                let mut wl = workouts_save.borrow_mut();
+                                if let Some(pos) = wl.iter().position(|w| w.id == id) {
+                                    wl[pos] = workout;
+                                }
+                                drop(wl);
+                                rebuild_save();
+                                on_toast_save(
+                                    adw::Toast::builder()
+                                        .title("Workout updated")
+                                        .timeout(3)
+                                        .build(),
+                                );
+                                win_save.close();
                             }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    },
-                    move |res| match res {
-                        Ok(workout) => {
-                            workouts_save.borrow_mut().push(workout);
-                            rebuild_save();
-                            on_toast_save(
-                                adw::Toast::builder()
-                                    .title("Workout saved")
-                                    .timeout(3)
-                                    .build(),
-                            );
-                            win_save.close();
-                        }
-                        Err(e) => {
-                            tracing::error!("save_workout failed: {e}");
-                            on_toast_save(
-                                adw::Toast::builder()
-                                    .title("Failed to save workout")
-                                    .timeout(4)
-                                    .build(),
-                            );
-                        }
-                    },
-                );
+                            Err(e) => {
+                                tracing::error!("update_workout failed: {e}");
+                                on_toast_save(
+                                    adw::Toast::builder()
+                                        .title("Failed to update workout")
+                                        .timeout(4)
+                                        .build(),
+                                );
+                            }
+                        },
+                    );
+                } else {
+                    crate::ui::spawn_to_main(
+                        &rt_save,
+                        async move {
+                            match db::save_workout(&pool_save, &workout).await {
+                                Ok(id) => {
+                                    workout.id = id;
+                                    Ok(workout)
+                                }
+                                Err(e) => Err(e.to_string()),
+                            }
+                        },
+                        move |res| match res {
+                            Ok(workout) => {
+                                workouts_save.borrow_mut().push(workout);
+                                rebuild_save();
+                                on_toast_save(
+                                    adw::Toast::builder()
+                                        .title("Workout saved")
+                                        .timeout(3)
+                                        .build(),
+                                );
+                                win_save.close();
+                            }
+                            Err(e) => {
+                                tracing::error!("save_workout failed: {e}");
+                                on_toast_save(
+                                    adw::Toast::builder()
+                                        .title("Failed to save workout")
+                                        .timeout(4)
+                                        .build(),
+                                );
+                            }
+                        },
+                    );
+                }
             }
-        });
+        ));
     }
 
     clamp.set_child(Some(&inner));

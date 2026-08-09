@@ -375,24 +375,29 @@ pub fn show(
     let finish = {
         let pool_f = pool.clone();
         let rt_f = rt_handle.clone();
-        let dialog_f = dialog.clone();
         let on_complete_f = Rc::clone(&on_complete);
-        Rc::new(move |api_key: String| {
-            if !api_key.is_empty() {
-                if let Err(e) = keystore::set_secret(keystore::KEY_ANTHROPIC, &api_key) {
-                    tracing::error!("save anthropic.api_key failed: {e}");
-                } else {
-                    tracing::debug!("AI provider API key saved (not logged)");
+        // Weak: both buttons that reach this closure are inside the dialog
+        // (CLAUDE.md §2.4).
+        Rc::new(glib::clone!(
+            #[weak]
+            dialog,
+            move |api_key: String| {
+                if !api_key.is_empty() {
+                    if let Err(e) = keystore::set_secret(keystore::KEY_ANTHROPIC, &api_key) {
+                        tracing::error!("save anthropic.api_key failed: {e}");
+                    } else {
+                        tracing::debug!("AI provider API key saved (not logged)");
+                    }
                 }
+                let p = pool_f.clone();
+                let rt = rt_f.clone();
+                rt.spawn(async move {
+                    let _ = settings::mark_first_use_complete(&p).await;
+                });
+                dialog.close();
+                on_complete_f();
             }
-            let p = pool_f.clone();
-            let rt = rt_f.clone();
-            rt.spawn(async move {
-                let _ = settings::mark_first_use_complete(&p).await;
-            });
-            dialog_f.close();
-            on_complete_f();
-        })
+        ))
     };
 
     let finish_skip = Rc::clone(&finish);

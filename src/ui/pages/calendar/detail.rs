@@ -1251,7 +1251,6 @@ pub fn show_session_detail(
         let pool_eval = pool.clone();
         let rt_eval = rt_handle.clone();
         let rh_eval = Rc::clone(&reload_holder);
-        let win_eval = win.clone();
 
         let rate_row = adw::ActionRow::builder()
             .title("No self-evaluation yet")
@@ -1264,30 +1263,35 @@ pub fn show_session_detail(
             .build();
         rate_row.add_prefix(&rate_icon);
 
-        rate_row.connect_activated(move |row| {
-            let pool = pool_eval.clone();
-            let rt = rt_eval.clone();
-            let rh = Rc::clone(&rh_eval);
-            let win = win_eval.clone();
-            crate::ui::widgets::rpe_dialog::show(row, move |rpe| {
-                let pool = pool.clone();
-                let rh = Rc::clone(&rh);
-                let win = win.clone();
-                crate::ui::spawn_to_main(
-                    &rt,
-                    async move { db::save_session_rpe(&pool, session_id_eval, rpe).await },
-                    move |res| {
-                        if let Err(e) = res {
-                            tracing::error!("save_session_rpe failed: {e}");
-                        }
-                        win.close();
-                        if let Some(reload) = rh.borrow().as_ref() {
-                            reload();
-                        }
-                    },
-                );
-            });
-        });
+        // Weak: rate_row is inside this window, so a strong capture would be a
+        // cycle and the window — with the ride's streams — would never be freed.
+        rate_row.connect_activated(glib::clone!(
+            #[weak]
+            win,
+            move |row| {
+                let pool = pool_eval.clone();
+                let rt = rt_eval.clone();
+                let rh = Rc::clone(&rh_eval);
+                crate::ui::widgets::rpe_dialog::show(row, move |rpe| {
+                    let pool = pool.clone();
+                    let rh = Rc::clone(&rh);
+                    let win = win.clone();
+                    crate::ui::spawn_to_main(
+                        &rt,
+                        async move { db::save_session_rpe(&pool, session_id_eval, rpe).await },
+                        move |res| {
+                            if let Err(e) = res {
+                                tracing::error!("save_session_rpe failed: {e}");
+                            }
+                            win.close();
+                            if let Some(reload) = rh.borrow().as_ref() {
+                                reload();
+                            }
+                        },
+                    );
+                });
+            }
+        ));
 
         eval_group.add(&rate_row);
     }

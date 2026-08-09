@@ -205,11 +205,15 @@ pub fn show_workout_detail(
     });
 
     let workout_for_start = workout.clone();
-    let win_for_start = win.clone();
-    start_btn.connect_clicked(move |_| {
-        on_start(workout_for_start.clone());
-        win_for_start.close();
-    });
+    // Weak: start_btn is inside this window (CLAUDE.md §2.4).
+    start_btn.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |_| {
+            on_start(workout_for_start.clone());
+            win.close();
+        }
+    ));
 
     actions.append(&schedule_btn);
     actions.append(&start_btn);
@@ -424,11 +428,15 @@ pub fn show_route_detail(
     inner.append(&ride_btn);
 
     let route_for_ride = route.clone();
-    let win_for_ride = win.clone();
-    ride_btn.connect_clicked(move |_| {
-        on_start_route(route_for_ride.clone());
-        win_for_ride.close();
-    });
+    // Weak: ride_btn is inside this window (CLAUDE.md §2.4).
+    ride_btn.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |_| {
+            on_start_route(route_for_ride.clone());
+            win.close();
+        }
+    ));
 
     clamp.set_child(Some(&inner));
     scroll.set_child(Some(&clamp));

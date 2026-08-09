@@ -247,10 +247,14 @@ fn connect_context(
 
     let pool = pool.clone();
     let rt_handle = rt_handle.clone();
-    let win = win.clone();
-    context_row.connect_activated(move |row| {
-        show_context_editor(&win, pool.clone(), rt_handle.clone(), row.clone());
-    });
+    // Weak: context_row sits inside this window (CLAUDE.md §2.4).
+    context_row.connect_activated(glib::clone!(
+        #[weak]
+        win,
+        move |row| {
+            show_context_editor(&win, pool.clone(), rt_handle.clone(), row.clone());
+        }
+    ));
 }
 
 fn connect_delete(
@@ -262,81 +266,85 @@ fn connect_delete(
 ) {
     let pool = pool.clone();
     let rt_handle = rt_handle.clone();
-    let win = win.clone();
 
-    delete_btn.connect_clicked(move |btn| {
-        let dialog = adw::AlertDialog::builder()
-            .heading("Delete Athlete Profile?")
-            .body(
-                "Your athlete profile (name, FTP, weight, heart rate) will be reset \
+    // Weak: delete_btn sits inside this window (CLAUDE.md §2.4).
+    delete_btn.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |btn| {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Delete Athlete Profile?")
+                .body(
+                    "Your athlete profile (name, FTP, weight, heart rate) will be reset \
                  to defaults. This cannot be undone.\n\n\
                  API keys and device settings are always preserved.",
-            )
-            .build();
-        dialog.add_response("cancel", "_Cancel");
-        dialog.add_response("delete", "_Delete");
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
+                )
+                .build();
+            dialog.add_response("cancel", "_Cancel");
+            dialog.add_response("delete", "_Delete");
+            dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
 
-        let wipe_check = gtk::CheckButton::builder()
-            .label(
-                "Also delete all training data\n\
+            let wipe_check = gtk::CheckButton::builder()
+                .label(
+                    "Also delete all training data\n\
                  (sessions, workouts, calendar, activities, wellness, goals, time off)",
-            )
-            .active(false)
-            .margin_top(6)
-            .build();
-        dialog.set_extra_child(Some(&wipe_check));
+                )
+                .active(false)
+                .margin_top(6)
+                .build();
+            dialog.set_extra_child(Some(&wipe_check));
 
-        let pool = pool.clone();
-        let rt_handle = rt_handle.clone();
-        let on_saved = Rc::clone(&on_saved);
-        let win = win.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "delete" {
-                return;
-            }
-            let wipe_data = wipe_check.is_active();
             let pool = pool.clone();
+            let rt_handle = rt_handle.clone();
             let on_saved = Rc::clone(&on_saved);
             let win = win.clone();
-            crate::ui::spawn_to_main(
-                &rt_handle,
-                async move {
-                    db::reset_athlete_data(&pool, wipe_data)
-                        .await
-                        .map_err(|e| tracing::error!("reset_athlete_data failed: {e}"))?;
-                    // Recreate a default athlete so the live engine stays valid.
-                    Ok(db::load_or_create_athlete(&pool).await.unwrap_or_default())
-                },
-                move |res: Result<AthleteProfile, ()>| match res {
-                    Err(()) => win.add_toast(
-                        adw::Toast::builder()
-                            .title("Failed to delete profile")
-                            .timeout(4)
-                            .build(),
-                    ),
-                    Ok(default_athlete) => {
-                        on_saved(default_athlete);
-                        win.add_toast(
+            dialog.connect_response(None, move |_, response| {
+                if response != "delete" {
+                    return;
+                }
+                let wipe_data = wipe_check.is_active();
+                let pool = pool.clone();
+                let on_saved = Rc::clone(&on_saved);
+                let win = win.clone();
+                crate::ui::spawn_to_main(
+                    &rt_handle,
+                    async move {
+                        db::reset_athlete_data(&pool, wipe_data)
+                            .await
+                            .map_err(|e| tracing::error!("reset_athlete_data failed: {e}"))?;
+                        // Recreate a default athlete so the live engine stays valid.
+                        Ok(db::load_or_create_athlete(&pool).await.unwrap_or_default())
+                    },
+                    move |res: Result<AthleteProfile, ()>| match res {
+                        Err(()) => win.add_toast(
                             adw::Toast::builder()
-                                .title(if wipe_data {
-                                    "Profile and all training data deleted"
-                                } else {
-                                    "Athlete profile reset to defaults"
-                                })
+                                .title("Failed to delete profile")
                                 .timeout(4)
                                 .build(),
-                        );
-                        win.close();
-                    }
-                },
-            );
-        });
+                        ),
+                        Ok(default_athlete) => {
+                            on_saved(default_athlete);
+                            win.add_toast(
+                                adw::Toast::builder()
+                                    .title(if wipe_data {
+                                        "Profile and all training data deleted"
+                                    } else {
+                                        "Athlete profile reset to defaults"
+                                    })
+                                    .timeout(4)
+                                    .build(),
+                            );
+                            win.close();
+                        }
+                    },
+                );
+            });
 
-        dialog.present(Some(btn));
-    });
+            dialog.present(Some(btn));
+        }
+    ));
 }
 
 /// Present the training-context editor, saving to `coaching.athlete_context`
@@ -442,37 +450,46 @@ fn show_context_editor(
                 .content_width(560)
                 .build();
 
-            let dialog_cancel = dialog.clone();
-            cancel_btn.connect_clicked(move |_| {
-                dialog_cancel.close();
-            });
+            // Weak: both buttons are inside the dialog (CLAUDE.md §2.4). Once the
+            // dialog can be freed on close, the strong `win_save` below goes with
+            // it, so that one does not need weakening too.
+            cancel_btn.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                move |_| {
+                    dialog.close();
+                }
+            ));
 
-            let dialog_save = dialog.clone();
             let win_save = win.clone();
-            save_btn.connect_clicked(move |_| {
-                let buffer = text_view.buffer();
-                let text = buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                    .trim()
-                    .to_string();
+            save_btn.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                move |_| {
+                    let buffer = text_view.buffer();
+                    let text = buffer
+                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                        .trim()
+                        .to_string();
 
-                let ctx = text.clone();
-                crate::ui::spawn_write(
-                    &rt_save,
-                    &pool,
-                    "your training context",
-                    |pool| async move { settings::set_coaching_context(&pool, &ctx).await },
-                );
+                    let ctx = text.clone();
+                    crate::ui::spawn_write(
+                        &rt_save,
+                        &pool,
+                        "your training context",
+                        |pool| async move { settings::set_coaching_context(&pool, &ctx).await },
+                    );
 
-                preview_row.set_subtitle(&context_preview(&text));
-                win_save.add_toast(
-                    adw::Toast::builder()
-                        .title("Training context saved")
-                        .timeout(3)
-                        .build(),
-                );
-                dialog_save.close();
-            });
+                    preview_row.set_subtitle(&context_preview(&text));
+                    win_save.add_toast(
+                        adw::Toast::builder()
+                            .title("Training context saved")
+                            .timeout(3)
+                            .build(),
+                    );
+                    dialog.close();
+                }
+            ));
 
             dialog.present(Some(&win));
         },

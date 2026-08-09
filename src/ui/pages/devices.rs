@@ -910,13 +910,17 @@ fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widge
             .build();
         let ctx_disc = ctx.clone();
         let addr_disc = address.to_string();
-        let dialog_disc = dialog.clone();
-        disconnect_btn.connect_clicked(move |_| {
-            let _ = ctx_disc.cmd_tx.try_send(DeviceCommand::Disconnect {
-                address: addr_disc.clone(),
-            });
-            dialog_disc.close();
-        });
+        // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+        disconnect_btn.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                let _ = ctx_disc.cmd_tx.try_send(DeviceCommand::Disconnect {
+                    address: addr_disc.clone(),
+                });
+                dialog.close();
+            }
+        ));
         actions.append(&disconnect_btn);
     } else if seen {
         let connect_btn = gtk::Button::builder()
@@ -926,17 +930,21 @@ fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widge
             .build();
         let ctx_conn = ctx.clone();
         let addr_conn = address.to_string();
-        let dialog_conn = dialog.clone();
-        connect_btn.connect_clicked(move |_| {
-            if let Some(e) = ctx_conn.entries.borrow_mut().get_mut(&addr_conn) {
-                e.connecting = true;
+        // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+        connect_btn.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                if let Some(e) = ctx_conn.entries.borrow_mut().get_mut(&addr_conn) {
+                    e.connecting = true;
+                }
+                set_saved_status(&ctx_conn, &addr_conn, RowStatus::Connecting);
+                let _ = ctx_conn.cmd_tx.try_send(DeviceCommand::Connect {
+                    address: addr_conn.clone(),
+                });
+                dialog.close();
             }
-            set_saved_status(&ctx_conn, &addr_conn, RowStatus::Connecting);
-            let _ = ctx_conn.cmd_tx.try_send(DeviceCommand::Connect {
-                address: addr_conn.clone(),
-            });
-            dialog_conn.close();
-        });
+        ));
         actions.append(&connect_btn);
     } else {
         // Never discovered this session — the manager can't connect to it yet.
@@ -954,10 +962,14 @@ fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widge
         .build();
     let ctx_forget = ctx.clone();
     let addr_forget = address.to_string();
-    let dialog_forget = dialog.clone();
-    forget_btn.connect_clicked(move |_| {
-        confirm_forget(&ctx_forget, &addr_forget, &dialog_forget);
-    });
+    // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+    forget_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            confirm_forget(&ctx_forget, &addr_forget, &dialog);
+        }
+    ));
     actions.append(&forget_btn);
     content.append(&actions);
 

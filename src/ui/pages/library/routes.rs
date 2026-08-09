@@ -94,40 +94,45 @@ pub fn reload_closure(
                     let route_id_rename = route.id;
                     let current_name = route.name.clone();
                     rename_btn.connect_clicked(move |btn| {
-                            let dialog = adw::Dialog::builder()
-                                .title("Rename Route")
-                                .content_width(380)
-                                .build();
-                            let toolbar = adw::ToolbarView::new();
-                            let header = adw::HeaderBar::new();
-                            let save_btn = gtk::Button::builder()
-                                .label("Save")
-                                .css_classes(["suggested-action"])
-                                .build();
-                            header.pack_end(&save_btn);
-                            toolbar.add_top_bar(&header);
+                        let dialog = adw::Dialog::builder()
+                            .title("Rename Route")
+                            .content_width(380)
+                            .build();
+                        let toolbar = adw::ToolbarView::new();
+                        let header = adw::HeaderBar::new();
+                        let save_btn = gtk::Button::builder()
+                            .label("Save")
+                            .css_classes(["suggested-action"])
+                            .build();
+                        header.pack_end(&save_btn);
+                        toolbar.add_top_bar(&header);
 
-                            let group = adw::PreferencesGroup::builder()
-                                .margin_top(18)
-                                .margin_bottom(18)
-                                .margin_start(18)
-                                .margin_end(18)
-                                .build();
-                            let entry = adw::EntryRow::builder().title("Name").build();
-                            entry.set_text(&current_name);
-                            group.add(&entry);
-                            toolbar.set_content(Some(&group));
-                            dialog.set_child(Some(&toolbar));
+                        let group = adw::PreferencesGroup::builder()
+                            .margin_top(18)
+                            .margin_bottom(18)
+                            .margin_start(18)
+                            .margin_end(18)
+                            .build();
+                        let entry = adw::EntryRow::builder().title("Name").build();
+                        entry.set_text(&current_name);
+                        group.add(&entry);
+                        toolbar.set_content(Some(&group));
+                        dialog.set_child(Some(&toolbar));
 
-                            // Saving from the button and pressing Enter in the
-                            // field do the same thing.
-                            let commit: Rc<dyn Fn(&adw::EntryRow)> = {
-                                let pool = pool_rename.clone();
-                                let rt = rt_rename.clone();
-                                let holder = Rc::clone(&holder_rename);
-                                let on_toast = Rc::clone(&on_toast_rename);
-                                let dialog = dialog.clone();
-                                Rc::new(move |entry: &adw::EntryRow| {
+                        // Saving from the button and pressing Enter in the
+                        // field do the same thing.
+                        let commit: Rc<dyn Fn(&adw::EntryRow)> = {
+                            let pool = pool_rename.clone();
+                            let rt = rt_rename.clone();
+                            let holder = Rc::clone(&holder_rename);
+                            let on_toast = Rc::clone(&on_toast_rename);
+                            // Weak: this closure is reached from save_btn and
+                            // from the entry row, both inside the dialog, so a
+                            // strong capture would be a cycle (CLAUDE.md §2.4).
+                            Rc::new(glib::clone!(
+                                #[weak]
+                                dialog,
+                                move |entry: &adw::EntryRow| {
                                     let name = entry.text().to_string();
                                     if name.trim().is_empty() {
                                         on_toast(
@@ -145,8 +150,7 @@ pub fn reload_closure(
                                     crate::ui::spawn_to_main(
                                         &rt,
                                         async move {
-                                            db::rename_route(&pool, route_id_rename, &name)
-                                                .await
+                                            db::rename_route(&pool, route_id_rename, &name).await
                                         },
                                         move |result| {
                                             if let Err(e) = result {
@@ -164,17 +168,18 @@ pub fn reload_closure(
                                             }
                                         },
                                     );
-                                })
-                            };
+                                }
+                            ))
+                        };
 
-                            let commit_btn = Rc::clone(&commit);
-                            let entry_btn = entry.clone();
-                            save_btn.connect_clicked(move |_| commit_btn(&entry_btn));
-                            let commit_entry = Rc::clone(&commit);
-                            entry.connect_apply(move |e| commit_entry(e));
+                        let commit_btn = Rc::clone(&commit);
+                        let entry_btn = entry.clone();
+                        save_btn.connect_clicked(move |_| commit_btn(&entry_btn));
+                        let commit_entry = Rc::clone(&commit);
+                        entry.connect_apply(move |e| commit_entry(e));
 
-                            dialog.present(Some(btn));
-                        });
+                        dialog.present(Some(btn));
+                    });
 
                     let delete_btn = gtk::Button::builder()
                         .icon_name("user-trash-symbolic")

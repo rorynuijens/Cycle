@@ -404,13 +404,17 @@ pub fn show_workout_detail_dialog(
             .build();
         let workouts_c = Rc::clone(&workouts);
         let on_start_c = Rc::clone(&on_start_workout);
-        let dialog_c = dialog.clone();
-        load_btn.connect_clicked(move |_| {
-            if let Some(w) = workouts_c.iter().find(|w| w.id == workout_id).cloned() {
-                dialog_c.close();
-                on_start_c(w);
+        // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+        load_btn.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                if let Some(w) = workouts_c.iter().find(|w| w.id == workout_id).cloned() {
+                    dialog.close();
+                    on_start_c(w);
+                }
             }
-        });
+        ));
 
         // Remove
         let remove_btn = gtk::Button::builder()
@@ -421,36 +425,40 @@ pub fn show_workout_detail_dialog(
         let pool_r = pool.clone();
         let rt_r = rt_handle.clone();
         let reload_r = Rc::clone(&reload);
-        let dialog_r = dialog.clone();
         let remove_btn_for_present = remove_btn.clone();
-        remove_btn.connect_clicked(move |_| {
-            let pool_c = pool_r.clone();
-            let rt_c = rt_r.clone();
-            let reload_c = Rc::clone(&reload_r);
-            let dialog_c2 = dialog_r.clone();
-            crate::ui::widgets::dialog::confirm_destructive(
-                &remove_btn_for_present,
-                "Remove workout?",
-                "This will remove this workout from your calendar.",
-                "_Remove",
-                move || {
-                    let pool_c = pool_c.clone();
-                    let reload_c = Rc::clone(&reload_c);
-                    let dialog_c2 = dialog_c2.clone();
-                    crate::ui::spawn_to_main(
-                        &rt_c,
-                        async move { db::delete_calendar_entry_by_id(&pool_c, entry_id).await },
-                        move |res| {
-                            if let Err(e) = res {
-                                tracing::error!("delete_calendar_entry_by_id: {e}");
-                            }
-                            dialog_c2.close();
-                            reload_c();
-                        },
-                    );
-                },
-            );
-        });
+        // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+        remove_btn.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                let pool_c = pool_r.clone();
+                let rt_c = rt_r.clone();
+                let reload_c = Rc::clone(&reload_r);
+                let dialog_c2 = dialog.clone();
+                crate::ui::widgets::dialog::confirm_destructive(
+                    &remove_btn_for_present,
+                    "Remove workout?",
+                    "This will remove this workout from your calendar.",
+                    "_Remove",
+                    move || {
+                        let pool_c = pool_c.clone();
+                        let reload_c = Rc::clone(&reload_c);
+                        let dialog_c2 = dialog_c2.clone();
+                        crate::ui::spawn_to_main(
+                            &rt_c,
+                            async move { db::delete_calendar_entry_by_id(&pool_c, entry_id).await },
+                            move |res| {
+                                if let Err(e) = res {
+                                    tracing::error!("delete_calendar_entry_by_id: {e}");
+                                }
+                                dialog_c2.close();
+                                reload_c();
+                            },
+                        );
+                    },
+                );
+            }
+        ));
 
         btn_row.append(&remove_btn);
         btn_row.append(&load_btn);

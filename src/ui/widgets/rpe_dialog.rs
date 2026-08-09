@@ -177,20 +177,28 @@ pub fn show(parent: &impl IsA<gtk::Widget>, on_submit: impl Fn(u8) + 'static) {
         .child(&toolbar_view)
         .build();
 
-    let dialog_skip = dialog.clone();
-    skip_btn.connect_clicked(move |_| {
-        dialog_skip.close();
-    });
-
-    let dialog_save = dialog.clone();
-    let on_submit = Rc::new(on_submit);
-    save_btn.connect_clicked(move |_| {
-        let rpe = selected.get();
-        if rpe > 0 {
-            on_submit(rpe);
+    // Weak, because these buttons live inside the dialog: a strong capture is a
+    // reference cycle the toolkit cannot break, and the dialog is never freed.
+    skip_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
         }
-        dialog_save.close();
-    });
+    ));
+
+    let on_submit = Rc::new(on_submit);
+    save_btn.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            let rpe = selected.get();
+            if rpe > 0 {
+                on_submit(rpe);
+            }
+            dialog.close();
+        }
+    ));
 
     dialog.present(Some(parent));
 }
