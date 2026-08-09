@@ -166,6 +166,30 @@ impl DeviceManager {
         // Internal channel: a spawned task forwards btleplug CentralEvents here.
         let (ble_tx, mut ble_rx) = tokio::sync::mpsc::channel::<CentralEvent>(64);
 
+        // One subscription for the life of the manager, not one per scan.
+        // `adapter.events()` is a broadcast that is independent of scan state —
+        // it simply goes quiet between scans — so subscribing per StartScan left
+        // a task and a stream behind on every scan, and delivered every later
+        // advertisement once per scan ever started. Auto-reconnect runs up to
+        // five scans per dropout, so that multiplied fast during exactly the
+        // ride where the radio was already struggling.
+        if let Some(ref adapter) = adapter {
+            let adapter = adapter.clone();
+            let tx = ble_tx.clone();
+            tokio::spawn(async move {
+                match adapter.events().await {
+                    Ok(mut stream) => {
+                        while let Some(ev) = stream.next().await {
+                            if tx.send(ev).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!("BLE event stream: {e}"),
+                }
+            });
+        }
+
         // State owned by the select loop (all non-Send, kept on this task).
         let mut discovered: HashMap<String, Peripheral> = HashMap::new();
         let mut trainer: Option<Peripheral> = None;
@@ -209,23 +233,10 @@ impl DeviceManager {
                                 tracing::warn!("StartScan: no BLE adapter available");
                                 continue;
                             };
+                            // The CentralEvent forwarder is already running — see
+                            // where it is spawned above.
                             match adapter.start_scan(ScanFilter::default()).await {
-                                Ok(_) => {
-                                    tracing::info!("BLE scan started");
-                                    // Spawn a task that forwards CentralEvents to our select loop.
-                                    let adapter = adapter.clone();
-                                    let tx = ble_tx.clone();
-                                    tokio::spawn(async move {
-                                        match adapter.events().await {
-                                            Ok(mut stream) => {
-                                                while let Some(ev) = stream.next().await {
-                                                    if tx.send(ev).await.is_err() { break; }
-                                                }
-                                            }
-                                            Err(e) => tracing::error!("BLE event stream: {e}"),
-                                        }
-                                    });
-                                }
+                                Ok(_) => tracing::info!("BLE scan started"),
                                 Err(e) => {
                                     tracing::error!("start_scan failed: {e}");
                                     let _ = self.event_tx.send(DeviceEvent::Error(e.to_string())).await;
