@@ -551,8 +551,13 @@ impl SummaryPage {
 
                 for (seg_idx, seg) in &named_segs {
                     let (t_start, t_end) = seg_times[*seg_idx];
+                    // What the trainer was asked for, which accounts for the
+                    // intensity dial; the plan is only the fallback for rides
+                    // recorded before target capture shipped.
                     let target_pct = (seg.power_low_pct + seg.power_high_pct) / 2.0;
-                    let target_watts = (target_pct / 100.0 * ftp as f32) as u32;
+                    let target_watts = session
+                        .mean_recorded_target(t_start, t_end)
+                        .unwrap_or_else(|| (target_pct / 100.0 * ftp as f32) as u32);
 
                     let actual_readings: Vec<u32> = session
                         .data_points

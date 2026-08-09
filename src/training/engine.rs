@@ -9,6 +9,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// Lowest the intensity dial goes, in percent of the workout as written.
+pub const MIN_INTENSITY_PCT: u32 = 50;
+/// Highest the intensity dial goes, in percent of the workout as written.
+pub const MAX_INTENSITY_PCT: u32 = 150;
+/// One press of the dial. Coarse on purpose: two presses is the usual move when
+/// a session turns out to be too much, and it is hard to fumble mid-interval.
+pub const INTENSITY_STEP_PCT: i32 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum EngineState {
@@ -27,7 +35,10 @@ pub struct EngineSnapshot {
     pub segment_index: usize,
     pub segment_elapsed_secs: u32,
     pub segment_remaining_secs: u32,
+    /// The target actually asked of the trainer — the plan with the dial applied.
     pub target_power_watts: u32,
+    /// Where the intensity dial stands, as a percentage of the plan.
+    pub intensity_pct: u32,
     pub readings: LiveReadings,
 }
 
@@ -43,6 +54,12 @@ pub struct WorkoutEngine {
     device_cmd_tx: Sender<DeviceCommand>,
     /// Max watts per second the ERG target may change. 0 = instant (no smoothing).
     pub erg_ramp_rate: u32,
+    /// The intensity dial, as a percentage of the workout as written. Every
+    /// target the trainer is given is scaled by this, so a rider who cannot hold
+    /// the plan today can finish the session at 90 % instead of abandoning it.
+    /// Read through [`WorkoutEngine::set_intensity_pct`] / [`Self::adjust_intensity`],
+    /// which keep it inside [`MIN_INTENSITY_PCT`]..=[`MAX_INTENSITY_PCT`].
+    intensity_pct: u32,
     current_erg_target: u32,
     /// Set by `resume_session` until the ride actually restarts. Keeps `start`
     /// from re-stamping `started_at` over the original ride's start time.
@@ -72,6 +89,7 @@ impl WorkoutEngine {
             pause_offset: Duration::ZERO,
             device_cmd_tx,
             erg_ramp_rate: 25,
+            intensity_pct: 100,
             current_erg_target: 0,
             resuming: false,
             interruption: chrono::Duration::zero(),
@@ -123,6 +141,9 @@ impl WorkoutEngine {
         self.state = EngineState::Idle;
         self.start_instant = None;
         self.pause_offset = Duration::from_secs(elapsed as u64);
+        // A ride picked back up starts at the plan again: the dial is a judgement
+        // about how the legs feel, and nothing recorded says where it stood.
+        self.intensity_pct = 100;
         self.current_erg_target = 0;
         self.resuming = true;
         self.interruption = chrono::Duration::zero();
@@ -143,6 +164,36 @@ impl WorkoutEngine {
             self.start_instant = Some(Instant::now());
             self.state = EngineState::Running;
         }
+    }
+
+    /// Where the intensity dial stands, in percent of the workout as written.
+    pub fn intensity_pct(&self) -> u32 {
+        self.intensity_pct
+    }
+
+    /// Move the intensity dial to `pct`, clamped to the dial's range.
+    ///
+    /// Takes effect on the next tick — the trainer is only spoken to once a
+    /// second, and the existing ERG ramp still governs how fast it gets there.
+    pub fn set_intensity_pct(&mut self, pct: u32) {
+        self.intensity_pct = pct.clamp(MIN_INTENSITY_PCT, MAX_INTENSITY_PCT);
+    }
+
+    /// Move the intensity dial by `delta` percentage points, clamped to range.
+    pub fn adjust_intensity(&mut self, delta: i32) {
+        let next = (self.intensity_pct as i32 + delta).max(0) as u32;
+        self.set_intensity_pct(next);
+    }
+
+    /// A planned target with the dial applied.
+    ///
+    /// A rest stays a rest: 0 W scales to 0 W rather than to some small nonzero
+    /// target, which would have the trainer pushing back during recovery.
+    fn dialled(&self, planned_watts: u32) -> u32 {
+        if planned_watts == 0 || self.intensity_pct == 100 {
+            return planned_watts;
+        }
+        (planned_watts as f32 * self.intensity_pct as f32 / 100.0).round() as u32
     }
 
     /// Skip to the start of the next segment.
@@ -177,6 +228,7 @@ impl WorkoutEngine {
         self.state = EngineState::Idle;
         self.start_instant = None;
         self.pause_offset = Duration::ZERO;
+        self.intensity_pct = 100;
         self.current_erg_target = 0;
         self.resuming = false;
         self.interruption = chrono::Duration::zero();
@@ -205,12 +257,17 @@ impl WorkoutEngine {
             self.stop();
         }
 
-        // `planned_target` is None once past the last segment — recorded data
+        // `recorded_target` is None once past the last segment — recorded data
         // points distinguish "no target" from "target of 0 W" for FTP detection.
-        let (target_watts, seg_remaining, planned_target) =
+        //
+        // It carries the *dialled* target, not the plan: that is what the trainer
+        // was actually asked for, so compliance reads as holding what was asked,
+        // and the FTP detector sees an honest lower target rather than a segment
+        // the rider was never given a chance to hit. See docs/ftp-detection.md.
+        let (target_watts, seg_remaining, recorded_target) =
             if let Some(seg) = self.workout.segments.get(seg_idx) {
                 let ftp = self.athlete.borrow().ftp_watts;
-                let target = seg.target_power_at(seg_elapsed, ftp);
+                let target = self.dialled(seg.target_power_at(seg_elapsed, ftp));
                 let remaining = seg.duration_secs.saturating_sub(seg_elapsed);
                 (target, remaining, Some(target))
             } else {
@@ -240,7 +297,7 @@ impl WorkoutEngine {
             self.session.data_points.push(DataPoint {
                 elapsed_secs: elapsed,
                 power_watts: readings.power_watts,
-                target_watts: planned_target,
+                target_watts: recorded_target,
                 heart_rate_bpm: readings.heart_rate_bpm,
                 cadence_rpm: readings.cadence_rpm,
                 speed_kmh: readings.speed_kmh,
@@ -258,6 +315,7 @@ impl WorkoutEngine {
             segment_elapsed_secs: seg_elapsed,
             segment_remaining_secs: seg_remaining,
             target_power_watts: target_watts,
+            intensity_pct: self.intensity_pct,
             readings,
         }
     }
@@ -332,6 +390,90 @@ mod tests {
             before * 2,
             "doubling FTP should double the ERG target for the same segment"
         );
+    }
+
+    #[test]
+    fn should_start_the_dial_at_the_plan() {
+        assert_eq!(make_engine().intensity_pct(), 100);
+    }
+
+    #[test]
+    fn should_scale_the_target_and_what_is_recorded_together_when_dialled_down() {
+        let mut engine = make_engine();
+        engine.start();
+        let planned = engine.tick(LiveReadings::default()).target_power_watts;
+        assert!(planned > 0, "sample workout should open with a real target");
+
+        engine.set_intensity_pct(90);
+        let snap = engine.tick(LiveReadings::default());
+
+        let expected = (planned as f32 * 0.9).round() as u32;
+        assert_eq!(snap.target_power_watts, expected);
+        assert_eq!(snap.intensity_pct, 90);
+        // What the trainer was asked for is what the ride records — compliance and
+        // FTP detection both read this rather than the plan.
+        let last = engine
+            .session
+            .data_points
+            .last()
+            .expect("a recorded second");
+        assert_eq!(last.target_watts, Some(expected));
+    }
+
+    #[test]
+    fn should_leave_a_rest_as_a_rest_when_dialled_down() {
+        let mut engine = make_engine();
+        engine.set_intensity_pct(50);
+        // Scaling a 0 W rest must not push the trainer back during recovery.
+        assert_eq!(engine.dialled(0), 0);
+    }
+
+    #[test]
+    fn should_stop_at_the_bottom_of_the_dial() {
+        let mut engine = make_engine();
+        engine.set_intensity_pct(10);
+        assert_eq!(engine.intensity_pct(), MIN_INTENSITY_PCT);
+    }
+
+    #[test]
+    fn should_stop_at_the_top_of_the_dial() {
+        let mut engine = make_engine();
+        engine.set_intensity_pct(400);
+        assert_eq!(engine.intensity_pct(), MAX_INTENSITY_PCT);
+    }
+
+    #[test]
+    fn should_hold_at_the_bottom_when_pressed_down_again() {
+        let mut engine = make_engine();
+        engine.set_intensity_pct(MIN_INTENSITY_PCT);
+        // Underflow territory: the dial is u32 and the step is negative.
+        engine.adjust_intensity(-INTENSITY_STEP_PCT);
+        assert_eq!(engine.intensity_pct(), MIN_INTENSITY_PCT);
+    }
+
+    #[test]
+    fn should_step_the_dial_by_one_press() {
+        let mut engine = make_engine();
+        engine.adjust_intensity(-INTENSITY_STEP_PCT);
+        assert_eq!(engine.intensity_pct(), 95);
+        engine.adjust_intensity(INTENSITY_STEP_PCT);
+        assert_eq!(engine.intensity_pct(), 100);
+    }
+
+    #[test]
+    fn should_return_the_dial_to_the_plan_when_reset_with_a_new_workout() {
+        let mut engine = make_engine();
+        engine.set_intensity_pct(85);
+        engine.reset_with_workout(Workout::sample_threshold());
+        assert_eq!(engine.intensity_pct(), 100);
+    }
+
+    #[test]
+    fn should_return_the_dial_to_the_plan_when_a_ride_is_resumed() {
+        let mut engine = make_engine();
+        engine.set_intensity_pct(85);
+        engine.resume_session(Workout::sample_threshold(), ridden_for(600));
+        assert_eq!(engine.intensity_pct(), 100);
     }
 
     #[test]

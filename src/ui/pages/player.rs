@@ -12,7 +12,7 @@ use crate::data::{
     session::{LiveReadings, ReadingsTracker, Session},
     workout::Workout,
 };
-use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine};
+use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
 
@@ -50,6 +50,8 @@ pub struct PlayerPage {
     #[allow(dead_code)]
     skip_btn: gtk::Button,
     end_btn: gtk::Button,
+    /// Reads the intensity dial's position, e.g. "90%".
+    intensity_label: gtk::Label,
     /// Visible only while the engine is in Idle state; lets the user back out
     /// before the workout has actually started.
     cancel_btn: gtk::Button,
@@ -65,6 +67,8 @@ pub struct PlayerPage {
     pause_cb: ButtonCb,
     skip_cb: ButtonCb,
     cancel_cb: ButtonCb,
+    intensity_down_cb: ButtonCb,
+    intensity_up_cb: ButtonCb,
     /// Shows the active workout name above the graph.
     workout_name_label: gtk::Label,
 }
@@ -292,11 +296,45 @@ impl PlayerPage {
             .tooltip_text("End the current workout")
             .build();
 
+        // ── Intensity dial ───────────────────────────────────────────────────
+        // Scales every remaining target, so a session that is too much today can
+        // be finished at 90 % rather than abandoned.
+        let intensity_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .tooltip_text("Workout intensity — scales every power target")
+            .build();
+        let intensity_down_btn = gtk::Button::builder()
+            .icon_name("list-remove-symbolic")
+            .tooltip_text("Lower workout intensity")
+            .css_classes(["circular", "flat"])
+            .build();
+        let intensity_label = gtk::Label::builder()
+            .label("100%")
+            .width_chars(4)
+            .css_classes(["caption", "numeric"])
+            .build();
+        let intensity_up_btn = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Raise workout intensity")
+            .css_classes(["circular", "flat"])
+            .build();
+        // The percentage is the dial's value, not decoration — screen readers get
+        // it from the group rather than from three unrelated children.
+        intensity_box.update_property(&[gtk::accessible::Property::Label(
+            "Workout intensity, percent of plan",
+        )]);
+        intensity_box.append(&intensity_down_btn);
+        intensity_box.append(&intensity_label);
+        intensity_box.append(&intensity_up_btn);
+
         let controls_spacer = gtk::Box::builder().hexpand(true).build();
 
         controls.append(&cancel_btn);
         controls.append(&pause_btn);
         controls.append(&skip_btn);
+        controls.append(&intensity_box);
         controls.append(&controls_spacer);
         controls.append(&end_btn);
         inner.append(&controls);
@@ -311,6 +349,8 @@ impl PlayerPage {
         let pause_cb: ButtonCb = Rc::new(RefCell::new(None));
         let skip_cb: ButtonCb = Rc::new(RefCell::new(None));
         let cancel_cb: ButtonCb = Rc::new(RefCell::new(None));
+        let intensity_down_cb: ButtonCb = Rc::new(RefCell::new(None));
+        let intensity_up_cb: ButtonCb = Rc::new(RefCell::new(None));
 
         {
             let cb = Rc::clone(&end_cb);
@@ -344,6 +384,24 @@ impl PlayerPage {
                 }
             });
         }
+        {
+            let cb = Rc::clone(&intensity_down_cb);
+            intensity_down_btn.connect_clicked(move |_| {
+                if let Some(f) = cb.borrow().as_ref() {
+                    f();
+                }
+            });
+        }
+        {
+            let cb = Rc::clone(&intensity_up_cb);
+            intensity_up_btn.connect_clicked(move |_| {
+                if let Some(f) = cb.borrow().as_ref() {
+                    f();
+                }
+            });
+        }
+
+        Self::add_intensity_shortcuts(&root, &intensity_down_cb, &intensity_up_cb);
 
         Self {
             root,
@@ -379,8 +437,41 @@ impl PlayerPage {
             pause_cb,
             skip_cb,
             cancel_cb,
+            intensity_label,
+            intensity_down_cb,
+            intensity_up_cb,
             workout_name_label,
         }
+    }
+
+    /// Bind `+` and `−` (and their keypad twins) to the intensity dial.
+    ///
+    /// Global scope with a mapped check, like the library's Ctrl+F
+    /// (`ui/pages/library/mod.rs`): the rider reaches this page by starting a
+    /// workout, so focus is not on it and a page-local shortcut would never fire.
+    fn add_intensity_shortcuts(root: &gtk::Box, down_cb: &ButtonCb, up_cb: &ButtonCb) {
+        let controller = gtk::ShortcutController::new();
+        controller.set_scope(gtk::ShortcutScope::Global);
+
+        for (keys, cb) in [("minus|KP_Subtract", down_cb), ("plus|equal|KP_Add", up_cb)] {
+            let Some(trigger) = gtk::ShortcutTrigger::parse_string(keys) else {
+                tracing::warn!("Could not parse intensity shortcut '{keys}'");
+                continue;
+            };
+            let cb = Rc::clone(cb);
+            let action = gtk::CallbackAction::new(move |widget, _| {
+                if !widget.is_mapped() {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(f) = cb.borrow().as_ref() {
+                    f();
+                }
+                glib::Propagation::Stop
+            });
+            controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+        }
+
+        root.add_controller(controller);
     }
 
     pub fn widget(&self) -> &gtk::Box {
@@ -485,6 +576,8 @@ impl PlayerPage {
         self.hr_label.set_label("— bpm");
         self.cadence_label.set_label("— rpm");
         self.target_label.set_label("— W");
+        // The engine resets the dial for a new workout; the label must follow.
+        self.intensity_label.set_label("100%");
         self.interval_label.set_label("—");
         self.interval_caption.set_label("Interval");
         self.avg_power_total.set_label("—");
@@ -575,6 +668,24 @@ impl PlayerPage {
                 engine_skip.borrow_mut().skip_to_next_segment();
             }));
         }
+
+        // ── Intensity dial ───────────────────────────────────────────────────
+        // The label is set here as well as from the snapshot: waiting up to a
+        // second for the tick to catch up reads as a dead button.
+        let dial_cb = |delta: i32| -> Box<dyn Fn()> {
+            let engine_dial = Rc::clone(&engine);
+            let label = page.borrow().intensity_label.clone();
+            Box::new(move || {
+                let pct = {
+                    let mut eng = engine_dial.borrow_mut();
+                    eng.adjust_intensity(delta);
+                    eng.intensity_pct()
+                };
+                label.set_label(&format!("{pct}%"));
+            })
+        };
+        *page.borrow().intensity_down_cb.borrow_mut() = Some(dial_cb(-INTENSITY_STEP_PCT));
+        *page.borrow().intensity_up_cb.borrow_mut() = Some(dial_cb(INTENSITY_STEP_PCT));
 
         // ── End Workout ──────────────────────────────────────────────────────
         {
@@ -715,8 +826,15 @@ impl PlayerPage {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "—".into())
         ));
-        self.target_label
-            .set_label(&format!("{} W", snap.target_power_watts));
+        // At the plan the percentage is noise; off it, the target alone would not
+        // explain why it no longer matches the graph.
+        self.target_label.set_label(&if snap.intensity_pct == 100 {
+            format!("{} W", snap.target_power_watts)
+        } else {
+            format!("{} W · {}%", snap.target_power_watts, snap.intensity_pct)
+        });
+        self.intensity_label
+            .set_label(&format!("{}%", snap.intensity_pct));
         self.zone_meter.set_power(snap.readings.power_watts);
 
         self.elapsed_label

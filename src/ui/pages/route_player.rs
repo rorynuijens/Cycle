@@ -8,6 +8,7 @@ use crate::data::athlete::AthleteProfile;
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
+use crate::training::engine::{INTENSITY_STEP_PCT, MAX_INTENSITY_PCT, MIN_INTENSITY_PCT};
 use crate::training::route_engine::RouteEngine;
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
@@ -84,6 +85,15 @@ pub struct RoutePlayerPage {
     elevation_chart: gtk::DrawingArea,
     pause_btn: gtk::Button,
     end_btn: gtk::Button,
+    /// The intensity dial for this ride, in percent of the road as it is.
+    ///
+    /// Per-ride and deliberately not written back to Preferences: the Trainer
+    /// Difficulty setting stays the baseline this multiplies, so dialling a climb
+    /// down mid-ride cannot silently follow the rider into every later ride.
+    /// Read live by the ride loop, so it applies from the next tick.
+    intensity_pct: Rc<Cell<u32>>,
+    /// Reads the dial's position, e.g. "90%".
+    intensity_label: gtk::Label,
     pub last_readings: Rc<RefCell<ReadingsTracker>>,
     end_cb: ButtonCb,
     pause_cb: ButtonCb,
@@ -360,7 +370,42 @@ impl RoutePlayerPage {
             .tooltip_text("End the route ride and save the session")
             .build();
 
+        // ── Intensity dial ───────────────────────────────────────────────────
+        // The same control as the workout page, applied to whatever the trainer
+        // is being asked for: the climb in SIM, the power target in ERG
+        // emulation. It multiplies the Trainer Difficulty baseline from
+        // Preferences rather than replacing it.
+        let intensity_pct = Rc::new(Cell::new(100u32));
+        let intensity_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .tooltip_text("Ride intensity — scales how hard the trainer makes the road")
+            .build();
+        let intensity_down_btn = gtk::Button::builder()
+            .icon_name("list-remove-symbolic")
+            .tooltip_text("Lower ride intensity")
+            .css_classes(["circular", "flat"])
+            .build();
+        let intensity_label = gtk::Label::builder()
+            .label("100%")
+            .width_chars(4)
+            .css_classes(["caption", "numeric"])
+            .build();
+        let intensity_up_btn = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("Raise ride intensity")
+            .css_classes(["circular", "flat"])
+            .build();
+        intensity_box.update_property(&[gtk::accessible::Property::Label(
+            "Ride intensity, percent of the road as it is",
+        )]);
+        intensity_box.append(&intensity_down_btn);
+        intensity_box.append(&intensity_label);
+        intensity_box.append(&intensity_up_btn);
+
         controls.append(&pause_btn);
+        controls.append(&intensity_box);
         controls.append(&gtk::Box::builder().hexpand(true).build());
         controls.append(&end_btn);
         inner.append(&controls);
@@ -390,6 +435,30 @@ impl RoutePlayerPage {
             });
         }
 
+        // The dial's state lives on the page rather than in a per-ride engine, so
+        // these wire straight through instead of via the replaceable callbacks
+        // that pause and end need.
+        let dial = {
+            let intensity_pct = Rc::clone(&intensity_pct);
+            let intensity_label = intensity_label.clone();
+            move |delta: i32| {
+                let next = (intensity_pct.get() as i32 + delta)
+                    .clamp(MIN_INTENSITY_PCT as i32, MAX_INTENSITY_PCT as i32)
+                    as u32;
+                intensity_pct.set(next);
+                intensity_label.set_label(&format!("{next}%"));
+            }
+        };
+        {
+            let dial = dial.clone();
+            intensity_down_btn.connect_clicked(move |_| dial(-INTENSITY_STEP_PCT));
+        }
+        {
+            let dial = dial.clone();
+            intensity_up_btn.connect_clicked(move |_| dial(INTENSITY_STEP_PCT));
+        }
+        Self::add_intensity_shortcuts(&root, dial);
+
         Self {
             root,
             countdown_banner,
@@ -414,6 +483,8 @@ impl RoutePlayerPage {
             elevation_chart,
             pause_btn,
             end_btn,
+            intensity_pct,
+            intensity_label,
             last_readings: Rc::new(RefCell::new(ReadingsTracker::default())),
             end_cb,
             pause_cb,
@@ -425,6 +496,37 @@ impl RoutePlayerPage {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Bind `+` and `−` (and their keypad twins) to the intensity dial.
+    ///
+    /// Global scope with a mapped check, as on the workout page: the rider
+    /// reaches this page by starting a ride, so focus is not on it and a
+    /// page-local shortcut would never fire.
+    fn add_intensity_shortcuts(root: &gtk::Box, dial: impl Fn(i32) + Clone + 'static) {
+        let controller = gtk::ShortcutController::new();
+        controller.set_scope(gtk::ShortcutScope::Global);
+
+        for (keys, delta) in [
+            ("minus|KP_Subtract", -INTENSITY_STEP_PCT),
+            ("plus|equal|KP_Add", INTENSITY_STEP_PCT),
+        ] {
+            let Some(trigger) = gtk::ShortcutTrigger::parse_string(keys) else {
+                tracing::warn!("Could not parse intensity shortcut '{keys}'");
+                continue;
+            };
+            let dial = dial.clone();
+            let action = gtk::CallbackAction::new(move |widget, _| {
+                if !widget.is_mapped() {
+                    return glib::Propagation::Proceed;
+                }
+                dial(delta);
+                glib::Propagation::Stop
+            });
+            controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
+        }
+
+        root.add_controller(controller);
     }
 
     /// A snapshot of the ride in progress, or `None` when no route ride is
@@ -538,6 +640,10 @@ impl RoutePlayerPage {
         self.pause_btn
             .set_icon_name("media-playback-pause-symbolic");
         self.pause_btn.set_tooltip_text(Some("Pause ride"));
+        // The dial is a judgement about today's legs, so each ride starts from
+        // the Preferences baseline rather than inheriting the last ride's.
+        self.intensity_pct.set(100);
+        self.intensity_label.set_label("100%");
 
         // Rebuild the profile and hand the map the new route line.
         *self.ele_pts.borrow_mut() = profile_samples(route);
@@ -729,17 +835,22 @@ impl RoutePlayerPage {
             // SIM when a controllable trainer is connected (checked live, so a
             // mid-ride trainer drop falls back to ERG emulation gracefully);
             // otherwise the original fixed-speed ERG-target emulation.
+            // The rider's live dial, read each tick so a press applies at once.
+            // It multiplies the Preferences baseline rather than replacing it.
+            let dial = page.intensity_pct.get() as f32 / 100.0;
+
             let sim = sim_capable.get();
             let speed_ms = if sim {
                 let power = readings.power_watts.unwrap_or(0);
                 let speed_ms = engine.borrow_mut().tick_sim(power);
                 // The rate-limited grade, scaled by the rider's difficulty setting
-                // and capped at their trainer's usable maximum. Virtual speed still
-                // comes from the true gradient — difficulty changes how the climb
-                // feels, not how fast the route goes by.
+                // and their live dial, and capped at their trainer's usable
+                // maximum. Virtual speed still comes from the true gradient —
+                // both change how the climb feels, not how fast the route goes by.
                 let max_grade = sim_max_grade.get();
-                let send_grade = (engine.borrow().trainer_grade_percent() * sim_difficulty.get())
-                    .clamp(-max_grade, max_grade);
+                let send_grade =
+                    (engine.borrow().trainer_grade_percent() * sim_difficulty.get() * dial)
+                        .clamp(-max_grade, max_grade);
                 // Send the grade on a ≥0.1% change, with a 5 s keepalive.
                 let last = last_sent_grade.get();
                 if (send_grade - last).abs() >= 0.1 || last.is_nan() || elapsed.is_multiple_of(5) {
@@ -755,7 +866,9 @@ impl RoutePlayerPage {
                 let speed_ms =
                     RouteEngine::emulated_speed_ms(readings.power_watts, readings.speed_kmh);
                 engine.borrow_mut().set_speed(speed_ms);
-                let target_watts = engine.borrow_mut().tick();
+                // The trainer cannot follow the road here, so the dial scales the
+                // power target instead of the climb — the same intent either way.
+                let target_watts = (engine.borrow_mut().tick() as f32 * dial).round() as u32;
                 // Send power target to trainer (clamped per CLAUDE.md §5.1)
                 if target_watts > 0 {
                     let watts = target_watts.min(1000) as u16;

@@ -301,11 +301,32 @@ pub struct IntervalStats {
 }
 
 impl Session {
+    /// The mean target recorded over `[from_secs, to_secs)`, or `None` when the
+    /// ride recorded no target there.
+    ///
+    /// Prefer this over reconstructing a target from the workout: what was
+    /// recorded is what the trainer was actually asked for, which accounts for
+    /// the intensity dial and follows a ramp segment second by second instead of
+    /// flattening it to its mid-point. Rides recorded before target capture
+    /// shipped have nothing here, hence the `Option`.
+    pub fn mean_recorded_target(&self, from_secs: u32, to_secs: u32) -> Option<u32> {
+        let targets: Vec<u32> = self
+            .data_points
+            .iter()
+            .filter(|dp| dp.elapsed_secs >= from_secs && dp.elapsed_secs < to_secs)
+            .filter_map(|dp| dp.target_watts)
+            .collect();
+        if targets.is_empty() {
+            return None;
+        }
+        Some(targets.iter().sum::<u32>() / targets.len() as u32)
+    }
+
     /// Per-segment stats against the structured workout plan.
     ///
-    /// Targets are reconstructed from the FTP the ride was executed at, so they
-    /// match the watts the trainer actually asked for. `fallback_ftp` is used
-    /// only when the session carries no stamped FTP.
+    /// Targets come from what the ride recorded where it has them, falling back
+    /// to reconstruction from the FTP the ride was executed at. `fallback_ftp` is
+    /// used only when the session carries no stamped FTP.
     pub fn interval_analysis(&self, segments: &[Segment], fallback_ftp: u32) -> Vec<IntervalStats> {
         let ftp = self.scoring_ftp(fallback_ftp);
         let mut stats = Vec::with_capacity(segments.len());
@@ -314,7 +335,11 @@ impl Session {
         for (i, seg) in segments.iter().enumerate() {
             let seg_end = seg_start + seg.duration_secs;
             let mid_pct = (seg.power_low_pct + seg.power_high_pct) / 2.0;
-            let target_watts = (mid_pct / 100.0 * ftp as f32) as u32;
+            let target_watts = self
+                .mean_recorded_target(seg_start, seg_end)
+                .unwrap_or_else(|| (mid_pct / 100.0 * ftp as f32) as u32);
+            // Whether a segment counts for compliance stays a property of the
+            // plan: a threshold interval ridden at 90 % is still a hard segment.
             let is_active = mid_pct > 55.0;
 
             let powers: Vec<u32> = self
@@ -851,6 +876,76 @@ mod tests {
         assert_eq!(stats[0].target_watts, 200);
         // …and compliance is therefore 100 %, not a false miss.
         assert_eq!(s.compliance_pct(&segments, 250), Some(100));
+    }
+
+    // ── targets recorded by the ride win over reconstruction ─────────────────────
+
+    /// A ride that recorded a target of `target` and held `power` for `secs`.
+    fn session_with_targets(power: u32, target: u32, secs: u32) -> Session {
+        let mut s = Session::new(None);
+        for i in 0..secs {
+            let mut point = dp(i, Some(power));
+            point.target_watts = Some(target);
+            s.data_points.push(point);
+        }
+        s
+    }
+
+    #[test]
+    fn should_score_against_the_target_the_ride_recorded() {
+        // A 100 % FTP segment at 200 W FTP, ridden with the dial at 90 %: the
+        // trainer asked for 180 W and the rider held it. That is a hit, not the
+        // 90 % miss that reconstructing the target from the plan would report.
+        let segments = vec![Segment::steady(60, 100.0, "Threshold")];
+        let mut s = session_with_targets(180, 180, 60);
+        s.ftp_watts = Some(200);
+        let stats = s.interval_analysis(&segments, 200);
+        assert_eq!(stats[0].target_watts, 180);
+        assert_eq!(s.compliance_pct(&segments, 200), Some(100));
+    }
+
+    #[test]
+    fn should_still_count_a_dialled_down_hard_segment_as_active() {
+        // Whether a segment is scored is a property of the plan, so dialling a
+        // threshold interval down must not quietly drop it out of compliance.
+        let segments = vec![Segment::steady(60, 100.0, "Threshold")];
+        let mut s = session_with_targets(100, 180, 60);
+        s.ftp_watts = Some(200);
+        assert!(s.interval_analysis(&segments, 200)[0].is_active);
+        assert_eq!(s.compliance_pct(&segments, 200), Some(0));
+    }
+
+    #[test]
+    fn should_reconstruct_the_target_when_the_ride_recorded_none() {
+        // Rides from before target capture shipped must score exactly as before.
+        let segments = vec![Segment::steady(60, 100.0, "Threshold")];
+        let mut s = session_const_power(200, 60);
+        s.ftp_watts = Some(200);
+        assert!(s.mean_recorded_target(0, 60).is_none());
+        assert_eq!(s.interval_analysis(&segments, 200)[0].target_watts, 200);
+    }
+
+    #[test]
+    fn should_read_the_target_only_from_inside_the_segment() {
+        // Two segments, dialled differently: each must score against its own.
+        let segments = vec![
+            Segment::steady(3, 100.0, "A"),
+            Segment::steady(3, 100.0, "B"),
+        ];
+        let mut s = Session::new(None);
+        for i in 0..3 {
+            let mut point = dp(i, Some(200));
+            point.target_watts = Some(200);
+            s.data_points.push(point);
+        }
+        for i in 3..6 {
+            let mut point = dp(i, Some(150));
+            point.target_watts = Some(150);
+            s.data_points.push(point);
+        }
+        let stats = s.interval_analysis(&segments, 200);
+        assert_eq!(stats[0].target_watts, 200);
+        assert_eq!(stats[1].target_watts, 150);
     }
 
     // ── duration_secs / kilojoules ───────────────────────────────────────────────
