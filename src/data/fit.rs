@@ -129,9 +129,23 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
     let avg_hr = avg_of(session, |p| p.heart_rate_bpm)
         .map(|v| v.min(0xFE) as u8)
         .unwrap_or(0xFF);
-    let avg_cad = avg_of(session, |p| p.cadence_rpm)
-        .map(|v| v.min(0xFE) as u8)
-        .unwrap_or(0xFF);
+    // FE-C trainers without a cadence sensor report a literal 0 rather than the
+    // invalid marker, so a ride arrives as thousands of real zeros. Written
+    // through, that tells Garmin the rider turned the cranks at 0 rpm for the
+    // whole ride and drags the averages down; reported as absent, it tells them
+    // there was no cadence sensor, which is the truth. Cranks that never turned
+    // once is the signal — a rider cannot coast for an entire ride.
+    let has_cadence = session
+        .data_points
+        .iter()
+        .any(|p| p.cadence_rpm.is_some_and(|c| c > 0));
+    let avg_cad = if has_cadence {
+        avg_of(session, |p| p.cadence_rpm)
+            .map(|v| v.min(0xFE) as u8)
+            .unwrap_or(0xFF)
+    } else {
+        0xFF
+    };
     let max_power = session
         .max_power()
         .map(|p| (p.min(0xFFFE)) as u16)
@@ -158,14 +172,19 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
         .max_speed_kmh()
         .map(|kmh| (kmh / 3.6 * 1000.0).round().clamp(0.0, 65534.0) as u16)
         .unwrap_or(0xFFFF);
-    // Crank revolutions, summing cadence over the ride.
-    let total_cycles = session
-        .data_points
-        .iter()
-        .filter_map(|p| p.cadence_rpm)
-        .map(|rpm| rpm as f64 / 60.0)
-        .sum::<f64>()
-        .round() as u32;
+    // Crank revolutions, summing cadence over the ride. Invalid without a
+    // cadence sensor — zero revolutions is a claim, not an absence.
+    let total_cycles = if has_cadence {
+        session
+            .data_points
+            .iter()
+            .filter_map(|p| p.cadence_rpm)
+            .map(|rpm| rpm as f64 / 60.0)
+            .sum::<f64>()
+            .round() as u32
+    } else {
+        0xFFFF_FFFF
+    };
 
     // The FTP the ride was actually ridden against, which is what makes TSS and
     // intensity factor mean anything to a service reading them later.
@@ -313,7 +332,11 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
             .map(|p| (p.min(4000)) as u16)
             .unwrap_or(0xFFFF);
         let hr = pt.heart_rate_bpm.map(|h| h.min(254) as u8).unwrap_or(0xFF);
-        let cad = pt.cadence_rpm.map(|c| c.min(254) as u8).unwrap_or(0xFF);
+        let cad = if has_cadence {
+            pt.cadence_rpm.map(|c| c.min(254) as u8).unwrap_or(0xFF)
+        } else {
+            0xFF
+        };
         // Data points are one second apart, so speed integrates straight to distance.
         if let Some(kmh) = pt.speed_kmh {
             distance_m += kmh / 3.6;
@@ -367,14 +390,20 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
             (7, 4, 0x86),   // total_elapsed_time: uint32 (ms)
             (8, 4, 0x86),   // total_timer_time: uint32 (ms)
             (11, 2, 0x84),  // total_calories: uint16
-            (16, 1, 0x02),  // avg_heart_rate: uint8
-            (18, 1, 0x02),  // avg_cadence: uint8
-            (20, 2, 0x84),  // avg_power: uint16
-            (32, 2, 0x84),  // normalized_power: uint16
-            (41, 4, 0x86),  // total_work: uint32 (J)
-            (9, 4, 0x86),   // total_distance: uint32 (cm)
-            (24, 1, 0x00),  // lap_trigger: enum
-            (25, 1, 0x00),  // sport: enum
+            // Lap numbering is NOT session numbering. Each average sits one
+            // below its maximum here (15/16, 17/18, 19/20), and NP is 33 — using
+            // the session's numbers filed the averages as maxima and NP as
+            // num_lengths, a swim field.
+            (15, 1, 0x02), // avg_heart_rate: uint8
+            (16, 1, 0x02), // max_heart_rate: uint8
+            (17, 1, 0x02), // avg_cadence: uint8
+            (19, 2, 0x84), // avg_power: uint16
+            (20, 2, 0x84), // max_power: uint16
+            (33, 2, 0x84), // normalized_power: uint16
+            (41, 4, 0x86), // total_work: uint32 (J)
+            (9, 4, 0x86),  // total_distance: uint32 (cm)
+            (24, 1, 0x00), // lap_trigger: enum
+            (25, 1, 0x00), // sport: enum
         ],
     );
     msgs.push(0x02);
@@ -387,8 +416,10 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
     msgs.extend_from_slice(&elapsed_ms.to_le_bytes());
     msgs.extend_from_slice(&calories.to_le_bytes());
     msgs.push(avg_hr);
+    msgs.push(max_hr);
     msgs.push(avg_cad);
     msgs.extend_from_slice(&avg_power.to_le_bytes());
+    msgs.extend_from_slice(&max_power.to_le_bytes());
     msgs.extend_from_slice(&np.to_le_bytes());
     msgs.extend_from_slice(&total_work_j.to_le_bytes());
     msgs.extend_from_slice(&total_distance_cm.to_le_bytes());
@@ -884,6 +915,117 @@ mod tests {
                 .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 10_000),
             "total distance not present in the encoded file"
         );
+    }
+
+    /// Decode the file and return the named field of the lap message.
+    fn lap_field(bytes: &[u8], name: &str) -> Option<fitparser::Value> {
+        let records = fitparser::from_bytes(bytes).expect("encoder must emit parseable FIT");
+        records
+            .iter()
+            .find(|r| r.kind() == fitparser::profile::MesgNum::Lap)
+            .and_then(|r| {
+                r.fields()
+                    .iter()
+                    .find(|f| f.name() == name)
+                    .map(|f| f.value().clone())
+            })
+    }
+
+    /// A ride whose cadence is the constant 0 an FE-C trainer sends when the
+    /// rider has no cadence sensor.
+    fn ride_without_cadence(points: u32) -> Session {
+        let mut s = ride(points, true);
+        for p in &mut s.data_points {
+            p.cadence_rpm = Some(0);
+        }
+        s
+    }
+
+    // ── Lap summary ─────────────────────────────────────────────────────────
+    // Lap field numbers differ from session ones. Borrowing the session's filed
+    // every average as a maximum, and NP as a count of swimming pool lengths.
+
+    #[test]
+    fn should_file_lap_averages_as_averages_not_maxima() {
+        let bytes = encode(60, true);
+        assert_eq!(
+            lap_field(&bytes, "avg_power"),
+            Some(fitparser::Value::UInt16(200))
+        );
+        assert_eq!(
+            lap_field(&bytes, "avg_heart_rate"),
+            Some(fitparser::Value::UInt8(145))
+        );
+        assert_eq!(
+            lap_field(&bytes, "avg_cadence"),
+            Some(fitparser::Value::UInt8(88))
+        );
+    }
+
+    #[test]
+    fn should_give_the_lap_its_own_maxima() {
+        let mut session = ride(60, true);
+        session.data_points[10].power_watts = Some(470);
+        session.data_points[10].heart_rate_bpm = Some(181);
+        let bytes = encode_session(&session, &profile());
+        assert_eq!(
+            lap_field(&bytes, "max_power"),
+            Some(fitparser::Value::UInt16(470))
+        );
+        assert_eq!(
+            lap_field(&bytes, "max_heart_rate"),
+            Some(fitparser::Value::UInt8(181))
+        );
+    }
+
+    #[test]
+    fn should_not_report_the_lap_as_a_swim() {
+        let bytes = encode(60, true);
+        assert_eq!(lap_field(&bytes, "num_lengths"), None);
+        assert!(
+            lap_field(&bytes, "normalized_power").is_some(),
+            "NP belongs in field 33, not num_lengths"
+        );
+    }
+
+    // ── Cadence ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_report_an_all_zero_cadence_ride_as_having_no_cadence() {
+        let bytes = encode_session(&ride_without_cadence(60), &profile());
+        assert_eq!(
+            session_field(&bytes, "avg_cadence"),
+            None,
+            "a trainer's constant 0 must not be averaged in as a real reading"
+        );
+        assert_eq!(session_field(&bytes, "total_cycles"), None);
+        let records = fitparser::from_bytes(&bytes).expect("parseable");
+        let with_cadence = records
+            .iter()
+            .filter(|r| r.kind() == fitparser::profile::MesgNum::Record)
+            .filter(|r| r.fields().iter().any(|f| f.name() == "cadence"))
+            .count();
+        assert_eq!(with_cadence, 0, "no record should carry a 0 rpm reading");
+    }
+
+    #[test]
+    fn should_keep_cadence_when_the_cranks_actually_turned() {
+        // The guard keys on the cranks never turning, so a ride that has real
+        // cadence keeps every sample — including its legitimate zeros.
+        let mut session = ride(60, true);
+        session.data_points[5].cadence_rpm = Some(0); // coasting
+        let bytes = encode_session(&session, &profile());
+        assert_eq!(
+            session_field(&bytes, "avg_cadence"),
+            Some(fitparser::Value::UInt8(86)) // 59 points at 88 rpm, one at 0
+        );
+        let records = fitparser::from_bytes(&bytes).expect("parseable");
+        let with_cadence = records
+            .iter()
+            .filter(|r| r.kind() == fitparser::profile::MesgNum::Record)
+            .filter(|r| r.fields().iter().any(|f| f.name() == "cadence"))
+            .count();
+        assert_eq!(with_cadence, 60);
     }
 
     #[test]
