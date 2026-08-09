@@ -19,6 +19,18 @@ pub const CYCLING_POWER_MEASUREMENT_UUID: &str = "00002a63-0000-1000-8000-00805f
 pub const CSC_SERVICE_UUID: &str = "00001816-0000-1000-8000-00805f9b34fb";
 pub const CSC_MEASUREMENT_UUID: &str = "00002a5b-0000-1000-8000-00805f9b34fb";
 
+// Ceilings for readings coming off the radio (CLAUDE.md §5.1). A trainer that
+// glitches or lies sends a full-scale uint16, and an unclamped one is written
+// into the ride and then into TSS, CTL, the FIT export and the coach prompt —
+// where it cannot be told from a real effort. Every parser below clamps at the
+// point of parsing so no caller can forget to.
+/// Well above any human capability.
+const MAX_PLAUSIBLE_POWER_W: u32 = 3000;
+/// The physical maximum for a pedalling cadence.
+const MAX_PLAUSIBLE_CADENCE_RPM: u32 = 250;
+/// The medical maximum for a heart rate.
+const MAX_PLAUSIBLE_HR_BPM: u32 = 250;
+
 /// Parse a Heart Rate Measurement GATT notification (Bluetooth Assigned Numbers §3.104).
 /// Supports both uint8 (bit 0 = 0) and uint16 (bit 0 = 1) heart rate formats.
 pub fn parse_hr_measurement(data: &[u8]) -> Option<u32> {
@@ -33,7 +45,7 @@ pub fn parse_hr_measurement(data: &[u8]) -> Option<u32> {
         }
         u16::from_le_bytes([data[1], data[2]]) as u32
     };
-    Some(hr.clamp(0, 250))
+    Some(hr.min(MAX_PLAUSIBLE_HR_BPM))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,6 +60,9 @@ pub struct IndoorBikeData {
 }
 
 /// Parse raw bytes from an Indoor Bike Data GATT notification.
+///
+/// Power, cadence and heart rate are clamped to physiologically plausible
+/// ranges — the trainer is untrusted hardware (CLAUDE.md §5.1).
 pub fn parse_indoor_bike_data(data: &[u8]) -> Option<IndoorBikeData> {
     if data.len() < 2 {
         return None;
@@ -64,21 +79,23 @@ pub fn parse_indoor_bike_data(data: &[u8]) -> Option<IndoorBikeData> {
         offset += 2;
     }
 
-    // Bit 2: instantaneous cadence
+    // Bit 2: instantaneous cadence (uint16, 0.5 rpm resolution)
     if flags & 0x0004 != 0 && offset + 2 <= data.len() {
-        result.cadence_rpm = Some(u16::from_le_bytes([data[offset], data[offset + 1]]) as u32 / 2);
+        let rpm = u16::from_le_bytes([data[offset], data[offset + 1]]) as u32 / 2;
+        result.cadence_rpm = Some(rpm.min(MAX_PLAUSIBLE_CADENCE_RPM));
         offset += 2;
     }
 
     // Bit 6: instantaneous power
     if flags & 0x0040 != 0 && offset + 2 <= data.len() {
-        result.power_watts = Some(u16::from_le_bytes([data[offset], data[offset + 1]]) as u32);
+        let watts = u16::from_le_bytes([data[offset], data[offset + 1]]) as u32;
+        result.power_watts = Some(watts.min(MAX_PLAUSIBLE_POWER_W));
         offset += 2;
     }
 
     // Bit 9: heart rate
     if flags & 0x0200 != 0 && offset < data.len() {
-        result.heart_rate_bpm = Some(data[offset] as u32);
+        result.heart_rate_bpm = Some((data[offset] as u32).min(MAX_PLAUSIBLE_HR_BPM));
         offset += 1;
     }
 
@@ -197,7 +214,7 @@ pub fn compute_cadence_rpm(
     let delta_revs = curr_revs.wrapping_sub(prev_revs) as u32;
     // cadence = (revolutions / time_s) × 60 = (delta_revs × 1024 × 60) / delta_time
     let rpm = (delta_revs * 1024 * 60) / delta_time;
-    Some(rpm.clamp(0, 250))
+    Some(rpm.min(MAX_PLAUSIBLE_CADENCE_RPM))
 }
 
 /// OpCode 0x05 — Set Target Power (ERG mode), little-endian i16.
@@ -269,6 +286,91 @@ mod tests {
     fn should_clamp_implausible_hr_to_250() {
         // 0xFF = 255 bpm — physiologically impossible, clamp to 250.
         assert_eq!(parse_hr_measurement(&[0x00, 0xFF]), Some(250));
+    }
+
+    // ── Indoor Bike Data sanitisation (CLAUDE.md §5.1) ───────────────────────
+
+    /// Flags 0x0245, little-endian: bit 2 (cadence), bit 6 (power), bit 9 (HR),
+    /// and bit 0 *set*, which per the spec means no speed field precedes them.
+    const FLAGS_CADENCE_POWER_HR: [u8; 2] = [0x45, 0x02];
+
+    #[test]
+    fn should_clamp_implausible_power_to_3000_watts() {
+        // 0xFFFF = 65535 W from a lying or glitching trainer.
+        let data = &[
+            FLAGS_CADENCE_POWER_HR[0],
+            FLAGS_CADENCE_POWER_HR[1],
+            0x00,
+            0x00, // cadence 0
+            0xFF,
+            0xFF, // power 65535
+            0x64, // HR 100
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.power_watts, Some(3000));
+    }
+
+    #[test]
+    fn should_pass_through_power_at_the_3000_watt_boundary() {
+        // 3000 W = 0x0BB8 LE — a real sprint peak must survive untouched.
+        let data = &[
+            FLAGS_CADENCE_POWER_HR[0],
+            FLAGS_CADENCE_POWER_HR[1],
+            0x00,
+            0x00,
+            0xB8,
+            0x0B,
+            0x64,
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.power_watts, Some(3000));
+    }
+
+    #[test]
+    fn should_pass_through_a_realistic_power_reading() {
+        // 280 W = 0x0118 LE.
+        let data = &[
+            FLAGS_CADENCE_POWER_HR[0],
+            FLAGS_CADENCE_POWER_HR[1],
+            0x00,
+            0x00,
+            0x18,
+            0x01,
+            0x64,
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.power_watts, Some(280));
+    }
+
+    #[test]
+    fn should_clamp_implausible_cadence_to_250_rpm() {
+        // 0xFFFF at 0.5 rpm resolution = 32767 rpm.
+        let data = &[
+            FLAGS_CADENCE_POWER_HR[0],
+            FLAGS_CADENCE_POWER_HR[1],
+            0xFF,
+            0xFF,
+            0x18,
+            0x01,
+            0x64,
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.cadence_rpm, Some(250));
+    }
+
+    #[test]
+    fn should_clamp_implausible_hr_from_indoor_bike_data_to_250() {
+        let data = &[
+            FLAGS_CADENCE_POWER_HR[0],
+            FLAGS_CADENCE_POWER_HR[1],
+            0x00,
+            0x00,
+            0x18,
+            0x01,
+            0xFF, // 255 bpm
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.heart_rate_bpm, Some(250));
     }
 
     // ── Cycling Power Measurement ────────────────────────────────────────────
