@@ -7,6 +7,8 @@ use crate::data::athlete::{AthleteProfile, ZONE_COLORS};
 use crate::data::session::Session;
 use crate::data::workout::{Segment, Workout, WorkoutCategory};
 use crate::training::engine::WorkoutEngine;
+use crate::training::progression::Effort;
+use crate::ui::widgets::progression_card;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_bar::ZoneBar;
 use crate::ui::widgets::zone_meter::ZONE_LABELS;
@@ -31,6 +33,8 @@ pub struct SummaryPage {
     cadence_label: gtk::Label,
     /// Holds the ride graph (profile + actual trace), rebuilt per session.
     graph_holder: gtk::Box,
+    /// Holds the "Compared with Last Time" card, rebuilt per session.
+    progression_holder: gtk::Box,
     last_session: Rc<RefCell<Option<Session>>>,
     /// The profile the last summary was drawn against — the FIT export reads
     /// FTP and heart-rate limits from it to derive training load.
@@ -181,6 +185,15 @@ impl SummaryPage {
         let cadence_label = make_ride_pair("Cadence", "Average cadence while pedalling");
         inner.append(&ride_row);
 
+        // ── Compared with last time ───────────────────────────────────────────
+        // Filled asynchronously once the ride history has been read, and left
+        // hidden when this is the first time the rider has done this effort.
+        let progression_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        inner.append(&progression_holder);
+
         // ── Zone breakdown ────────────────────────────────────────────────────
         let zone_bar =
             ZoneBar::new("Power zone distribution bar: proportional time in zones Z1 through Z7");
@@ -323,6 +336,7 @@ impl SummaryPage {
             max_hr_label,
             cadence_label,
             graph_holder,
+            progression_holder,
             last_session,
             last_athlete,
             export_banner,
@@ -375,6 +389,36 @@ impl SummaryPage {
             cr.fill().ok();
         });
         area
+    }
+
+    /// Look up earlier attempts at this effort and show how the ride compares.
+    ///
+    /// Called after [`Self::update`], separately from it, because the lookup
+    /// needs the database and the rest of the summary does not — the ride's own
+    /// figures are on screen whether or not the history can be read.
+    ///
+    /// The ride's own perceived effort is not known yet: the RPE prompt opens
+    /// alongside this page. The comparison therefore never carries an RPE row
+    /// here, only on the ride detail seen later.
+    pub fn show_progression(
+        &self,
+        session: &Session,
+        workout_name: &str,
+        pool: sqlx::SqlitePool,
+        rt_handle: &tokio::runtime::Handle,
+    ) {
+        let distance = session.distance_m();
+        let current = Effort {
+            date: session.started_at.date_naive(),
+            name: workout_name.to_string(),
+            duration_secs: session.duration_secs() as u32,
+            normalised_power: session.normalised_power().map(|p| p as u32),
+            average_power: session.average_power().map(|p| p as u32),
+            average_hr: session.average_hr().map(|h| h as u32),
+            distance_m: (distance > 0.0).then_some(distance),
+            rpe: session.rpe,
+        };
+        progression_card::attach(&self.progression_holder, current, pool, rt_handle);
     }
 
     /// Show the bundled RPE emoticon icon in the hero.

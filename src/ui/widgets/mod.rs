@@ -2,6 +2,7 @@ pub mod api_key_banner;
 pub mod api_key_row;
 pub mod dialog;
 pub mod fit_import;
+pub mod progression_card;
 pub mod route_map;
 pub mod rpe_dialog;
 pub mod sparkline;

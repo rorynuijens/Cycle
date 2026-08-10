@@ -18,11 +18,13 @@ use crate::data::athlete::power_zone_index;
 use crate::data::db;
 use crate::data::keystore;
 use crate::data::settings;
-use crate::data::sport::is_run;
+use crate::data::sport::{is_cycling, is_run};
 use crate::data::streams::ActivityStreams;
 use crate::data::workout::Workout;
 use crate::training::analytics::{format_average_pace, format_distance};
 use crate::training::engine::WorkoutEngine;
+use crate::training::progression::Effort;
+use crate::ui::widgets::progression_card;
 use crate::ui::widgets::zone_bar::ZoneBar;
 
 use crate::ui::ReloadHolder;
@@ -224,6 +226,32 @@ pub fn show_intervals_detail(
     }
 
     inner.append(&stats_group);
+
+    // ── Compared with last time ───────────────────────────────────────────────
+    // Cycling only: the comparison is built on watts, which say nothing useful
+    // about a run or a swim.
+    if is_cycling(&act.sport_type) {
+        let progression_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        progression_card::attach(
+            &progression_holder,
+            Effort {
+                date: act.date,
+                name: act.name.clone(),
+                duration_secs: act.duration_secs.unwrap_or(0),
+                normalised_power: act.normalized_watts,
+                average_power: act.average_watts,
+                average_hr: act.average_hr,
+                distance_m: act.distance_m,
+                rpe: None,
+            },
+            pool.clone(),
+            rt_handle,
+        );
+        inner.append(&progression_holder);
+    }
 
     // ── Route map (Shumate tile map) ──────────────────────────────────────────
     let route_map = libshumate::SimpleMap::new();
@@ -968,6 +996,29 @@ pub fn show_session_detail(
     }
 
     inner.append(&stats_group);
+
+    // ── Compared with last time ───────────────────────────────────────────
+    let progression_holder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .visible(false)
+        .build();
+    let distance = session.distance_m();
+    progression_card::attach(
+        &progression_holder,
+        Effort {
+            date: local_dt.date_naive(),
+            name: title.to_string(),
+            duration_secs: session.duration_secs() as u32,
+            normalised_power: session.normalised_power().map(|p| p as u32),
+            average_power: session.average_power().map(|p| p as u32),
+            average_hr: session.average_hr().map(|h| h as u32),
+            distance_m: (distance > 0.0).then_some(distance),
+            rpe: session.rpe,
+        },
+        pool.clone(),
+        &rt_handle,
+    );
+    inner.append(&progression_holder);
 
     // ── Zone breakdown ────────────────────────────────────────────────────
     let mut zone_secs = [0u32; 7];

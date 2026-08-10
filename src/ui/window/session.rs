@@ -235,6 +235,12 @@ pub fn finish_session_closure(
         // over the profile, so a bump taken mid-ride is not re-suggested.
         let ftp = session.ftp_watts.unwrap_or(athlete_now.ftp_watts);
         summary_for_complete.update(&session, &name, &athlete_now, segments.as_deref());
+        summary_for_complete.show_progression(
+            &session,
+            &name,
+            pool_for_complete.clone(),
+            &rt_for_complete,
+        );
         stack_for_complete.set_visible_child_name("summary");
 
         // FTP auto-suggestion based on 20-minute best power
