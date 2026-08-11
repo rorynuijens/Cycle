@@ -19,6 +19,9 @@ pub use athlete::*;
 mod calendar;
 pub use calendar::*;
 
+mod programs;
+pub use programs::*;
+
 mod wellness;
 pub use wellness::*;
 

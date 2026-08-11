@@ -42,7 +42,7 @@ const NO_API_KEY: &str = "No AI provider key configured. Enter your API key in \
 ///
 /// Programs are laid out in whole weeks, so a plan started mid-week still
 /// begins on that week's Monday rather than shifting every later week.
-fn week_start(date: NaiveDate) -> NaiveDate {
+pub(super) fn week_start(date: NaiveDate) -> NaiveDate {
     date - CDuration::days(date.weekday().num_days_from_monday() as i64)
 }
 
@@ -289,13 +289,16 @@ impl ProgramSection {
             // thread (CLAUDE.md §2.3). icu_workouts comes back with the reply so
             // the handler can format a program naming Intervals.icu workouts.
             rt_handle.spawn(async move {
+                let today = Local::now().date_naive();
                 let ProgramPromptData {
                     athlete_ctx,
                     goals,
                     records,
                     intervals_pairs,
                     icu_workouts,
-                } = match load_program_prompt_data(&pool_task).await {
+                    wellness: _,
+                    time_off,
+                } = match load_program_prompt_data(&pool_task, today).await {
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Could not read training history to plan: {e}");
@@ -304,7 +307,6 @@ impl ProgramSection {
                     }
                 };
 
-                let today = Local::now().date_naive();
                 let metrics = compute_load_metrics(&records, &intervals_pairs, ftp_watts, today);
                 let ctx = ProgramContext {
                     athlete: profile,
@@ -315,6 +317,10 @@ impl ProgramSection {
                     workout_options: workouts_as_options(&library, &icu_workouts),
                     training_days,
                     num_weeks,
+                    time_off: time_off
+                        .iter()
+                        .map(|t| t.date.format("%Y-%m-%d").to_string())
+                        .collect(),
                 };
 
                 let result = get_suggestion(&api_key, &build_program_prompt(&ctx), 2800)
@@ -367,39 +373,127 @@ impl ProgramSection {
         let entries = Rc::clone(&self.entries);
         let workouts = Rc::clone(&self.workouts);
 
+        let days = self.day_toggles.clone();
+
         self.schedule_btn.connect_clicked(move |btn| {
             let entries = entries.borrow().clone();
             if entries.is_empty() {
                 return;
             }
 
-            let dialog = adw::AlertDialog::new(
-                Some("Schedule Program"),
-                Some("Choose a start date. The program begins on the Monday of that week."),
-            );
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("schedule", "Schedule");
-            dialog.set_response_appearance("schedule", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("schedule"));
-            dialog.set_close_response("cancel");
-
-            let date_entry = adw::EntryRow::builder()
-                .title("Start date (YYYY-MM-DD)")
-                .text(Local::now().date_naive().format("%Y-%m-%d").to_string())
-                .input_hints(gtk::InputHints::NO_EMOJI)
-                .build();
-            let date_list = gtk::ListBox::builder()
-                .css_classes(["boxed-list"])
-                .selection_mode(gtk::SelectionMode::None)
-                .build();
-            date_list.append(&date_entry);
-            dialog.set_extra_child(Some(&date_list));
-
+            // Whether a program is already being followed decides what this
+            // dialog has to say, so it is read before the dialog is built —
+            // the rider is told they are replacing a plan before they agree
+            // to it, not after.
             let pool = pool.clone();
             let rt_handle = rt_handle.clone();
             let on_toast = Rc::clone(&on_toast);
             let workouts = Rc::clone(&workouts);
+            let training_days = days
+                .iter()
+                .zip(DAYS.iter())
+                .filter(|(toggle, _)| toggle.is_active())
+                .map(|(_, (_, value))| *value)
+                .collect::<Vec<_>>()
+                .join(",");
+            let btn = btn.clone();
+            let pool_for_check = pool.clone();
 
+            crate::ui::spawn_to_main(
+                &rt_handle.clone(),
+                async move { db::active_program(&pool_for_check).await },
+                move |existing| {
+                    let existing = match existing {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // Scheduling on top of an unknown state could
+                            // silently double a plan, so it does not proceed.
+                            tracing::error!("Could not check for an existing program: {e}");
+                            on_toast(
+                                adw::Toast::builder()
+                                    .title(
+                                        "Could not read your current program — nothing scheduled",
+                                    )
+                                    .timeout(5)
+                                    .build(),
+                            );
+                            return;
+                        }
+                    };
+
+                    let body = match &existing {
+                        Some(_) => {
+                            "Choose a start date. The program begins on the Monday of that \
+                             week.\n\nYou are already following a program. Its remaining \
+                             sessions will be replaced by this one; rides you have already \
+                             done are kept."
+                        }
+                        None => {
+                            "Choose a start date. The program begins on the Monday of that week."
+                        }
+                    };
+
+                    let dialog = adw::AlertDialog::new(Some("Schedule Program"), Some(body));
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response(
+                        "schedule",
+                        if existing.is_some() {
+                            "Replace"
+                        } else {
+                            "Schedule"
+                        },
+                    );
+                    dialog.set_response_appearance("schedule", adw::ResponseAppearance::Suggested);
+                    dialog.set_default_response(Some("schedule"));
+                    dialog.set_close_response("cancel");
+
+                    let date_entry = adw::EntryRow::builder()
+                        .title("Start date (YYYY-MM-DD)")
+                        .text(Local::now().date_naive().format("%Y-%m-%d").to_string())
+                        .input_hints(gtk::InputHints::NO_EMOJI)
+                        .build();
+                    let date_list = gtk::ListBox::builder()
+                        .css_classes(["boxed-list"])
+                        .selection_mode(gtk::SelectionMode::None)
+                        .build();
+                    date_list.append(&date_entry);
+                    dialog.set_extra_child(Some(&date_list));
+
+                    let replacing = existing.map(|p| p.id);
+                    Self::connect_schedule_response(
+                        &dialog,
+                        date_entry,
+                        entries,
+                        workouts,
+                        training_days,
+                        replacing,
+                        pool,
+                        rt_handle,
+                        on_toast,
+                    );
+                    dialog.present(Some(&btn));
+                },
+            );
+        });
+    }
+
+    /// The half of scheduling that runs once the rider has picked a date.
+    ///
+    /// Split out so the caller stays readable: everything above it decides what
+    /// the dialog should say, and everything here acts on the answer.
+    #[allow(clippy::too_many_arguments)]
+    fn connect_schedule_response(
+        dialog: &adw::AlertDialog,
+        date_entry: adw::EntryRow,
+        entries: Vec<ProgramEntry>,
+        workouts: Rc<Vec<Workout>>,
+        training_days: String,
+        replacing: Option<i64>,
+        pool: SqlitePool,
+        rt_handle: tokio::runtime::Handle,
+        on_toast: Rc<dyn Fn(adw::Toast)>,
+    ) {
+        {
             dialog.connect_response(None, move |_, response| {
                 if response != "schedule" {
                     return;
@@ -434,15 +528,51 @@ impl ProgramSection {
                     }
                 }
 
+                // The program spans as many weeks as the coach actually
+                // returned, which is what the rider will be held to — not the
+                // number that was asked for.
+                let weeks = entries.iter().map(|e| e.week.max(1)).max().unwrap_or(1);
+
                 let pool = pool.clone();
                 let on_toast = Rc::clone(&on_toast);
+                let training_days = training_days.clone();
                 crate::ui::spawn_to_main(
                     &rt_handle,
                     async move {
+                        // Retiring the old plan first means a failure here
+                        // leaves the rider following one program, not two.
+                        if let Some(old) = replacing {
+                            if let Err(e) =
+                                db::clear_future_sessions(&pool, old, start_monday).await
+                            {
+                                tracing::error!("clearing the previous program: {e}");
+                                return Err(());
+                            }
+                            if let Err(e) = db::deactivate_program(&pool, old).await {
+                                tracing::error!("retiring the previous program: {e}");
+                                return Err(());
+                            }
+                        }
+
+                        let program_id = match db::save_program(
+                            &pool,
+                            start_monday,
+                            weeks,
+                            &training_days,
+                        )
+                        .await
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::error!("saving the program: {e}");
+                                return Err(());
+                            }
+                        };
+
                         let mut scheduled = 0u32;
                         let mut failed = 0u32;
                         for (id, date) in to_schedule {
-                            match db::schedule_workout(&pool, id, &date).await {
+                            match db::schedule_workout(&pool, id, &date, Some(program_id)).await {
                                 Ok(_) => scheduled += 1,
                                 Err(e) => {
                                     tracing::error!("schedule_workout {id} on {date}: {e}");
@@ -450,22 +580,27 @@ impl ProgramSection {
                                 }
                             }
                         }
-                        (scheduled, failed)
+                        Ok((scheduled, failed))
                     },
-                    move |(scheduled, failed)| {
-                        let missed = failed + skipped;
-                        let msg = if missed == 0 {
-                            format!("{scheduled} workouts added to calendar")
-                        } else {
-                            format!("{scheduled} added, {missed} skipped")
+                    move |result| {
+                        let msg = match result {
+                            Ok((scheduled, failed)) => {
+                                let missed = failed + skipped;
+                                if missed == 0 {
+                                    format!("{scheduled} workouts added to calendar")
+                                } else {
+                                    format!("{scheduled} added, {missed} skipped")
+                                }
+                            }
+                            Err(()) => {
+                                "Could not save the program — nothing was scheduled".to_string()
+                            }
                         };
                         on_toast(adw::Toast::builder().title(msg).timeout(5).build());
                     },
                 );
             });
-
-            dialog.present(Some(btn));
-        });
+        }
     }
 
     /// A second handle on the same widgets, for moving into a callback.

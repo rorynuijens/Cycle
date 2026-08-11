@@ -92,7 +92,7 @@ async fn swap_todays_workout(pool: &SqlitePool, name: &str, today: &str) -> anyh
     if let Some(entry) = db::load_today_entry(pool, today).await? {
         db::delete_today_calendar_entry(pool, entry.workout.id, today).await?;
     }
-    db::schedule_workout(pool, alt.id, today).await?;
+    db::schedule_workout(pool, alt.id, today, None).await?;
     Ok(())
 }
 
@@ -1146,7 +1146,7 @@ impl DashboardPage {
                             &rt_handle,
                             async move {
                                 if let Err(e) =
-                                    db::schedule_workout(&pool, workout_id, &today).await
+                                    db::schedule_workout(&pool, workout_id, &today, None).await
                                 {
                                     tracing::error!("schedule suggested workout: {e}");
                                 }

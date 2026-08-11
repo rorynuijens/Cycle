@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -40,7 +40,32 @@ struct Migration {
 ///
 /// Append only, never edit or reorder: a released step has already run on real
 /// databases, and changing it makes the version number a lie about their shape.
-const MIGRATIONS: &[Migration] = &[];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 2,
+    name: "training programs",
+    statements: &[
+        // A program the rider is following. `active` is a flag rather than a
+        // deletion so an abandoned plan keeps its calendar entries: the rides
+        // were still planned, and the history should not rewrite itself.
+        "CREATE TABLE programs (
+             id            INTEGER PRIMARY KEY,
+             created_at    TEXT    NOT NULL,
+             start_monday  TEXT    NOT NULL,
+             num_weeks     INTEGER NOT NULL,
+             training_days TEXT    NOT NULL,
+             active        INTEGER NOT NULL DEFAULT 1
+         )",
+        // Which program put this session on the calendar. NULL for anything
+        // scheduled by hand or from a daily suggestion, which adaptation must
+        // never touch.
+        "ALTER TABLE calendar_entries
+             ADD COLUMN program_id INTEGER REFERENCES programs(id)",
+        // What the program originally asked for, stamped the first time an
+        // entry is eased, so an adjustment can explain and undo itself.
+        "ALTER TABLE calendar_entries
+             ADD COLUMN original_workout_id INTEGER REFERENCES workouts(id)",
+    ],
+}];
 
 /// Bring `pool` up to [`SCHEMA_VERSION`], or fail explaining why it cannot be.
 pub async fn run(pool: &SqlitePool) -> Result<()> {
@@ -110,15 +135,25 @@ async fn apply(pool: &SqlitePool, migration: &Migration) -> Result<()> {
 
     let mut tx = pool.begin().await?;
     for statement in migration.statements {
-        sqlx::query(statement)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| {
-                format!(
+        match sqlx::query(statement).execute(&mut *tx).await {
+            Ok(_) => {}
+            // Already in place — see `is_already_applied`. Logged rather than
+            // passed over in silence, because on a database whose version was
+            // accurate this would mean two migrations claim the same object.
+            Err(sqlx::Error::Database(e)) if is_already_applied(e.as_ref()) => {
+                tracing::warn!(
+                    "schema v{} ({}): already applied, skipping: {statement}",
+                    migration.version,
+                    migration.name
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
                     "schema v{} ({}) failed on: {statement}",
                     migration.version, migration.name
-                )
-            })?;
+                )))
+            }
+        }
     }
     set_user_version_tx(&mut tx, migration.version).await?;
     tx.commit().await?;
@@ -164,6 +199,27 @@ async fn add_column_if_missing(pool: &SqlitePool, statement: &str) -> Result<()>
 /// SQLite reports an already-present column as "duplicate column name: x".
 fn is_duplicate_column(e: &dyn DatabaseError) -> bool {
     e.message().contains("duplicate column name")
+}
+
+/// SQLite reports a `CREATE TABLE` over an existing name as "table x already
+/// exists".
+fn is_existing_table(e: &dyn DatabaseError) -> bool {
+    e.message().contains("already exists")
+}
+
+/// True for the two failures that mean "the database is already in the shape
+/// this statement wants": the column is there, or the table is.
+///
+/// Nothing else is benign. A missing table, a locked or corrupt database, a
+/// full disk or a syntax error all still propagate and abort the migration.
+///
+/// This tolerance exists because `user_version` and the schema can disagree:
+/// a database restored from a backup, or interrupted between the write and the
+/// version bump, arrives holding tables it is not credited with. Re-running the
+/// step must then be a no-op rather than a hard failure that locks the rider
+/// out of their own history.
+fn is_already_applied(e: &dyn DatabaseError) -> bool {
+    is_duplicate_column(e) || is_existing_table(e)
 }
 
 async fn user_version(pool: &SqlitePool) -> Result<i32> {
@@ -446,6 +502,78 @@ mod tests {
 
         assert_eq!(user_version(&pool).await.unwrap(), SCHEMA_VERSION);
         assert_eq!(columns(&pool, "sessions").await, first);
+    }
+
+    // ── v2: training programs ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_add_the_programs_table_and_its_calendar_columns() {
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+
+        let programs = columns(&pool, "programs").await;
+        for expected in [
+            "id",
+            "created_at",
+            "start_monday",
+            "num_weeks",
+            "training_days",
+            "active",
+        ] {
+            assert!(
+                programs.iter().any(|c| c == expected),
+                "programs is missing {expected}"
+            );
+        }
+
+        let entries = columns(&pool, "calendar_entries").await;
+        for expected in ["program_id", "original_workout_id"] {
+            assert!(
+                entries.iter().any(|c| c == expected),
+                "calendar_entries is missing {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_carry_a_v1_database_up_to_v2_keeping_its_calendar() {
+        // The rider's own database is at v1 with a calendar already on it, so
+        // this is the upgrade that will actually run in the field.
+        let pool = empty_pool().await;
+        sqlx::query(BASELINE_TABLES).execute(&pool).await.unwrap();
+        set_user_version(&pool, 1).await.unwrap();
+        sqlx::query(
+            "INSERT INTO workouts (name, description, duration_secs, tss, category, segments_json)
+             VALUES ('Sweet Spot', '', 3600, 60, 'SweetSpot', '[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO calendar_entries (workout_id, scheduled_date, completed)
+             VALUES (1, '2026-06-16', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run(&pool).await.expect("v1 to v2 should succeed");
+
+        assert_eq!(user_version(&pool).await.unwrap(), 2);
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "the rider's planned session must survive");
+
+        // An entry that predates programs belongs to none, which is what makes
+        // it an orphan the card can offer to adopt.
+        let program: Option<i64> =
+            sqlx::query_scalar("SELECT program_id FROM calendar_entries WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(program, None);
     }
 
     // ── a database written before versioning existed ─────────────────────────

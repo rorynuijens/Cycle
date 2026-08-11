@@ -118,12 +118,24 @@ pub async fn count_upcoming_scheduled(pool: &SqlitePool, from_date: &str) -> Res
 }
 
 /// Insert a calendar entry scheduling a workout on a given ISO date ("YYYY-MM-DD").
-pub async fn schedule_workout(pool: &SqlitePool, workout_id: i64, date: &str) -> Result<i64> {
+///
+/// `program_id` names the training program this session belongs to, or `None`
+/// for one the rider scheduled themselves or accepted from a daily suggestion.
+/// Program adaptation only ever touches rows that carry an id, which is what
+/// keeps it away from everything else on the calendar.
+pub async fn schedule_workout(
+    pool: &SqlitePool,
+    workout_id: i64,
+    date: &str,
+    program_id: Option<i64>,
+) -> Result<i64> {
     let result = sqlx::query(
-        "INSERT INTO calendar_entries (workout_id, scheduled_date, completed) VALUES (?, ?, 0)",
+        "INSERT INTO calendar_entries (workout_id, scheduled_date, completed, program_id)
+         VALUES (?, ?, 0, ?)",
     )
     .bind(workout_id)
     .bind(date)
+    .bind(program_id)
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())

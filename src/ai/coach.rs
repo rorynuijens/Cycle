@@ -406,6 +406,9 @@ pub struct ProgramContext {
     pub training_days: Vec<String>,
     /// None = generate at least 8 weeks.
     pub num_weeks: Option<u32>,
+    /// Dates the rider has already said they will not be training. A plan laid
+    /// over a fortnight they are away for is a plan they will miss.
+    pub time_off: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +462,16 @@ pub fn build_program_prompt(ctx: &ProgramContext) -> String {
         None => ("open-ended".to_string(), 8),
     };
 
+    let time_off_text = if ctx.time_off.is_empty() {
+        "  None planned.".to_string()
+    } else {
+        ctx.time_off
+            .iter()
+            .map(|d| format!("  - {d}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         r#"You are an expert cycling coach building a structured training program.
 
@@ -474,10 +487,13 @@ TRAINING SCHEDULE:
 - Training days: {days}
 - Program duration: {duration}
 
+PLANNED TIME OFF:
+{time_off}
+
 AVAILABLE WORKOUTS:
 {workouts}
 
-Build a {weeks}-week training program. Apply progressive overload: weeks 1–3 build load, week 4 is a recovery week (lighter workouts), then repeat. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: mix of sweet spot, threshold, VO₂max depending on goals and current fitness).
+Build a {weeks}-week training program. Apply progressive overload: weeks 1–3 build load, week 4 is a recovery week (lighter workouts), then repeat. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: mix of sweet spot, threshold, VO₂max depending on goals and current fitness). Do not schedule anything on a planned day off.
 
 Return ONLY a JSON array — no text before or after it — in exactly this format:
 [
@@ -498,8 +514,176 @@ Rules:
         goals = goals_text,
         days = days_str,
         duration = duration_str,
+        time_off = time_off_text,
         workouts = workout_list,
         weeks = week_count,
+    )
+}
+
+// ── Program revision ──────────────────────────────────────────────────────────
+
+/// What the coach needs to replan the rest of a program the rider is part way
+/// through — the plan as built, and what has actually happened to it.
+pub struct ProgramRevisionContext {
+    pub athlete: AthleteProfile,
+    pub ctl: f64,
+    pub tsb: f64,
+    pub goals: Vec<AthleteGoal>,
+    pub athlete_context: String,
+    pub workout_options: Vec<WorkoutOption>,
+    pub training_days: Vec<String>,
+    /// Which week of the original plan the rider is in now.
+    pub current_week: u32,
+    /// Weeks still to plan, counted from the week after this one.
+    pub weeks_remaining: u32,
+    pub completed: usize,
+    pub missed: usize,
+    /// The most recently missed sessions, newest last: "Wed 5 Aug — Threshold".
+    pub recent_missed: Vec<String>,
+    pub wellness: Vec<WellnessSnapshot>,
+    /// Dates the rider has already said they will not be training.
+    pub time_off: Vec<String>,
+}
+
+/// Ask the coach to replan the remainder of a program.
+///
+/// Deliberately separate from [`build_program_prompt`] rather than a flag on
+/// it: this prompt has to argue against the plan it is replacing, and the two
+/// sets of instructions pull in different directions.
+pub fn build_program_revision_prompt(ctx: &ProgramRevisionContext) -> String {
+    let goals_text = if ctx.goals.is_empty() {
+        "  No specific goals stated.".to_string()
+    } else {
+        ctx.goals
+            .iter()
+            .map(|g| format!("  - {}", g.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let context_section = if ctx.athlete_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("ATHLETE BACKGROUND:\n{}\n\n", ctx.athlete_context.trim())
+    };
+
+    let workout_list = ctx
+        .workout_options
+        .iter()
+        .map(|w| {
+            format!(
+                "  - {} ({}, {} min, TSS {:.0})",
+                w.name, w.category, w.duration_mins, w.tss
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let missed_text = if ctx.recent_missed.is_empty() {
+        "  None.".to_string()
+    } else {
+        ctx.recent_missed
+            .iter()
+            .map(|m| format!("  - {m}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let wellness_text = if ctx.wellness.is_empty() {
+        "  No recent readings.".to_string()
+    } else {
+        ctx.wellness
+            .iter()
+            .map(|w| {
+                let rhr = w
+                    .resting_hr
+                    .map(|v| format!("resting HR {v}"))
+                    .unwrap_or_else(|| "resting HR —".into());
+                let sleep = w
+                    .sleep_score
+                    .map(|v| format!("sleep score {v}"))
+                    .unwrap_or_else(|| "sleep score —".into());
+                format!("  - {}: {rhr}, {sleep}", w.date)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let time_off_text = if ctx.time_off.is_empty() {
+        "  None planned.".to_string()
+    } else {
+        ctx.time_off
+            .iter()
+            .map(|d| format!("  - {d}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        r#"You are an expert cycling coach revising a training program already under way.
+
+{context_section}ATHLETE:
+- FTP: {ftp} W · {weight:.1} kg
+- Current CTL (fitness): {ctl:.0}
+- Current TSB (form): {tsb:+.0}
+
+GOALS:
+{goals}
+
+THE PROGRAM SO FAR:
+- The rider is in week {current_week}.
+- Sessions completed: {completed}
+- Sessions missed: {missed}
+
+RECENTLY MISSED SESSIONS:
+{missed_list}
+
+RECENT WELLNESS:
+{wellness}
+
+PLANNED TIME OFF:
+{time_off}
+
+TRAINING SCHEDULE:
+- Training days: {days}
+
+AVAILABLE WORKOUTS:
+{workouts}
+
+Replan the next {weeks} weeks, starting from next week. Week 1 of your reply is next week.
+
+Take the rider's actual training into account rather than the plan they were given:
+- Missed sessions are gone. Do NOT try to make up lost work by adding volume or intensity.
+- If form (TSB) is very negative, or wellness is trending badly, start easier and rebuild.
+- If the rider has been consistent and form is good, progress normally.
+- Do not schedule anything on a planned day off.
+- Keep applying progressive overload with a lighter recovery week every fourth week.
+
+Return ONLY a JSON array — no text before or after it — in exactly this format:
+[
+  {{"week": 1, "day": "monday", "workout": "Exact Workout Name"}},
+  {{"week": 1, "day": "wednesday", "workout": "Exact Workout Name"}}
+]
+
+Rules:
+- Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
+- Use only the days listed in TRAINING SCHEDULE.
+- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday."#,
+        context_section = context_section,
+        ftp = ctx.athlete.ftp_watts,
+        weight = ctx.athlete.weight_kg,
+        ctl = ctx.ctl,
+        tsb = ctx.tsb,
+        goals = goals_text,
+        current_week = ctx.current_week,
+        completed = ctx.completed,
+        missed = ctx.missed,
+        missed_list = missed_text,
+        wellness = wellness_text,
+        time_off = time_off_text,
+        days = ctx.training_days.join(", "),
+        workouts = workout_list,
+        weeks = ctx.weeks_remaining.max(1),
     )
 }
 
@@ -744,6 +928,7 @@ mod tests {
             workout_options: vec![workout("Sweet Spot 2x20")],
             training_days: vec!["monday".into(), "wednesday".into()],
             num_weeks,
+            time_off: Vec::new(),
         }
     }
 

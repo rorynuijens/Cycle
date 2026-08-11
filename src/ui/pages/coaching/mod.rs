@@ -6,6 +6,7 @@
 
 mod data;
 mod goals;
+mod plan;
 mod program;
 mod suggestion;
 
@@ -19,6 +20,7 @@ use crate::ui::widgets::api_key_banner::ApiKeyBanner;
 
 use data::{load_coaching_data, CoachingData};
 use goals::GoalsSection;
+use plan::PlanCard;
 use program::ProgramSection;
 use suggestion::SuggestionCard;
 
@@ -70,6 +72,13 @@ impl CoachingPage {
             Rc::clone(&on_toast),
         ));
         let goals = Rc::new(GoalsSection::new(pool.clone(), rt_handle.clone()));
+        let plan = PlanCard::new(
+            pool.clone(),
+            rt_handle.clone(),
+            Rc::clone(&athlete),
+            Rc::clone(&workouts),
+            Rc::clone(&on_toast),
+        );
         let program = ProgramSection::new(
             pool.clone(),
             rt_handle.clone(),
@@ -79,6 +88,9 @@ impl CoachingPage {
         );
 
         inner.append(suggestion.widget());
+        // The plan the rider is living with comes before the builder that makes
+        // a new one: following one is the common case, starting one is not.
+        inner.append(plan.widget());
         inner.append(goals.widget());
         inner.append(program.widget());
 
@@ -94,8 +106,12 @@ impl CoachingPage {
             let pool = pool.clone();
             let goals = Rc::clone(&goals);
             let on_toast = Rc::clone(&on_toast);
+            let plan = Rc::clone(&plan);
             Rc::new(move || {
                 api_banner.refresh();
+                // The program's state is read on every visit: a ride finished
+                // since the page was last open changes what it has to say.
+                plan.reload();
 
                 // Load off the main thread (CLAUDE.md §2.3), then fill the goals
                 // list and restore the last suggestion once it arrives.

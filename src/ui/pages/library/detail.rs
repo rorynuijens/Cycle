@@ -483,7 +483,7 @@ fn show_schedule_dialog(
         let on_toast = Rc::clone(&on_toast);
         crate::ui::spawn_to_main(
             &rt_handle,
-            async move { db::schedule_workout(&pool, workout_id, &date_str).await },
+            async move { db::schedule_workout(&pool, workout_id, &date_str, None).await },
             move |res| match res {
                 Ok(_) => {
                     tracing::info!("Scheduled workout {workout_id}");

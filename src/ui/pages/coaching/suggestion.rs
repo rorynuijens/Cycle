@@ -526,7 +526,7 @@ impl SuggestionCard {
                 let date_for_msg = date_str.clone();
                 crate::ui::spawn_to_main(
                     &rt_handle,
-                    async move { db::schedule_workout(&pool, workout_id, &date_str).await },
+                    async move { db::schedule_workout(&pool, workout_id, &date_str, None).await },
                     move |res| match res {
                         Ok(_) => on_toast(
                             adw::Toast::builder()

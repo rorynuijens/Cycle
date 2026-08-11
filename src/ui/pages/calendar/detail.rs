@@ -1496,10 +1496,12 @@ fn show_schedule_past_ride_dialog(
         let pool = pool.clone();
         rt_handle.spawn(async move {
             match db::create_workout_from_session(&pool, &session, &name, ftp).await {
-                Ok(workout_id) => match db::schedule_workout(&pool, workout_id, &date_str).await {
-                    Ok(_) => tracing::info!("Scheduled past ride '{}' for {}", name, date_str),
-                    Err(e) => tracing::error!("schedule_workout failed: {e}"),
-                },
+                Ok(workout_id) => {
+                    match db::schedule_workout(&pool, workout_id, &date_str, None).await {
+                        Ok(_) => tracing::info!("Scheduled past ride '{}' for {}", name, date_str),
+                        Err(e) => tracing::error!("schedule_workout failed: {e}"),
+                    }
+                }
                 Err(e) => tracing::error!("create_workout_from_session failed: {e}"),
             }
         });
@@ -1552,10 +1554,12 @@ fn show_schedule_icu_ride_dialog(
             match db::create_workout_from_icu_activity(&pool, &name, duration_secs, avg_watts, ftp)
                 .await
             {
-                Ok(workout_id) => match db::schedule_workout(&pool, workout_id, &date_str).await {
-                    Ok(_) => tracing::info!("Scheduled ICU ride '{}' for {}", name, date_str),
-                    Err(e) => tracing::error!("schedule_workout failed: {e}"),
-                },
+                Ok(workout_id) => {
+                    match db::schedule_workout(&pool, workout_id, &date_str, None).await {
+                        Ok(_) => tracing::info!("Scheduled ICU ride '{}' for {}", name, date_str),
+                        Err(e) => tracing::error!("schedule_workout failed: {e}"),
+                    }
+                }
                 Err(e) => tracing::error!("create_workout_from_icu_activity failed: {e}"),
             }
         });
