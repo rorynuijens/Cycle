@@ -406,6 +406,103 @@ pub async fn fetch_combined_activity_data(
     }
 }
 
+// ── Sync ──────────────────────────────────────────────────────────────────────
+
+/// How far back a routine sync pulls activities.
+const SYNC_ACTIVITY_DAYS: i64 = 30;
+
+/// How far back a routine sync pulls wellness entries.
+///
+/// Shorter than the activity window because wellness is only ever read as "the
+/// last week or so": it is a picture of the rider now, not of their season.
+const SYNC_WELLNESS_DAYS: i64 = 7;
+
+/// Pull recent activities and wellness into the local database.
+///
+/// Errors are deliberately swallowed rather than propagated. This runs before
+/// the morning brief, and a brief written against yesterday's data is worth far
+/// more to a rider on a hotel wifi than no brief at all. What did arrive is
+/// still saved; what did not is logged.
+///
+/// Does nothing without both credentials, which is not a failure — plenty of
+/// riders never connect Intervals.icu.
+pub async fn sync_recent(
+    pool: &sqlx::SqlitePool,
+    athlete_id: &str,
+    api_key: &str,
+    today: NaiveDate,
+) {
+    use crate::data::db;
+
+    if athlete_id.trim().is_empty() || api_key.trim().is_empty() {
+        return;
+    }
+
+    match fetch_activities(
+        athlete_id,
+        api_key,
+        today - chrono::Duration::days(SYNC_ACTIVITY_DAYS),
+        today,
+    )
+    .await
+    {
+        Ok(activities) => {
+            for a in activities {
+                let _ = db::upsert_intervals_activity(
+                    pool,
+                    &a.id,
+                    a.start_date_local,
+                    &a.name,
+                    a.icu_training_load,
+                    a.moving_time,
+                    a.average_watts,
+                    a.normalized_watts,
+                    a.average_hr,
+                    a.max_hr,
+                    &a.sport_type,
+                    a.start_datetime_local,
+                    a.distance_m,
+                    a.elevation_gain_m,
+                    a.average_cadence,
+                )
+                .await;
+            }
+            // A ride recorded in-app can arrive back here after a round trip
+            // through Garmin or Strava — link the two so it is shown and
+            // counted once.
+            if let Err(e) = db::reconcile_icu_links(pool).await {
+                tracing::error!("reconcile_icu_links: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("Intervals.icu activity sync failed: {e}"),
+    }
+
+    match fetch_wellness(
+        athlete_id,
+        api_key,
+        today - chrono::Duration::days(SYNC_WELLNESS_DAYS),
+        today,
+    )
+    .await
+    {
+        Ok(entries) => {
+            for w in entries {
+                let entry = db::WellnessEntry {
+                    date: w.date,
+                    hrv: w.hrv,
+                    resting_hr: w.resting_hr,
+                    sleep_secs: w.sleep_secs,
+                    sleep_score: w.sleep_score,
+                    steps: w.steps,
+                    calories: w.calories,
+                };
+                let _ = db::upsert_wellness_entry(pool, &entry).await;
+            }
+        }
+        Err(e) => tracing::warn!("Intervals.icu wellness sync failed: {e}"),
+    }
+}
+
 // ── Upload ────────────────────────────────────────────────────────────────────
 
 /// Upload a completed session to Intervals.icu as a FIT file.

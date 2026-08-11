@@ -1,4 +1,4 @@
-pub mod briefing;
+pub mod brief;
 pub mod coach;
 pub mod context;
 pub mod intervals;

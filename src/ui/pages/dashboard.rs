@@ -1,46 +1,33 @@
 use adw::prelude::*;
-use async_channel;
 use chrono::{Duration, Local, Timelike};
-use gtk::glib;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use sqlx::SqlitePool;
 
-use crate::ai::briefing::{
-    build_briefing_prompt, parse_alternative_workout, parse_briefing_decision, resolve_decision,
-    BriefingContext, BriefingDecision,
-};
-use crate::ai::coach::get_suggestion;
-use crate::ai::context::{resolve_planned_workout, wellness_snapshots, workouts_as_options};
 use crate::data::{
     ai_cache,
     athlete::AthleteProfile,
     db::{self},
-    keystore, settings,
+    settings,
     workout::Workout,
 };
 use crate::training::fitness::compute_load_metrics;
+use crate::training::program::CoachVerdict;
+use crate::ui::brief_store::{BriefState, BriefStatus, BriefStore};
 use crate::ui::markdown::{insight_preview, to_pango};
+use crate::ui::widgets::api_key_banner::ApiKeyBanner;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::AiFailure;
 
 use crate::ui::ReloadHolder;
 
-/// How far ahead the briefing prompt looks for planned time off.
-const TIME_OFF_LOOKAHEAD_DAYS: i64 = 14;
-
-/// How far back the briefing syncs activities from Intervals.icu.
-const ICU_SYNC_DAYS: i64 = 30;
-
-/// How far back the briefing syncs wellness entries from Intervals.icu.
-const ICU_WELLNESS_SYNC_DAYS: i64 = 7;
-
 /// Everything the dashboard's cards are drawn from, loaded in one pass.
 struct DashboardData {
     today_entry: Option<db::TodayEntry>,
     records: Vec<db::SessionSummary>,
-    /// The cached AI suggestion resolved against the library, when today is open.
+    /// The brief's recommendation resolved against the library, when today is
+    /// open and no program owned the day.
     suggested_workout: Option<Workout>,
     ai_workout_detail: String,
     ai_fitness_insight: String,
@@ -49,29 +36,55 @@ struct DashboardData {
 }
 
 /// Load the dashboard's data off the GTK main thread (CLAUDE.md §2.3).
+///
+/// The hero and the form row read today's brief from the cache rather than
+/// being handed it, so a reload triggered by anything — a finished ride, an FTP
+/// edit — redraws them from the same brief the Coach card above is showing.
 async fn load_dashboard_data(pool: &SqlitePool, today: &str) -> anyhow::Result<DashboardData> {
     let today_entry = db::load_today_entry(pool, today).await?;
-    let cached = ai_cache::load_suggestion(pool).await?;
-    let ai_workout_name = cached.workout_name.clone();
+    let brief = ai_cache::daily_brief(pool)
+        .await?
+        .filter(|b| b.is_for(today));
 
-    // The suggestion only matters on an empty day — with a workout scheduled,
+    // A recommendation only matters on an empty day — with a workout scheduled,
     // the plan wins and the suggestion hides.
-    let suggested_workout = if today_entry.is_none() && !ai_workout_name.trim().is_empty() {
-        db::load_workouts(pool)
+    let recommended = brief
+        .as_ref()
+        .and_then(|b| b.recommended_workout.as_deref())
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+
+    let suggested_workout = match (today_entry.is_none(), recommended) {
+        (true, Some(name)) => db::load_workouts(pool)
             .await?
             .into_iter()
             // Case-insensitive — the AI may return different casing.
-            .find(|w| crate::ai::naming::names_match(&w.name, ai_workout_name.trim()))
-    } else {
-        None
+            .find(|w| crate::ai::naming::names_match(&w.name, name)),
+        _ => None,
     };
+
+    let ai_workout_detail = suggested_workout
+        .as_ref()
+        .map(|w| {
+            format!(
+                "{} · {} min · TSS {:.0}",
+                w.category.label(),
+                w.duration_secs / 60,
+                w.tss
+            )
+        })
+        .unwrap_or_default();
 
     Ok(DashboardData {
         today_entry,
         records: db::load_session_summaries(pool).await?,
         suggested_workout,
-        ai_workout_detail: cached.workout_detail,
-        ai_fitness_insight: ai_cache::fitness_insight(pool).await?.unwrap_or_default(),
+        ai_workout_detail,
+        ai_fitness_insight: brief
+            .as_ref()
+            .and_then(|b| b.form_slice())
+            .unwrap_or_default()
+            .to_string(),
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
         first_use_done: settings::first_use_complete(pool).await?,
     })
@@ -96,67 +109,13 @@ async fn swap_todays_workout(pool: &SqlitePool, name: &str, today: &str) -> anyh
     Ok(())
 }
 
-/// Read today's cached briefing, and the name of the workout on today's
-/// calendar if there is one.
-async fn load_cached_briefing(
-    pool: &SqlitePool,
-    today: &str,
-) -> anyhow::Result<(Option<ai_cache::Briefing>, Option<String>)> {
-    Ok((
-        ai_cache::briefing(pool).await?,
-        db::load_today_entry(pool, today)
-            .await?
-            .map(|e| e.workout.name),
-    ))
-}
-
-/// The training history behind the morning briefing prompt.
-struct BriefingPromptData {
-    today_entry: Option<db::TodayEntry>,
-    records: Vec<db::SessionSummary>,
-    intervals_pairs: Vec<(chrono::NaiveDate, f32)>,
-    wellness: Vec<db::WellnessEntry>,
-    workouts: Vec<Workout>,
-    athlete_context: String,
-    cached_suggestion_name: String,
-    time_off: Vec<db::TimeOffEntry>,
-}
-
-/// Load the history the morning briefing is written from.
-///
-/// The first failure aborts: a partial read would still be sent, and the coach
-/// would tell the rider how their day looks having been shown a training history
-/// that is missing rides — at the rider's expense, since the request is billed.
-async fn load_briefing_prompt_data(
-    pool: &SqlitePool,
-    today: chrono::NaiveDate,
-) -> anyhow::Result<BriefingPromptData> {
-    let lookahead = today + Duration::days(TIME_OFF_LOOKAHEAD_DAYS);
-    Ok(BriefingPromptData {
-        today_entry: db::load_today_entry(pool, &today.format("%Y-%m-%d").to_string()).await?,
-        records: db::load_session_summaries(pool).await?,
-        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
-        wellness: db::load_wellness_recent(pool, 1).await?,
-        workouts: db::load_workouts(pool).await?,
-        athlete_context: settings::coaching_context(pool).await?,
-        cached_suggestion_name: ai_cache::suggestion_workout_name(pool)
-            .await?
-            .unwrap_or_default(),
-        time_off: db::load_time_off_between(
-            pool,
-            &today.format("%Y-%m-%d").to_string(),
-            &lookahead.format("%Y-%m-%d").to_string(),
-        )
-        .await?,
-    })
-}
-
 pub struct DashboardPage {
     root: gtk::Box,
 }
 
 impl DashboardPage {
     /// Returns `(page, reload_fn)`. Call `reload_fn()` whenever data may have changed.
+    #[allow(clippy::too_many_arguments)] // page constructor wiring; grouping deferred
     pub fn new(
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
@@ -165,6 +124,8 @@ impl DashboardPage {
         on_view_fitness: Rc<dyn Fn()>,
         on_open_calendar: Rc<dyn Fn()>,
         on_toast: Rc<dyn Fn(adw::Toast)>,
+        brief_store: Rc<BriefStore>,
+        on_go_to_coaching: Rc<dyn Fn()>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -222,14 +183,22 @@ impl DashboardPage {
             .build();
         inner.append(&dynamic_top);
 
+        // ── Missing-key banner ───────────────────────────────────────────────
+        // The dashboard is the page whose primary card is written by the AI,
+        // and it was the one page without this — a rider with no key saw a
+        // permanently empty Coach card and nothing explaining why.
+        let api_key_banner = ApiKeyBanner::new("Add an API key to get your morning brief");
+        inner.append(api_key_banner.widget());
+
         // ── Coach briefing card (static — not rebuilt on each reload) ────────
         let reload_holder: ReloadHolder = Rc::new(RefCell::new(None));
         let briefing_card = Self::build_briefing_card(
             pool.clone(),
             rt_handle.clone(),
-            Rc::clone(&athlete),
             Rc::clone(&reload_holder),
             Rc::clone(&on_toast),
+            Rc::clone(&brief_store),
+            Rc::clone(&on_go_to_coaching),
         );
         inner.append(&briefing_card);
 
@@ -427,6 +396,29 @@ impl DashboardPage {
         };
 
         *reload_holder.borrow_mut() = Some(Rc::clone(&reload));
+
+        // The Today hero and the form row read the brief from the cache, so
+        // they have to be redrawn when a new one lands. The Coach card above
+        // them updates itself through its own observer.
+        brief_store.observe({
+            let reload = Rc::clone(&reload);
+            let last: RefCell<Option<String>> = RefCell::new(None);
+            move |state: &BriefState| {
+                // Only when the brief itself changed. The store also notifies
+                // for status-only transitions, and redrawing the whole page on
+                // each of those would re-query the database for nothing.
+                let stamp = state
+                    .brief
+                    .as_ref()
+                    .map(|b| format!("{}|{}", b.written_for, b.fingerprint));
+                if last.borrow().as_ref() == stamp.as_ref() {
+                    return;
+                }
+                *last.borrow_mut() = stamp;
+                reload();
+            }
+        });
+
         reload();
 
         (Self { root }, reload)
@@ -436,12 +428,14 @@ impl DashboardPage {
         &self.root
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_briefing_card(
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
-        athlete: Rc<RefCell<AthleteProfile>>,
         reload_holder: ReloadHolder,
         on_toast: Rc<dyn Fn(adw::Toast)>,
+        brief_store: Rc<BriefStore>,
+        on_go_to_coaching: Rc<dyn Fn()>,
     ) -> adw::PreferencesGroup {
         let today_str = Local::now().date_naive().format("%Y-%m-%d").to_string();
 
@@ -492,6 +486,22 @@ impl DashboardPage {
             .build();
         action_row.add_suffix(&remove_btn);
 
+        // Ease/Rest under a program: the plan owns the change, so send the
+        // rider where it can be made properly rather than editing the calendar
+        // behind the program's back.
+        let see_plan_btn = gtk::Button::builder()
+            .label("See plan")
+            .css_classes(["pill"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .tooltip_text("Open your program, where this session can be eased")
+            .build();
+        {
+            let go = Rc::clone(&on_go_to_coaching);
+            see_plan_btn.connect_clicked(move |_| go());
+        }
+        action_row.add_suffix(&see_plan_btn);
+
         // ── Text label as a fake row (inlined via Box) ────────────────────────
         let text_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -506,10 +516,14 @@ impl DashboardPage {
         let content_row = adw::ActionRow::builder().visible(false).build();
         content_row.set_child(Some(&text_box));
 
-        // ── Spinner + Generate button ─────────────────────────────────────────
+        // ── Spinner + Refresh button ──────────────────────────────────────────
+        // The subtitle is the provenance line: where what is shown came from,
+        // and whether anything has happened since. It is the only place the
+        // rider is told the brief has been overtaken, and pressing Refresh is
+        // the only way a second request is ever made in a day.
         let generate_row = adw::ActionRow::builder()
-            .title("Morning briefing")
-            .subtitle("Checks today's readiness against your plan")
+            .title("Morning brief")
+            .subtitle("")
             .build();
 
         let spinner = gtk::Spinner::builder().visible(false).build();
@@ -517,11 +531,15 @@ impl DashboardPage {
 
         // Plain pill — the Today hero keeps the page's single primary action.
         let generate_btn = gtk::Button::builder()
-            .label("Generate")
+            .label("Refresh")
             .css_classes(["pill"])
             .valign(gtk::Align::Center)
-            .tooltip_text("Ask the AI coach for today's briefing")
+            .tooltip_text("Ask your coach to write today's brief again")
             .build();
+        {
+            let store = Rc::clone(&brief_store);
+            generate_btn.connect_clicked(move |_| store.refresh());
+        }
         generate_row.add_suffix(&generate_btn);
         generate_row.set_activatable_widget(Some(&generate_btn));
 
@@ -626,384 +644,120 @@ impl DashboardPage {
             });
         }
 
-        // Wire up Generate button
-        {
-            let pool_g = pool.clone();
-            let rt_g = rt_handle.clone();
-            let athlete_g = Rc::clone(&athlete);
-            let text_label_g = text_label.clone();
-            let action_row_g = action_row.clone();
-            let content_row_g = content_row.clone();
-            let decision_badge_g = decision_badge.clone();
-            let use_workout_btn_g = use_workout_btn.clone();
-            let remove_btn_g = remove_btn.clone();
-            let spinner_g = spinner.clone();
-            let today_g = today_str.clone();
-            let alt_name_g = Rc::clone(&pending_alt_name);
+        // ── Subscribe to the daily brief ──────────────────────────────────────
+        // The card never asks for anything itself. One request stands behind
+        // this card, the Fitness page's and the Coaching page's, so whatever
+        // they show cannot disagree — see ai::brief.
+        brief_store.observe({
+            let text_label = text_label.clone();
+            let action_row = action_row.clone();
+            let content_row = content_row.clone();
+            let decision_badge = decision_badge.clone();
+            let use_workout_btn = use_workout_btn.clone();
+            let remove_btn = remove_btn.clone();
+            let see_plan_btn = see_plan_btn.clone();
+            let generate_row = generate_row.clone();
+            let generate_btn = generate_btn.clone();
+            let spinner = spinner.clone();
+            let pending_alt = Rc::clone(&pending_alt_name);
 
-            generate_btn.connect_clicked(move |btn| {
-                let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
-                    Ok(Some(k)) if !k.trim().is_empty() => k,
-                    _ => {
-                        tracing::warn!("Morning briefing: no AI provider key configured");
-                        return;
-                    }
-                };
+            move |state: &BriefState| {
+                generate_row.set_subtitle(state.provenance());
+                generate_btn.set_sensitive(state.can_refresh());
 
-                // Get ICU credentials synchronously (fast local D-Bus calls, not network).
-                let icu_api_key = keystore::get_secret(keystore::KEY_INTERVALS_API)
-                    .unwrap_or(None)
-                    .unwrap_or_default();
+                let loading = state.status == BriefStatus::Loading;
+                spinner.set_visible(loading);
+                if loading {
+                    spinner.start();
+                } else {
+                    spinner.stop();
+                }
 
-                btn.set_sensitive(false);
-                spinner_g.set_visible(true);
-                spinner_g.start();
-                text_label_g.set_markup("Generating briefing…");
-                text_label_g.set_visible(true);
-                content_row_g.set_visible(true);
+                *pending_alt.borrow_mut() = state
+                    .brief
+                    .as_ref()
+                    .and_then(|b| b.recommended_workout.clone());
 
-                // Channel carries (briefing_text, planned_name_for_align, has_planned).
-                let (tx, rx) =
-                    async_channel::bounded::<Result<(String, Option<String>, bool), AiFailure>>(1);
-
-                let pool_t = pool_g.clone();
-                // Read at click time, not at card-build time — the briefing is
-                // written against the rider's current FTP and HR range.
-                let athlete_t = athlete_g.borrow().clone();
-
-                // All network and DB work happens in the tokio runtime — the GTK main
-                // thread is never blocked, so the UI stays responsive even with no internet.
-                rt_g.spawn(async move {
-                    let icu_athlete_id = settings::load_intervals(&pool_t)
-                        .await
-                        .map(|s| s.athlete_id)
-                        .unwrap_or_default();
-
-                    // Sync intervals.icu — errors are non-fatal; we just skip stale data.
-                    if !icu_api_key.trim().is_empty() && !icu_athlete_id.trim().is_empty() {
-                        let today = chrono::Local::now().date_naive();
-                        let thirty_ago = today - Duration::days(ICU_SYNC_DAYS);
-                        let seven_ago = today - Duration::days(ICU_WELLNESS_SYNC_DAYS);
-
-                        if let Ok(acts) = crate::ai::intervals::fetch_activities(
-                            &icu_athlete_id,
-                            &icu_api_key,
-                            thirty_ago,
-                            today,
-                        )
-                        .await
-                        {
-                            for a in acts {
-                                let _ = db::upsert_intervals_activity(
-                                    &pool_t,
-                                    &a.id,
-                                    a.start_date_local,
-                                    &a.name,
-                                    a.icu_training_load,
-                                    a.moving_time,
-                                    a.average_watts,
-                                    a.normalized_watts,
-                                    a.average_hr,
-                                    a.max_hr,
-                                    &a.sport_type,
-                                    a.start_datetime_local,
-                                    a.distance_m,
-                                    a.elevation_gain_m,
-                                    a.average_cadence,
-                                )
-                                .await;
-                            }
-                            // A ride recorded in-app can arrive back here after a round
-                            // trip through Garmin or Strava — link the two so it is shown
-                            // and counted once.
-                            if let Err(e) = crate::data::db::reconcile_icu_links(&pool_t).await {
-                                tracing::error!("reconcile_icu_links: {e}");
-                            }
-                        }
-
-                        if let Ok(wellness) = crate::ai::intervals::fetch_wellness(
-                            &icu_athlete_id,
-                            &icu_api_key,
-                            seven_ago,
-                            today,
-                        )
-                        .await
-                        {
-                            for w in wellness {
-                                let entry = db::WellnessEntry {
-                                    date: w.date,
-                                    hrv: w.hrv,
-                                    resting_hr: w.resting_hr,
-                                    sleep_secs: w.sleep_secs,
-                                    sleep_score: w.sleep_score,
-                                    steps: w.steps,
-                                    calories: w.calories,
-                                };
-                                let _ = db::upsert_wellness_entry(&pool_t, &entry).await;
-                            }
-                        }
-                    }
-
-                    let today_naive = chrono::Local::now().date_naive();
-                    let BriefingPromptData {
-                        today_entry,
-                        records,
-                        intervals_pairs,
-                        wellness,
-                        workouts,
-                        athlete_context,
-                        cached_suggestion_name,
-                        time_off,
-                    } = match load_briefing_prompt_data(&pool_t, today_naive).await {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::error!("Could not read training history to brief: {e}");
-                            let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
-                            return;
-                        }
-                    };
-
-                    // Whether a workout is actually on today's calendar — the
-                    // decision copy must not say "as planned" when nothing is.
-                    let has_planned = today_entry.is_some();
-
-                    let ftp = athlete_t.ftp_watts;
-                    let m = compute_load_metrics(&records, &intervals_pairs, ftp, today_naive);
-                    let (ctl, atl, tsb) = (m.ctl, m.atl, m.tsb());
-
-                    let today_wellness = wellness_snapshots(&wellness).into_iter().next();
-
-                    let planned_workout = resolve_planned_workout(
-                        today_entry.as_ref().map(|e| &e.workout),
-                        &cached_suggestion_name,
-                        &workouts,
-                    );
-                    let planned_name_for_align = planned_workout.as_ref().map(|p| p.name.clone());
-
-                    let workout_options = workouts_as_options(&workouts, &[]);
-                    let time_off_dates: Vec<String> = time_off
-                        .into_iter()
-                        .map(|e| e.date.format("%Y-%m-%d").to_string())
-                        .collect();
-
-                    let ctx = BriefingContext {
-                        athlete: athlete_t,
-                        ctl,
-                        atl,
-                        tsb,
-                        today_wellness,
-                        planned_workout,
-                        workout_options,
-                        athlete_context,
-                        time_off_dates,
-                    };
-                    let prompt = build_briefing_prompt(&ctx);
-
-                    let r = get_suggestion(&api_key, &prompt, 1600)
-                        .await
-                        .map(|text| (text, planned_name_for_align, has_planned))
-                        .map_err(|e| {
-                            tracing::error!("AI morning briefing failed: {e}");
-                            AiFailure::Request
-                        });
-                    let _ = tx.send(r).await;
-                });
-
-                let text_l = text_label_g.clone();
-                let action_r = action_row_g.clone();
-                let content_r = content_row_g.clone();
-                let badge = decision_badge_g.clone();
-                let use_btn = use_workout_btn_g.clone();
-                let rem_btn = remove_btn_g.clone();
-                let spinner_c = spinner_g.clone();
-                let btn_c = btn.clone();
-                let pool_c = pool_g.clone();
-                let rt_c = rt_g.clone();
-                let today_c = today_g.clone();
-                let alt_name_c = Rc::clone(&alt_name_g);
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(result) = rx.recv().await {
-                        match result {
-                            Ok((text, planned_name_for_align, has_planned)) => {
-                                let (decision, alt) = resolve_decision(
-                                    parse_briefing_decision(&text),
-                                    parse_alternative_workout(&text),
-                                    planned_name_for_align.as_deref(),
-                                );
-                                *alt_name_c.borrow_mut() = alt.clone();
-                                Self::apply_briefing(
-                                    &text_l,
-                                    &action_r,
-                                    &content_r,
-                                    &badge,
-                                    &use_btn,
-                                    &rem_btn,
-                                    &text,
-                                    &decision,
-                                    alt.as_deref(),
-                                    has_planned,
-                                );
-                                // Align the coaching suggestion with the briefing decision
-                                let suggest_name = match &decision {
-                                    BriefingDecision::Proceed => {
-                                        planned_name_for_align.unwrap_or_default()
-                                    }
-                                    BriefingDecision::Modify => alt.unwrap_or_default(),
-                                    BriefingDecision::Rest => String::new(),
-                                };
-                                // Cache the result and persist aligned suggestion
-                                rt_c.spawn(async move {
-                                    let _ = ai_cache::save_briefing(&pool_c, &text, &today_c).await;
-                                    if !suggest_name.is_empty() {
-                                        let _ = ai_cache::set_suggestion_workout_name(
-                                            &pool_c,
-                                            &suggest_name,
-                                        )
-                                        .await;
-                                        // The detail belongs to whichever workout the name
-                                        // names. Leaving the coaching page's older detail
-                                        // in place left its card describing one workout in
-                                        // the title and another underneath, with no Start
-                                        // button because the stale pair matched nothing.
-                                        let detail = db::load_workouts(&pool_c)
-                                            .await
-                                            .ok()
-                                            .and_then(|ws| {
-                                                ws.into_iter()
-                                                    .find(|w| {
-                                                        crate::ai::naming::names_match(
-                                                            &w.name,
-                                                            &suggest_name,
-                                                        )
-                                                    })
-                                                    .map(|w| {
-                                                        format!(
-                                                            "{} · {} min · TSS {:.0}",
-                                                            w.category.label(),
-                                                            w.duration_secs / 60,
-                                                            w.tss
-                                                        )
-                                                    })
-                                            })
-                                            .unwrap_or_default();
-                                        let _ = ai_cache::set_suggestion_workout_detail(
-                                            &pool_c, &detail,
-                                        )
-                                        .await;
-                                    }
-                                });
-                            }
-                            Err(failure) => {
-                                // Previously this only logged, leaving the card
-                                // blank with no explanation for the rider.
-                                text_l.set_text(failure.message());
-                                text_l.set_visible(true);
-                                content_r.set_visible(true);
-                            }
-                        }
-                    }
-                    spinner_c.stop();
-                    spinner_c.set_visible(false);
-                    btn_c.set_sensitive(true);
-                });
-            });
-        }
-
-        // Load any cached briefing off the main thread (CLAUDE.md §2.3). On arrival,
-        // either restore today's cached briefing or auto-generate a fresh one.
-        {
-            let pool_cache = pool.clone();
-            let today_c = today_str.clone();
-            let today_q = today_str.clone();
-            let text_label_c = text_label.clone();
-            let action_row_c = action_row.clone();
-            let content_row_c = content_row.clone();
-            let decision_badge_c = decision_badge.clone();
-            let use_workout_btn_c = use_workout_btn.clone();
-            let remove_btn_c = remove_btn.clone();
-            let pending_alt_c = Rc::clone(&pending_alt_name);
-            let generate_btn_c = generate_btn.clone();
-            crate::ui::spawn_to_main(
-                &rt_handle,
-                async move { load_cached_briefing(&pool_cache, &today_q).await },
-                move |result| {
-                    // On a failed read, do nothing at all. Falling through to the
-                    // auto-generate branch would bill the rider for a briefing
-                    // because the database hiccupped, and overwrite the good one
-                    // already cached for today.
-                    let (cached, planned_name) = match result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::error!("Could not read the cached briefing: {e}");
-                            return;
-                        }
-                    };
-                    if let Some(cached_text) = cached.filter(|b| b.is_for(&today_c)).map(|b| b.text)
-                    {
-                        // Reconcile against the plan: a cached "modify" naming
-                        // the workout already scheduled is agreement, not a swap.
-                        let (decision, alt) = resolve_decision(
-                            parse_briefing_decision(&cached_text),
-                            parse_alternative_workout(&cached_text),
-                            planned_name.as_deref(),
-                        );
-                        let has_planned = planned_name.is_some();
-                        *pending_alt_c.borrow_mut() = alt.clone();
-                        Self::apply_briefing(
-                            &text_label_c,
-                            &action_row_c,
-                            &content_row_c,
-                            &decision_badge_c,
-                            &use_workout_btn_c,
-                            &remove_btn_c,
-                            &cached_text,
-                            &decision,
-                            alt.as_deref(),
-                            has_planned,
-                        );
-                    } else {
-                        // No briefing cached for today — auto-generate one.
-                        generate_btn_c.emit_by_name::<()>("clicked", &[]);
-                    }
-                },
-            );
-        }
+                Self::apply_brief(
+                    state,
+                    &text_label,
+                    &action_row,
+                    &content_row,
+                    &decision_badge,
+                    &use_workout_btn,
+                    &remove_btn,
+                    &see_plan_btn,
+                );
+            }
+        });
 
         group
     }
 
+    /// Render one state of the brief onto the card.
+    ///
+    /// Which actions are offered turns on `program_active`, not on the verdict
+    /// alone. Replacing or deleting a session a program scheduled would drop
+    /// work the plan was counting on, and the plan never makes it up — so with
+    /// a program running the card sends the rider to the Coaching page, where
+    /// easing goes through the plan's own rules and is recorded.
     #[allow(clippy::too_many_arguments)]
-    fn apply_briefing(
+    fn apply_brief(
+        state: &BriefState,
         text_label: &gtk::Label,
         action_row: &adw::ActionRow,
         content_row: &adw::ActionRow,
         decision_badge: &gtk::Label,
         use_workout_btn: &gtk::Button,
         remove_btn: &gtk::Button,
-        text: &str,
-        decision: &BriefingDecision,
-        alt_workout: Option<&str>,
-        has_planned: bool,
+        see_plan_btn: &gtk::Button,
     ) {
-        // Strip DECISION: and ALTERNATIVE_WORKOUT: lines from displayed text
-        let cleaned: String = text
-            .lines()
-            .filter(|l| {
-                let u = l.trim().to_uppercase();
-                !u.starts_with("DECISION:") && !u.starts_with("ALTERNATIVE_WORKOUT:")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
+        // A failure gets its own sentence rather than a blank card. Previously
+        // this path only logged, and a rider with no key saw nothing at all.
+        if let BriefStatus::Failed(failure) = state.status {
+            if state.brief.is_none() {
+                text_label.set_text(failure.message());
+                text_label.set_visible(true);
+                content_row.set_visible(true);
+                action_row.set_visible(false);
+                return;
+            }
+        }
+        if state.status == BriefStatus::NoApiKey && state.brief.is_none() {
+            text_label.set_text(AiFailure::NoApiKey.message());
+            text_label.set_visible(true);
+            content_row.set_visible(true);
+            action_row.set_visible(false);
+            return;
+        }
 
-        text_label.set_markup(&to_pango(&cleaned));
-        text_label.set_visible(true);
-        content_row.set_visible(true);
+        let Some(brief) = &state.brief else {
+            content_row.set_visible(false);
+            action_row.set_visible(false);
+            return;
+        };
+
+        let prose = brief.full_prose();
+        if prose.trim().is_empty() {
+            content_row.set_visible(false);
+        } else {
+            text_label.set_markup(&to_pango(&prose));
+            text_label.set_visible(true);
+            content_row.set_visible(true);
+        }
         action_row.set_visible(true);
 
-        match decision {
-            BriefingDecision::Proceed => {
+        let has_planned = brief.planned_workout.is_some();
+        // Only ever `Some` when no program owns the day — enforced in
+        // ai::brief::parse, so this is safe to act on.
+        let alternative = brief.recommended_workout.as_deref();
+
+        // With a program running, easing is the Coaching page's job.
+        let defer_to_plan = brief.program_active && brief.verdict != CoachVerdict::Proceed;
+        see_plan_btn.set_visible(defer_to_plan);
+
+        match brief.verdict {
+            CoachVerdict::Proceed => {
                 // "As planned" only makes sense when something is on the calendar.
                 if has_planned {
                     action_row.set_title("Proceed as planned");
@@ -1017,27 +771,35 @@ impl DashboardPage {
                 use_workout_btn.set_visible(false);
                 remove_btn.set_visible(false);
             }
-            BriefingDecision::Modify => {
-                let label = if let Some(name) = alt_workout {
-                    format!("Modify → {name}")
-                } else {
-                    "Modify".to_string()
+            CoachVerdict::Ease => {
+                let title = match alternative {
+                    Some(name) => format!("Ride easier → {name}"),
+                    None => "Ride easier today".to_string(),
                 };
-                action_row.set_title(&label);
-                action_row.set_subtitle("Your readiness suggests an easier alternative today.");
-                decision_badge.set_label("Modify");
+                action_row.set_title(&title);
+                action_row.set_subtitle(if defer_to_plan {
+                    "Your program can ease this session for you."
+                } else {
+                    "Your readiness suggests a lighter session today."
+                });
+                decision_badge.set_label("Ease");
                 decision_badge.set_css_classes(&["pill", "caption", "warning"]);
-                use_workout_btn.set_visible(alt_workout.is_some());
+                use_workout_btn.set_visible(alternative.is_some());
                 remove_btn.set_visible(false);
             }
-            BriefingDecision::Rest => {
+            CoachVerdict::Rest => {
                 action_row.set_title("Rest today");
-                action_row.set_subtitle("Recovery takes priority over training today.");
+                action_row.set_subtitle(if defer_to_plan {
+                    "Your program can ease this session for you."
+                } else {
+                    "Recovery takes priority over training today."
+                });
                 decision_badge.set_label("Rest");
                 decision_badge.set_css_classes(&["pill", "caption", "error"]);
                 use_workout_btn.set_visible(false);
-                // Nothing to remove when nothing is scheduled.
-                remove_btn.set_visible(has_planned);
+                // Nothing to remove when nothing is scheduled — and never a
+                // programmed session, which the plan is still counting on.
+                remove_btn.set_visible(has_planned && !brief.program_active);
             }
         }
     }

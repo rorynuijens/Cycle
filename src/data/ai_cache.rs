@@ -14,19 +14,20 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use super::db;
+use crate::ai::brief::{DailyBrief, BRIEF_VERSION};
 // A plain domain enum with no UI dependency — see `retrospective`.
 use crate::ai::retrospective::RetroPeriod;
 
 /// The keys cached AI output is stored under.
 pub mod keys {
-    pub const SUGGESTION_RESPONSE: &str = "ai.suggestion_response";
-    pub const SUGGESTION_WORKOUT_NAME: &str = "ai.suggestion_workout_name";
-    pub const SUGGESTION_WORKOUT_DETAIL: &str = "ai.suggestion_workout_detail";
-
-    pub const FITNESS_INSIGHT: &str = "ai.fitness_insight";
-
-    pub const BRIEFING_TEXT: &str = "ai.morning_briefing_text";
-    pub const BRIEFING_DATE: &str = "ai.morning_briefing_date";
+    /// The whole daily brief, as JSON.
+    ///
+    /// One key rather than one per section, because it is one artefact. The
+    /// date it was written for and the inputs it was written from have to move
+    /// with the text they describe — separate rows can be written apart and
+    /// read apart, and a brief paired with someone else's date stamp is exactly
+    /// the confusion this consolidation exists to remove.
+    pub const DAILY_BRIEF: &str = "ai.daily_brief";
 
     pub const WEEKLY_RETROSPECTIVE: &str = "ai.weekly_retrospective";
     pub const MONTHLY_RETROSPECTIVE: &str = "ai.monthly_retrospective";
@@ -38,120 +39,59 @@ fn present(raw: Option<String>) -> Option<String> {
     raw.filter(|v| !v.is_empty())
 }
 
-// ── Ride suggestion ──────────────────────────────────────────────────────────
+// ── Daily brief ──────────────────────────────────────────────────────────────
 
-/// The most recent "what should I ride today?" answer, cached so the page has
-/// something to show before the next request comes back.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CachedSuggestion {
-    /// The coach's prose answer.
-    pub response: String,
-    /// The workout it recommended, if it named one.
-    pub workout_name: String,
-    /// The longer description of that workout.
-    pub workout_detail: String,
-}
-
-/// Read all three parts together — the coaching page shows them as one thing.
-/// Missing parts come back empty rather than failing.
-pub async fn load_suggestion(pool: &SqlitePool) -> Result<CachedSuggestion> {
-    Ok(CachedSuggestion {
-        response: db::get_setting(pool, keys::SUGGESTION_RESPONSE)
-            .await?
-            .unwrap_or_default(),
-        workout_name: db::get_setting(pool, keys::SUGGESTION_WORKOUT_NAME)
-            .await?
-            .unwrap_or_default(),
-        workout_detail: db::get_setting(pool, keys::SUGGESTION_WORKOUT_DETAIL)
-            .await?
-            .unwrap_or_default(),
-    })
-}
-
-pub async fn save_suggestion(pool: &SqlitePool, suggestion: &CachedSuggestion) -> Result<()> {
-    db::set_setting(pool, keys::SUGGESTION_RESPONSE, &suggestion.response).await?;
-    db::set_setting(
-        pool,
-        keys::SUGGESTION_WORKOUT_NAME,
-        &suggestion.workout_name,
-    )
-    .await?;
-    db::set_setting(
-        pool,
-        keys::SUGGESTION_WORKOUT_DETAIL,
-        &suggestion.workout_detail,
-    )
-    .await
-}
-
-/// Just the recommended workout's name — the dashboard and the calendar's
-/// schedule dialog want this on its own, without the surrounding prose.
-pub async fn suggestion_workout_name(pool: &SqlitePool) -> Result<Option<String>> {
-    Ok(present(
-        db::get_setting(pool, keys::SUGGESTION_WORKOUT_NAME).await?,
-    ))
-}
-
-/// Written on its own when the morning briefing recommends a workout, which
-/// happens independently of a full suggestion being generated.
-pub async fn set_suggestion_workout_name(pool: &SqlitePool, name: &str) -> Result<()> {
-    db::set_setting(pool, keys::SUGGESTION_WORKOUT_NAME, name).await
-}
-
-/// The description belongs to whichever workout the name names, so it is
-/// rewritten whenever the name is — otherwise a card ends up titled with one
-/// workout and described with another.
-pub async fn set_suggestion_workout_detail(pool: &SqlitePool, detail: &str) -> Result<()> {
-    db::set_setting(pool, keys::SUGGESTION_WORKOUT_DETAIL, detail).await
-}
-
-// ── Fitness insight ──────────────────────────────────────────────────────────
-
-pub async fn fitness_insight(pool: &SqlitePool) -> Result<Option<String>> {
-    Ok(present(db::get_setting(pool, keys::FITNESS_INSIGHT).await?))
-}
-
-pub async fn set_fitness_insight(pool: &SqlitePool, text: &str) -> Result<()> {
-    db::set_setting(pool, keys::FITNESS_INSIGHT, text).await
-}
-
-// ── Morning briefing ─────────────────────────────────────────────────────────
-
-/// A cached briefing and the day it was written for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Briefing {
-    pub text: String,
-    /// ISO `YYYY-MM-DD` the briefing was generated for. Empty on briefings
-    /// cached before the date was recorded — treat that as stale.
-    pub written_for: String,
-}
-
-impl Briefing {
-    /// Whether this briefing was written for `today`. A briefing from yesterday
-    /// is worse than none: it opens with plans the rider has already ridden.
-    pub fn is_for(&self, today: &str) -> bool {
-        !self.written_for.is_empty() && self.written_for == today
-    }
-}
-
-/// `None` until a briefing has been generated.
-pub async fn briefing(pool: &SqlitePool) -> Result<Option<Briefing>> {
-    let Some(text) = present(db::get_setting(pool, keys::BRIEFING_TEXT).await?) else {
+/// The brief on hand, or `None` when there is nothing this build can use.
+///
+/// A stored brief that will not parse, or that carries a version this build
+/// does not understand, comes back as `None` rather than as an error. Both mean
+/// the same thing to every caller — there is nothing to show — and the repair
+/// in both cases is to generate a new one. Failing the read instead would stop
+/// the caller before it got there.
+pub async fn daily_brief(pool: &SqlitePool) -> Result<Option<DailyBrief>> {
+    let Some(raw) = present(db::get_setting(pool, keys::DAILY_BRIEF).await?) else {
         return Ok(None);
     };
-    Ok(Some(Briefing {
-        text,
-        written_for: db::get_setting(pool, keys::BRIEFING_DATE)
-            .await?
-            .unwrap_or_default(),
-    }))
+    let brief: DailyBrief = match serde_json::from_str(&raw) {
+        Ok(brief) => brief,
+        Err(e) => {
+            tracing::warn!("Discarding an unreadable cached brief: {e}");
+            return Ok(None);
+        }
+    };
+    if brief.version != BRIEF_VERSION {
+        tracing::info!(
+            "Discarding a brief written by another version (v{}, this build reads v{})",
+            brief.version,
+            BRIEF_VERSION
+        );
+        return Ok(None);
+    }
+    Ok(Some(brief))
 }
 
-/// Stamped with the date it is for, so the next read can tell whether it still
-/// applies.
-pub async fn save_briefing(pool: &SqlitePool, text: &str, written_for: &str) -> Result<()> {
-    db::set_setting(pool, keys::BRIEFING_TEXT, text).await?;
-    db::set_setting(pool, keys::BRIEFING_DATE, written_for).await
+pub async fn save_daily_brief(pool: &SqlitePool, brief: &DailyBrief) -> Result<()> {
+    let json = serde_json::to_string(brief)?;
+    db::set_setting(pool, keys::DAILY_BRIEF, &json).await
+}
+
+/// The workout today's brief points at, for the calendar's schedule dialog.
+///
+/// Only today's brief answers. The dialog offers this as a preselection, and
+/// preselecting yesterday's recommendation is worse than preselecting nothing.
+/// A brief that recommended nothing falls back to the session it was written
+/// about, which is what the rider is actually doing today.
+pub async fn brief_workout_name(pool: &SqlitePool, today: &str) -> Result<Option<String>> {
+    let Some(brief) = daily_brief(pool).await? else {
+        return Ok(None);
+    };
+    if !brief.is_for(today) {
+        return Ok(None);
+    }
+    Ok(brief
+        .recommended_workout
+        .or(brief.planned_workout)
+        .filter(|n| !n.trim().is_empty()))
 }
 
 // ── Retrospectives ───────────────────────────────────────────────────────────
@@ -189,122 +129,122 @@ mod tests {
         pool
     }
 
-    // ── Suggestion ───────────────────────────────────────────────────────────
+    // ── Daily brief ──────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn should_read_an_empty_suggestion_before_anything_is_generated() {
-        let pool = test_pool().await;
-        assert_eq!(
-            load_suggestion(&pool).await.unwrap(),
-            CachedSuggestion::default()
-        );
-        assert_eq!(suggestion_workout_name(&pool).await.unwrap(), None);
+    fn brief() -> DailyBrief {
+        DailyBrief {
+            version: BRIEF_VERSION,
+            written_for: "2026-08-11".into(),
+            fingerprint: "v1|rides:143".into(),
+            readiness: Some("Fresh this morning.".into()),
+            form: Some("Fitness is building.".into()),
+            session: Some("Ride it as written.".into()),
+            fueling: Some("Pilav before.".into()),
+            verdict: crate::training::program::CoachVerdict::Ease,
+            planned_workout: Some("Threshold 3x12".into()),
+            ..DailyBrief::default()
+        }
     }
 
     #[tokio::test]
-    async fn should_round_trip_a_whole_suggestion() {
+    async fn should_have_no_brief_before_one_is_written() {
         let pool = test_pool().await;
-        let suggestion = CachedSuggestion {
-            response: "Ride easy today.".into(),
-            workout_name: "Endurance 90".into(),
-            workout_detail: "90 minutes at 65% FTP.".into(),
+        assert_eq!(daily_brief(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn should_round_trip_a_brief_with_its_sections_verdict_and_fingerprint() {
+        let pool = test_pool().await;
+        save_daily_brief(&pool, &brief()).await.unwrap();
+        assert_eq!(daily_brief(&pool).await.unwrap(), Some(brief()));
+    }
+
+    #[tokio::test]
+    async fn should_recognise_yesterdays_brief_as_written_for_another_day() {
+        let pool = test_pool().await;
+        save_daily_brief(&pool, &brief()).await.unwrap();
+
+        let cached = daily_brief(&pool).await.unwrap().expect("it was saved");
+        assert!(cached.is_for("2026-08-11"));
+        assert!(!cached.is_for("2026-08-12"));
+    }
+
+    #[tokio::test]
+    async fn should_ignore_a_brief_written_by_another_version() {
+        // Its sections may no longer mean what this build thinks they do.
+        let pool = test_pool().await;
+        let stale = DailyBrief {
+            version: BRIEF_VERSION + 1,
+            ..brief()
         };
-        save_suggestion(&pool, &suggestion).await.unwrap();
-        assert_eq!(load_suggestion(&pool).await.unwrap(), suggestion);
+        save_daily_brief(&pool, &stale).await.unwrap();
+        assert_eq!(daily_brief(&pool).await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn should_let_the_briefing_set_the_workout_name_on_its_own() {
-        // The morning briefing names a workout without generating a full
-        // suggestion; the other two parts must be left alone.
+    async fn should_ignore_an_unparseable_brief_rather_than_failing_the_read() {
+        // A caller that gets an error here stops; one that gets None generates
+        // a replacement, which is the actual repair.
         let pool = test_pool().await;
-        save_suggestion(
-            &pool,
-            &CachedSuggestion {
-                response: "keep me".into(),
-                workout_name: "old".into(),
-                workout_detail: "keep me too".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        set_suggestion_workout_name(&pool, "Sweet Spot 2x20")
+        db::set_setting(&pool, keys::DAILY_BRIEF, "{ not json")
             .await
             .unwrap();
-
-        let loaded = load_suggestion(&pool).await.unwrap();
-        assert_eq!(loaded.workout_name, "Sweet Spot 2x20");
-        assert_eq!(loaded.response, "keep me");
-        assert_eq!(loaded.workout_detail, "keep me too");
+        assert_eq!(daily_brief(&pool).await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn should_treat_a_blank_cached_name_as_nothing_cached() {
+    async fn should_treat_an_empty_stored_brief_as_nothing_cached() {
         let pool = test_pool().await;
-        set_suggestion_workout_name(&pool, "").await.unwrap();
-        assert_eq!(suggestion_workout_name(&pool).await.unwrap(), None);
+        db::set_setting(&pool, keys::DAILY_BRIEF, "").await.unwrap();
+        assert_eq!(daily_brief(&pool).await.unwrap(), None);
     }
 
-    // ── Fitness insight ──────────────────────────────────────────────────────
+    // ── The workout the calendar dialog preselects ───────────────────────────
 
     #[tokio::test]
-    async fn should_round_trip_the_fitness_insight() {
+    async fn should_offer_todays_recommendation_to_the_calendar_dialog() {
         let pool = test_pool().await;
-        assert_eq!(fitness_insight(&pool).await.unwrap(), None);
-
-        set_fitness_insight(&pool, "Form is trending up.")
-            .await
-            .unwrap();
+        let recommended = DailyBrief {
+            recommended_workout: Some("Recovery Spin".into()),
+            ..brief()
+        };
+        save_daily_brief(&pool, &recommended).await.unwrap();
         assert_eq!(
-            fitness_insight(&pool).await.unwrap().as_deref(),
-            Some("Form is trending up.")
+            brief_workout_name(&pool, "2026-08-11").await.unwrap(),
+            Some("Recovery Spin".into())
         );
     }
 
-    // ── Briefing ─────────────────────────────────────────────────────────────
-
     #[tokio::test]
-    async fn should_have_no_briefing_before_one_is_written() {
+    async fn should_fall_back_to_the_planned_session_when_nothing_was_recommended() {
+        // With a program running the brief never recommends; the session the
+        // rider is actually doing is the useful preselection.
         let pool = test_pool().await;
-        assert_eq!(briefing(&pool).await.unwrap(), None);
+        save_daily_brief(&pool, &brief()).await.unwrap();
+        assert_eq!(
+            brief_workout_name(&pool, "2026-08-11").await.unwrap(),
+            Some("Threshold 3x12".into())
+        );
     }
 
     #[tokio::test]
-    async fn should_round_trip_a_briefing_with_its_date() {
+    async fn should_offer_nothing_from_a_brief_written_for_another_day() {
+        // Preselecting yesterday's pick is worse than preselecting nothing.
         let pool = test_pool().await;
-        save_briefing(&pool, "Sweet spot today.", "2026-08-08")
-            .await
-            .unwrap();
-
-        let cached = briefing(&pool).await.unwrap().expect("briefing was saved");
-        assert_eq!(cached.text, "Sweet spot today.");
-        assert_eq!(cached.written_for, "2026-08-08");
+        save_daily_brief(&pool, &brief()).await.unwrap();
+        assert_eq!(brief_workout_name(&pool, "2026-08-12").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn should_recognise_yesterdays_briefing_as_stale() {
+    async fn should_offer_nothing_when_the_brief_names_no_workout_at_all() {
         let pool = test_pool().await;
-        save_briefing(&pool, "Yesterday's plan.", "2026-08-07")
-            .await
-            .unwrap();
-
-        let cached = briefing(&pool).await.unwrap().unwrap();
-        assert!(!cached.is_for("2026-08-08"));
-        assert!(cached.is_for("2026-08-07"));
-    }
-
-    #[tokio::test]
-    async fn should_treat_an_undated_briefing_as_stale() {
-        // Cached before the date was recorded — it applies to no known day.
-        let pool = test_pool().await;
-        db::set_setting(&pool, keys::BRIEFING_TEXT, "Undated.")
-            .await
-            .unwrap();
-
-        let cached = briefing(&pool).await.unwrap().unwrap();
-        assert!(cached.written_for.is_empty());
-        assert!(!cached.is_for("2026-08-08"));
+        let nameless = DailyBrief {
+            planned_workout: None,
+            recommended_workout: None,
+            ..brief()
+        };
+        save_daily_brief(&pool, &nameless).await.unwrap();
+        assert_eq!(brief_workout_name(&pool, "2026-08-11").await.unwrap(), None);
     }
 
     // ── Retrospectives ───────────────────────────────────────────────────────
@@ -351,12 +291,7 @@ mod tests {
         // The prefix is what lets a future cache-clear find these rows without
         // touching a rider's settings.
         for key in [
-            keys::SUGGESTION_RESPONSE,
-            keys::SUGGESTION_WORKOUT_NAME,
-            keys::SUGGESTION_WORKOUT_DETAIL,
-            keys::FITNESS_INSIGHT,
-            keys::BRIEFING_TEXT,
-            keys::BRIEFING_DATE,
+            keys::DAILY_BRIEF,
             keys::WEEKLY_RETROSPECTIVE,
             keys::MONTHLY_RETROSPECTIVE,
         ] {

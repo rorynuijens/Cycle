@@ -7,33 +7,17 @@
 //! nothing, in which case the prose stands on its own.
 
 use adw::prelude::*;
-use chrono::{Duration as CDuration, Local, NaiveDate};
-use gtk::glib;
+use chrono::{Local, NaiveDate};
 use sqlx::SqlitePool;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::ai::coach::{build_prompt, get_suggestion, RecentSession, TrainingContext};
-use crate::ai::context::{
-    build_recent_session, extract_recommended_workout, icu_activity_to_recent_session,
-    strip_recommended_line, wellness_snapshots, workouts_as_options, ICU_PREFIX,
-};
-use crate::data::{ai_cache, athlete::AthleteProfile, db, keystore, workout::Workout};
-use crate::training::fitness::compute_load_metrics;
+use crate::ai::context::ICU_PREFIX;
+use crate::data::{athlete::AthleteProfile, db, workout::Workout};
+use crate::ui::brief_store::{BriefState, BriefStatus, BriefStore};
 use crate::ui::markdown::to_pango;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::AiFailure;
-
-use super::data::{load_suggestion_prompt_data, SuggestionPromptData};
-
-/// How far back the suggestion prompt summarises recent training.
-const RECENT_TRAINING_WEEKS: i64 = 4;
-
-/// Most recent sessions described to the coach.
-const MAX_RECENT_SESSIONS: usize = 10;
-
-const NO_API_KEY: &str = "No AI provider key configured. Enter your API key in \
-                          Preferences → Integrations.";
 
 /// How a built-in workout is summarised under its name.
 fn library_detail(workout: &Workout) -> String {
@@ -70,6 +54,8 @@ pub struct SuggestionCard {
     detail: gtk::Label,
     start_btn: gtk::Button,
     schedule_btn: gtk::Button,
+    provenance: gtk::Label,
+    refresh_btn: gtk::Button,
     /// The workout the action buttons act on — `None` whenever the
     /// recommendation is not something this app can start.
     suggested: Rc<RefCell<Option<Workout>>>,
@@ -85,6 +71,7 @@ impl SuggestionCard {
         workouts: Rc<Vec<Workout>>,
         on_start_workout: Rc<dyn Fn(Workout)>,
         on_toast: Rc<dyn Fn(adw::Toast)>,
+        brief_store: Rc<BriefStore>,
     ) -> Self {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -98,36 +85,49 @@ impl SuggestionCard {
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .build();
-        header.append(
+        let title_col = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .build();
+        title_col.append(
             &gtk::Label::builder()
-                .label("What should I ride today?")
+                .label("Today")
                 .halign(gtk::Align::Start)
-                .hexpand(true)
                 .css_classes(["heading"])
                 .tooltip_text(
-                    "The AI Coach analyses your training load, recent sessions, goals, and \
-                     athlete profile to recommend a specific workout from your library. \
-                     Edit your training context in Preferences → Athlete.",
+                    "Your morning brief's read on today, written from your training load, \
+                     recent sessions, goals and wellness. Edit your training context in \
+                     Preferences → Athlete.",
                 )
                 .build(),
         );
-        let spinner = gtk::Spinner::new();
-        spinner.set_visible(false);
-        header.append(&spinner);
-        let get_btn = gtk::Button::builder()
-            .label("Get Suggestion")
-            .css_classes(["pill", "suggested-action"])
-            .tooltip_text("Ask the AI Coach for a personalised workout suggestion")
+        // Where this text came from, and whether anything has happened since.
+        // Worded once in BriefState so all three cards say the same thing.
+        let provenance = gtk::Label::builder()
+            .label("")
+            .halign(gtk::Align::Start)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        title_col.append(&provenance);
+        header.append(&title_col);
+
+        // One shared action: every card that shows a slice of the brief
+        // refreshes the same brief, so they cannot drift apart again.
+        let refresh_btn = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .css_classes(["flat"])
+            .tooltip_text("Ask your coach to write today's brief again")
             .valign(gtk::Align::Center)
             .build();
-        header.append(&get_btn);
+        {
+            let store = Rc::clone(&brief_store);
+            refresh_btn.connect_clicked(move |_| store.refresh());
+        }
+        header.append(&refresh_btn);
         root.append(&header);
 
         let response = gtk::Label::builder()
-            .label(
-                "Select \"Get Suggestion\" to receive a personalised workout recommendation \
-                 from the AI Coach.",
-            )
+            .label("Your morning brief will appear here.")
             .css_classes(["dim-label"])
             .halign(gtk::Align::Start)
             .valign(gtk::Align::Start)
@@ -216,12 +216,13 @@ impl SuggestionCard {
             detail,
             start_btn,
             schedule_btn,
+            provenance,
+            refresh_btn,
             suggested: Rc::new(RefCell::new(None)),
             athlete,
             workouts,
         };
 
-        card.connect_get(&get_btn, &spinner, pool.clone(), rt_handle.clone());
         card.connect_start(on_start_workout);
         card.connect_schedule(pool, rt_handle, on_toast);
         card
@@ -231,30 +232,86 @@ impl SuggestionCard {
         &self.root
     }
 
-    /// Restore the suggestion cached from a previous session.
+    /// Render the daily brief's slice of today.
     ///
-    /// The action buttons come back only for built-in workouts: a cached name
-    /// that no longer matches the library must not offer a Start button that
-    /// would do nothing.
-    pub fn restore_cached(&self, response: &str, name: &str, detail: &str) {
-        if response.trim().is_empty() {
-            return;
-        }
-        self.response.set_markup(&to_pango(response));
-        self.response.remove_css_class("dim-label");
+    /// The card shows the session the rider is actually doing: whichever
+    /// workout the brief was written about, or the one it chose when no program
+    /// owned the day. It never asks for anything itself — see `ai::brief`.
+    pub fn apply_brief(&self, state: &BriefState, icu_workouts: &[db::IntervalsWorkout]) {
+        self.provenance.set_label(state.provenance());
+        self.refresh_btn.set_sensitive(state.can_refresh());
 
-        if name.is_empty() {
+        let Some(brief) = &state.brief else {
+            // Nothing yet — say why, and offer no actions.
+            let message = match state.status {
+                BriefStatus::Loading => "Asking your coach…",
+                BriefStatus::NoApiKey => AiFailure::NoApiKey.message(),
+                BriefStatus::Failed(failure) => failure.message(),
+                _ => "Your morning brief will appear here.",
+            };
+            self.response.set_text(message);
+            self.action_frame.set_visible(false);
+            *self.suggested.borrow_mut() = None;
             return;
+        };
+
+        match brief.session_slice() {
+            Some(prose) => {
+                self.response.set_markup(&to_pango(prose));
+                self.response.remove_css_class("dim-label");
+            }
+            None => self
+                .response
+                .set_text("Your morning brief will appear here."),
         }
-        let title = format!("Recommended: {name}");
-        match self
+
+        // A workout the brief chose outright, else the one it was written about.
+        let Some(name) = brief
+            .recommended_workout
+            .as_deref()
+            .or(brief.planned_workout.as_deref())
+            .filter(|n| !n.trim().is_empty())
+        else {
+            self.action_frame.set_visible(false);
+            *self.suggested.borrow_mut() = None;
+            return;
+        };
+
+        // Whether this is the plan's own session or the coach's pick changes
+        // what the rider is being told, so it changes the label.
+        let heading = if brief.recommended_workout.is_some() {
+            "Recommended"
+        } else {
+            "Today"
+        };
+
+        if let Some(workout) = self
             .workouts
             .iter()
             .find(|w| crate::ai::naming::names_match(&w.name, name))
         {
-            Some(workout) => self.show_library(workout, &title, detail),
-            None => self.show_unstartable(&title, detail),
+            let detail = library_detail(workout);
+            self.show_library(workout, &format!("{heading}: {}", workout.name), &detail);
+            return;
         }
+
+        // The coach may name a workout from the rider's Intervals.icu library,
+        // which this app can describe but not run.
+        let lookup = name.strip_prefix(ICU_PREFIX).unwrap_or(name);
+        if let Some(workout) = icu_workouts
+            .iter()
+            .find(|w| crate::ai::naming::names_match(&w.name, lookup))
+        {
+            self.show_unstartable(
+                &format!("{heading}: {} [Intervals.icu]", workout.name),
+                &intervals_detail(workout),
+            );
+            return;
+        }
+
+        // A name matching nothing — the prose still stands on its own, but
+        // there must be no button offering to start something that is gone.
+        self.show_unstartable(&format!("{heading}: {name}"), "");
     }
 
     /// Show a built-in workout, with the buttons that act on it.
@@ -293,165 +350,6 @@ impl SuggestionCard {
             self.thumb.append(graph.widget());
         }
         self.thumb.set_visible(workout.is_some());
-    }
-
-    /// Resolve the coach's reply against both libraries and show the result.
-    /// Returns `(name, detail)` to cache, empty when nothing resolved.
-    fn apply_reply(&self, text: &str, icu_workouts: &[db::IntervalsWorkout]) -> (String, String) {
-        let recommended = extract_recommended_workout(text);
-        let prose = strip_recommended_line(text);
-        self.response.set_markup(&to_pango(&prose));
-        self.response.remove_css_class("dim-label");
-
-        let Some(name) = recommended else {
-            return (String::new(), String::new());
-        };
-
-        if let Some(workout) = self
-            .workouts
-            .iter()
-            .find(|w| crate::ai::naming::names_match(&w.name, &name))
-        {
-            let detail = library_detail(workout);
-            self.show_library(workout, &format!("Recommended: {}", workout.name), &detail);
-            return (workout.name.clone(), detail);
-        }
-
-        // The coach may name a workout from the rider's Intervals.icu library,
-        // which this app can describe but not run.
-        let lookup = name.strip_prefix(ICU_PREFIX).unwrap_or(&name);
-        if let Some(workout) = icu_workouts
-            .iter()
-            .find(|w| crate::ai::naming::names_match(&w.name, lookup))
-        {
-            let detail = intervals_detail(workout);
-            self.show_unstartable(
-                &format!("Recommended: {} [Intervals.icu]", workout.name),
-                &detail,
-            );
-            return (format!("{ICU_PREFIX}{}", workout.name), detail);
-        }
-
-        // A name matching nothing: the prose still stands on its own.
-        (name, String::new())
-    }
-
-    /// Show a plain status line — progress, or why a request produced nothing.
-    fn set_status(&self, text: &str) {
-        self.response.set_text(text);
-        self.response.remove_css_class("dim-label");
-    }
-
-    fn connect_get(
-        &self,
-        button: &gtk::Button,
-        spinner: &gtk::Spinner,
-        pool: SqlitePool,
-        rt_handle: tokio::runtime::Handle,
-    ) {
-        let card = self.clone_handles();
-        let spinner = spinner.clone();
-        let athlete = Rc::clone(&self.athlete);
-        let workouts = Rc::clone(&self.workouts);
-
-        button.connect_clicked(move |btn| {
-            let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
-                Ok(Some(k)) if !k.trim().is_empty() => k,
-                _ => {
-                    card.set_status(NO_API_KEY);
-                    card.action_frame.set_visible(false);
-                    return;
-                }
-            };
-
-            // Read the !Send shared state on the main thread before spawning.
-            let profile = athlete.borrow().clone();
-            let ftp_watts = profile.ftp_watts;
-            let library: Vec<Workout> = (*workouts).clone();
-
-            btn.set_sensitive(false);
-            spinner.set_visible(true);
-            spinner.start();
-            card.set_status("Asking the AI Coach for a suggestion…");
-            card.action_frame.set_visible(false);
-            *card.suggested.borrow_mut() = None;
-
-            let (tx, rx) =
-                async_channel::bounded::<Result<(String, Vec<db::IntervalsWorkout>), AiFailure>>(1);
-            let pool_task = pool.clone();
-            // All DB reads + prompt assembly + the network call run off the main
-            // thread (CLAUDE.md §2.3). icu_workouts comes back with the reply so
-            // the handler can still match an Intervals.icu recommendation.
-            rt_handle.spawn(async move {
-                let today = Local::now().date_naive();
-                let SuggestionPromptData {
-                    athlete_ctx,
-                    records,
-                    intervals_pairs,
-                    icu_activities,
-                    goals,
-                    icu_workouts,
-                    wellness,
-                    time_off,
-                } = match load_suggestion_prompt_data(&pool_task, today).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::error!("Could not read training history to suggest: {e}");
-                        let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
-                        return;
-                    }
-                };
-
-                let metrics = compute_load_metrics(&records, &intervals_pairs, ftp_watts, today);
-                let ctx = TrainingContext {
-                    athlete: profile,
-                    ctl: metrics.ctl,
-                    atl: metrics.atl,
-                    tsb: metrics.tsb(),
-                    recent_sessions: recent_sessions(&records, &icu_activities, ftp_watts, today),
-                    goals,
-                    athlete_context: athlete_ctx,
-                    workout_options: workouts_as_options(&library, &icu_workouts),
-                    wellness: wellness_snapshots(&wellness),
-                    time_off_dates: time_off
-                        .into_iter()
-                        .map(|e| e.date.format("%Y-%m-%d").to_string())
-                        .collect(),
-                };
-
-                let result = get_suggestion(&api_key, &build_prompt(&ctx), 1400)
-                    .await
-                    .map(|text| (text, icu_workouts))
-                    .map_err(|e| {
-                        tracing::error!("AI coaching request failed: {e}");
-                        AiFailure::Request
-                    });
-                let _ = tx.send(result).await;
-            });
-
-            let card = card.clone_handles();
-            let btn = btn.clone();
-            let spinner = spinner.clone();
-            let pool = pool.clone();
-            let rt_handle = rt_handle.clone();
-            glib::MainContext::default().spawn_local(async move {
-                if let Ok(result) = rx.recv().await {
-                    match result {
-                        Ok((text, icu_workouts)) => {
-                            let prose = strip_recommended_line(&text);
-                            let (name, detail) = card.apply_reply(&text, &icu_workouts);
-                            // Cached as raw text, not markup — the dashboard and
-                            // calendar render it themselves.
-                            cache_suggestion(&pool, &rt_handle, prose, name, detail);
-                        }
-                        Err(failure) => card.set_status(failure.message()),
-                    }
-                }
-                spinner.stop();
-                spinner.set_visible(false);
-                btn.set_sensitive(true);
-            });
-        });
     }
 
     fn connect_start(&self, on_start_workout: Rc<dyn Fn(Workout)>) {
@@ -550,69 +448,6 @@ impl SuggestionCard {
             dialog.present(Some(btn));
         });
     }
-
-    /// A second handle on the same widgets, for moving into a callback.
-    ///
-    /// Everything here is a refcounted handle, so this shares the card rather
-    /// than copying it — the clone drives the same widgets.
-    fn clone_handles(&self) -> Self {
-        Self {
-            root: self.root.clone(),
-            response: self.response.clone(),
-            action_frame: self.action_frame.clone(),
-            thumb: self.thumb.clone(),
-            title: self.title.clone(),
-            detail: self.detail.clone(),
-            start_btn: self.start_btn.clone(),
-            schedule_btn: self.schedule_btn.clone(),
-            suggested: Rc::clone(&self.suggested),
-            athlete: Rc::clone(&self.athlete),
-            workouts: Rc::clone(&self.workouts),
-        }
-    }
-}
-
-/// The rides the coach is told about: recent local sessions and synced
-/// activities, newest first and capped so the prompt stays a summary.
-fn recent_sessions(
-    records: &[db::SessionSummary],
-    icu_activities: &[db::IntervalsActivity],
-    ftp_watts: u32,
-    today: NaiveDate,
-) -> Vec<RecentSession> {
-    let since = today - CDuration::weeks(RECENT_TRAINING_WEEKS);
-    let mut recent: Vec<RecentSession> = records
-        .iter()
-        .filter(|r| r.started_at.with_timezone(&Local).date_naive() >= since)
-        .map(|r| build_recent_session(r, ftp_watts))
-        .collect();
-    for activity in icu_activities.iter().filter(|a| a.date >= since) {
-        recent.push(icu_activity_to_recent_session(activity));
-    }
-    recent.sort_by(|a, b| b.date.cmp(&a.date));
-    recent.truncate(MAX_RECENT_SESSIONS);
-    recent
-}
-
-/// Persist the suggestion so the dashboard and calendar can show it too.
-fn cache_suggestion(
-    pool: &SqlitePool,
-    rt_handle: &tokio::runtime::Handle,
-    response: String,
-    name: String,
-    detail: String,
-) {
-    let suggestion = ai_cache::CachedSuggestion {
-        response,
-        workout_name: name,
-        workout_detail: detail,
-    };
-    crate::ui::spawn_write(
-        rt_handle,
-        pool,
-        "the coach's suggestion",
-        move |pool| async move { ai_cache::save_suggestion(&pool, &suggestion).await },
-    );
 }
 
 #[cfg(test)]

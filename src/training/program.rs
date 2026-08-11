@@ -116,6 +116,29 @@ impl ProgramStatus {
     }
 }
 
+/// What the morning brief made of today.
+///
+/// The brief never picks the session — the program owns that, because it is the
+/// only thing here with a memory longer than one morning. The brief answers the
+/// one question a rule reading yesterday's numbers cannot: how today's rider
+/// actually is.
+///
+/// It lives in this module rather than in `ai` because `training` must not
+/// depend on `ai` (CLAUDE.md §2.6); `ai::brief` re-exports it.
+/// Serialised with the brief it came from, so the card the rider sees after a
+/// restart is the one the plan was adjusted against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoachVerdict {
+    /// No brief today, or it agreed with the plan.
+    #[default]
+    Proceed,
+    /// Ride, but lighter than planned.
+    Ease,
+    /// Do not train today.
+    Rest,
+}
+
 /// Why a session is being eased. Each variant carries what it was measured
 /// from, so the card can show the rider the number behind the advice.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -126,6 +149,12 @@ pub enum Reason {
     WellnessDip { resting_hr_pct: Option<f32> },
     /// Sessions were missed back to back.
     MissedRun { count: usize },
+    /// The morning brief read today's signals as a day to ride lighter.
+    ///
+    /// Deliberately carries nothing: [`Reason`] is `Copy`, which [`suggest`]
+    /// relies on, and the brief's own sentence is already on the rider's
+    /// dashboard where it was written.
+    CoachAdvised,
 }
 
 impl Reason {
@@ -150,6 +179,9 @@ impl Reason {
                 "You have missed {count} sessions in a row. Easing back in beats \
                  picking up where the plan assumed you would be."
             ),
+            Self::CoachAdvised => "Your morning brief read today's signals as a day to \
+                                   ride lighter."
+                .to_string(),
         }
     }
 
@@ -158,11 +190,18 @@ impl Reason {
     /// Measured fatigue outranks a wellness signal, which outranks missed work:
     /// the first is the most direct evidence of accumulated load, the last is
     /// the most easily explained by an ordinary busy week.
+    ///
+    /// The brief's verdict ranks below all of them, and that is not a judgement
+    /// on it. This picks the *sentence shown*, not whether to ease at all: when
+    /// the brief and a measurement agree, "your form is -18" tells the rider
+    /// something "your coach said so" does not. It wins only when it is alone —
+    /// which is exactly when it is the only thing that noticed.
     fn severity(&self) -> u8 {
         match self {
             Self::Fatigued { .. } => 3,
             Self::WellnessDip { .. } => 2,
             Self::MissedRun { .. } => 1,
+            Self::CoachAdvised => 0,
         }
     }
 }
@@ -320,6 +359,11 @@ fn wellness_reason(wellness: &[WellnessEntry], today: NaiveDate) -> Option<Reaso
 /// Returns at most one adjustment — the next session only. Form is recomputed
 /// every day, so easing the whole week in advance would be deciding on
 /// Wednesday's behalf using Monday's evidence.
+///
+/// `verdict` is what the morning brief made of today. It is a reason to ease,
+/// never a way to pick the session: this module remains the only thing that
+/// produces an [`Adjustment`], so a rider is never shown two different answers
+/// to the same question.
 pub fn suggest(
     status: &ProgramStatus,
     decided: &[PlannedSession],
@@ -327,15 +371,26 @@ pub fn suggest(
     wellness: &[WellnessEntry],
     library: &[Workout],
     today: NaiveDate,
+    verdict: CoachVerdict,
 ) -> Vec<Adjustment> {
     // A recovery week is already the easy week. There is nothing to take out of
-    // it, and nothing may be put in.
+    // it, and nothing may be put in — including by the brief, which sees one
+    // morning and not the shape of the block around it.
     if status.phase == Phase::Recovery {
         return Vec::new();
     }
 
     let Some(target) = status.upcoming.first() else {
         return Vec::new();
+    };
+
+    // The brief speaks for today and only for today. On a rest day the next
+    // session is Wednesday's, and this morning's wellness says nothing about
+    // it — the same reason this function only ever adjusts one session.
+    let verdict = if target.date == today {
+        verdict
+    } else {
+        CoachVerdict::Proceed
     };
 
     let tsb = metrics.tsb();
@@ -350,6 +405,9 @@ pub fn suggest(
     if run >= MISSED_RUN_FOR_EASING {
         reasons.push(Reason::MissedRun { count: run });
     }
+    if verdict != CoachVerdict::Proceed {
+        reasons.push(Reason::CoachAdvised);
+    }
 
     let Some(reason) = reasons.into_iter().max_by_key(|r| r.severity()) else {
         return Vec::new();
@@ -361,7 +419,16 @@ pub fn suggest(
         return Vec::new();
     }
 
-    let Some(eased) = ease(target.category) else {
+    // A brief asking for rest is not asking for a slightly easier session, so
+    // one rung down the ladder would be answering a question it did not ask.
+    // Recovery is as far as this module goes: dropping the day outright is the
+    // rider's call, never the plan's — see the module note.
+    let eased = if verdict == CoachVerdict::Rest {
+        (target.category != WorkoutCategory::Recovery).then_some(WorkoutCategory::Recovery)
+    } else {
+        ease(target.category)
+    };
+    let Some(eased) = eased else {
         return Vec::new();
     };
     let Some(replacement) = pick_replacement(library, eased, target.duration_secs) else {
@@ -405,6 +472,30 @@ mod tests {
             num_weeks: weeks,
             training_days: "monday,wednesday,friday".into(),
         }
+    }
+
+    /// [`suggest`] with no brief for the day — the local rules on their own.
+    ///
+    /// Most of these tests predate the brief and are the regression net proving
+    /// it changed nothing about them, so they say so by construction rather
+    /// than by threading a `Proceed` through every call.
+    fn suggest_local(
+        status: &ProgramStatus,
+        decided: &[PlannedSession],
+        metrics: &LoadMetrics,
+        wellness: &[WellnessEntry],
+        library: &[Workout],
+        today: NaiveDate,
+    ) -> Vec<Adjustment> {
+        suggest(
+            status,
+            decided,
+            metrics,
+            wellness,
+            library,
+            today,
+            CoachVerdict::Proceed,
+        )
     }
 
     fn session(id: i64, d: NaiveDate, cat: WorkoutCategory, completed: bool) -> PlannedSession {
@@ -663,7 +754,7 @@ mod tests {
     fn should_ease_the_next_session_when_form_is_dug_in() {
         let today = date(2026, 8, 5);
         let s = ready_status(WorkoutCategory::Threshold, today);
-        let out = suggest(&s, &[], &metrics(-35.0), &[], &library(), today);
+        let out = suggest_local(&s, &[], &metrics(-35.0), &[], &library(), today);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].entry_id, 1);
@@ -675,7 +766,7 @@ mod tests {
     fn should_leave_a_rested_rider_alone() {
         let today = date(2026, 8, 5);
         let s = ready_status(WorkoutCategory::Threshold, today);
-        assert!(suggest(&s, &[], &metrics(0.0), &[], &library(), today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(0.0), &[], &library(), today).is_empty());
     }
 
     #[test]
@@ -684,7 +775,7 @@ mod tests {
         let today = date(2026, 8, 26); // week 4 of a program starting 3 Aug
         let s = ready_status(WorkoutCategory::Threshold, today);
         assert_eq!(s.phase, Phase::Recovery);
-        assert!(suggest(&s, &[], &metrics(-40.0), &[], &library(), today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(-40.0), &[], &library(), today).is_empty());
     }
 
     #[test]
@@ -698,7 +789,7 @@ mod tests {
         ];
         let s = status(&program(12), &sessions, today);
         let past = decided(&sessions, today);
-        let out = suggest(&s, &past, &metrics(5.0), &[], &library(), today);
+        let out = suggest_local(&s, &past, &metrics(5.0), &[], &library(), today);
 
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].reason, Reason::MissedRun { count: 2 }));
@@ -715,7 +806,7 @@ mod tests {
         ];
         let s = status(&program(12), &sessions, today);
         let past = decided(&sessions, today);
-        assert!(suggest(&s, &past, &metrics(5.0), &[], &library(), today).is_empty());
+        assert!(suggest_local(&s, &past, &metrics(5.0), &[], &library(), today).is_empty());
     }
 
     #[test]
@@ -731,7 +822,7 @@ mod tests {
         ];
         let s = status(&program(12), &sessions, today);
         let past = decided(&sessions, today);
-        assert!(suggest(&s, &past, &metrics(5.0), &[], &library(), today).is_empty());
+        assert!(suggest_local(&s, &past, &metrics(5.0), &[], &library(), today).is_empty());
     }
 
     #[test]
@@ -740,7 +831,7 @@ mod tests {
         let s = ready_status(WorkoutCategory::Threshold, today);
         // Steady at 50, then 58 today — 16 % up.
         let w = wellness(&[(4, 50), (3, 50), (2, 50), (1, 50), (0, 58)], today);
-        let out = suggest(&s, &[], &metrics(0.0), &w, &library(), today);
+        let out = suggest_local(&s, &[], &metrics(0.0), &w, &library(), today);
 
         assert_eq!(out.len(), 1);
         assert!(matches!(
@@ -757,7 +848,7 @@ mod tests {
         let s = ready_status(WorkoutCategory::Threshold, today);
         // 51 against a baseline of 50 — 2 %, inside normal variation.
         let w = wellness(&[(4, 50), (3, 50), (2, 50), (1, 50), (0, 51)], today);
-        assert!(suggest(&s, &[], &metrics(0.0), &w, &library(), today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(0.0), &w, &library(), today).is_empty());
     }
 
     #[test]
@@ -766,7 +857,7 @@ mod tests {
         let s = ready_status(WorkoutCategory::Threshold, today);
         // Two readings is not a baseline, however alarming the second looks.
         let w = wellness(&[(1, 50), (0, 70)], today);
-        assert!(suggest(&s, &[], &metrics(0.0), &w, &library(), today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(0.0), &w, &library(), today).is_empty());
     }
 
     #[test]
@@ -780,7 +871,7 @@ mod tests {
         ];
         let s = status(&program(12), &sessions, today);
         let past = decided(&sessions, today);
-        let out = suggest(&s, &past, &metrics(-35.0), &[], &library(), today);
+        let out = suggest_local(&s, &past, &metrics(-35.0), &[], &library(), today);
 
         assert_eq!(out.len(), 1, "one adjustment, not one per reason");
         assert!(matches!(out[0].reason, Reason::Fatigued { .. }));
@@ -796,7 +887,7 @@ mod tests {
             session(3, date(2026, 8, 12), Anaerobic, false),
         ];
         let s = status(&program(12), &sessions, today);
-        let out = suggest(&s, &[], &metrics(-40.0), &[], &library(), today);
+        let out = suggest_local(&s, &[], &metrics(-40.0), &[], &library(), today);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].entry_id, 1, "the soonest one");
@@ -806,7 +897,7 @@ mod tests {
     fn should_propose_nothing_when_the_plan_is_finished() {
         let today = date(2026, 8, 5);
         let s = status(&program(12), &[], today);
-        assert!(suggest(&s, &[], &metrics(-40.0), &[], &library(), today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(-40.0), &[], &library(), today).is_empty());
     }
 
     #[test]
@@ -815,14 +906,14 @@ mod tests {
         let s = ready_status(WorkoutCategory::Threshold, today);
         // No sweet spot workout to step down to.
         let sparse = vec![workout(1, WorkoutCategory::Vo2Max, 3600)];
-        assert!(suggest(&s, &[], &metrics(-40.0), &[], &sparse, today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(-40.0), &[], &sparse, today).is_empty());
     }
 
     #[test]
     fn should_propose_nothing_when_the_session_is_already_the_easiest_there_is() {
         let today = date(2026, 8, 5);
         let s = ready_status(WorkoutCategory::Recovery, today);
-        assert!(suggest(&s, &[], &metrics(-40.0), &[], &library(), today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(-40.0), &[], &library(), today).is_empty());
     }
 
     #[test]
@@ -836,6 +927,162 @@ mod tests {
         sessions[0].duration_secs = 3600;
         let s = status(&program(12), &sessions, today);
         let library = vec![workout(2, Endurance, 3600)];
-        assert!(suggest(&s, &[], &metrics(-40.0), &[], &library, today).is_empty());
+        assert!(suggest_local(&s, &[], &metrics(-40.0), &[], &library, today).is_empty());
+    }
+
+    // ── The morning brief's verdict ───────────────────────────────────────────
+
+    /// A program whose next session is *today*, which is the only day the
+    /// brief's verdict speaks for.
+    fn due_today(category: WorkoutCategory, today: NaiveDate) -> ProgramStatus {
+        status(&program(12), &[session(1, today, category, false)], today)
+    }
+
+    #[test]
+    fn should_ease_the_next_session_when_the_coach_advises_it() {
+        // Nothing measured is wrong — a rested rider, no wellness dip, nothing
+        // missed. The brief is the only thing that noticed.
+        let today = date(2026, 8, 5);
+        let s = due_today(WorkoutCategory::Threshold, today);
+        let out = suggest(
+            &s,
+            &[],
+            &metrics(0.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Ease,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reason, Reason::CoachAdvised);
+        assert_eq!(out[0].to_name, "Sweet Spot 60", "one rung down");
+    }
+
+    #[test]
+    fn should_prefer_a_measured_reason_over_the_coachs_when_both_apply() {
+        // "Your form is -35" is worth more to the rider than "your coach said
+        // so", so the measurement supplies the sentence.
+        let today = date(2026, 8, 5);
+        let s = due_today(WorkoutCategory::Threshold, today);
+        let out = suggest(
+            &s,
+            &[],
+            &metrics(-35.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Ease,
+        );
+
+        assert_eq!(out.len(), 1, "one adjustment, not one per reason");
+        assert!(matches!(out[0].reason, Reason::Fatigued { .. }));
+    }
+
+    #[test]
+    fn should_drop_a_rest_verdict_to_recovery_rather_than_one_rung() {
+        // Rest is not a request for a slightly easier session. Easing threshold
+        // one rung would land on sweet spot, which is not what was asked.
+        let today = date(2026, 8, 5);
+        let s = due_today(WorkoutCategory::Threshold, today);
+        let out = suggest(
+            &s,
+            &[],
+            &metrics(0.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Rest,
+        );
+
+        assert_eq!(out.len(), 1);
+        // Recovery, and still the hour the rider set aside — easing intensity
+        // must not invent a scheduling problem.
+        assert_eq!(out[0].to_name, "Recovery 60");
+    }
+
+    #[test]
+    fn should_change_nothing_when_rest_is_advised_and_the_session_is_already_recovery() {
+        let today = date(2026, 8, 5);
+        let s = due_today(WorkoutCategory::Recovery, today);
+        assert!(suggest(
+            &s,
+            &[],
+            &metrics(0.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Rest,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_ignore_the_verdict_when_the_next_session_is_not_today() {
+        // Mon/Wed/Fri, and today is Tuesday: the next session is tomorrow's.
+        // This morning's readiness says nothing about how the rider will wake
+        // up, and the local rules found nothing on their own.
+        let today = date(2026, 8, 5);
+        let s = ready_status(WorkoutCategory::Threshold, today);
+        assert!(suggest(
+            &s,
+            &[],
+            &metrics(0.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Rest,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_still_apply_the_local_rules_when_the_session_is_not_today() {
+        // Gating the verdict must not gate the measurements — those read
+        // rolling averages and apply whenever the session falls.
+        let today = date(2026, 8, 5);
+        let s = ready_status(WorkoutCategory::Threshold, today);
+        let out = suggest(
+            &s,
+            &[],
+            &metrics(-35.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Rest,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].reason, Reason::Fatigued { .. }));
+        assert_eq!(
+            out[0].to_name, "Sweet Spot 60",
+            "eased, not dropped to rest"
+        );
+    }
+
+    #[test]
+    fn should_change_nothing_in_a_recovery_week_even_when_the_coach_advises_rest() {
+        // Week 4 is the recovery week. It is already the easy week, and the
+        // brief sees one morning rather than the shape of the block.
+        let today = start() + chrono::Duration::weeks(3);
+        let s = due_today(WorkoutCategory::Endurance, today);
+        assert_eq!(s.phase, Phase::Recovery, "the fixture is a recovery week");
+        assert!(suggest(
+            &s,
+            &[],
+            &metrics(0.0),
+            &[],
+            &library(),
+            today,
+            CoachVerdict::Rest,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_default_to_proceeding() {
+        // A rider with no brief — no key, or the request failed — must get
+        // exactly the behaviour they had before the brief existed.
+        assert_eq!(CoachVerdict::default(), CoachVerdict::Proceed);
     }
 }

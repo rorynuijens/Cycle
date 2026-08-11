@@ -6,7 +6,7 @@
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 
-use crate::data::db::{IntervalsActivity, SessionRecord, WellnessEntry};
+use crate::data::db::{IntervalsActivity, SessionRecord, SessionSummary, WellnessEntry};
 use crate::data::streams::ActivityStreams;
 
 /// Rolling window lengths, in seconds, plotted on the mean-maximal power curve.
@@ -258,18 +258,36 @@ pub fn compute_weekly_tss(
     today: NaiveDate,
     weeks: i64,
 ) -> Vec<(String, f32)> {
+    let summaries: Vec<SessionSummary> = records.iter().map(|r| r.summary()).collect();
+    compute_weekly_tss_from_summaries(&summaries, intervals_pairs, fallback_ftp, today, weeks)
+}
+
+/// [`compute_weekly_tss`] over summaries rather than whole rides.
+///
+/// The two exist because their callers hold different things. A page that has
+/// already loaded full records passes those; the morning brief holds only
+/// summaries, and loading every ride's data points to total a week of TSS would
+/// read megabytes to produce six numbers. Only this one has an implementation —
+/// the other maps and delegates — so they cannot drift apart.
+pub fn compute_weekly_tss_from_summaries(
+    summaries: &[SessionSummary],
+    intervals_pairs: &[(NaiveDate, f32)],
+    fallback_ftp: u32,
+    today: NaiveDate,
+    weeks: i64,
+) -> Vec<(String, f32)> {
     let week_start = week_start_of(today);
     let mut out = Vec::with_capacity(weeks as usize);
     for i in (0..weeks).rev() {
         let ws = week_start - Duration::weeks(i);
         let we = ws + Duration::days(6);
-        let tss_sessions: f32 = records
+        let tss_sessions: f32 = summaries
             .iter()
-            .filter(|r| {
-                let d = session_date(r);
+            .filter(|s| {
+                let d = s.started_at.with_timezone(&Local).date_naive();
                 d >= ws && d <= we
             })
-            .filter_map(|r| r.session.tss(fallback_ftp))
+            .filter_map(|s| s.tss(fallback_ftp))
             .sum();
         let tss_icu: f32 = intervals_pairs
             .iter()

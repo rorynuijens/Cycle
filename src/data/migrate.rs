@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -40,14 +40,15 @@ struct Migration {
 ///
 /// Append only, never edit or reorder: a released step has already run on real
 /// databases, and changing it makes the version number a lie about their shape.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 2,
-    name: "training programs",
-    statements: &[
-        // A program the rider is following. `active` is a flag rather than a
-        // deletion so an abandoned plan keeps its calendar entries: the rides
-        // were still planned, and the history should not rewrite itself.
-        "CREATE TABLE programs (
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 2,
+        name: "training programs",
+        statements: &[
+            // A program the rider is following. `active` is a flag rather than a
+            // deletion so an abandoned plan keeps its calendar entries: the rides
+            // were still planned, and the history should not rewrite itself.
+            "CREATE TABLE programs (
              id            INTEGER PRIMARY KEY,
              created_at    TEXT    NOT NULL,
              start_monday  TEXT    NOT NULL,
@@ -55,17 +56,39 @@ const MIGRATIONS: &[Migration] = &[Migration {
              training_days TEXT    NOT NULL,
              active        INTEGER NOT NULL DEFAULT 1
          )",
-        // Which program put this session on the calendar. NULL for anything
-        // scheduled by hand or from a daily suggestion, which adaptation must
-        // never touch.
-        "ALTER TABLE calendar_entries
+            // Which program put this session on the calendar. NULL for anything
+            // scheduled by hand or from a daily suggestion, which adaptation must
+            // never touch.
+            "ALTER TABLE calendar_entries
              ADD COLUMN program_id INTEGER REFERENCES programs(id)",
-        // What the program originally asked for, stamped the first time an
-        // entry is eased, so an adjustment can explain and undo itself.
-        "ALTER TABLE calendar_entries
+            // What the program originally asked for, stamped the first time an
+            // entry is eased, so an adjustment can explain and undo itself.
+            "ALTER TABLE calendar_entries
              ADD COLUMN original_workout_id INTEGER REFERENCES workouts(id)",
-    ],
-}];
+        ],
+    },
+    Migration {
+        version: 3,
+        name: "consolidate the daily AI brief",
+        statements: &[
+            // The morning briefing, the ride suggestion and the fitness insight are
+            // now sections of one brief, cached under `ai.daily_brief`. None of
+            // these can be carried across: they carry no date, no sections and no
+            // verdict, so a migration could only guess — and guessing would restore
+            // exactly the disagreement between cards this replaced. Dropping them
+            // costs one launch with an empty Coach card, which the launch itself
+            // fills.
+            "DELETE FROM settings WHERE key IN (
+             'ai.suggestion_response',
+             'ai.suggestion_workout_name',
+             'ai.suggestion_workout_detail',
+             'ai.fitness_insight',
+             'ai.morning_briefing_text',
+             'ai.morning_briefing_date'
+         )",
+        ],
+    },
+];
 
 /// Bring `pool` up to [`SCHEMA_VERSION`], or fail explaining why it cannot be.
 pub async fn run(pool: &SqlitePool) -> Result<()> {
@@ -536,7 +559,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_carry_a_v1_database_up_to_v2_keeping_its_calendar() {
+    async fn should_forget_the_cached_text_the_daily_brief_replaced() {
+        // The suggestion, the fitness insight and the old morning briefing were
+        // three separate answers with no shared date or verdict. Carrying them
+        // forward would restore the disagreement between cards the brief exists
+        // to remove, so v3 drops them.
+        let pool = empty_pool().await;
+        sqlx::query(BASELINE_TABLES).execute(&pool).await.unwrap();
+        set_user_version(&pool, 2).await.unwrap();
+
+        let superseded = [
+            "ai.suggestion_response",
+            "ai.suggestion_workout_name",
+            "ai.suggestion_workout_detail",
+            "ai.fitness_insight",
+            "ai.morning_briefing_text",
+            "ai.morning_briefing_date",
+        ];
+        for key in superseded {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?, 'stale')")
+                .bind(key)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // A retrospective is a separate, still-current feature.
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('ai.weekly_retrospective', 'keep')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // And a rider's own setting must not be caught by the sweep.
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('intervals.athlete_id', 'i12345')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        run(&pool).await.expect("upgrading from v2 should succeed");
+
+        for key in superseded {
+            let left: Option<String> =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+                    .bind(key)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(left, None, "{key} should have been dropped");
+        }
+
+        let kept: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'ai.weekly_retrospective'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept.as_deref(),
+            Some("keep"),
+            "retrospectives are not affected"
+        );
+
+        let setting: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'intervals.athlete_id'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            setting.as_deref(),
+            Some("i12345"),
+            "a rider's settings are not cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_carry_a_v1_database_to_the_current_version_keeping_its_calendar() {
         // The rider's own database is at v1 with a calendar already on it, so
         // this is the upgrade that will actually run in the field.
         let pool = empty_pool().await;
@@ -557,9 +651,11 @@ mod tests {
         .await
         .unwrap();
 
-        run(&pool).await.expect("v1 to v2 should succeed");
+        run(&pool).await.expect("upgrading from v1 should succeed");
 
-        assert_eq!(user_version(&pool).await.unwrap(), 2);
+        // Against SCHEMA_VERSION rather than a literal, so adding a migration
+        // does not make this test wrong about what it is checking.
+        assert_eq!(user_version(&pool).await.unwrap(), SCHEMA_VERSION);
         let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_entries")
             .fetch_one(&pool)
             .await

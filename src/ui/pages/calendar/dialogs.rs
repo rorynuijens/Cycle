@@ -79,7 +79,13 @@ pub fn show_schedule_dialog(
         let names_ai: Vec<String> = workouts.iter().map(|w| w.name.clone()).collect();
         crate::ui::spawn_to_main(
             &rt_handle,
-            async move { ai_cache::suggestion_workout_name(&pool_ai).await },
+            async move {
+                let today = chrono::Local::now()
+                    .date_naive()
+                    .format("%Y-%m-%d")
+                    .to_string();
+                ai_cache::brief_workout_name(&pool_ai, &today).await
+            },
             move |result| {
                 let suggestion = match result {
                     Ok(Some(name)) if !name.trim().is_empty() => name,
@@ -87,7 +93,7 @@ pub fn show_schedule_dialog(
                     Err(e) => {
                         // Not worth a toast: the rider can still pick a
                         // workout, they just do not get the shortcut.
-                        tracing::warn!("Could not read the coach's suggestion: {e}");
+                        tracing::warn!("Could not read the morning brief's workout: {e}");
                         return;
                     }
                 };
@@ -100,7 +106,7 @@ pub fn show_schedule_dialog(
                 dropdown_ai.set_selected(idx as u32);
                 content_ai.append(
                     &gtk::Label::builder()
-                        .label(format!("AI Coach suggests: {}", suggestion.trim()))
+                        .label(format!("Your morning brief: {}", suggestion.trim()))
                         .css_classes(["caption", "accent"])
                         .halign(gtk::Align::Start)
                         .build(),

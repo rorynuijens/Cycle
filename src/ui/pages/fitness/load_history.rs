@@ -233,11 +233,6 @@ impl LoadHistory {
         self.total_sessions
             .set_label(&volume.activity_count.to_string());
     }
-
-    /// The current bar values, for the AI fitness prompt.
-    pub fn weekly_tss(&self) -> Vec<f32> {
-        self.weekly_tss.borrow().clone()
-    }
 }
 
 #[cfg(test)]

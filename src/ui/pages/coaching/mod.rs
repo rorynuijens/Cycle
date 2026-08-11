@@ -15,7 +15,7 @@ use sqlx::SqlitePool;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::data::{athlete::AthleteProfile, workout::Workout};
+use crate::data::{athlete::AthleteProfile, db, workout::Workout};
 use crate::ui::widgets::api_key_banner::ApiKeyBanner;
 
 use data::{load_coaching_data, CoachingData};
@@ -38,6 +38,7 @@ impl CoachingPage {
         workouts: Vec<Workout>,
         on_start_workout: Rc<dyn Fn(Workout)>,
         on_toast: Rc<dyn Fn(adw::Toast)>,
+        brief_store: Rc<crate::ui::brief_store::BriefStore>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -70,6 +71,7 @@ impl CoachingPage {
             Rc::clone(&workouts),
             on_start_workout,
             Rc::clone(&on_toast),
+            Rc::clone(&brief_store),
         ));
         let goals = Rc::new(GoalsSection::new(pool.clone(), rt_handle.clone()));
         let plan = PlanCard::new(
@@ -79,6 +81,18 @@ impl CoachingPage {
             Rc::clone(&workouts),
             Rc::clone(&on_toast),
         );
+
+        // The reconciliation: the brief's verdict reaches the plan, which is
+        // the only thing that produces an adjustment. Re-run the rules whenever
+        // the verdict changes, so easing follows the brief without the brief
+        // ever picking a session — see training::program::suggest.
+        brief_store.observe({
+            let plan = Rc::clone(&plan);
+            move |state: &crate::ui::brief_store::BriefState| {
+                let verdict = state.brief.as_ref().map(|b| b.verdict).unwrap_or_default();
+                plan.set_verdict(verdict);
+            }
+        });
         let program = ProgramSection::new(
             pool.clone(),
             rt_handle.clone(),
@@ -86,6 +100,21 @@ impl CoachingPage {
             workouts,
             on_toast.clone(),
         );
+
+        // The rider's Intervals.icu templates, refreshed on each page load. The
+        // brief can arrive before or after them, so both paths render through
+        // whatever is currently here rather than assuming an order.
+        let icu_workouts: Rc<RefCell<Rc<Vec<db::IntervalsWorkout>>>> =
+            Rc::new(RefCell::new(Rc::new(vec![])));
+
+        brief_store.observe({
+            let suggestion = Rc::clone(&suggestion);
+            let icu_workouts = Rc::clone(&icu_workouts);
+            move |state: &crate::ui::brief_store::BriefState| {
+                let icu = Rc::clone(&icu_workouts.borrow());
+                suggestion.apply_brief(state, &icu);
+            }
+        });
 
         inner.append(suggestion.widget());
         // The plan the rider is living with comes before the builder that makes
@@ -107,6 +136,8 @@ impl CoachingPage {
             let goals = Rc::clone(&goals);
             let on_toast = Rc::clone(&on_toast);
             let plan = Rc::clone(&plan);
+            let icu_for_reload = Rc::clone(&icu_workouts);
+            let brief_for_reload = Rc::clone(&brief_store);
             Rc::new(move || {
                 api_banner.refresh();
                 // The program's state is read on every visit: a ride finished
@@ -119,18 +150,22 @@ impl CoachingPage {
                 let goals = Rc::clone(&goals);
                 let suggestion = Rc::clone(&suggestion);
                 let on_toast = Rc::clone(&on_toast);
+                let icu_for_reload = Rc::clone(&icu_for_reload);
+                let brief_for_reload = Rc::clone(&brief_for_reload);
                 crate::ui::spawn_to_main(
                     &rt_handle,
                     async move { load_coaching_data(&pool_load).await },
                     move |result| match result {
                         Ok(CoachingData {
                             goals: entries,
-                            cached_resp,
-                            cached_name,
-                            cached_detail,
+                            icu_workouts,
                         }) => {
                             goals.set_goals(&entries);
-                            suggestion.restore_cached(&cached_resp, &cached_name, &cached_detail);
+                            // The brief may already have arrived; re-render it
+                            // now that the Intervals.icu names are on hand.
+                            *icu_for_reload.borrow_mut() = Rc::new(icu_workouts);
+                            let icu = Rc::clone(&icu_for_reload.borrow());
+                            suggestion.apply_brief(&brief_for_reload.state(), &icu);
                         }
                         // A failed load must not redraw the page as empty: an
                         // empty goals list reads as "you have no goals", which

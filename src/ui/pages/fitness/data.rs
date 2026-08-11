@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use sqlx::SqlitePool;
 
-use crate::data::{ai_cache, db, settings};
+use crate::data::{db, settings};
 use crate::training::analytics::WELLNESS_WINDOW_DAYS;
 
 /// Everything the page's charts are drawn from, loaded in one pass.
@@ -16,7 +16,6 @@ pub struct FitnessData {
     pub icu_activities: Vec<db::IntervalsActivity>,
     pub wellness: Vec<db::WellnessEntry>,
     pub run_streams: Vec<(NaiveDate, String)>,
-    pub cached_insight: String,
 }
 
 /// Load the page's data off the GTK main thread (CLAUDE.md §2.3).
@@ -30,34 +29,6 @@ pub async fn load_fitness_data(pool: &SqlitePool) -> anyhow::Result<FitnessData>
         icu_activities: db::load_unlinked_intervals_activities(pool).await?,
         wellness: db::load_wellness_recent(pool, WELLNESS_WINDOW_DAYS as u32).await?,
         run_streams: db::load_run_activity_streams(pool).await?,
-        cached_insight: ai_cache::fitness_insight(pool).await?.unwrap_or_default(),
-    })
-}
-
-/// Days of wellness history sent with the "Analyse Fitness" prompt.
-const AI_WELLNESS_DAYS: u32 = 7;
-
-/// The training history behind the "Analyse Fitness" prompt.
-pub struct FitnessPromptData {
-    pub records: Vec<db::SessionSummary>,
-    pub intervals_pairs: Vec<(NaiveDate, f32)>,
-    pub icu_count: usize,
-    pub wellness: Vec<db::WellnessEntry>,
-    pub athlete_context: String,
-}
-
-/// Load the history the fitness analysis is based on.
-///
-/// Unlike the chart data, a partial read here is not a cosmetic problem: the
-/// prompt would still be sent, and the AI would confidently analyse a training
-/// history that is missing rides. The first failure aborts the request.
-pub async fn load_fitness_prompt_data(pool: &SqlitePool) -> anyhow::Result<FitnessPromptData> {
-    Ok(FitnessPromptData {
-        records: db::load_session_summaries(pool).await?,
-        intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
-        icu_count: db::count_intervals_activities(pool).await? as usize,
-        wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS).await?,
-        athlete_context: settings::coaching_context(pool).await?,
     })
 }
 

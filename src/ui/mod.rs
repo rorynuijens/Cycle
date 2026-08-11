@@ -1,3 +1,4 @@
+pub mod brief_store;
 pub mod markdown;
 pub mod pages;
 pub mod preferences;
@@ -42,8 +43,10 @@ pub fn load_css() {
 /// other at their database. Telling someone to check their key when the database
 /// is at fault sends them to the wrong place, and the wording is worth keeping
 /// identical across the pages that ask the coach for something.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiFailure {
+    /// There is no API key to ask with, so nothing was sent.
+    NoApiKey,
     /// The training history could not be read, so nothing was sent.
     DataUnavailable,
     /// The request was sent but did not come back with an answer.
@@ -53,6 +56,10 @@ pub enum AiFailure {
 impl AiFailure {
     pub fn message(self) -> &'static str {
         match self {
+            Self::NoApiKey => {
+                "No AI provider key configured. \
+                 Add your API key in Preferences → Integrations."
+            }
             Self::DataUnavailable => {
                 "Could not read your training history, so nothing was sent to the AI Coach."
             }
@@ -60,6 +67,15 @@ impl AiFailure {
                 "The AI Coach couldn't complete this request. \
                  Please check your API key and try again."
             }
+        }
+    }
+}
+
+impl From<crate::ai::brief::BriefError> for AiFailure {
+    fn from(error: crate::ai::brief::BriefError) -> Self {
+        match error {
+            crate::ai::brief::BriefError::DataUnavailable => Self::DataUnavailable,
+            crate::ai::brief::BriefError::Request => Self::Request,
         }
     }
 }

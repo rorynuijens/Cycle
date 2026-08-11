@@ -21,7 +21,9 @@ use std::rc::Rc;
 
 use crate::data::{athlete::AthleteProfile, db, workout::Workout};
 use crate::training::fitness::TsbBand;
-use crate::training::program::{decided, status, suggest, Adjustment, Phase, ProgramStatus};
+use crate::training::program::{
+    decided, status, suggest, Adjustment, CoachVerdict, Phase, ProgramStatus,
+};
 
 use super::data::{load_plan_data, PlanData};
 use super::program::week_start;
@@ -44,6 +46,12 @@ pub struct PlanCard {
     /// The state the card was last drawn from, which the AI rebuild describes
     /// to the coach rather than reading the whole plan a second time.
     last_state: Rc<RefCell<Option<ProgramStatus>>>,
+    /// What the morning brief made of today, as of the last time it changed.
+    ///
+    /// Held rather than passed in because the card reloads on navigation and
+    /// the brief arrives on its own schedule; whichever happens last must still
+    /// see the other.
+    verdict: Rc<std::cell::Cell<CoachVerdict>>,
     athlete: Rc<RefCell<AthleteProfile>>,
     workouts: Rc<Vec<Workout>>,
     pool: SqlitePool,
@@ -122,6 +130,7 @@ impl PlanCard {
             pending: Rc::new(RefCell::new(Vec::new())),
             program_id: Rc::new(RefCell::new(None)),
             last_state: Rc::new(RefCell::new(None)),
+            verdict: Rc::new(std::cell::Cell::new(CoachVerdict::Proceed)),
             athlete,
             workouts,
             pool,
@@ -167,6 +176,17 @@ impl PlanCard {
     }
 
     /// Read the program's state and redraw. Safe to call on every page visit.
+    /// Record what the morning brief said, and redraw if it changed.
+    ///
+    /// Only a change redraws: the store notifies on every state transition,
+    /// including ones that say nothing about the verdict, and reloading the
+    /// plan on each of those would re-query the database for nothing.
+    pub fn set_verdict(self: &Rc<Self>, verdict: CoachVerdict) {
+        if self.verdict.replace(verdict) != verdict {
+            self.reload();
+        }
+    }
+
     pub fn reload(self: &Rc<Self>) {
         let today = Local::now().date_naive();
         let ftp = self.athlete.borrow().ftp_watts;
@@ -218,6 +238,9 @@ impl PlanCard {
 
         let state = status(&program, &data.sessions, today);
         let past = decided(&data.sessions, today);
+        // The brief says how hard today should be; these rules decide what
+        // that means for the plan, and are the only thing that produces an
+        // adjustment. One authority, so the rider gets one answer.
         let adjustments = suggest(
             &state,
             &past,
@@ -225,6 +248,7 @@ impl PlanCard {
             &data.wellness,
             &self.workouts,
             today,
+            self.verdict.get(),
         );
 
         self.group.set_description(Some(&Self::describe(&state)));

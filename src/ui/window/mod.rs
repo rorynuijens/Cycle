@@ -310,6 +310,16 @@ impl CycleGtkWindow {
             })
         };
 
+        // ── The daily brief ───────────────────────────────────────────────────
+        // Built before the pages that show it, so each can subscribe as it is
+        // constructed. Nothing is requested until `start()` below, once every
+        // page exists — otherwise a card built late would miss the result.
+        let brief_store = crate::ui::brief_store::BriefStore::new(
+            pool.clone(),
+            rt_handle.clone(),
+            Rc::clone(&athlete_rc),
+        );
+
         // ── Calendar page — built after on_library_start so "Load Now" can start workouts ──
         let toast_overlay_for_cal = self.toast_overlay.clone();
         let on_toast_cal: Rc<dyn Fn(adw::Toast)> =
@@ -318,6 +328,7 @@ impl CycleGtkWindow {
         let stack_for_coaching_nav = stack.clone();
         let on_go_to_coaching: Rc<dyn Fn()> =
             Rc::new(move || stack_for_coaching_nav.set_visible_child_name("coaching"));
+        let on_go_to_coaching_dash = Rc::clone(&on_go_to_coaching);
 
         let (calendar_page, calendar_reload) = CalendarPage::new(
             pool.clone(),
@@ -339,6 +350,7 @@ impl CycleGtkWindow {
             rt_handle.clone(),
             Rc::clone(&athlete_rc),
             toast_fn_fitness,
+            Rc::clone(&brief_store),
         );
 
         // ── Coaching page ─────────────────────────────────────────────────────
@@ -353,6 +365,7 @@ impl CycleGtkWindow {
             workouts.clone(),
             Rc::clone(&on_library_start),
             toast_fn_coaching,
+            Rc::clone(&brief_store),
         );
 
         // ── Dashboard page — needs on_library_start for today's workout ────────
@@ -376,6 +389,8 @@ impl CycleGtkWindow {
             on_view_fitness,
             on_open_calendar,
             toast_fn_dash,
+            Rc::clone(&brief_store),
+            on_go_to_coaching_dash,
         );
 
         // ── Route player page ─────────────────────────────────────────────────
@@ -506,6 +521,7 @@ impl CycleGtkWindow {
         // Also show/hide the Resume Workout button: it only appears while a
         // workout is running and the user is away from the player page.
         let content_nav_for_title = content_nav_page.clone();
+        let brief_store_for_nav = Rc::clone(&brief_store);
         let start_btn_for_vis = start_btn.clone();
         let workout_active_for_vis = Rc::clone(&workout_active);
         let back_btn_for_vis = back_btn.clone();
@@ -537,6 +553,15 @@ impl CycleGtkWindow {
                 Some("coaching") => coaching_reload(),
                 _ => {}
             }
+            // Check whether the brief has been overtaken — a read, never a
+            // request. Landing on any page that shows one is the moment the
+            // rider would notice it saying something the data no longer says.
+            if matches!(
+                page.as_deref(),
+                Some("dashboard") | Some("fitness") | Some("coaching")
+            ) {
+                brief_store_for_nav.revalidate();
+            }
         });
 
         let sidebar_nav_page = chrome::build_sidebar_page(&sidebar_list);
@@ -557,6 +582,13 @@ impl CycleGtkWindow {
 
         self.toast_overlay.set_child(Some(&split_view));
         self.window.set_content(Some(&self.toast_overlay));
+
+        // ── The one automatic AI request the app makes ────────────────────────
+        // Every page that shows a slice of the brief has now been built and has
+        // subscribed, so whatever comes back reaches all of them. Whether this
+        // actually asks anything is `brief::startup_action`'s decision: it only
+        // does so when nothing is cached for today.
+        brief_store.start();
 
         // ── App actions and shortcuts ────────────────────────────────────────
         actions::install(

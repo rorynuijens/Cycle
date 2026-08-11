@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::ai::coach::{build_fitness_prompt, get_suggestion, FitnessContext, WellnessSnapshot};
+use crate::ai::coach::{get_suggestion, WellnessSnapshot};
 use crate::ai::context::parse_ai_sections;
 use crate::ai::retrospective::{
     build_retrospective_prompt, RetroPeriod, RetroSession, RetrospectiveContext,
@@ -19,16 +19,11 @@ use crate::data::ai_cache;
 use crate::data::db::{self, WellnessEntry};
 use crate::data::{athlete::AthleteProfile, keystore};
 use crate::training::fitness::compute_load_metrics;
+use crate::ui::brief_store::{BriefState, BriefStatus, BriefStore};
 use crate::ui::markdown::to_pango;
 use crate::ui::AiFailure;
 
-use super::data::{
-    load_fitness_prompt_data, load_retro_prompt_data, FitnessPromptData, RetroPromptData,
-};
-
-/// Shown when the rider has no Anthropic key configured.
-const NO_API_KEY: &str = "No API key configured. Enter your Anthropic API key in \
-                          Preferences → Integrations.";
+use super::data::{load_retro_prompt_data, RetroPromptData};
 
 /// How many days each retrospective looks back over.
 fn period_days(period: RetroPeriod) -> i64 {
@@ -154,16 +149,17 @@ impl AiOutput {
 pub struct CoachCard {
     root: gtk::Box,
     analysis: AiOutput,
+    provenance: gtk::Label,
+    analyse_btn: gtk::Button,
+    analyse_spinner: gtk::Spinner,
 }
 
 impl CoachCard {
-    /// `weekly_tss` reads the load-history bars at click time, so the prompt
-    /// always carries what the page is currently showing.
     pub fn new(
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
         athlete: Rc<RefCell<AthleteProfile>>,
-        weekly_tss: Rc<dyn Fn() -> Vec<f32>>,
+        brief_store: Rc<BriefStore>,
     ) -> Self {
         let root = gtk::Box::builder()
             .css_classes(["card"])
@@ -185,37 +181,48 @@ impl CoachCard {
                 .css_classes(["dim-label"])
                 .build(),
         );
-        header.append(
+        let title_col = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .build();
+        title_col.append(
             &gtk::Label::builder()
                 .label("Coach")
                 .css_classes(["heading"])
                 .halign(gtk::Align::Start)
-                .hexpand(true)
-                .tooltip_text(
-                    "AI interpretation of your training metrics, recovery signals, \
-                     and wellness data",
-                )
+                .tooltip_text("Your morning brief's read on what your training load is doing")
                 .build(),
         );
+        // Where this came from — the same sentence the dashboard and Coaching
+        // page show, so three cards cannot describe one brief three ways.
+        let provenance = gtk::Label::builder()
+            .label("")
+            .halign(gtk::Align::Start)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        title_col.append(&provenance);
+        header.append(&title_col);
+
         let analyse_spinner = gtk::Spinner::new();
         analyse_spinner.set_visible(false);
         header.append(&analyse_spinner);
 
+        // Refreshes the one brief behind all three cards, not this card alone.
         let analyse_btn = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
             .css_classes(["flat", "circular"])
-            .tooltip_text("Refresh AI fitness analysis")
+            .tooltip_text("Ask your coach to write today's brief again")
             .valign(gtk::Align::Center)
             .build();
+        {
+            let store = Rc::clone(&brief_store);
+            analyse_btn.connect_clicked(move |_| store.refresh());
+        }
         header.append(&analyse_btn);
         root.append(&header);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        let analysis = AiOutput::new(
-            "Select the refresh button above to get an AI-powered interpretation \
-             of your training metrics, recovery signals, and wellness data.",
-            12,
-        );
+        let analysis = AiOutput::new("Your morning brief will appear here.", 12);
         root.append(&analysis.container);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
@@ -300,15 +307,6 @@ impl CoachCard {
         Self::restore_cached(&pool, &rt_handle, RetroPeriod::Weekly, &weekly);
         Self::restore_cached(&pool, &rt_handle, RetroPeriod::Monthly, &monthly);
 
-        Self::connect_analyse(
-            &analyse_btn,
-            &analyse_spinner,
-            &analysis,
-            pool.clone(),
-            rt_handle.clone(),
-            Rc::clone(&athlete),
-            weekly_tss,
-        );
         Self::connect_generate(
             &generate_btn,
             &month_toggle,
@@ -319,17 +317,45 @@ impl CoachCard {
             athlete,
         );
 
-        Self { root, analysis }
+        Self {
+            root,
+            analysis,
+            provenance,
+            analyse_btn,
+            analyse_spinner,
+        }
     }
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
     }
 
-    /// Restore the fitness analysis cached from a previous session.
-    pub fn set_cached_insight(&self, text: &str) {
-        if !text.trim().is_empty() {
-            self.analysis.set_text(text);
+    /// Render the daily brief's slice of what the training load is doing.
+    ///
+    /// This card used to make its own request, with its own cache that was
+    /// never invalidated — so it could describe a fitness state months out of
+    /// date while the dashboard described today's. Now it shows a section of
+    /// the same brief every other card shows.
+    pub fn apply_brief(&self, state: &BriefState) {
+        self.provenance.set_label(state.provenance());
+        self.analyse_btn.set_sensitive(state.can_refresh());
+
+        let loading = state.status == BriefStatus::Loading;
+        self.analyse_spinner.set_visible(loading);
+        if loading {
+            self.analyse_spinner.start();
+        } else {
+            self.analyse_spinner.stop();
+        }
+
+        match state.brief.as_ref().and_then(|b| b.form_slice()) {
+            Some(text) => self.analysis.set_text(text),
+            None => self.analysis.set_status(match state.status {
+                BriefStatus::Loading => "Asking your coach…",
+                BriefStatus::NoApiKey => AiFailure::NoApiKey.message(),
+                BriefStatus::Failed(failure) => failure.message(),
+                _ => "Your morning brief will appear here.",
+            }),
         }
     }
 
@@ -364,110 +390,6 @@ impl CoachCard {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn connect_analyse(
-        button: &gtk::Button,
-        spinner: &gtk::Spinner,
-        output: &AiOutput,
-        pool: SqlitePool,
-        rt_handle: tokio::runtime::Handle,
-        athlete: Rc<RefCell<AthleteProfile>>,
-        weekly_tss: Rc<dyn Fn() -> Vec<f32>>,
-    ) {
-        let spinner = spinner.clone();
-        let output = output.clone();
-        button.connect_clicked(move |btn| {
-            let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
-                Ok(Some(k)) if !k.trim().is_empty() => k,
-                _ => {
-                    output.set_status(NO_API_KEY);
-                    return;
-                }
-            };
-
-            // Read the !Send shared state on the main thread before spawning.
-            let ftp_watts = athlete.borrow().ftp_watts;
-            let week_tss = weekly_tss();
-            let profile = athlete.borrow().clone();
-
-            btn.set_sensitive(false);
-            spinner.set_visible(true);
-            spinner.start();
-            output.set_status("Asking the AI Coach to analyse your fitness metrics…");
-
-            let (tx, rx) = async_channel::bounded::<Result<String, AiFailure>>(1);
-            let pool_task = pool.clone();
-            // All DB reads + prompt assembly + the network call run off the main
-            // thread, so the click never blocks the GLib loop (CLAUDE.md §2.3).
-            rt_handle.spawn(async move {
-                let FitnessPromptData {
-                    records,
-                    intervals_pairs,
-                    icu_count,
-                    wellness,
-                    athlete_context,
-                } = match load_fitness_prompt_data(&pool_task).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::error!("Could not read training history to analyse: {e}");
-                        let _ = tx.send(Err(AiFailure::DataUnavailable)).await;
-                        return;
-                    }
-                };
-
-                let today = Local::now().date_naive();
-                let metrics = compute_load_metrics(&records, &intervals_pairs, ftp_watts, today);
-                let ctx = FitnessContext {
-                    athlete: profile,
-                    ctl: metrics.ctl,
-                    atl: metrics.atl,
-                    tsb: metrics.tsb(),
-                    ctl_4wk_ago: metrics.ctl_4wk_ago,
-                    week_tss,
-                    total_sessions: records.len() + icu_count,
-                    athlete_context,
-                    wellness: wellness_snapshots(&wellness),
-                };
-
-                let result = get_suggestion(&api_key, &build_fitness_prompt(&ctx), 1400)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("AI fitness analysis failed: {e}");
-                        AiFailure::Request
-                    });
-                let _ = tx.send(result).await;
-            });
-
-            let btn = btn.clone();
-            let spinner = spinner.clone();
-            let output = output.clone();
-            let pool = pool.clone();
-            let rt_handle = rt_handle.clone();
-            glib::MainContext::default().spawn_local(async move {
-                if let Ok(result) = rx.recv().await {
-                    match result {
-                        Ok(text) => {
-                            output.set_text(&text);
-                            let cached = text.clone();
-                            crate::ui::spawn_write(
-                                &rt_handle,
-                                &pool,
-                                "the fitness insight",
-                                move |pool| async move {
-                                    ai_cache::set_fitness_insight(&pool, &cached).await
-                                },
-                            );
-                        }
-                        Err(failure) => output.set_status(failure.message()),
-                    }
-                }
-                spinner.stop();
-                spinner.set_visible(false);
-                btn.set_sensitive(true);
-            });
-        });
-    }
-
-    /// One Generate button serves both periods; dispatch on the active toggle.
     fn connect_generate(
         button: &gtk::Button,
         month_toggle: &gtk::ToggleButton,
@@ -494,7 +416,7 @@ impl CoachCard {
             let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
                 Ok(Some(k)) if !k.trim().is_empty() => k,
                 _ => {
-                    output.set_status(NO_API_KEY);
+                    output.set_status(AiFailure::NoApiKey.message());
                     return;
                 }
             };

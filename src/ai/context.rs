@@ -7,7 +7,6 @@
 
 use chrono::Local;
 
-use crate::ai::briefing::PlannedWorkout;
 use crate::ai::coach::{ProgramEntry, RecentSession, WellnessSnapshot, WorkoutOption};
 use crate::data::db::{IntervalsActivity, IntervalsWorkout, SessionSummary, WellnessEntry};
 use crate::data::sport::{is_cycling, normalize_sport_type};
@@ -109,55 +108,6 @@ pub fn workouts_as_options(
         });
     }
     opts
-}
-
-/// Describe a workout to the coach as the one planned for today.
-pub fn planned_from_workout(w: &Workout) -> PlannedWorkout {
-    PlannedWorkout {
-        name: w.name.clone(),
-        duration_mins: w.duration_secs / 60,
-        tss: w.tss,
-        category: w.category.label().to_string(),
-    }
-}
-
-/// Work out which workout today's briefing should be written around.
-///
-/// A workout actually on the calendar wins. With the day empty, the cached
-/// coaching suggestion stands in, so the Morning Brief and the Coaching page do
-/// not contradict each other. Returns `None` when the day is genuinely open —
-/// or when the cached suggestion names a workout no longer in the library.
-pub fn resolve_planned_workout(
-    scheduled: Option<&Workout>,
-    cached_suggestion_name: &str,
-    library: &[Workout],
-) -> Option<PlannedWorkout> {
-    if let Some(w) = scheduled {
-        return Some(planned_from_workout(w));
-    }
-    let wanted = cached_suggestion_name.trim();
-    if wanted.is_empty() {
-        return None;
-    }
-    library
-        .iter()
-        .find(|w| crate::ai::naming::names_match(&w.name, wanted))
-        .map(planned_from_workout)
-}
-
-/// The workout named on the reply's `RECOMMENDED_WORKOUT:` marker line.
-pub fn extract_recommended_workout(text: &str) -> Option<String> {
-    crate::ai::naming::extract_marker_value(text, "RECOMMENDED_WORKOUT:")
-}
-
-/// The reply with its marker line removed, ready to show the rider.
-pub fn strip_recommended_line(text: &str) -> String {
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with("RECOMMENDED_WORKOUT:"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_end()
-        .to_string()
 }
 
 /// Render a parsed multi-week program as markdown, annotating each day with the
@@ -382,76 +332,6 @@ mod tests {
         let opts = workouts_as_options(&[], &[icu_workout("Untimed", None, None)]);
         assert_eq!(opts[0].duration_mins, 60);
         assert_eq!(opts[0].tss, 0.0);
-    }
-
-    // ── resolve_planned_workout ──────────────────────────────────────────────
-
-    fn workout(name: &str, secs: u32) -> Workout {
-        Workout {
-            id: 1,
-            name: name.into(),
-            description: String::new(),
-            duration_secs: secs,
-            tss: 60.0,
-            category: crate::data::workout::WorkoutCategory::Endurance,
-            segments: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn should_prefer_the_scheduled_workout_over_the_cached_suggestion() {
-        let library = vec![workout("Sweet Spot", 3600)];
-        let scheduled = workout("Threshold 2x20", 4800);
-        let planned = resolve_planned_workout(Some(&scheduled), "Sweet Spot", &library)
-            .expect("a scheduled workout is always planned");
-        assert_eq!(planned.name, "Threshold 2x20");
-        assert_eq!(planned.duration_mins, 80);
-    }
-
-    #[test]
-    fn should_fall_back_to_the_cached_suggestion_on_an_empty_day() {
-        // Otherwise the Morning Brief and the Coaching page contradict each other.
-        let library = vec![workout("Sweet Spot", 3600)];
-        let planned = resolve_planned_workout(None, "Sweet Spot", &library)
-            .expect("the cached suggestion should stand in");
-        assert_eq!(planned.name, "Sweet Spot");
-        assert_eq!(planned.duration_mins, 60);
-    }
-
-    #[test]
-    fn should_plan_nothing_when_the_day_is_genuinely_open() {
-        assert!(resolve_planned_workout(None, "", &[workout("Sweet Spot", 3600)]).is_none());
-        assert!(resolve_planned_workout(None, "   ", &[workout("Sweet Spot", 3600)]).is_none());
-    }
-
-    #[test]
-    fn should_plan_nothing_when_the_suggestion_names_a_deleted_workout() {
-        let library = vec![workout("Sweet Spot", 3600)];
-        assert!(resolve_planned_workout(None, "Workout Since Deleted", &library).is_none());
-    }
-
-    // ── marker line handling ─────────────────────────────────────────────────
-
-    #[test]
-    fn should_remove_the_marker_line_from_the_displayed_reply() {
-        let reply = "Ride easy today.\nRECOMMENDED_WORKOUT: Recovery Spin\n";
-        assert_eq!(strip_recommended_line(reply), "Ride easy today.");
-        assert_eq!(
-            extract_recommended_workout(reply).as_deref(),
-            Some("Recovery Spin")
-        );
-    }
-
-    #[test]
-    fn should_remove_an_indented_marker_line() {
-        let reply = "Ride easy today.\n   RECOMMENDED_WORKOUT: Recovery Spin";
-        assert_eq!(strip_recommended_line(reply), "Ride easy today.");
-    }
-
-    #[test]
-    fn should_leave_a_reply_without_a_marker_untouched() {
-        assert_eq!(strip_recommended_line("Just rest."), "Just rest.");
-        assert_eq!(extract_recommended_workout("Just rest."), None);
     }
 
     // ── day_name_to_offset ───────────────────────────────────────────────────

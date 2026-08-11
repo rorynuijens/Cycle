@@ -62,7 +62,6 @@ impl Sections {
             icu_activities,
             wellness,
             run_streams,
-            cached_insight,
         } = data;
 
         let today = Local::now().date_naive();
@@ -107,8 +106,6 @@ impl Sections {
             compute_power_curve(&records, recent_cutoff),
             compute_pace_curve(&run_streams, recent_cutoff),
         );
-
-        self.coach.set_cached_insight(&cached_insight);
     }
 }
 
@@ -124,6 +121,7 @@ impl FitnessPage {
         rt_handle: tokio::runtime::Handle,
         athlete: Rc<RefCell<AthleteProfile>>,
         on_toast: Rc<dyn Fn(adw::Toast)>,
+        brief_store: Rc<crate::ui::brief_store::BriefStore>,
     ) -> (Self, Rc<dyn Fn()>) {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -150,13 +148,7 @@ impl FitnessPage {
             .spacing(18)
             .build();
 
-        // The load history feeds the AI prompt, so it is built first and read
-        // back at click time — the prompt then carries what the page is showing.
         let load = Rc::new(LoadHistory::new());
-        let weekly_tss: Rc<dyn Fn() -> Vec<f32>> = {
-            let load = Rc::clone(&load);
-            Rc::new(move || load.weekly_tss())
-        };
 
         let sections = Rc::new(Sections {
             hero: FormHero::new(),
@@ -167,7 +159,7 @@ impl FitnessPage {
                 pool.clone(),
                 rt_handle.clone(),
                 Rc::clone(&athlete),
-                weekly_tss,
+                Rc::clone(&brief_store),
             ),
             load,
         });
@@ -178,6 +170,13 @@ impl FitnessPage {
         inner.append(sections.bests.widget());
         inner.append(sections.load.widget());
         inner.append(sections.coach.widget());
+
+        // The Coach card shows a slice of the one daily brief, like the
+        // dashboard and the Coaching page — no request of its own.
+        brief_store.observe({
+            let sections = Rc::clone(&sections);
+            move |state: &crate::ui::brief_store::BriefState| sections.coach.apply_brief(state)
+        });
 
         clamp.set_child(Some(&inner));
         let scroll = gtk::ScrolledWindow::builder()
