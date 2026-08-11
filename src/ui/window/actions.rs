@@ -20,6 +20,7 @@ pub fn install(
     rt_handle: tokio::runtime::Handle,
     athlete_rc: Rc<RefCell<AthleteProfile>>,
     engine_rc: Rc<RefCell<WorkoutEngine>>,
+    player_rc: Rc<RefCell<crate::ui::pages::player::PlayerPage>>,
     sim_difficulty: Rc<Cell<f32>>,
     sim_max_grade: Rc<Cell<f32>>,
 ) {
@@ -51,6 +52,7 @@ pub fn install(
     let athlete_for_prefs = Rc::clone(&athlete_rc);
     let sim_difficulty_for_prefs = Rc::clone(&sim_difficulty);
     let sim_max_grade_for_prefs = Rc::clone(&sim_max_grade);
+    let player_for_prefs = Rc::clone(&player_rc);
     let prefs_action = gio::SimpleAction::new("preferences", None);
     prefs_action.connect_activate(move |_, _| {
         let current_athlete = athlete_for_prefs.borrow().clone();
@@ -58,6 +60,7 @@ pub fn install(
         let engine_for_erg = Rc::clone(&engine_for_prefs);
         let sim_difficulty_prefs = Rc::clone(&sim_difficulty_for_prefs);
         let sim_max_grade_prefs = Rc::clone(&sim_max_grade_for_prefs);
+        let player_for_cues = Rc::clone(&player_for_prefs);
         crate::ui::preferences::show(
             &window_for_prefs,
             current_athlete,
@@ -74,6 +77,9 @@ pub fn install(
             move |difficulty_pct, max_grade_pct| {
                 sim_difficulty_prefs.set(difficulty_pct as f32 / 100.0);
                 sim_max_grade_prefs.set(max_grade_pct as f32);
+            },
+            move |on| {
+                player_for_cues.borrow().set_cues_enabled(on);
             },
         );
     });

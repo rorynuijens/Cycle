@@ -162,6 +162,7 @@ impl CycleGtkWindow {
             &workout,
             &athlete_rc.borrow(),
         )));
+        player_rc.borrow().set_cues_enabled(training.interval_cues);
 
         // ── Header resume button — created here so on_complete and do_start can ref it ──
         // Only visible while a workout is running and the user has navigated away
@@ -277,11 +278,19 @@ impl CycleGtkWindow {
             let timer_alive = Rc::clone(&timer_alive);
             let timer_started = Rc::clone(&timer_started);
             let do_start = Rc::clone(&do_start);
+            let pool_for_cues = pool.clone();
+            let rt_for_cues = rt_handle.clone();
             Rc::new(move |workout: Workout| {
                 timer_alive.set(false); // stop any running timer on its next tick
                 engine.borrow_mut().reset_with_workout(workout.clone());
                 let ftp = engine.borrow().athlete.borrow().ftp_watts;
                 player.borrow().reset_workout(&workout, ftp);
+                crate::ui::pages::player::load_cues(
+                    Rc::clone(&player),
+                    workout,
+                    pool_for_cues.clone(),
+                    &rt_for_cues,
+                );
                 timer_started.set(false);
                 do_start();
             })
@@ -299,10 +308,18 @@ impl CycleGtkWindow {
             let timer_started = Rc::clone(&timer_started);
             let do_start = Rc::clone(&do_start);
             let checkpoint_id = Rc::clone(&checkpoint_id);
+            let pool_for_cues = pool.clone();
+            let rt_for_cues = rt_handle.clone();
             Rc::new(move |workout: Workout, session, row_id: i64| {
                 timer_alive.set(false);
                 let ftp = engine.borrow().athlete.borrow().ftp_watts;
                 player.borrow().reset_workout(&workout, ftp);
+                crate::ui::pages::player::load_cues(
+                    Rc::clone(&player),
+                    workout.clone(),
+                    pool_for_cues.clone(),
+                    &rt_for_cues,
+                );
                 engine.borrow_mut().resume_session(workout, session);
                 checkpoint_id.set(Some(row_id));
                 timer_started.set(false);
@@ -598,6 +615,7 @@ impl CycleGtkWindow {
             rt_handle.clone(),
             Rc::clone(&athlete_rc),
             Rc::clone(&engine_rc),
+            Rc::clone(&player_rc),
             Rc::clone(&sim_difficulty),
             Rc::clone(&sim_max_grade),
         );

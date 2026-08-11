@@ -12,6 +12,7 @@ use crate::data::{
     session::{LiveReadings, ReadingsTracker, Session},
     workout::Workout,
 };
+use crate::training::cues::{SegmentCue, CLOSING_SECS};
 use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
@@ -71,6 +72,23 @@ pub struct PlayerPage {
     intensity_up_cb: ButtonCb,
     /// Shows the active workout name above the graph.
     workout_name_label: gtk::Label,
+    /// ── Interval cues ───────────────────────────────────────────────────────
+    /// What this interval is for, in words: which rep it is, how many remain,
+    /// how to ride it. Built once per ride off the main thread (the history it
+    /// draws on lives in the database) and then read by segment index.
+    cue_box: gtk::Box,
+    cue_headline: gtk::Label,
+    cue_detail: gtk::Label,
+    cues: RefCell<Vec<SegmentCue>>,
+    /// Whether the rider wants cues at all — Preferences → Training.
+    cues_enabled: Cell<bool>,
+    /// What is currently rendered, so the labels and CSS classes are only
+    /// touched when the cue actually changes rather than every tick.
+    cue_rendered: Cell<Option<(usize, bool)>>,
+    /// Bumped by every `reset_workout`. A history read in flight when the rider
+    /// backs out and starts something else would otherwise land its rep numbers
+    /// on the wrong workout.
+    cue_generation: Cell<u64>,
 }
 
 impl PlayerPage {
@@ -192,6 +210,32 @@ impl PlayerPage {
         // ── Zone ribbon: where the current effort sits across Z1–Z7 ─────────
         let zone_meter = ZoneMeter::new(athlete.ftp_watts);
         inner.append(zone_meter.widget());
+
+        // ── Interval cue ─────────────────────────────────────────────────────
+        // Sits directly under the hero numbers, where the rider is already
+        // looking. Hidden until a ride is running and cues have been built, so
+        // it never leaves an empty gap in the cockpit.
+        let cue_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let cue_headline = gtk::Label::builder()
+            .label("")
+            .css_classes(["title-4"])
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .build();
+        let cue_detail = gtk::Label::builder()
+            .label("")
+            .css_classes(["caption", "dim-label"])
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .build();
+        cue_box.append(&cue_headline);
+        cue_box.append(&cue_detail);
+        inner.append(&cue_box);
 
         // ── Secondary metrics: HR · cadence · elapsed · remaining ────────────
         let secondary_grid = gtk::Grid::builder()
@@ -441,6 +485,13 @@ impl PlayerPage {
             intensity_down_cb,
             intensity_up_cb,
             workout_name_label,
+            cue_box,
+            cue_headline,
+            cue_detail,
+            cues: RefCell::new(Vec::new()),
+            cues_enabled: Cell::new(true),
+            cue_rendered: Cell::new(None),
+            cue_generation: Cell::new(0),
         }
     }
 
@@ -565,6 +616,14 @@ impl PlayerPage {
         self.countdown_banner.set_revealed(true);
         self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
+        // Cues belong to one workout. Clearing them here means a ride whose
+        // history has not loaded yet shows nothing rather than the last ride's
+        // rep numbers, which would be wrong for a different workout.
+        self.cues.replace(Vec::new());
+        self.cue_rendered.set(None);
+        self.cue_box.set_visible(false);
+        self.cue_generation
+            .set(self.cue_generation.get().wrapping_add(1));
         self.graph.set_workout(workout);
         self.zone_meter.set_power(None);
         self.elapsed_label.set_label("0:00");
@@ -864,10 +923,76 @@ impl PlayerPage {
             self.interval_caption.set_label("Interval");
         }
 
+        self.update_cue(snap);
+
         // Countdown banner and cancel button: visible only while engine is still Idle.
         let is_idle = snap.state == EngineState::Idle;
         self.countdown_banner.set_revealed(is_idle);
         self.cancel_btn.set_visible(is_idle);
+    }
+
+    /// Show the cue for the segment being ridden.
+    ///
+    /// Called every tick, but only rewrites the labels when the segment changes
+    /// or the interval enters its closing seconds — a cue that re-rendered each
+    /// second would restyle a widget the rider is reading mid-effort.
+    fn update_cue(&self, snap: &EngineSnapshot) {
+        // Before the start the countdown banner is doing the talking, and after
+        // the finish the summary page is; a cue in either case is noise.
+        let riding = matches!(snap.state, EngineState::Running | EngineState::Paused);
+        let cues = self.cues.borrow();
+        let cue = cues.get(snap.segment_index);
+
+        let Some(cue) = cue.filter(|_| riding && self.cues_enabled.get()) else {
+            self.cue_box.set_visible(false);
+            self.cue_rendered.set(None);
+            return;
+        };
+
+        // The closing line only replaces the detail while the interval is still
+        // running — at zero the engine has already moved to the next segment.
+        let closing = cue.closing.is_some()
+            && snap.segment_remaining_secs <= CLOSING_SECS
+            && snap.segment_remaining_secs > 0;
+
+        if self.cue_rendered.get() != Some((snap.segment_index, closing)) {
+            self.cue_headline.set_label(&cue.headline);
+
+            let detail = if closing {
+                cue.closing.as_deref()
+            } else {
+                cue.detail.as_deref()
+            };
+            self.cue_detail.set_label(detail.unwrap_or(""));
+            self.cue_detail.set_visible(detail.is_some());
+
+            // An effort gets the accent colour so the rider can tell at a glance
+            // whether they are working or resting; the closing seconds of one
+            // get it too, on the line that is counting them down.
+            self.cue_headline.set_css_classes(if cue.role.is_effort() {
+                &["title-4", "accent"]
+            } else {
+                &["title-4"]
+            });
+            self.cue_detail.set_css_classes(if closing {
+                &["caption", "heading", "accent"]
+            } else {
+                &["caption", "dim-label"]
+            });
+
+            self.cue_rendered.set(Some((snap.segment_index, closing)));
+        }
+
+        self.cue_box.set_visible(true);
+    }
+
+    /// Apply the Preferences → Training toggle, mid-ride if need be.
+    pub fn set_cues_enabled(&self, enabled: bool) {
+        self.cues_enabled.set(enabled);
+        if !enabled {
+            self.cue_box.set_visible(false);
+            self.cue_rendered.set(None);
+        }
     }
 
     /// Update the live session totals strip from the current in-progress session.
@@ -921,4 +1046,58 @@ impl PlayerPage {
         vbox.append(&value_label);
         (vbox, value_label)
     }
+}
+
+/// Build this workout's interval cues and hand them to the player.
+///
+/// Call straight after `reset_workout`. The rep numbering comes from the workout
+/// itself, but the "you've ridden this before" line needs the rider's history,
+/// which lives in the database — so the read runs on the tokio runtime and the
+/// cues land on the main thread a moment later (CLAUDE.md §2.3). A ride never
+/// waits for them; the cue row appears when they arrive.
+///
+/// A failed read is logged and the structural cues are built anyway. Cues are an
+/// extra, and losing the history line is not worth interrupting a ride over.
+pub fn load_cues(
+    player: Rc<RefCell<PlayerPage>>,
+    workout: Workout,
+    pool: sqlx::SqlitePool,
+    rt_handle: &tokio::runtime::Handle,
+) {
+    let generation = player.borrow().cue_generation.get();
+
+    crate::ui::spawn_to_main(
+        rt_handle,
+        async move {
+            let sessions = crate::data::db::load_session_summaries(&pool).await?;
+            let activities = crate::data::db::load_intervals_activities(&pool).await?;
+            anyhow::Ok((sessions, activities))
+        },
+        move |loaded| {
+            let p = player.borrow();
+            // The rider has started something else since; these cues are stale.
+            if p.cue_generation.get() != generation {
+                return;
+            }
+
+            let (sessions, activities) = match loaded {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Could not read ride history for interval cues: {e}");
+                    (Vec::new(), Vec::new())
+                }
+            };
+
+            let history = crate::training::progression::build_history(&sessions, &activities);
+            let priors = crate::training::progression::prior_efforts(
+                &history,
+                &workout.name,
+                chrono::Utc::now().date_naive(),
+            );
+
+            p.cues
+                .replace(crate::training::cues::build_cues(&workout, &priors));
+            p.cue_rendered.set(None);
+        },
+    );
 }

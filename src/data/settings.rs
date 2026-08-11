@@ -30,6 +30,7 @@ pub mod keys {
     pub const ERG_RAMP_RATE: &str = "training.erg_ramp_rate";
     pub const SIM_DIFFICULTY: &str = "training.sim_difficulty";
     pub const SIM_MAX_GRADIENT: &str = "training.sim_max_gradient";
+    pub const INTERVAL_CUES: &str = "training.interval_cues";
 
     pub const INTERVALS_ATHLETE_ID: &str = "intervals.athlete_id";
     pub const INTERVALS_UPLOAD: &str = "intervals.upload";
@@ -68,6 +69,10 @@ pub struct TrainingSettings {
     pub sim_difficulty_pct: f32,
     /// Gradient ceiling in percent, whatever the route actually climbs.
     pub sim_max_gradient_pct: f32,
+    /// Whether the player narrates each interval. On by default: a rider who
+    /// has never opened Preferences is the one who benefits most from being
+    /// told which rep they are on.
+    pub interval_cues: bool,
 }
 
 impl Default for TrainingSettings {
@@ -76,6 +81,7 @@ impl Default for TrainingSettings {
             erg_ramp_rate: 25,
             sim_difficulty_pct: 100.0,
             sim_max_gradient_pct: 20.0,
+            interval_cues: true,
         }
     }
 }
@@ -96,6 +102,10 @@ pub async fn load_training(pool: &SqlitePool) -> Result<TrainingSettings> {
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.sim_max_gradient_pct),
+        interval_cues: flag(
+            db::get_setting(pool, keys::INTERVAL_CUES).await?,
+            d.interval_cues,
+        ),
     })
 }
 
@@ -109,6 +119,10 @@ pub async fn set_sim_difficulty_pct(pool: &SqlitePool, percent: f32) -> Result<(
 
 pub async fn set_sim_max_gradient_pct(pool: &SqlitePool, percent: f32) -> Result<()> {
     db::set_setting(pool, keys::SIM_MAX_GRADIENT, &percent.to_string()).await
+}
+
+pub async fn set_interval_cues(pool: &SqlitePool, on: bool) -> Result<()> {
+    db::set_setting(pool, keys::INTERVAL_CUES, flag_value(on)).await
 }
 
 // ── Intervals.icu ────────────────────────────────────────────────────────────
@@ -247,11 +261,30 @@ mod tests {
         set_erg_ramp_rate(&pool, 40).await.unwrap();
         set_sim_difficulty_pct(&pool, 75.0).await.unwrap();
         set_sim_max_gradient_pct(&pool, 12.5).await.unwrap();
+        set_interval_cues(&pool, false).await.unwrap();
 
         let loaded = load_training(&pool).await.unwrap();
         assert_eq!(loaded.erg_ramp_rate, 40);
         assert_eq!(loaded.sim_difficulty_pct, 75.0);
         assert_eq!(loaded.sim_max_gradient_pct, 12.5);
+        assert!(!loaded.interval_cues);
+    }
+
+    #[tokio::test]
+    async fn should_default_interval_cues_on() {
+        let pool = test_pool().await;
+        assert!(load_training(&pool).await.unwrap().interval_cues);
+    }
+
+    #[tokio::test]
+    async fn should_keep_interval_cues_off_once_turned_off() {
+        // The flag helper treats anything but "1" as unset, so an explicit "off"
+        // has to survive a reload rather than falling back to the default.
+        let pool = test_pool().await;
+        set_interval_cues(&pool, false).await.unwrap();
+        assert!(!load_training(&pool).await.unwrap().interval_cues);
+        set_interval_cues(&pool, true).await.unwrap();
+        assert!(load_training(&pool).await.unwrap().interval_cues);
     }
 
     #[tokio::test]
@@ -376,6 +409,7 @@ mod tests {
             keys::ERG_RAMP_RATE,
             keys::SIM_DIFFICULTY,
             keys::SIM_MAX_GRADIENT,
+            keys::INTERVAL_CUES,
             keys::INTERVALS_ATHLETE_ID,
             keys::INTERVALS_UPLOAD,
             keys::INTERVALS_SYNC,

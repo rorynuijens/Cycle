@@ -17,7 +17,8 @@ use crate::data::settings::{self, IntervalsSettings, TrainingSettings};
 /// Changes apply immediately — no Save button. `on_saved` is called whenever the
 /// athlete profile changes; `on_erg_rate_changed` whenever the ERG ramp rate
 /// changes; `on_sim_changed` with `(difficulty_percent, max_gradient_percent)`
-/// whenever either SIM setting changes.
+/// whenever either SIM setting changes; `on_cues_changed` whenever the interval
+/// cues are switched on or off.
 ///
 /// The stored settings are read before the window is built, off the GTK main
 /// thread (CLAUDE.md §2.3). They used to be read with `block_on` partway through
@@ -27,6 +28,7 @@ use crate::data::settings::{self, IntervalsSettings, TrainingSettings};
 /// If the read fails the window does not open. Opening it on defaults would show
 /// the rider values that are not the ones saved, and a rider who "corrects" one
 /// of them writes the wrong value over a good one.
+#[allow(clippy::too_many_arguments)] // preferences window wiring
 pub fn show(
     parent: &adw::ApplicationWindow,
     athlete: AthleteProfile,
@@ -35,6 +37,7 @@ pub fn show(
     on_saved: impl Fn(AthleteProfile) + 'static,
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
+    on_cues_changed: impl Fn(bool) + 'static,
 ) {
     let parent = parent.clone();
     let pool_load = pool.clone();
@@ -58,6 +61,7 @@ pub fn show(
                 on_saved,
                 on_erg_rate_changed,
                 on_sim_changed,
+                on_cues_changed,
             ),
             Err(e) => {
                 tracing::error!("Could not read your settings: {e}");
@@ -87,6 +91,7 @@ fn build_and_present(
     on_saved: impl Fn(AthleteProfile) + 'static,
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
+    on_cues_changed: impl Fn(bool) + 'static,
 ) {
     let win = adw::PreferencesWindow::builder()
         .transient_for(parent)
@@ -108,6 +113,7 @@ fn build_and_present(
         rt_handle.clone(),
         on_erg_rate_changed,
         on_sim_changed,
+        on_cues_changed,
     ));
     win.add(&integrations::build(
         &win,

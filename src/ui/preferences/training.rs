@@ -17,11 +17,27 @@ pub fn build(
     rt_handle: tokio::runtime::Handle,
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
+    on_cues_changed: impl Fn(bool) + 'static,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Training")
         .icon_name("media-playback-start-symbolic")
         .build();
+
+    let cues_group = adw::PreferencesGroup::builder()
+        .title("During a Ride")
+        .description(
+            "Coaching for the interval you are on — which rep it is, how many \
+             are left, and how to ride it.",
+        )
+        .build();
+    let cues_row = adw::SwitchRow::builder()
+        .title("Interval Cues")
+        .subtitle("Show a line of coaching under the live numbers")
+        .active(settings.interval_cues)
+        .build();
+    cues_group.add(&cues_row);
+    page.add(&cues_group);
 
     let erg_group = adw::PreferencesGroup::builder()
         .title("ERG Mode")
@@ -70,6 +86,21 @@ pub fn build(
     max_grade_row.set_subtitle("Climbs steeper than this are capped (%)");
     sim_group.add(&max_grade_row);
     page.add(&sim_group);
+
+    {
+        let pool = pool.clone();
+        let rt_handle = rt_handle.clone();
+        cues_row.connect_active_notify(move |row| {
+            let on = row.is_active();
+            on_cues_changed(on);
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the interval cues setting",
+                move |pool| async move { settings::set_interval_cues(&pool, on).await },
+            );
+        });
+    }
 
     {
         let pool = pool.clone();
