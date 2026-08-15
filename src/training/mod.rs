@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod course_cues;
 pub mod cues;
 pub mod engine;
 pub mod fitness;

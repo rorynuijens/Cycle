@@ -1,4 +1,5 @@
 mod actions;
+mod awake;
 mod chrome;
 mod events;
 mod session;
@@ -541,6 +542,7 @@ impl CycleGtkWindow {
         let brief_store_for_nav = Rc::clone(&brief_store);
         let start_btn_for_vis = start_btn.clone();
         let workout_active_for_vis = Rc::clone(&workout_active);
+        let route_alive_for_vis = Rc::clone(&route_timer_alive);
         let back_btn_for_vis = back_btn.clone();
         stack.connect_visible_child_notify(move |s| {
             let page = s.visible_child_name();
@@ -557,9 +559,21 @@ impl CycleGtkWindow {
                 _ => "Cycle",
             };
             content_nav_for_title.set_title(title);
-            let show_start =
+            // The way back to whichever ride is running. A route ride counts as
+            // much as a workout: leaving one used to strand it with nothing on
+            // screen pointing at it, and no way to reach it again.
+            let workout_away =
                 workout_active_for_vis.get() && !matches!(page.as_deref(), Some("player"));
-            start_btn_for_vis.set_visible(show_start);
+            let route_away =
+                route_alive_for_vis.get() && !matches!(page.as_deref(), Some("route_player"));
+            if route_away {
+                start_btn_for_vis.set_label("Back to Ride");
+                start_btn_for_vis.set_tooltip_text(Some("Return to the route ride in progress"));
+            } else if workout_away {
+                start_btn_for_vis.set_label("Resume Workout");
+                start_btn_for_vis.set_tooltip_text(Some("Return to the workout in progress"));
+            }
+            start_btn_for_vis.set_visible(workout_away || route_away);
             let show_back = matches!(page.as_deref(), Some("summary"));
             back_btn_for_vis.set_visible(show_back);
             match page.as_deref() {
@@ -584,20 +598,34 @@ impl CycleGtkWindow {
         let sidebar_nav_page = chrome::build_sidebar_page(&sidebar_list);
 
         // ── Content chrome ───────────────────────────────────────────────────
-        let (split_view, fs_exit_btn) = chrome::build_content(
+        let content_chrome = chrome::build_content(
             &content_nav_page,
             &sidebar_nav_page,
             &stack,
             &back_btn,
             &start_btn,
+            Rc::clone(&route_timer_alive),
             Rc::clone(&engine_rc),
             Rc::clone(&player_rc),
         );
 
         // ── Fullscreen ───────────────────────────────────────────────────────
-        chrome::connect_fullscreen(&self.window, &fs_exit_btn);
+        chrome::connect_fullscreen(
+            &self.window,
+            &content_chrome,
+            Rc::clone(&player_rc),
+            Rc::clone(&route_player_rc),
+        );
 
-        self.toast_overlay.set_child(Some(&split_view));
+        // ── Keep the screen lit for the whole ride ───────────────────────────
+        awake::keep_awake_during_rides(
+            app,
+            &self.window,
+            Rc::clone(&workout_active),
+            Rc::clone(&route_timer_alive),
+        );
+
+        self.toast_overlay.set_child(Some(&content_chrome.root));
         self.window.set_content(Some(&self.toast_overlay));
 
         // ── The one automatic AI request the app makes ────────────────────────

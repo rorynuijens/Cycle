@@ -31,6 +31,25 @@ pub fn install(
     window.add_action(&close_action);
     app.set_accels_for_action("win.close", &["<Control>w"]);
 
+    // Fullscreen as an action rather than a raw key handler, so the menu item,
+    // the two exit buttons and the on-page buttons in both ride players all
+    // drive one thing — and none of them has to capture the window to do it
+    // (CLAUDE.md §2.4).
+    let fullscreen_action = gio::SimpleAction::new("toggle-fullscreen", None);
+    fullscreen_action.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            if window.is_fullscreen() {
+                window.unfullscreen();
+            } else {
+                window.fullscreen();
+            }
+        }
+    ));
+    window.add_action(&fullscreen_action);
+    app.set_accels_for_action("win.toggle-fullscreen", &["F11"]);
+
     // ── App actions ──────────────────────────────────────────────────────
     let window_for_about = window.clone();
     let about_action = gio::SimpleAction::new("about", None);

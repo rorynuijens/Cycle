@@ -16,6 +16,7 @@ use crate::training::cues::{SegmentCue, CLOSING_SECS};
 use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
+use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 
 pub struct PlayerPage {
     root: gtk::Box,
@@ -89,6 +90,10 @@ pub struct PlayerPage {
     /// backs out and starts something else would otherwise land its rep numbers
     /// on the wrong workout.
     cue_generation: Cell<u64>,
+    /// The content clamp and the box inside it, kept so fullscreen can widen
+    /// the one and tighten the other — see [`PlayerPage::set_fullscreen`].
+    clamp: adw::Clamp,
+    inner: gtk::Box,
 }
 
 impl PlayerPage {
@@ -122,7 +127,7 @@ impl PlayerPage {
         // Everything the rider needs mid-effort is visible at once — no scroll.
         // The graph absorbs spare height so the page fills any window size.
         let clamp = adw::Clamp::builder()
-            .maximum_size(900)
+            .maximum_size(WINDOWED_CLAMP)
             .margin_top(18)
             .margin_bottom(24)
             .margin_start(24)
@@ -375,11 +380,22 @@ impl PlayerPage {
 
         let controls_spacer = gtk::Box::builder().hexpand(true).build();
 
+        // Fullscreen from the page itself. A rider clipped into the pedals is
+        // not in a position to go looking for F11, and the menu it also lives in
+        // is three widgets away at the top of the window.
+        let fullscreen_btn = gtk::Button::builder()
+            .icon_name("view-fullscreen-symbolic")
+            .tooltip_text("Fullscreen")
+            .css_classes(["circular", "flat"])
+            .action_name("win.toggle-fullscreen")
+            .build();
+
         controls.append(&cancel_btn);
         controls.append(&pause_btn);
         controls.append(&skip_btn);
         controls.append(&intensity_box);
         controls.append(&controls_spacer);
+        controls.append(&fullscreen_btn);
         controls.append(&end_btn);
         inner.append(&controls);
 
@@ -492,7 +508,31 @@ impl PlayerPage {
             cues_enabled: Cell::new(true),
             cue_rendered: Cell::new(None),
             cue_generation: Cell::new(0),
+            clamp,
+            inner,
         }
+    }
+
+    /// Lay the cockpit out for the room fullscreen gives it.
+    ///
+    /// Windowed, the 900 px clamp keeps line lengths sane next to the sidebar.
+    /// Fullscreen there is no sidebar and no header, and holding the same
+    /// 900 px would leave a ride marooned in the middle of a 27-inch screen, so
+    /// the clamp opens up and the margins tighten onto the 6 px grid.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.clamp.set_maximum_size(if fullscreen {
+            FULLSCREEN_CLAMP
+        } else {
+            WINDOWED_CLAMP
+        });
+        let margin = if fullscreen { 12 } else { 24 };
+        self.clamp.set_margin_top(if fullscreen { 12 } else { 18 });
+        self.clamp.set_margin_bottom(margin);
+        self.clamp.set_margin_start(margin);
+        self.clamp.set_margin_end(margin);
+        // Tighter gaps between sections, so the graph gains what the header bar
+        // and the margins gave up and the cockpit still fits without scrolling.
+        self.inner.set_spacing(if fullscreen { 12 } else { 18 });
     }
 
     /// Bind `+` and `−` (and their keypad twins) to the intensity dial.

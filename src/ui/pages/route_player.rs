@@ -8,17 +8,57 @@ use crate::data::athlete::AthleteProfile;
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
+use crate::training::course_cues::{self, CourseCue};
 use crate::training::engine::{INTENSITY_STEP_PCT, MAX_INTENSITY_PCT, MIN_INTENSITY_PCT};
 use crate::training::route_engine::RouteEngine;
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
 use crate::ui::widgets::zone_meter::ZoneMeter;
+use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 
 type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
+/// The route sampled for the profile charts, as `(distance km, elevation m,
+/// gradient %)`. Shared between the page and the two charts' draw functions,
+/// and replaced wholesale by `reset_route`.
+type ProfileSamples = Rc<RefCell<Vec<(f32, f32, f32)>>>;
 
 /// Consecutive seconds of power data required before a route ride starts,
 /// matching the workout player's pre-start gate.
 const PRE_START_SECS: u32 = 10;
+
+/// How much road the look-ahead chart shows behind and ahead of the rider, in
+/// metres. A little behind for context; two kilometres ahead is about four
+/// minutes at a climbing pace and one at a descending one.
+const LOOKAHEAD_BEHIND_M: f32 = 300.0;
+const LOOKAHEAD_AHEAD_M: f32 = 2000.0;
+
+/// Spacing of the distance ticks along the look-ahead chart, in metres.
+const TICK_SPACING_M: f32 = 500.0;
+
+/// Room left under the look-ahead chart for its distance labels, in pixels.
+const AXIS_HEIGHT: f64 = 14.0;
+
+/// Smallest elevation span a profile is drawn against, in metres. Without it a
+/// flat road's GPS noise is stretched to fill the chart and reads as terrain.
+const MIN_PROFILE_SPAN_M: f64 = 10.0;
+
+/// Height of the look-ahead chart, in pixels (6 px grid).
+const LOOKAHEAD_CHART_HEIGHT: i32 = 144;
+
+/// Floor under the map's height, in pixels.
+///
+/// A floor, not a size: the map takes all the height the page has spare, and
+/// this only stops it collapsing when there is none. It used to have `vexpand`
+/// and nothing else, which under a hero row, a zone ribbon and a four-column
+/// metric grid left it a sliver.
+///
+/// Asking for a *tall* map instead would be worse, and briefly was: a fixed
+/// request large enough to look right on a big screen makes the page's minimum
+/// height exceed the screen, and then the whole cockpit scrolls — the one thing
+/// a rider cannot do mid-effort. Everything on this page must fit in whatever
+/// room there is, so the spare height is distributed rather than demanded.
+const MAP_MIN_HEIGHT: i32 = 180;
 
 /// Stamp the moment the ride actually begins.
 ///
@@ -52,6 +92,34 @@ fn profile_samples(route: &Route) -> Vec<(f32, f32, f32)> {
         .collect()
 }
 
+/// How far ahead the map highlights the road, in metres, and how finely that
+/// highlight is sampled.
+///
+/// A kilometre is far enough to make the next junction unambiguous at any speed
+/// a trainer produces, and at 50 m steps it is about twenty coordinates — cheap
+/// enough to rebuild every tick, which the full route line is emphatically not.
+const MAP_LOOKAHEAD_M: f32 = 1000.0;
+const MAP_LOOKAHEAD_STEP_M: f32 = 50.0;
+
+/// The coordinates of the next [`MAP_LOOKAHEAD_M`] of road from `distance_m`.
+fn lookahead_points(engine: &RouteEngine, distance_m: f32) -> Vec<(f64, f64)> {
+    let end = (distance_m + MAP_LOOKAHEAD_M).min(engine.route.total_distance_m);
+    let mut points = Vec::new();
+    let mut d = distance_m;
+    while d < end {
+        if let Some(p) = engine.position_at(d) {
+            points.push(p);
+        }
+        d += MAP_LOOKAHEAD_STEP_M;
+    }
+    // Always finish on the real end point, so a highlight that runs out at the
+    // finish line stops there rather than one step short of it.
+    if let Some(p) = engine.position_at(end) {
+        points.push(p);
+    }
+    points
+}
+
 pub struct RoutePlayerPage {
     root: gtk::Box,
     /// Shown during the pre-start countdown — hides once the ride begins.
@@ -82,7 +150,22 @@ pub struct RoutePlayerPage {
     zone_meter: ZoneMeter,
     /// Slippy map following the rider along the route.
     route_map: RouteMap,
-    elevation_chart: gtk::DrawingArea,
+    /// The next two kilometres of road, drawn large.
+    lookahead_chart: gtk::DrawingArea,
+    /// ── Course cues ─────────────────────────────────────────────────────────
+    /// What the road ahead does, in words. Derived from the route file each
+    /// tick, so it costs nothing per ride and needs no API key.
+    cue_box: gtk::Box,
+    cue_headline: gtk::Label,
+    cue_detail: gtk::Label,
+    /// What is currently rendered — the stretch's start and whether it had been
+    /// reached — so the labels and CSS classes are only touched when the cue
+    /// actually changes rather than every second.
+    cue_rendered: Cell<Option<(i32, bool)>>,
+    /// The content clamp and the box inside it, kept so fullscreen can widen
+    /// the one and tighten the other.
+    clamp: adw::Clamp,
+    inner: gtk::Box,
     pause_btn: gtk::Button,
     end_btn: gtk::Button,
     /// The intensity dial for this ride, in percent of the road as it is.
@@ -101,7 +184,7 @@ pub struct RoutePlayerPage {
     playhead_dist: Rc<Cell<f32>>,
     /// Profile samples as (distance km, elevation m, gradient %) — rebuilt by
     /// reset_route() for each new ride. The gradient colours the trace.
-    ele_pts: Rc<RefCell<Vec<(f32, f32, f32)>>>,
+    ele_pts: ProfileSamples,
     /// The ride currently being recorded, published so the checkpoint timer in
     /// `window.rs` can persist it. `None` outside a route ride.
     live_session: RefCell<Option<Rc<RefCell<Session>>>>,
@@ -142,7 +225,8 @@ impl RoutePlayerPage {
             .build();
 
         let clamp = adw::Clamp::builder()
-            .maximum_size(900)
+            .maximum_size(WINDOWED_CLAMP)
+            .vexpand(true)
             .margin_top(20)
             .margin_bottom(24)
             .margin_start(24)
@@ -198,74 +282,11 @@ impl RoutePlayerPage {
         inner.append(&devices_section);
 
         // ── Gradient profile ──────────────────────────────────────────────────
-        let ele_pts_rc: Rc<RefCell<Vec<(f32, f32, f32)>>> =
-            Rc::new(RefCell::new(profile_samples(route)));
+        let ele_pts_rc: ProfileSamples = Rc::new(RefCell::new(profile_samples(route)));
         let playhead_dist = Rc::new(Cell::new(0.0f32));
         let total_dist_km = route.total_distance_m / 1000.0;
 
-        let elevation_chart = gtk::DrawingArea::builder()
-            .content_height(90)
-            .hexpand(true)
-            .accessible_role(gtk::AccessibleRole::Img)
-            .build();
-        elevation_chart.update_property(&[gtk::accessible::Property::Label(
-            "Route gradient profile, coloured by steepness, with current position marker",
-        )]);
-        {
-            let pts = Rc::clone(&ele_pts_rc);
-            let ph = Rc::clone(&playhead_dist);
-            elevation_chart.set_draw_func(move |area, cr, width, height| {
-                let fg = area.color(); // theme foreground — works in light and dark
-                let pts = pts.borrow();
-                if pts.len() < 2 {
-                    return;
-                }
-                let w = width as f64;
-                let h = height as f64;
-                let x_max = pts.last().map(|p| p.0).unwrap_or(1.0) as f64;
-                let y_min = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min) as f64;
-                let y_max = pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max) as f64;
-                let y_span = (y_max - y_min).max(1.0);
-                let pad_t = 4.0;
-                let usable = h - pad_t - 2.0;
-
-                let to_x = |x: f32| x as f64 / x_max * w;
-                let to_y = |y: f32| pad_t + (1.0 - (y as f64 - y_min) / y_span) * usable;
-
-                // Fill, one quad per sample, coloured by that stretch's gradient
-                // so climbs read at a glance in the same palette as power zones.
-                for pair in pts.windows(2) {
-                    let (p0, p1) = (pair[0], pair[1]);
-                    let (r, g, b) = gradient_rgb(p1.2);
-                    cr.set_source_rgba(r, g, b, 0.55);
-                    cr.move_to(to_x(p0.0), h);
-                    cr.line_to(to_x(p0.0), to_y(p0.1));
-                    cr.line_to(to_x(p1.0), to_y(p1.1));
-                    cr.line_to(to_x(p1.0), h);
-                    cr.close_path();
-                    cr.fill().ok();
-                }
-
-                // Ridge line, in the theme foreground so it reads on any fill.
-                let (x0, y0) = (to_x(pts[0].0), to_y(pts[0].1));
-                cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.7);
-                cr.set_line_width(1.5);
-                cr.move_to(x0, y0);
-                for p in &pts[1..] {
-                    cr.line_to(to_x(p.0), to_y(p.1));
-                }
-                cr.stroke().ok();
-
-                // Playhead
-                let ph_km = ph.get() / 1000.0;
-                let px = (ph_km as f64 / x_max * w).clamp(0.0, w);
-                cr.set_source_rgba(0.47, 0.68, 0.93, 1.0);
-                cr.set_line_width(2.0);
-                cr.move_to(px, 0.0);
-                cr.line_to(px, h);
-                cr.stroke().ok();
-            });
-        }
+        let lookahead_chart = Self::build_lookahead_chart(&ele_pts_rc, &playhead_dist);
 
         // ── Overall progress bar ──────────────────────────────────────────────
         let progress_bar = gtk::ProgressBar::builder()
@@ -312,6 +333,31 @@ impl RoutePlayerPage {
         let zone_meter = ZoneMeter::new(ftp_watts);
         inner.append(zone_meter.widget());
 
+        // ── Course cue ───────────────────────────────────────────────────────
+        // What the road is about to do, in words, in the same slot and the same
+        // voice the workout player gives its interval cues. The gradient number
+        // in the hero row says what is under the wheels; this says what is
+        // coming, which is the thing a rider changes gear for.
+        let cue_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let cue_headline = gtk::Label::builder()
+            .css_classes(["title-4"])
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .build();
+        let cue_detail = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .build();
+        cue_box.append(&cue_headline);
+        cue_box.append(&cue_detail);
+        inner.append(&cue_box);
+
         // ── Secondary metrics: HR · cadence · elapsed · remaining ────────────
         let secondary_grid = gtk::Grid::builder()
             .column_spacing(12)
@@ -331,14 +377,14 @@ impl RoutePlayerPage {
         secondary_grid.attach(&climb_box, 3, 0, 1, 1);
         inner.append(&secondary_grid);
 
-        // ── Map and profile — the slot the workout screen gives its graph ────
-        // Both span the full width: the map takes the height, since "where am I"
-        // is what the rider looks at mid-ride, with the profile as a strip
-        // beneath answering "what is coming". Full-width rows stay legible at any
-        // window size, so this needs no breakpoint.
+        // ── Map and profiles — the slot the workout screen gives its graph ───
+        // All three span the full width and stack in the order the rider reads
+        // them: where am I (map), what is coming (look-ahead), how much is left
+        // (whole-route strip). Full-width rows stay legible at any window size,
+        // so this needs no breakpoint.
         let route_map = RouteMap::new();
         route_map.widget().set_vexpand(true);
-        elevation_chart.set_content_height(90);
+        route_map.widget().set_size_request(-1, MAP_MIN_HEIGHT);
 
         let graph_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -346,7 +392,7 @@ impl RoutePlayerPage {
             .vexpand(true)
             .build();
         graph_column.append(route_map.widget());
-        graph_column.append(&elevation_chart);
+        graph_column.append(&lookahead_chart);
         inner.append(&graph_column);
 
         inner.append(&progress_bar);
@@ -404,9 +450,19 @@ impl RoutePlayerPage {
         intensity_box.append(&intensity_label);
         intensity_box.append(&intensity_up_btn);
 
+        // Fullscreen from the page itself — a rider clipped into the pedals is
+        // not in a position to go looking for F11.
+        let fullscreen_btn = gtk::Button::builder()
+            .icon_name("view-fullscreen-symbolic")
+            .tooltip_text("Fullscreen")
+            .css_classes(["circular", "flat"])
+            .action_name("win.toggle-fullscreen")
+            .build();
+
         controls.append(&pause_btn);
         controls.append(&intensity_box);
         controls.append(&gtk::Box::builder().hexpand(true).build());
+        controls.append(&fullscreen_btn);
         controls.append(&end_btn);
         inner.append(&controls);
 
@@ -480,7 +536,13 @@ impl RoutePlayerPage {
             progress_bar,
             zone_meter,
             route_map,
-            elevation_chart,
+            lookahead_chart,
+            cue_box,
+            cue_headline,
+            cue_detail,
+            cue_rendered: Cell::new(None),
+            clamp,
+            inner,
             pause_btn,
             end_btn,
             intensity_pct,
@@ -496,6 +558,67 @@ impl RoutePlayerPage {
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Lay the cockpit out for the room fullscreen gives it.
+    ///
+    /// Windowed, the map and the charts are rationed against everything else on
+    /// the page. Fullscreen there is no sidebar and no header bar, and that room
+    /// goes where it does the most good: the map roughly doubles and the
+    /// look-ahead profile grows with it.
+    pub fn set_fullscreen(&self, fullscreen: bool) {
+        self.clamp.set_maximum_size(if fullscreen {
+            FULLSCREEN_CLAMP
+        } else {
+            WINDOWED_CLAMP
+        });
+        let margin = if fullscreen { 12 } else { 24 };
+        self.clamp.set_margin_top(if fullscreen { 12 } else { 20 });
+        self.clamp.set_margin_bottom(margin);
+        self.clamp.set_margin_start(margin);
+        self.clamp.set_margin_end(margin);
+        // Tighter gaps between sections in fullscreen. Every pixel saved here is
+        // a pixel the map gains, and it keeps the page's minimum height well
+        // under a screen so nothing has to scroll.
+        self.inner.set_spacing(if fullscreen { 12 } else { 18 });
+        // The map itself needs no resizing: it carries `vexpand`, so whatever
+        // height fullscreen frees reaches it on its own.
+    }
+
+    /// Show what the road ahead does, re-rendering only when it changes.
+    ///
+    /// Rewriting two labels every second would make the cue flicker and would
+    /// churn CSS classes for no reason, so a cue is identified by where its
+    /// stretch starts and whether the rider has reached it — the two things that
+    /// change the words.
+    fn update_cue(&self, cue: Option<&CourseCue>, distance_m: f32) {
+        let Some(cue) = cue else {
+            self.cue_box.set_visible(false);
+            self.cue_rendered.set(None);
+            return;
+        };
+
+        let under_way = cue.is_under_way(distance_m);
+        let identity = (cue.starts_at_m as i32, under_way);
+        if self.cue_rendered.get() == Some(identity) {
+            // The detail line counts down, so it still needs refreshing even
+            // when the stretch itself has not changed.
+            self.cue_detail.set_label(&cue.detail);
+            return;
+        }
+        self.cue_rendered.set(Some(identity));
+
+        self.cue_headline.set_label(&cue.headline);
+        self.cue_detail.set_label(&cue.detail);
+        // A climb underway is the one thing here worth colouring, the same way
+        // the workout player accents a work interval.
+        let classes: &[&str] = if cue.terrain.is_effort() && under_way {
+            &["title-4", "accent"]
+        } else {
+            &["title-4"]
+        };
+        self.cue_headline.set_css_classes(classes);
+        self.cue_box.set_visible(true);
     }
 
     /// Bind `+` and `−` (and their keypad twins) to the intensity dial.
@@ -645,12 +768,20 @@ impl RoutePlayerPage {
         self.intensity_pct.set(100);
         self.intensity_label.set_label("100%");
 
-        // Rebuild the profile and hand the map the new route line.
+        // Clear the previous ride's course cue rather than leaving its last
+        // climb on screen until the new ride's first tick replaces it.
+        self.cue_box.set_visible(false);
+        self.cue_rendered.set(None);
+
+        // Rebuild the profiles and hand the map the new route line. The
+        // look-ahead highlight is cleared with it: it belongs to the old route
+        // and would otherwise sit on the map until the ride starts moving.
         *self.ele_pts.borrow_mut() = profile_samples(route);
-        self.elevation_chart.queue_draw();
+        self.lookahead_chart.queue_draw();
         self.zone_meter.set_power(None);
         let line: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lng)).collect();
         self.route_map.set_route(&line);
+        self.route_map.set_lookahead(&[]);
     }
 
     /// Start the 1 Hz ride loop. Calls `on_complete` with the session when the route
@@ -952,8 +1083,23 @@ impl RoutePlayerPage {
             }
 
             page.playhead_dist.set(distance_m);
-            page.elevation_chart.queue_draw();
+            page.lookahead_chart.queue_draw();
             page.zone_meter.set_power(readings.power_watts);
+
+            // The road ahead, on the map and in words. Both are read off the
+            // route file, so they cost a handful of interpolations a second.
+            let (lookahead, cue) = {
+                let eng = engine.borrow();
+                (
+                    lookahead_points(&eng, distance_m),
+                    course_cues::cue_at(&eng.route, distance_m),
+                )
+            };
+            page.route_map.set_lookahead(&lookahead);
+            page.update_cue(cue.as_ref(), distance_m);
+
+            // Ordered after the look-ahead so the marker layer is added over it
+            // on the first fix and the rider is never drawn under the highlight.
             if let Some((lat, lng)) = position {
                 page.route_map.set_position(lat, lng);
             }
@@ -969,6 +1115,143 @@ impl RoutePlayerPage {
 
             glib::ControlFlow::Continue
         });
+    }
+
+    /// The road immediately ahead, drawn large.
+    ///
+    /// The whole-route profile answers "how big is this ride"; it cannot answer
+    /// "what happens in the next minute", because at forty kilometres across a
+    /// strip the next kilometre is a few pixels wide. This chart shows a fixed
+    /// window around the rider instead — a little of the road just ridden for
+    /// context, and two kilometres of what is coming — so a climb arrives as a
+    /// wall growing from the right rather than as a number changing.
+    ///
+    /// Colours follow the accent convention the fitness chart already uses: the
+    /// `accent` class makes `widget.color()` the GNOME accent, and the neutral
+    /// theme foreground comes from the parent.
+    fn build_lookahead_chart(
+        ele_pts: &ProfileSamples,
+        playhead: &Rc<Cell<f32>>,
+    ) -> gtk::DrawingArea {
+        let chart = gtk::DrawingArea::builder()
+            .content_height(LOOKAHEAD_CHART_HEIGHT)
+            .hexpand(true)
+            .css_classes(["accent"])
+            .accessible_role(gtk::AccessibleRole::Img)
+            .build();
+        chart.update_property(&[gtk::accessible::Property::Label(
+            "The road ahead: the next two kilometres of the route, coloured by steepness",
+        )]);
+
+        let pts = Rc::clone(ele_pts);
+        let ph = Rc::clone(playhead);
+        chart.set_draw_func(move |widget, cr, width, height| {
+            let pts = pts.borrow();
+            if pts.len() < 2 {
+                return;
+            }
+            let accent = widget.color();
+            let fg = widget.parent().map(|p| p.color()).unwrap_or(accent);
+            let (fr, fgr, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
+            let w = width as f64;
+            let h = height as f64;
+
+            // The window, in kilometres, and where the rider sits inside it.
+            // Its width is fixed so the scale never changes under the rider, but
+            // it is held inside the route: in the first three hundred metres
+            // there is no road behind to show, and a window that ran off the
+            // start would open the ride on a third of a chart of blank paper.
+            let route_end_km = pts.last().map(|p| p.0).unwrap_or(0.0);
+            let span_km = ((LOOKAHEAD_BEHIND_M + LOOKAHEAD_AHEAD_M) / 1000.0) as f64;
+            let here_km = ph.get() / 1000.0;
+            let from_km = (here_km - LOOKAHEAD_BEHIND_M / 1000.0)
+                .max(0.0)
+                .min((route_end_km - span_km as f32).max(0.0));
+            let to_km = from_km + span_km as f32;
+
+            // Only the samples inside the window matter, plus one either side so
+            // the fill reaches the edges instead of stopping short of them.
+            let lo = pts.partition_point(|p| p.0 < from_km).saturating_sub(1);
+            let hi = (pts.partition_point(|p| p.0 <= to_km) + 1).min(pts.len());
+            let window = &pts[lo..hi];
+            if window.len() < 2 {
+                return;
+            }
+
+            let y_min = window.iter().map(|p| p.1).fold(f32::INFINITY, f32::min) as f64;
+            let y_max = window.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max) as f64;
+            // A minimum span so a flat stretch draws as a flat line rather than
+            // as noise amplified to fill the chart.
+            let y_span = (y_max - y_min).max(MIN_PROFILE_SPAN_M);
+            let pad_t = 6.0;
+            let usable = h - pad_t - AXIS_HEIGHT;
+
+            let to_x = |km: f32| (km as f64 - from_km as f64) / span_km * w;
+            let to_y = |m: f32| pad_t + (1.0 - (m as f64 - y_min) / y_span) * usable;
+            let base_y = pad_t + usable;
+            let here_x = to_x(here_km);
+
+            // Fill, one quad per 25 m sample. What is already ridden is dimmed:
+            // it is context, not information.
+            for pair in window.windows(2) {
+                let (p0, p1) = (pair[0], pair[1]);
+                let (r, g, b) = gradient_rgb(p1.2);
+                let alpha = if p1.0 < here_km { 0.30 } else { 0.85 };
+                cr.set_source_rgba(r, g, b, alpha);
+                cr.move_to(to_x(p0.0), base_y);
+                cr.line_to(to_x(p0.0), to_y(p0.1));
+                cr.line_to(to_x(p1.0), to_y(p1.1));
+                cr.line_to(to_x(p1.0), base_y);
+                cr.close_path();
+                cr.fill().ok();
+            }
+
+            // Ridge line over the fill.
+            cr.set_source_rgba(fr, fgr, fb, 0.75);
+            cr.set_line_width(1.5);
+            cr.move_to(to_x(window[0].0), to_y(window[0].1));
+            for p in &window[1..] {
+                cr.line_to(to_x(p.0), to_y(p.1));
+            }
+            cr.stroke().ok();
+
+            // Distance ticks every 500 m ahead, so "how far to the top" has
+            // something to be read against.
+            cr.set_source_rgba(fr, fgr, fb, 0.55);
+            cr.set_font_size(10.0);
+            let mut ahead_m = TICK_SPACING_M;
+            while ahead_m <= LOOKAHEAD_AHEAD_M {
+                let tick_km = here_km + ahead_m / 1000.0;
+                // Near the finish the window stops advancing, so the further
+                // ticks fall outside it and would be drawn off the edge.
+                if tick_km > to_km {
+                    break;
+                }
+                let x = to_x(tick_km);
+                cr.set_line_width(1.0);
+                cr.move_to(x, base_y);
+                cr.line_to(x, base_y + 4.0);
+                cr.stroke().ok();
+                cr.move_to(x + 3.0, h - 2.0);
+                cr.show_text(&format!("{:.1} km", ahead_m / 1000.0)).ok();
+                ahead_m += TICK_SPACING_M;
+            }
+
+            // The rider: a full-height line in the accent colour, matching the
+            // dot on the map above.
+            cr.set_source_rgba(
+                accent.red() as f64,
+                accent.green() as f64,
+                accent.blue() as f64,
+                1.0,
+            );
+            cr.set_line_width(3.0);
+            cr.move_to(here_x, 0.0);
+            cr.line_to(here_x, base_y);
+            cr.stroke().ok();
+        });
+
+        chart
     }
 
     /// A centred caption-over-value column, as used on the workout screen.

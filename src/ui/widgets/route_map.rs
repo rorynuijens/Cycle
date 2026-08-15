@@ -20,13 +20,44 @@ use libshumate::prelude::*;
 /// looking ahead up the road impossible.
 const FOLLOW_SUSPEND: Duration = Duration::from_secs(10);
 
-/// Zoom level used when following the rider — close enough to see the road,
-/// wide enough to see the next corner coming.
-const FOLLOW_ZOOM: f64 = 14.0;
+/// Zoom level used when following the rider — street level, roughly 400 m
+/// across, so individual roads and the next junction are readable at speed.
+///
+/// The wider town-scale view this used to sit at showed where the ride was
+/// happening but not where the road went, which is the one thing a rider needs
+/// from a map mid-effort.
+const FOLLOW_ZOOM: f64 = 16.0;
+
+/// Width of the route line, and of the pale casing drawn under it.
+///
+/// OSM's own tiles are full of coloured roads, so a thin translucent line
+/// disappears into them. A wide line with a contrasting casing is the standard
+/// cartographic answer and reads at a glance without hiding the road beneath.
+const ROUTE_STROKE_WIDTH: f64 = 7.0;
+const ROUTE_OUTLINE_WIDTH: f64 = 3.0;
+
+/// Width of the highlight over the stretch the rider is about to ride.
+const LOOKAHEAD_STROKE_WIDTH: f64 = 9.0;
+
+/// Map colours are fixed rather than theme-derived on purpose: OSM raster tiles
+/// are light whatever the app theme is doing, so a line that followed the theme
+/// would turn near-black-on-grey in dark mode and read worse, not better. This
+/// is map cartography, not app chrome (CLAUDE.md §1.6 governs the latter).
+const ROUTE_COLOR: gtk::gdk::RGBA = gtk::gdk::RGBA::new(0.13, 0.35, 0.85, 1.0);
+const ROUTE_CASING_COLOR: gtk::gdk::RGBA = gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 0.9);
+/// The next kilometre, in a warm colour no OSM road uses.
+const LOOKAHEAD_COLOR: gtk::gdk::RGBA = gtk::gdk::RGBA::new(1.0, 0.42, 0.05, 0.95);
+
+/// Overall size of the rider marker, in pixels — the dot plus its halo.
+const MARKER_SIZE: i32 = 34;
 
 pub struct RouteMap {
     map: libshumate::SimpleMap,
     path_layer: RefCell<Option<libshumate::PathLayer>>,
+    /// The next stretch of road, drawn over the route line. Rebuilt each tick,
+    /// which is why it is kept separate from the full route: the route may hold
+    /// thousands of nodes and must never be rebuilt mid-ride.
+    lookahead_layer: RefCell<Option<libshumate::PathLayer>>,
     marker_layer: RefCell<Option<libshumate::MarkerLayer>>,
     marker: RefCell<Option<libshumate::Marker>>,
     /// When the rider last panned or zoomed; following resumes after that.
@@ -52,6 +83,7 @@ impl RouteMap {
         Self {
             map,
             path_layer: RefCell::new(None),
+            lookahead_layer: RefCell::new(None),
             marker_layer: RefCell::new(None),
             marker: RefCell::new(None),
             last_interaction,
@@ -87,13 +119,43 @@ impl RouteMap {
         for &(lat, lng) in points {
             path_layer.add_node(&libshumate::Coordinate::new_full(lat, lng));
         }
-        path_layer.set_stroke_color(Some(&gtk::gdk::RGBA::new(0.35, 0.60, 1.0, 0.9)));
-        path_layer.set_stroke_width(3.0);
+        path_layer.set_stroke_color(Some(&ROUTE_COLOR));
+        path_layer.set_stroke_width(ROUTE_STROKE_WIDTH);
+        path_layer.set_outline_color(Some(&ROUTE_CASING_COLOR));
+        path_layer.set_outline_width(ROUTE_OUTLINE_WIDTH);
         self.map.add_overlay_layer(&path_layer);
         *self.path_layer.borrow_mut() = Some(path_layer);
 
         self.frame_route(points, &viewport);
         self.last_interaction.set(None);
+    }
+
+    /// Highlight the stretch of road the rider is about to ride.
+    ///
+    /// The route line says where the course goes; this says which way to go
+    /// *next*, which at a junction is a different question. Called every tick
+    /// with a short slice — around twenty nodes — so rebuilding it is cheap.
+    /// Passing an empty slice clears the highlight.
+    pub fn set_lookahead(&self, points: &[(f64, f64)]) {
+        let Some(viewport) = self.map.viewport() else {
+            return;
+        };
+
+        // Created lazily so a static map that never rides keeps one layer.
+        if self.lookahead_layer.borrow().is_none() {
+            let layer = libshumate::PathLayer::new(&viewport);
+            layer.set_stroke_color(Some(&LOOKAHEAD_COLOR));
+            layer.set_stroke_width(LOOKAHEAD_STROKE_WIDTH);
+            self.map.add_overlay_layer(&layer);
+            *self.lookahead_layer.borrow_mut() = Some(layer);
+        }
+
+        if let Some(layer) = self.lookahead_layer.borrow().as_ref() {
+            layer.remove_all();
+            for &(lat, lng) in points {
+                layer.add_node(&libshumate::Coordinate::new_full(lat, lng));
+            }
+        }
     }
 
     /// Centre and zoom so the whole route is visible.
@@ -122,9 +184,7 @@ impl RouteMap {
         if self.marker.borrow().is_none() {
             let layer = libshumate::MarkerLayer::new(&viewport);
             let marker = libshumate::Marker::new();
-            let dot = gtk::Image::from_icon_name("find-location-symbolic");
-            dot.add_css_class("accent");
-            dot.set_pixel_size(20);
+            let dot = rider_dot();
             marker.set_child(Some(&dot));
             marker.update_property(&[gtk::accessible::Property::Label("Your position")]);
             layer.add_marker(&marker);
@@ -143,6 +203,54 @@ impl RouteMap {
             viewport.set_location(lat, lng);
         }
     }
+}
+
+/// The rider's position on the map: a solid accent core inside a white ring
+/// inside a soft halo.
+///
+/// This replaced a 20 px location-pin icon, which sat at roughly the weight of
+/// an OSM place marker and was lost among them. The ring is what does the work —
+/// a coloured dot alone competes with the map's own colours, while a dot with a
+/// light collar reads against anything underneath it.
+///
+/// The accent colour is picked up the way the rest of the app's charts do it:
+/// the `accent` CSS class makes `widget.color()` resolve to the GNOME accent,
+/// since libadwaita 1.5 exposes no accent API.
+fn rider_dot() -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder()
+        .content_width(MARKER_SIZE)
+        .content_height(MARKER_SIZE)
+        .css_classes(["accent"])
+        .can_target(false) // never swallow a drag meant for the map
+        .build();
+
+    area.set_draw_func(|widget, cr, width, height| {
+        let accent = widget.color();
+        let (r, g, b) = (
+            accent.red() as f64,
+            accent.green() as f64,
+            accent.blue() as f64,
+        );
+        let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
+        let radius = cx.min(cy);
+
+        // Halo — gives the marker presence without hiding the road under it.
+        cr.set_source_rgba(r, g, b, 0.22);
+        cr.arc(cx, cy, radius, 0.0, std::f64::consts::TAU);
+        cr.fill().ok();
+
+        // White collar.
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        cr.arc(cx, cy, radius * 0.62, 0.0, std::f64::consts::TAU);
+        cr.fill().ok();
+
+        // Core.
+        cr.set_source_rgba(r, g, b, 1.0);
+        cr.arc(cx, cy, radius * 0.44, 0.0, std::f64::consts::TAU);
+        cr.fill().ok();
+    });
+
+    area
 }
 
 /// Note pans and zooms so following stands aside while the rider looks around.

@@ -17,6 +17,20 @@ const APP_CSS: &str = "
 }
 ";
 
+/// Content width for a ride page in a normal window, in pixels.
+///
+/// The app-wide clamp width (CLAUDE.md §1.1): wide enough for the cockpit's
+/// four-column metric rows, narrow enough not to strand them beside a sidebar.
+pub const WINDOWED_CLAMP: i32 = 900;
+
+/// Content width for a ride page in fullscreen, in pixels.
+///
+/// Fullscreen has neither sidebar nor header, so the windowed clamp would leave
+/// a ride floating in the middle of a large screen with the metrics no larger
+/// for it. The wide clamp is reserved for genuinely wide layouts, and a cockpit
+/// with the frame stood down is one.
+pub const FULLSCREEN_CLAMP: i32 = 1440;
+
 /// Install the app stylesheet on the default display. Call once at activate,
 /// before the main window is built.
 pub fn load_css() {
