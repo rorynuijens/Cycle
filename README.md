@@ -6,6 +6,18 @@ The application targets GNOME desktop environments and is distributed as a Flatp
 
 ---
 
+## Screenshots
+
+| | |
+|---|---|
+| **Workout player** — a structured workout loaded and ready: target power, the live power, cadence and heart-rate row, and the colour-coded workout graph. <br><br> ![Workout player](docs/screenshots/workout-player.png) | **Route ride** — a GPX course underway, with live gradient, speed, the next climb called out, and the map following the rider. <br><br> ![Route ride map](docs/screenshots/route-ride-map.png) |
+| **Route overview** — the whole course on the map with the look-ahead elevation chart beneath it. <br><br> ![Route ride overview](docs/screenshots/route-ride-overview.png) | **Route preview** — elevation profile, average gradient and route map before committing to the ride. <br><br> ![Route details](docs/screenshots/route-details.png) |
+| **Workout library** — structured workouts grouped by training category, each with duration, TSS and a shape preview. <br><br> ![Workout library](docs/screenshots/library.png) | **Training calendar** — the week view, showing scheduled sessions with their planned duration and TSS. <br><br> ![Training calendar](docs/screenshots/calendar-week.png) |
+| **Scheduled workout** — the detail dialog for a calendar entry, from which the workout can be loaded or removed. <br><br> ![Calendar workout details](docs/screenshots/calendar-workout-details.png) | **Fitness** — CTL, ATL and TSB over time, wellness synced from Intervals.icu, and time spent in each power and heart-rate zone. <br><br> ![Fitness](docs/screenshots/fitness.png) |
+| **Coaching** — the training program with its adjustments, the day's brief, and the athlete's stated goals. <br><br> ![Coaching](docs/screenshots/coaching.png) | **Devices** — saved trainers and sensors across BLE and ANT+, with automatic reconnection. <br><br> ![Devices](docs/screenshots/devices.png) |
+
+---
+
 ## Features
 
 ### Device connectivity
