@@ -26,14 +26,54 @@ pub fn build_sidebar_list(
         sidebar_list.select_row(Some(&first_row));
     }
 
-    let stack = stack.clone();
-    sidebar_list.connect_row_selected(move |_, row| {
-        if let Some(row) = row {
-            let page_name = row.widget_name();
-            let page_name = page_name.as_str();
-            if stack.child_by_name(page_name).is_some() {
-                stack.set_visible_child_name(page_name);
+    // The page this list last sent the stack to.
+    //
+    // A ride is a stack page with no row here, so while one is showing the
+    // sidebar still highlights wherever the rider started it — usually Library.
+    // Anything that makes the list re-assert that highlight (bringing the
+    // sidebar back after fullscreen realises it afresh) fires `row-selected`
+    // again for the row that was *already* selected, and navigating on that
+    // throws the rider off their ride.
+    //
+    // A fresh click cannot look like this: GTK only emits `row-selected` when
+    // the selection actually changes, so an emission naming the row we last
+    // acted on is a re-assertion, never a new choice. Clicking the highlighted
+    // row is handled by `row-activated` below, which does fire in that case.
+    let last_page: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    let navigate = {
+        let stack = stack.clone();
+        move |row: &gtk::ListBoxRow| {
+            let page_name = row.widget_name().to_string();
+            if stack.child_by_name(&page_name).is_some() {
+                stack.set_visible_child_name(&page_name);
             }
+        }
+    };
+
+    sidebar_list.connect_row_selected({
+        let last_page = Rc::clone(&last_page);
+        let navigate = navigate.clone();
+        move |_, row| {
+            let Some(row) = row else { return };
+            let page_name = row.widget_name().to_string();
+            if last_page.borrow().as_deref() == Some(page_name.as_str()) {
+                return; // re-assertion of the current highlight, not a new choice
+            }
+            *last_page.borrow_mut() = Some(page_name);
+            navigate(row);
+        }
+    });
+
+    // Clicking or pressing Enter on the row that is already highlighted emits
+    // only `row-activated`. Without this, a rider on a ride cannot get back to
+    // the page they started it from by clicking it — the highlight is already
+    // there, so nothing happens.
+    sidebar_list.connect_row_activated({
+        let last_page = Rc::clone(&last_page);
+        move |_, row| {
+            *last_page.borrow_mut() = Some(row.widget_name().to_string());
+            navigate(row);
         }
     });
 
@@ -222,12 +262,16 @@ pub fn connect_fullscreen(
 
     // The page fullscreen was entered on, so leaving fullscreen can put it back.
     //
-    // Bringing the sidebar back moves keyboard focus into it, and a focused row
-    // in a single-selection GtkListBox selects itself — which fires
-    // `row-selected` and navigates. The rider pressed Escape on a ride and
-    // landed on whatever the sidebar happened to have highlighted, usually the
-    // Library page they started the ride from. Nothing in the ride asked to be
-    // left, so the ride is what comes back.
+    // This is the second line of defence, not the first. Bringing the sidebar
+    // back makes the list re-assert its highlight, which fires `row-selected`
+    // for a row the rider never touched; [`build_sidebar_list`] is where that is
+    // recognised and ignored. Restoring here as well costs nothing and covers
+    // the case where the sidebar comes back with a *different* row highlighted,
+    // which the re-assertion check cannot tell from a real choice.
+    //
+    // Note this restore alone is not enough and never was: it has to win a race
+    // against the spurious selection, and it loses that race on the route player,
+    // whose map makes the relayout — and so the selection — arrive later.
     let page_before_fullscreen: Rc<RefCell<Option<glib::GString>>> = Rc::new(RefCell::new(None));
 
     window.connect_fullscreened_notify(move |win| {
