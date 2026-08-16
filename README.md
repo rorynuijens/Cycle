@@ -6,6 +6,65 @@ The application targets GNOME desktop environments and is distributed as a Flatp
 
 ---
 
+## Install
+
+Cycle is not on Flathub. It is published from its own Flatpak repository instead, which works exactly the same way — you just have to tell your computer about it once.
+
+**What is a Flatpak?** It is a way of installing Linux apps that keeps each app and everything it needs in its own box. Nothing it installs can break the rest of your system, and removing it leaves nothing behind. Most Linux systems already have Flatpak; if yours does not, install the `flatpak` package from your distribution.
+
+### Step 1 — add the repository (once)
+
+A "repository" is just an address your computer checks for the app and its updates. Open a terminal and paste:
+
+```bash
+flatpak remote-add --if-not-exists cycle https://rorynuijens.github.io/Cycle/cycle.flatpakrepo
+```
+
+Nothing is installed yet — this only saves the address.
+
+### Step 2 — install the app
+
+```bash
+flatpak install cycle io.github.rorynuijens.Cycle
+```
+
+The first install also downloads the GNOME runtime (the shared set of libraries every GNOME Flatpak uses), so it may take a few minutes and a few hundred megabytes. Later updates are much smaller. Cycle then appears in your applications menu like any other app.
+
+### Step 3 — keep it up to date
+
+```bash
+flatpak update
+```
+
+Run this whenever you like. It updates Cycle along with everything else you installed through Flatpak. There is nothing else to configure.
+
+### Alternative: install a single file
+
+Every [release](https://github.com/rorynuijens/Cycle/releases) also has a `.flatpak` file attached. Download it and run:
+
+```bash
+flatpak install ./cycle-0.1.0.flatpak
+```
+
+This is handy for a machine that cannot reach the repository, but it is a one-off: `flatpak update` will not find new versions, so you have to repeat the download for each release. The repository in step 1 is the better option if it works for you.
+
+### Uninstalling
+
+```bash
+flatpak uninstall io.github.rorynuijens.Cycle
+flatpak remote-delete cycle
+```
+
+Your training data lives outside the app and is not deleted by this. To remove that too, delete `~/.var/app/io.github.rorynuijens.Cycle`.
+
+### If something goes wrong
+
+- **"No remote refs found"** — the repository address could not be reached. Check your network; some networks block GitHub.
+- **"GPG signatures found, but none are in trusted keyring"** — the remote was added incorrectly. Remove it with `flatpak remote-delete cycle` and redo step 1 using the full `.flatpakrepo` URL above, which carries the signing key with it.
+- **The app starts but finds no trainer** — that is a Bluetooth or ANT+ matter, not an installation one; see [Requirements](#requirements) below.
+
+---
+
 ## Features
 
 ### Device connectivity
