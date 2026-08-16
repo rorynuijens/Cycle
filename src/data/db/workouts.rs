@@ -77,7 +77,6 @@ pub async fn load_workout_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Wor
 }
 
 /// Update an existing workout (name, description, category, segments).
-#[allow(dead_code)]
 pub async fn update_workout(pool: &SqlitePool, workout: &Workout) -> Result<()> {
     let segments_json = serde_json::to_string(&workout.segments)?;
     sqlx::query(

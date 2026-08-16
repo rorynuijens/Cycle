@@ -18,7 +18,6 @@ pub const MAX_INTENSITY_PCT: u32 = 150;
 pub const INTENSITY_STEP_PCT: i32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum EngineState {
     Idle,
     Running,

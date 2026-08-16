@@ -40,24 +40,6 @@ impl Workout {
         }
     }
 
-    /// Weighted average % of FTP across all segments.
-    #[allow(dead_code)]
-    pub fn average_ftp_percent(&self) -> f32 {
-        let total_secs: u32 = self.segments.iter().map(|s| s.duration_secs).sum();
-        if total_secs == 0 {
-            return 0.0;
-        }
-        let weighted: f32 = self
-            .segments
-            .iter()
-            .map(|s| {
-                let mid = (s.power_low_pct + s.power_high_pct) / 2.0;
-                mid * s.duration_secs as f32
-            })
-            .sum();
-        weighted / total_secs as f32
-    }
-
     /// Returns a sample workout for UI previews and tests.
     pub fn sample_threshold() -> Self {
         Self {
@@ -1253,6 +1235,5 @@ mod tests {
         let w = Workout::from_segments("Empty", "", WorkoutCategory::Custom, Vec::new());
         assert_eq!(w.duration_secs, 0);
         assert_eq!(w.tss, 0.0);
-        assert_eq!(w.average_ftp_percent(), 0.0);
     }
 }

@@ -120,7 +120,9 @@ Use Adwaita semantic CSS classes — never hardcode font sizes:
 
 - Never hardcode colours in Rust. All colour comes from:
   - Adwaita CSS classes (`"accent"`, `"success"`, `"warning"`, `"error"`)
-  - Cairo drawing using `athlete.power_zone(watts).rgb()` — zone colours only
+  - Cairo drawing using `power_zone_index(watts, ftp)` to index `ZONE_COLORS`, or the
+    helpers in `ui/widgets/zone_color.rs` — zone colours only. (`PowerZone::rgb()` names
+    the same palette but nothing draws through it; see the note in `data/athlete.rs`.)
 - Always support both light and dark themes (Adwaita handles this automatically if you don't hardcode)
 - Test UI in both themes before marking a task complete
 
@@ -496,10 +498,12 @@ mod tests {
 
     #[test]
     fn should_parse_power_from_known_ftms_packet() {
-        // Flags: bit 6 set (power present), bit 0 clear (speed present)
+        // Flags 0x0040: bit 6 set (power present), bit 0 clear (speed present).
+        // Every field the flags claim must be stepped over in order, so get the
+        // flags right: 0x44 would also set bit 2 and make 0x0118 the cadence.
         // Speed = 0x0BB8 = 3000 → 30.00 km/h
         // Power = 0x0118 = 280 W
-        let data = &[0x44, 0x00, 0xB8, 0x0B, 0x18, 0x01];
+        let data = &[0x40, 0x00, 0xB8, 0x0B, 0x18, 0x01];
         let result = parse_indoor_bike_data(data).unwrap();
         assert_eq!(result.power_watts, Some(280));
         assert_eq!(result.speed_kmh, Some(30.0));
@@ -793,7 +797,7 @@ When asking Claude to write code for this project:
 | `Arc<Mutex<>>` for GTK shared state | `Rc<RefCell<>>` — GTK is single-threaded |
 | `tokio::main` without a separate GLib runtime | Run GLib loop on main thread, tokio in a separate thread |
 | Hardcoded pixel sizes for fonts | Adwaita CSS classes (`"title-1"`, `"caption"`, etc.) |
-| Hardcoded colours | Adwaita CSS classes or `PowerZone::rgb()` for zone colours |
+| Hardcoded colours | Adwaita CSS classes, or `ZONE_COLORS[power_zone_index(..)]` / `ui/widgets/zone_color.rs` |
 | `gtk::Window` | `adw::ApplicationWindow` |
 | `gtk::Paned` for sidebar layout | `adw::NavigationSplitView` |
 | Embedding preferences in main window | `adw::PreferencesWindow` (separate window) |

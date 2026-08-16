@@ -58,9 +58,18 @@ pub fn power_zone_index(watts: u32, ftp: u32) -> usize {
     }
 }
 
+// ── the named-zone API ───────────────────────────────────────────────────────
+//
+// Everything that draws works from zone *indices* (`power_zone_index` +
+// `ZONE_COLORS`, and `ui/widgets/zone_color.rs`), so nothing in the app calls
+// the named half. It is kept deliberately: it is the readable statement of
+// where the Coggan boundaries fall, it is what the boundary tests below are
+// written against, and `should_keep_the_named_zones_and_the_index_in_step`
+// pins the two halves together so the index path cannot drift from it silently.
+// Retained on purpose — not awaiting a caller.
+#[allow(dead_code)]
 impl AthleteProfile {
     /// Watts per kilogram at FTP
-    #[allow(dead_code)]
     pub fn watts_per_kg(&self) -> f32 {
         self.ftp_watts as f32 / self.weight_kg
     }
@@ -70,7 +79,6 @@ impl AthleteProfile {
     /// Drawing code wants a colour rather than a zone and goes through the
     /// `power_zone_index` / `ZONE_COLORS` pair instead, so at present only the
     /// tests exercise this — it stays as the named-zone half of the API.
-    #[allow(dead_code)]
     pub fn power_zone(&self, watts: u32) -> PowerZone {
         let pct = (watts as f32 / self.ftp_watts as f32) * 100.0;
         match pct as u32 {
@@ -85,7 +93,6 @@ impl AthleteProfile {
     }
 
     /// Return the heart-rate zone (1–5) for a given HR reading.
-    #[allow(dead_code)]
     pub fn hr_zone(&self, bpm: u32) -> HrZone {
         let hrr = self.max_hr - self.resting_hr;
         let pct = ((bpm.saturating_sub(self.resting_hr)) as f32 / hrr as f32) * 100.0;
@@ -99,7 +106,9 @@ impl AthleteProfile {
     }
 }
 
+/// Named Coggan power zones. See the note above `impl AthleteProfile`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PowerZone {
     ActiveRecovery,
     Endurance,
@@ -110,8 +119,8 @@ pub enum PowerZone {
     Neuromuscular,
 }
 
+#[allow(dead_code)]
 impl PowerZone {
-    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::ActiveRecovery => "Z1 Recovery",
@@ -143,12 +152,12 @@ impl PowerZone {
     /// from zone indices, and two hand-written copies of the palette would
     /// eventually disagree about what Z4 looks like. Like [`Self::label`], this
     /// is the named-zone half of the API and currently only tests reach it.
-    #[allow(dead_code)]
     pub fn rgb(&self) -> (f64, f64, f64) {
         ZONE_COLORS[self.index()]
     }
 }
 
+/// Named heart-rate zones. See the note above `impl AthleteProfile`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum HrZone {

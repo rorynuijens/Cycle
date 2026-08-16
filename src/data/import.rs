@@ -6,6 +6,19 @@ use crate::data::workout::{Segment, Workout, WorkoutCategory};
 
 const MAX_IMPORT_BYTES: usize = 1_048_576; // 1 MB
 
+// Bounds on what a file may expand *to*, which the size cap above does not give
+// us (CLAUDE.md §5.3). A single 60-byte `<IntervalsT Repeat="4000000000"/>` asks
+// for eight billion segments, each carrying a heap-allocated label — the parse
+// dies on memory long before the 1 MB limit is anywhere near relevant. Every
+// import is checked against these before a `Workout` exists.
+/// Generous ceiling on segment count: a 30×30s over-under set is ~120 segments.
+const MAX_SEGMENTS: usize = 2_000;
+/// No single interval in a real workout runs longer than this.
+const MAX_SEGMENT_SECS: u32 = 6 * 60 * 60;
+/// Longest total a structured workout may declare. Also keeps the duration sum
+/// in [`build_workout`] clear of overflowing the `u32` it is accumulated into.
+const MAX_WORKOUT_SECS: u32 = 24 * 60 * 60;
+
 /// Parse a `.zwo` file (Zwift XML format) into a `Workout`.
 pub fn parse_zwo(content: &str) -> Result<Workout> {
     anyhow::ensure!(
@@ -80,6 +93,13 @@ pub fn parse_zwo(content: &str) -> Result<Workout> {
                 let off_dur = attr_u32(tag, "OffDuration").unwrap_or(60);
                 let on_pwr = attr_f32(tag, "OnPower").unwrap_or(1.05) * 100.0;
                 let off_pwr = attr_f32(tag, "OffPower").unwrap_or(0.5) * 100.0;
+                // This is the one tag that multiplies, so it has to be refused
+                // before the loop rather than trimmed after it: by then the
+                // memory has already been asked for.
+                anyhow::ensure!(
+                    u64::from(repeat) * 2 <= MAX_SEGMENTS.saturating_sub(segments.len()) as u64,
+                    "workout expands to too many segments (IntervalsT Repeat=\"{repeat}\")"
+                );
                 for i in 1..=repeat {
                     segments.push(Segment::steady(on_dur, on_pwr, &format!("Interval {i}")));
                     segments.push(Segment::steady(off_dur, off_pwr, "Recovery"));
@@ -97,7 +117,7 @@ pub fn parse_zwo(content: &str) -> Result<Workout> {
         bail!("No workout segments found in ZWO file");
     }
 
-    Ok(build_workout(name, description, segments))
+    build_workout(name, description, segments)
 }
 
 // ── ERG / MRC ─────────────────────────────────────────────────────────────────
@@ -194,16 +214,40 @@ pub fn parse_erg(content: &str) -> Result<Workout> {
         bail!("Could not build segments from ERG data");
     }
 
-    Ok(build_workout(name, description, segments))
+    build_workout(name, description, segments)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn build_workout(name: String, description: String, segments: Vec<Segment>) -> Workout {
-    let duration_secs: u32 = segments.iter().map(|s| s.duration_secs).sum();
+/// Assemble a parsed file into a `Workout`, refusing anything outside the
+/// bounds a real workout stays inside.
+///
+/// Every import funnels through here, so this is where the guard rails live: a
+/// parser cannot forget to apply them, and nothing that fails them is ever
+/// handed to the rest of the app. The duration is summed into a `u64` first
+/// because the whole point is that the numbers in the file are untrusted.
+fn build_workout(name: String, description: String, segments: Vec<Segment>) -> Result<Workout> {
+    anyhow::ensure!(
+        segments.len() <= MAX_SEGMENTS,
+        "workout has too many segments ({}, limit {MAX_SEGMENTS})",
+        segments.len()
+    );
+    if let Some(longest) = segments.iter().find(|s| s.duration_secs > MAX_SEGMENT_SECS) {
+        bail!(
+            "workout has a {}s segment, longer than the {MAX_SEGMENT_SECS}s limit",
+            longest.duration_secs
+        );
+    }
+    let total: u64 = segments.iter().map(|s| u64::from(s.duration_secs)).sum();
+    anyhow::ensure!(
+        total <= u64::from(MAX_WORKOUT_SECS),
+        "workout is {total}s long, over the {MAX_WORKOUT_SECS}s limit"
+    );
+
+    let duration_secs = total as u32;
     let tss = estimate_tss(&segments, duration_secs);
     let category = guess_category(&segments);
-    Workout {
+    Ok(Workout {
         id: 0,
         name,
         description,
@@ -211,7 +255,7 @@ fn build_workout(name: String, description: String, segments: Vec<Segment>) -> W
         tss,
         category,
         segments,
-    }
+    })
 }
 
 fn xml_text(xml: &str, tag: &str) -> Option<String> {
@@ -312,6 +356,83 @@ mod tests {
         let w = parse_zwo(zwo).unwrap();
         assert_eq!(w.segments.len(), 6); // 3 × (on + off)
         assert_eq!(w.duration_secs, 360);
+    }
+
+    // ── guard rails on untrusted files (CLAUDE.md §5.3) ──────────────────────
+
+    /// Wrap `body` in the minimum ZWO scaffolding the parser needs.
+    fn zwo(body: &str) -> String {
+        format!("<workout_file><name>t</name><workout>{body}</workout></workout_file>")
+    }
+
+    #[test]
+    fn should_refuse_an_intervals_repeat_that_would_exhaust_memory() {
+        // 158 bytes asking for 8.6 billion segments. The file is nowhere near
+        // the 1 MB limit, which is exactly why size alone cannot be the guard.
+        let file = zwo(
+            r#"<IntervalsT Repeat="4294967295" OnDuration="60" OffDuration="60" OnPower="1.05" OffPower="0.5"/>"#,
+        );
+        assert!(file.len() < MAX_IMPORT_BYTES);
+        let err = parse_zwo(&file).expect_err("an unbounded Repeat must be refused");
+        assert!(
+            err.to_string().contains("too many segments"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_refuse_a_repeat_just_past_the_segment_limit() {
+        // Each repeat is two segments, so the last accepted Repeat is half the cap.
+        let ok = zwo(&format!(
+            r#"<IntervalsT Repeat="{}" OnDuration="1" OffDuration="1"/>"#,
+            MAX_SEGMENTS / 2
+        ));
+        assert_eq!(parse_zwo(&ok).unwrap().segments.len(), MAX_SEGMENTS);
+
+        let over = zwo(&format!(
+            r#"<IntervalsT Repeat="{}" OnDuration="1" OffDuration="1"/>"#,
+            MAX_SEGMENTS / 2 + 1
+        ));
+        assert!(parse_zwo(&over).is_err());
+    }
+
+    #[test]
+    fn should_count_repeats_against_segments_already_parsed() {
+        // The budget is what is left, not the whole cap: two tags that each fit
+        // on their own must still be refused together.
+        let half = MAX_SEGMENTS / 4;
+        let file = zwo(&format!(
+            r#"<IntervalsT Repeat="{half}" OnDuration="1" OffDuration="1"/>
+               <IntervalsT Repeat="{}" OnDuration="1" OffDuration="1"/>"#,
+            MAX_SEGMENTS / 2
+        ));
+        assert!(parse_zwo(&file).is_err());
+    }
+
+    #[test]
+    fn should_refuse_a_single_absurdly_long_segment() {
+        let file = zwo(r#"<SteadyState Duration="4000000000" Power="0.75"/>"#);
+        let err = parse_zwo(&file).expect_err("a 127-year segment must be refused");
+        assert!(err.to_string().contains("longer than"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn should_refuse_a_workout_longer_than_a_day() {
+        // Each segment is under the per-segment cap; only the total is over it.
+        let seg = r#"<SteadyState Duration="18000" Power="0.75"/>"#; // 5 h
+        let file = zwo(&seg.repeat(6)); // 30 h
+        let err = parse_zwo(&file).expect_err("a 30-hour workout must be refused");
+        assert!(err.to_string().contains("over the"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn should_still_accept_a_long_but_realistic_workout() {
+        // A 3 h endurance ride with a warm-up is ordinary and must survive.
+        let file = zwo(r#"<Warmup Duration="900" PowerLow="0.4" PowerHigh="0.75"/>
+               <SteadyState Duration="9900" Power="0.65"/>
+               <Cooldown Duration="600" PowerHigh="0.6" PowerLow="0.3"/>"#);
+        let w = parse_zwo(&file).expect("a 3 h ride is a normal workout");
+        assert_eq!(w.duration_secs, 11_400);
     }
 
     #[test]

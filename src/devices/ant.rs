@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use async_channel::Sender;
 
 use crate::data::session::{LiveReadings, ReadingSource};
-use crate::devices::ftms::compute_cadence_rpm;
+use crate::devices::ftms::{compute_cadence_rpm, MAX_PLAUSIBLE_HR_BPM, MAX_PLAUSIBLE_POWER_W};
 use crate::devices::manager::{DeviceEvent, DeviceType};
 use crate::devices::peripheral::Transport;
 
@@ -89,9 +89,6 @@ const FEC_CHANNEL: u8 = 0x00;
 const FEC_DEVICE_TYPE: u8 = 0x11; // 17 = Fitness Equipment Control
 const FEC_CHANNEL_PERIOD: u16 = 8192; // 4 Hz (32768 / 8192)
 
-/// Channel 1 — Bike Speed & Cadence: some trainers (e.g. Elite Drivo) report a bogus
-/// cadence of 0 in both the FE-C and Bike Power pages, so we open this dedicated
-/// channel and derive cadence from its crank-revolution counter instead.
 /// How long to wait before retrying a channel configuration that failed.
 const CHANNEL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -105,6 +102,9 @@ const HR_CHANNEL: u8 = 0x02;
 const HR_DEVICE_TYPE: u8 = 0x78; // 120 = Heart Rate Monitor
 const HR_CHANNEL_PERIOD: u16 = 8070; // ANT+ HR profile period (~4.06 Hz)
 
+/// Channel 1 — Bike Speed & Cadence: some trainers (e.g. Elite Drivo) report a
+/// bogus cadence of 0 in both the FE-C and Bike Power pages, so we open this
+/// dedicated channel and derive cadence from its crank-revolution counter.
 const CADENCE_CHANNEL: u8 = 0x01;
 const SC_DEVICE_TYPE: u8 = 0x79; // 121 = Bike Speed and Cadence (combined)
 const SC_CHANNEL_PERIOD: u16 = 8086; // ANT+ combined Speed & Cadence period
@@ -188,7 +188,7 @@ fn parse_specific_trainer(payload: &[u8]) -> Option<LiveReadings> {
     let power = if inst_power == 0x0FFF {
         None
     } else {
-        Some((inst_power as u32).min(3000)) // clamp implausible values — CLAUDE.md §5.1
+        Some((inst_power as u32).min(MAX_PLAUSIBLE_POWER_W)) // CLAUDE.md §5.1
     };
     Some(LiveReadings {
         power_watts: power,
@@ -222,7 +222,6 @@ fn parse_general_fe(payload: &[u8]) -> Option<LiveReadings> {
     })
 }
 
-/// Extract `(cumulative cadence revolutions, cadence event time)` from a combined
 /// Computed heart rate from an ANT+ HR page (device type 120).
 ///
 /// Every HR data page carries the computed heart rate in the last byte, whatever
@@ -234,7 +233,7 @@ fn parse_ant_heart_rate(payload: &[u8]) -> Option<u32> {
     }
     match payload[7] {
         0 => None,
-        bpm => Some((bpm as u32).min(250)), // clamp per CLAUDE.md §5.1
+        bpm => Some((bpm as u32).min(MAX_PLAUSIBLE_HR_BPM)), // CLAUDE.md §5.1
     }
 }
 
@@ -420,7 +419,10 @@ impl AntStick {
     }
 
     fn send_target_power(&self, watts: u16) {
-        let clamped = watts.min(1000); // never send an unclamped ERG target — CLAUDE.md §5.1
+        // Never send an unclamped ERG target (CLAUDE.md §5.1). The manager already
+        // clamps at the boundary; this keeps the guarantee local to the write, and
+        // shares the BLE path's ceiling so the two transports cannot drift apart.
+        let clamped = watts.min(crate::devices::ftms::MAX_ERG_TARGET_W);
         let page = build_target_power_page(clamped);
         let mut data = Vec::with_capacity(9);
         data.push(FEC_CHANNEL);

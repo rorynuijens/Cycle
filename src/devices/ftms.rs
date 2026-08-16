@@ -1,21 +1,17 @@
 /// Fitness Machine Service (FTMS) — BLE GATT profile for smart trainers.
-#[allow(dead_code)]
 pub const FTMS_SERVICE_UUID: &str = "00001826-0000-1000-8000-00805f9b34fb";
 pub const INDOOR_BIKE_DATA_UUID: &str = "00002ad2-0000-1000-8000-00805f9b34fb";
 pub const CONTROL_POINT_UUID: &str = "00002ad9-0000-1000-8000-00805f9b34fb";
 
 /// Heart Rate Service — BLE GATT profile for HR monitors and bands.
-#[allow(dead_code)]
 pub const HR_SERVICE_UUID: &str = "0000180d-0000-1000-8000-00805f9b34fb";
 pub const HR_MEASUREMENT_UUID: &str = "00002a37-0000-1000-8000-00805f9b34fb";
 
 /// Cycling Power Service (CPS) — BLE GATT profile for power meters.
-#[allow(dead_code)]
 pub const CYCLING_POWER_SERVICE_UUID: &str = "00001818-0000-1000-8000-00805f9b34fb";
 pub const CYCLING_POWER_MEASUREMENT_UUID: &str = "00002a63-0000-1000-8000-00805f9b34fb";
 
 /// Cycling Speed and Cadence Service (CSC) — BLE GATT profile for cadence/speed sensors.
-#[allow(dead_code)]
 pub const CSC_SERVICE_UUID: &str = "00001816-0000-1000-8000-00805f9b34fb";
 pub const CSC_MEASUREMENT_UUID: &str = "00002a5b-0000-1000-8000-00805f9b34fb";
 
@@ -25,11 +21,18 @@ pub const CSC_MEASUREMENT_UUID: &str = "00002a5b-0000-1000-8000-00805f9b34fb";
 // where it cannot be told from a real effort. Every parser below clamps at the
 // point of parsing so no caller can forget to.
 /// Well above any human capability.
-const MAX_PLAUSIBLE_POWER_W: u32 = 3000;
+pub const MAX_PLAUSIBLE_POWER_W: u32 = 3000;
 /// The physical maximum for a pedalling cadence.
-const MAX_PLAUSIBLE_CADENCE_RPM: u32 = 250;
+pub const MAX_PLAUSIBLE_CADENCE_RPM: u32 = 250;
 /// The medical maximum for a heart rate.
-const MAX_PLAUSIBLE_HR_BPM: u32 = 250;
+pub const MAX_PLAUSIBLE_HR_BPM: u32 = 250;
+
+/// Ceiling on an ERG target this app will ask a trainer to hold (CLAUDE.md §5.1).
+///
+/// Unlike the ceilings above, this one guards the write rather than the read: it
+/// bounds what leaves for the hardware, not what arrives from it. It lives here,
+/// beside them, so the BLE and ANT+ paths cannot drift to different limits.
+pub const MAX_ERG_TARGET_W: u16 = 1000;
 
 /// Parse a Heart Rate Measurement GATT notification (Bluetooth Assigned Numbers §3.104).
 /// Supports both uint8 (bit 0 = 0) and uint16 (bit 0 = 1) heart rate formats.
@@ -55,57 +58,122 @@ pub struct IndoorBikeData {
     pub power_watts: Option<u32>,
     pub heart_rate_bpm: Option<u32>,
     pub elapsed_time_secs: Option<u32>,
-    #[allow(dead_code)]
     pub distance_m: Option<u32>,
 }
 
-/// Parse raw bytes from an Indoor Bike Data GATT notification.
+/// A cursor over the variable-length body of an Indoor Bike Data packet.
+///
+/// The fields appear in flag-bit order with no length prefixes and no padding,
+/// so the only way to find one is to step over every field before it. A field
+/// this app has no use for still has to be consumed, or everything after it is
+/// read from the wrong offset.
+struct Fields<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl Fields<'_> {
+    /// Consume `n` bytes, or `None` when the packet ends first.
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let end = self.offset.checked_add(n)?;
+        let field = self.data.get(self.offset..end)?;
+        self.offset = end;
+        Some(field)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        self.take(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn i16(&mut self) -> Option<i16> {
+        self.take(2).map(|b| i16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// A 24-bit little-endian unsigned field (total distance is the only one).
+    fn u24(&mut self) -> Option<u32> {
+        self.take(3)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], 0]))
+    }
+}
+
+/// Parse raw bytes from an Indoor Bike Data GATT notification
+/// (FTMS spec §4.9.1).
 ///
 /// Power, cadence and heart rate are clamped to physiologically plausible
 /// ranges — the trainer is untrusted hardware (CLAUDE.md §5.1).
+///
+/// Returns `None` only for a packet too short to hold the flags. A packet that
+/// ends part-way through its declared fields keeps whatever was read before the
+/// truncation: those fields were still at the right offset, and dropping a live
+/// power reading because the trailer was short loses real data.
 pub fn parse_indoor_bike_data(data: &[u8]) -> Option<IndoorBikeData> {
     if data.len() < 2 {
         return None;
     }
-
     let flags = u16::from_le_bytes([data[0], data[1]]);
+    let mut fields = Fields {
+        data,
+        offset: 2, // past the flags
+    };
     let mut result = IndoorBikeData::default();
-    let mut offset = 2usize;
-
-    // Bit 0 = 0 means speed field IS present
-    if flags & 0x0001 == 0 && offset + 2 <= data.len() {
-        result.speed_kmh =
-            Some(u16::from_le_bytes([data[offset], data[offset + 1]]) as f32 / 100.0);
-        offset += 2;
-    }
-
-    // Bit 2: instantaneous cadence (uint16, 0.5 rpm resolution)
-    if flags & 0x0004 != 0 && offset + 2 <= data.len() {
-        let rpm = u16::from_le_bytes([data[offset], data[offset + 1]]) as u32 / 2;
-        result.cadence_rpm = Some(rpm.min(MAX_PLAUSIBLE_CADENCE_RPM));
-        offset += 2;
-    }
-
-    // Bit 6: instantaneous power
-    if flags & 0x0040 != 0 && offset + 2 <= data.len() {
-        let watts = u16::from_le_bytes([data[offset], data[offset + 1]]) as u32;
-        result.power_watts = Some(watts.min(MAX_PLAUSIBLE_POWER_W));
-        offset += 2;
-    }
-
-    // Bit 9: heart rate
-    if flags & 0x0200 != 0 && offset < data.len() {
-        result.heart_rate_bpm = Some((data[offset] as u32).min(MAX_PLAUSIBLE_HR_BPM));
-        offset += 1;
-    }
-
-    // Bit 11: elapsed time
-    if flags & 0x0800 != 0 && offset + 2 <= data.len() {
-        result.elapsed_time_secs =
-            Some(u16::from_le_bytes([data[offset], data[offset + 1]]) as u32);
-    }
-
+    let _ = read_fields(flags, &mut fields, &mut result);
     Some(result)
+}
+
+/// Walk the packet body in field order, filling in what this app uses.
+///
+/// Returns `None` at the first field that runs off the end of the packet, which
+/// stops the walk — a caller cannot meaningfully carry on past a truncation,
+/// since every later offset would be a guess.
+fn read_fields(flags: u16, f: &mut Fields, out: &mut IndoorBikeData) -> Option<()> {
+    // Bit 0 is "More Data": unlike every other flag, the field is present when
+    // the bit is *clear*.
+    if flags & 0x0001 == 0 {
+        out.speed_kmh = Some(f.u16()? as f32 / 100.0);
+    }
+    if flags & 0x0002 != 0 {
+        f.u16()?; // average speed
+    }
+    // Instantaneous cadence, uint16 at 0.5 rpm resolution.
+    if flags & 0x0004 != 0 {
+        out.cadence_rpm = Some((f.u16()? as u32 / 2).min(MAX_PLAUSIBLE_CADENCE_RPM));
+    }
+    if flags & 0x0008 != 0 {
+        f.u16()?; // average cadence
+    }
+    if flags & 0x0010 != 0 {
+        out.distance_m = Some(f.u24()?);
+    }
+    if flags & 0x0020 != 0 {
+        f.i16()?; // resistance level
+    }
+    // Instantaneous power is signed: a trainer may report a negative watt or two
+    // while coasting, which is not a reading worth keeping, so it floors at 0.
+    if flags & 0x0040 != 0 {
+        out.power_watts = Some((f.i16()?.max(0) as u32).min(MAX_PLAUSIBLE_POWER_W));
+    }
+    if flags & 0x0080 != 0 {
+        f.i16()?; // average power
+    }
+    if flags & 0x0100 != 0 {
+        f.take(5)?; // expended energy: total (u16) + per hour (u16) + per minute (u8)
+    }
+    if flags & 0x0200 != 0 {
+        out.heart_rate_bpm = Some((f.u8()? as u32).min(MAX_PLAUSIBLE_HR_BPM));
+    }
+    if flags & 0x0400 != 0 {
+        f.u8()?; // metabolic equivalent
+    }
+    if flags & 0x0800 != 0 {
+        out.elapsed_time_secs = Some(f.u16()? as u32);
+    }
+    // Remaining time (bit 12) is the last field, so nothing depends on stepping
+    // over it and nothing here uses it.
+    Some(())
 }
 
 /// Parsed fields from a Cycling Power Measurement GATT notification (BT Spec §3.67).
@@ -228,12 +296,6 @@ pub fn request_control_command() -> Vec<u8> {
     vec![0x00]
 }
 
-/// OpCode 0x01 — Reset machine to default state.
-#[allow(dead_code)]
-pub fn reset_command() -> Vec<u8> {
-    vec![0x01]
-}
-
 /// OpCode 0x11 — Set Indoor Bike Simulation Parameters (SIM mode).
 ///
 /// Field layout: wind speed (sint16, 0.001 m/s), grade (sint16, 0.01 %),
@@ -296,18 +358,37 @@ mod tests {
 
     #[test]
     fn should_clamp_implausible_power_to_3000_watts() {
-        // 0xFFFF = 65535 W from a lying or glitching trainer.
+        // 0x7FFF = 32767 W, the largest a sint16 can claim, from a lying or
+        // glitching trainer.
         let data = &[
             FLAGS_CADENCE_POWER_HR[0],
             FLAGS_CADENCE_POWER_HR[1],
             0x00,
             0x00, // cadence 0
             0xFF,
-            0xFF, // power 65535
+            0x7F, // power 32767
             0x64, // HR 100
         ];
         let result = parse_indoor_bike_data(data).unwrap();
         assert_eq!(result.power_watts, Some(3000));
+    }
+
+    #[test]
+    fn should_floor_a_negative_power_reading_at_zero() {
+        // Instantaneous power is sint16 in the spec, so 0xFFFF is −1 W (a
+        // coasting trainer), not 65535 W. Reading it unsigned turned a rider
+        // freewheeling into a full-scale reading that clamped to 3000 W.
+        let data = &[
+            FLAGS_CADENCE_POWER_HR[0],
+            FLAGS_CADENCE_POWER_HR[1],
+            0x00,
+            0x00,
+            0xFF,
+            0xFF, // power −1
+            0x64,
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.power_watts, Some(0));
     }
 
     #[test]
@@ -371,6 +452,88 @@ mod tests {
         ];
         let result = parse_indoor_bike_data(data).unwrap();
         assert_eq!(result.heart_rate_bpm, Some(250));
+    }
+
+    // ── Indoor Bike Data field alignment ─────────────────────────────────────
+    //
+    // The fields are positional: one the app does not use still has to be
+    // stepped over, or every field after it is read from the wrong offset and
+    // the wrong number lands in the ride, the TSS and the FIT export.
+
+    #[test]
+    fn should_parse_power_from_known_ftms_packet() {
+        // The worked example in CLAUDE.md §3.4, kept executable so the standards
+        // doc and the parser cannot drift apart again.
+        // Flags 0x0040: bit 6 (power), bit 0 clear (speed present).
+        let data = &[0x40, 0x00, 0xB8, 0x0B, 0x18, 0x01];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.power_watts, Some(280));
+        assert_eq!(result.speed_kmh, Some(30.0));
+    }
+
+    #[test]
+    fn should_read_power_past_an_average_speed_field() {
+        // Flags 0x0043: bit 1 (average speed) and bit 6 (power), with bit 0 set
+        // so no instantaneous speed leads. Skipping the average-speed field read
+        // power from its bytes instead — 0x1388 — and reported a clamped 3000 W.
+        let data = &[
+            0x43, 0x00, // flags
+            0x88, 0x13, // average speed 50.00 km/h
+            0x18, 0x01, // power 280 W
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.power_watts, Some(280));
+    }
+
+    #[test]
+    fn should_step_over_every_field_it_does_not_use() {
+        // Flags 0x1FFE: every optional field present, and bit 0 clear so the
+        // instantaneous speed field leads. This is the widest packet the spec
+        // allows, and the one where a missed field is most costly.
+        let data = &[
+            0xFE, 0x1F, // flags
+            0xB8, 0x0B, // instantaneous speed 30.00 km/h
+            0x00, 0x00, // average speed
+            0xB4, 0x00, // instantaneous cadence 180 → 90 rpm
+            0x00, 0x00, // average cadence
+            0x39, 0x30, 0x00, // total distance 12345 m
+            0x00, 0x00, // resistance level
+            0x18, 0x01, // instantaneous power 280 W
+            0x00, 0x00, // average power
+            0x00, 0x00, 0x00, 0x00, 0x00, // expended energy
+            0x96, // heart rate 150 bpm
+            0x00, // metabolic equivalent
+            0x10, 0x0E, // elapsed time 3600 s
+            0x00, 0x00, // remaining time
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.speed_kmh, Some(30.0));
+        assert_eq!(result.cadence_rpm, Some(90));
+        assert_eq!(result.distance_m, Some(12_345));
+        assert_eq!(result.power_watts, Some(280));
+        assert_eq!(result.heart_rate_bpm, Some(150));
+        assert_eq!(result.elapsed_time_secs, Some(3600));
+    }
+
+    #[test]
+    fn should_keep_the_fields_read_before_a_truncation() {
+        // Flags promise speed, cadence and power, but the packet stops after
+        // cadence. Speed and cadence were still read at the right offsets.
+        let data = &[
+            0x44, 0x00, // flags: cadence + power, speed present
+            0xB8, 0x0B, // speed 30.00 km/h
+            0xB4, 0x00, // cadence 90 rpm
+        ];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.speed_kmh, Some(30.0));
+        assert_eq!(result.cadence_rpm, Some(90));
+        assert_eq!(result.power_watts, None);
+    }
+
+    #[test]
+    fn should_return_none_for_a_packet_too_short_to_hold_flags() {
+        assert!(parse_indoor_bike_data(&[]).is_none());
+        assert!(parse_indoor_bike_data(&[0x00]).is_none());
     }
 
     // ── Cycling Power Measurement ────────────────────────────────────────────

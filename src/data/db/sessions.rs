@@ -9,7 +9,32 @@ use crate::data::session::{DataPoint, Session};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{Row, SqlitePool};
 
-/// Persist a completed session and return its new DB id.
+/// Read a ride's `started_at`, which every caller needs and none can do without.
+///
+/// A timestamp that will not parse means the row is damaged. Falling back to
+/// `Utc::now()` is the one thing that must not happen: it silently re-dates the
+/// ride to today, where it inflates today's CTL and ATL, lands on today's page
+/// in the calendar, and feeds the coach a session the rider never did — all
+/// while looking entirely plausible. The epoch is wrong too, but inertly so:
+/// the ride sorts to the bottom of history, falls outside every rolling window,
+/// and is obviously broken to anyone who looks at it.
+///
+/// The row is kept rather than skipped, for the same reason an unreadable blob
+/// keeps its row: a ride that vanishes with no explanation is worse than one
+/// that is visibly wrong.
+fn parse_started_at(raw: &str, session_id: i64) -> DateTime<Utc> {
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(e) => {
+            tracing::error!(
+                "session {session_id}: started_at {raw:?} is unreadable ({e}) \
+                 — dating it to the epoch so it cannot distort recent training load"
+            );
+            DateTime::UNIX_EPOCH
+        }
+    }
+}
+
 /// A ride reduced to the figures the list views actually need, read straight
 /// from columns without touching `data_points_json`.
 ///
@@ -19,7 +44,8 @@ use sqlx::{Row, SqlitePool};
 /// [`load_session_records`] only when the samples themselves are needed.
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
-    /// Identifies the ride so callers can go on to load or act on it.
+    /// Identifies the ride so callers can go on to load or act on it. Carried
+    /// for that purpose rather than because a summary reader needs it today.
     #[allow(dead_code)]
     pub id: i64,
     pub started_at: DateTime<Utc>,
@@ -101,9 +127,7 @@ pub async fn load_session_summaries(pool: &SqlitePool) -> Result<Vec<SessionSumm
         .into_iter()
         .map(|r| SessionSummary {
             id: r.get("id"),
-            started_at: DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            started_at: parse_started_at(r.get::<&str, _>("started_at"), r.get("id")),
             duration_secs: r.get::<Option<i64>, _>("duration_secs").unwrap_or(0).max(0) as u64,
             normalised_power: r
                 .get::<Option<f64>, _>("normalised_power")
@@ -144,9 +168,7 @@ pub(super) async fn backfill_session_metrics(pool: &SqlitePool) -> Result<()> {
             }
         };
         let mut session = Session::new(None);
-        session.started_at = DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        session.started_at = parse_started_at(r.get::<&str, _>("started_at"), id);
         session.ended_at = r
             .get::<Option<&str>, _>("ended_at")
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -174,6 +196,7 @@ async fn write_session_metrics(pool: &SqlitePool, id: i64, session: &Session) ->
     Ok(())
 }
 
+/// Persist a completed session and return its new DB id.
 pub async fn save_session(pool: &SqlitePool, session: &Session) -> Result<i64> {
     upsert_session(pool, None, session).await
 }
@@ -570,10 +593,7 @@ async fn load_session_records_where(
             }
         };
 
-        let started_at: DateTime<Utc> =
-            DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+        let started_at = parse_started_at(r.get::<&str, _>("started_at"), session_id);
 
         let ended_at: Option<DateTime<Utc>> = r
             .get::<Option<&str>, _>("ended_at")
@@ -633,10 +653,7 @@ pub async fn load_sessions_between(
     for r in rows {
         let data_points: Vec<DataPoint> =
             serde_json::from_str(r.get("data_points_json")).unwrap_or_default();
-        let started_at: DateTime<Utc> =
-            DateTime::parse_from_rfc3339(r.get::<&str, _>("started_at"))
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+        let started_at = parse_started_at(r.get::<&str, _>("started_at"), r.get("id"));
         let ended_at: Option<DateTime<Utc>> = r
             .get::<Option<&str>, _>("ended_at")
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -853,6 +870,55 @@ mod tests {
             "blob said {from_blob}, columns said {from_columns}"
         );
         assert_eq!(summaries[0].duration_secs, full[0].session.duration_secs());
+    }
+
+    /// Corrupt a saved ride's timestamp behind the loaders' backs, the way a
+    /// damaged or hand-edited database would.
+    async fn break_started_at(pool: &SqlitePool, id: i64) {
+        sqlx::query("UPDATE sessions SET started_at = 'not a timestamp' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("the row exists");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_start_time_does_not_re_date_a_ride_to_today() {
+        // Dating it to "now" would put a ride the rider never did into today's
+        // CTL, ATL and calendar, looking entirely plausible.
+        let pool = test_pool().await;
+        let mut session = riding_session(3600);
+        session.started_at = Utc::now() - chrono::Duration::days(400);
+        session.ended_at = Some(Utc::now() - chrono::Duration::days(400));
+        let id = save_session(&pool, &session).await.unwrap();
+        break_started_at(&pool, id).await;
+
+        for started_at in [
+            load_session_records(&pool).await.unwrap()[0]
+                .session
+                .started_at,
+            load_session_summaries(&pool).await.unwrap()[0].started_at,
+        ] {
+            assert_eq!(started_at, DateTime::UNIX_EPOCH);
+            assert!(
+                Utc::now().signed_duration_since(started_at).num_days() > 365,
+                "a damaged ride must fall outside every rolling load window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ride_with_an_unreadable_start_time_is_still_listed() {
+        // Keeping the row matters as much as not trusting it: a ride that
+        // vanishes with no explanation is worse than one visibly wrong.
+        let pool = test_pool().await;
+        let mut session = riding_session(600);
+        session.ended_at = Some(Utc::now());
+        let id = save_session(&pool, &session).await.unwrap();
+        break_started_at(&pool, id).await;
+
+        assert_eq!(load_session_records(&pool).await.unwrap().len(), 1);
+        assert_eq!(load_session_summaries(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

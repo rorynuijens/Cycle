@@ -5,7 +5,6 @@ use anyhow::Result;
 use sqlx::{Row, SqlitePool};
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CalendarEntry {
     pub id: i64,
     pub workout_id: i64,
@@ -16,42 +15,6 @@ pub struct CalendarEntry {
     pub category: WorkoutCategory,
     pub tss: f32,
     pub duration_secs: u32,
-}
-
-/// Load all calendar entries for a given month, joined with workout names.
-#[allow(dead_code)]
-pub async fn load_calendar_entries_for_month(
-    pool: &SqlitePool,
-    year: i32,
-    month: u32,
-) -> Result<Vec<CalendarEntry>> {
-    let pattern = format!("{:04}-{:02}-%", year, month);
-    let rows = sqlx::query(
-        "SELECT ce.id, ce.workout_id, w.name AS workout_name,
-                ce.scheduled_date, ce.completed,
-                w.category, w.tss, w.duration_secs
-         FROM calendar_entries ce
-         JOIN workouts w ON ce.workout_id = w.id
-         WHERE ce.scheduled_date LIKE ?
-         ORDER BY ce.scheduled_date",
-    )
-    .bind(&pattern)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .iter()
-        .map(|r| CalendarEntry {
-            id: r.get("id"),
-            workout_id: r.get("workout_id"),
-            workout_name: r.get("workout_name"),
-            scheduled_date: r.get("scheduled_date"),
-            completed: r.get::<i64, _>("completed") != 0,
-            category: WorkoutCategory::from_db_str(&r.get::<String, _>("category")),
-            tss: r.get::<f32, _>("tss"),
-            duration_secs: r.get::<i64, _>("duration_secs") as u32,
-        })
-        .collect())
 }
 
 /// Mark all incomplete calendar entries for a given workout and date as done.

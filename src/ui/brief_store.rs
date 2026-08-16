@@ -300,14 +300,23 @@ fn api_key() -> Option<String> {
 }
 
 /// The Intervals.icu athlete id and key, either possibly empty.
+///
+/// The keyring read is a synchronous D-Bus round trip, and this runs on a tokio
+/// worker: called directly it would park that worker for the whole exchange, and
+/// for as long as the unlock prompt sits there if the keyring is locked. Handing
+/// it to `spawn_blocking` keeps it off the async threads.
 async fn intervals_credentials(pool: &SqlitePool) -> (String, String) {
     let id = crate::data::settings::load_intervals(pool)
         .await
         .map(|s| s.athlete_id)
         .unwrap_or_default();
-    let key = keystore::get_secret(keystore::KEY_INTERVALS_API)
-        .unwrap_or(None)
-        .unwrap_or_default();
+    let key = tokio::task::spawn_blocking(|| {
+        keystore::get_secret(keystore::KEY_INTERVALS_API)
+            .unwrap_or(None)
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
     (id, key)
 }
 

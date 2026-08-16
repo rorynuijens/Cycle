@@ -124,7 +124,6 @@ pub async fn load_intervals_tss_pairs(pool: &SqlitePool) -> Result<Vec<(NaiveDat
 
 /// A full Intervals.icu activity row, used for display in History and AI coaching.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct IntervalsActivity {
     pub icu_id: String,
     pub date: NaiveDate,
@@ -205,6 +204,8 @@ pub async fn load_intervals_activities(pool: &SqlitePool) -> Result<Vec<Interval
         .collect())
 }
 
+/// One row of `intervals_workouts`. The columns are carried whole so callers
+/// can pick what they need; not every one has a reader today.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct IntervalsWorkout {

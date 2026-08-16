@@ -67,6 +67,8 @@ pub async fn log_ftp_change(
 
 /// Most recent FTP history entry as `(date, ftp_watts, source)`, if any.
 // TODO(ftp-detect): used by the phase-2 check-in card for cooldown decisions.
+// Phase-1 `ftp_history` CRUD from docs/ftp-detection.md §10 — caller-less by
+// design until the detector ships, not an oversight.
 #[allow(dead_code)]
 pub async fn latest_ftp_entry(pool: &SqlitePool) -> Result<Option<(String, u32, String)>> {
     let row = sqlx::query(

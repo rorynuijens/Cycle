@@ -88,11 +88,6 @@ impl CycleGtkWindow {
         self.window.present();
     }
 
-    #[allow(dead_code)]
-    pub fn add_toast(&self, toast: adw::Toast) {
-        self.toast_overlay.add_toast(toast);
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn build_ui(
         &self,

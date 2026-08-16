@@ -49,8 +49,6 @@ pub struct PlayerPage {
     tss_total: gtk::Label,
     kj_total: gtk::Label,
     pause_btn: gtk::Button,
-    #[allow(dead_code)]
-    skip_btn: gtk::Button,
     end_btn: gtk::Button,
     /// Reads the intensity dial's position, e.g. "90%".
     intensity_label: gtk::Label,
@@ -487,7 +485,6 @@ impl PlayerPage {
             tss_total,
             kj_total,
             pause_btn,
-            skip_btn,
             end_btn,
             last_readings: Rc::new(RefCell::new(ReadingsTracker::default())),
             power_countdown: Rc::new(Cell::new(0)),

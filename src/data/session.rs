@@ -46,19 +46,16 @@ impl Session {
         }
     }
 
-    #[allow(dead_code)]
     pub fn duration_secs(&self) -> u64 {
         let end = self.ended_at.unwrap_or_else(Utc::now);
         (end - self.started_at).num_seconds().max(0) as u64
     }
 
-    #[allow(dead_code)]
     pub fn kilojoules(&self) -> f32 {
         let avg_watts = self.average_power().unwrap_or(0.0);
         avg_watts * self.duration_secs() as f32 / 1000.0
     }
 
-    #[allow(dead_code)]
     pub fn average_power(&self) -> Option<f32> {
         let readings: Vec<f32> = self
             .data_points
@@ -212,7 +209,6 @@ impl Session {
     }
 
     /// Normalised Power — 30s rolling average → 4th power → mean → 4th root.
-    #[allow(dead_code)]
     pub fn normalised_power(&self) -> Option<f32> {
         let powers: Vec<f32> = self
             .data_points
@@ -223,13 +219,18 @@ impl Session {
         if powers.len() < 30 {
             return None;
         }
-        let rolling: Vec<f32> = powers
+        // Accumulated in f64: a rolling average near 300 W raised to the fourth
+        // is ~8×10⁹, and summing thousands of those in f32 — 24 bits of mantissa
+        // — starts dropping the low-order bits of each addend once the running
+        // total outgrows them. The inputs and the result stay f32; only the
+        // arithmetic in between is widened.
+        let rolling: Vec<f64> = powers
             .windows(30)
-            .map(|w| w.iter().sum::<f32>() / 30.0)
+            .map(|w| w.iter().map(|&p| p as f64).sum::<f64>() / 30.0)
             .collect();
-        let mean_fourth: f32 =
-            rolling.iter().map(|p| p.powi(4)).sum::<f32>() / rolling.len() as f32;
-        Some(mean_fourth.powf(0.25))
+        let mean_fourth: f64 =
+            rolling.iter().map(|p| p.powi(4)).sum::<f64>() / rolling.len() as f64;
+        Some(mean_fourth.powf(0.25) as f32)
     }
 
     /// Peak average power over a rolling window of `duration_secs` consecutive data points.
@@ -251,7 +252,6 @@ impl Session {
     /// Training Stress Score.
     ///
     /// `fallback_ftp` is used only when the session carries no stamped FTP.
-    #[allow(dead_code)]
     pub fn tss(&self, fallback_ftp: u32) -> Option<f32> {
         let ftp = self.scoring_ftp(fallback_ftp);
         let np = self.normalised_power()?;
@@ -408,7 +408,6 @@ pub struct LiveReadings {
     pub heart_rate_bpm: Option<u32>,
     pub cadence_rpm: Option<u32>,
     pub speed_kmh: Option<f32>,
-    #[allow(dead_code)]
     pub resistance_target_watts: Option<u32>,
     /// Which radio carried this reading. Defaults to BLE, so only ANT+ sources
     /// need to say so.

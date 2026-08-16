@@ -149,28 +149,3 @@ pub async fn load_time_off_between(
         })
         .collect())
 }
-
-#[allow(dead_code)]
-pub async fn load_upcoming_time_off(pool: &SqlitePool, limit: u32) -> Result<Vec<TimeOffEntry>> {
-    let today = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    let rows = sqlx::query(
-        "SELECT date, notes FROM time_off_entries WHERE date >= ? ORDER BY date LIMIT ?",
-    )
-    .bind(&today)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| {
-            let date = NaiveDate::parse_from_str(r.get("date"), "%Y-%m-%d").ok()?;
-            Some(TimeOffEntry {
-                date,
-                notes: r.get::<String, _>("notes"),
-            })
-        })
-        .collect())
-}

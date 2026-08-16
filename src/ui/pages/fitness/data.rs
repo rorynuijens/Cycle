@@ -39,8 +39,11 @@ pub struct RetroPromptData {
     pub icu_acts: Vec<db::IntervalsActivity>,
     pub intervals_all: Vec<(NaiveDate, f32)>,
     pub wellness: Vec<db::WellnessEntry>,
-    /// All sessions ever — the fitness trend needs history from before the period.
-    pub all_records: Vec<db::SessionRecord>,
+    /// Every ride ever, as summaries — the fitness trend needs history from
+    /// before the period. Summaries, not records: the trend only reads stored
+    /// metrics, and loading each ride's samples to compute figures the columns
+    /// already hold costs half a megabyte of JSON per riding hour.
+    pub all_rides: Vec<db::SessionSummary>,
     pub athlete_context: String,
 }
 
@@ -63,7 +66,7 @@ pub async fn load_retro_prompt_data(
             &today.format("%Y-%m-%d").to_string(),
         )
         .await?,
-        all_records: db::load_session_records(pool).await?,
+        all_rides: db::load_session_summaries(pool).await?,
         athlete_context: settings::coaching_context(pool).await?,
     })
 }

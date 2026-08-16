@@ -457,7 +457,7 @@ impl CoachCard {
                     icu_acts,
                     intervals_all,
                     wellness,
-                    all_records,
+                    all_rides,
                     athlete_context,
                 } = match load_retro_prompt_data(
                     &pool_task, &start_utc, &end_utc, start_date, today,
@@ -472,8 +472,6 @@ impl CoachCard {
                     }
                 };
 
-                let all_rides: Vec<db::SessionSummary> =
-                    all_records.iter().map(|r| r.summary()).collect();
                 let end = compute_load_metrics(&all_rides, &intervals_all, ftp_watts, today);
                 // Fitness at the start of the period, so the prompt can say
                 // which way the trend went rather than just where it landed.

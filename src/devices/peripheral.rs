@@ -59,7 +59,6 @@ impl Transport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ConnectionState {
     Disconnected,
     Scanning,
@@ -70,7 +69,6 @@ pub enum ConnectionState {
 
 #[derive(Debug, Clone)]
 pub struct PeripheralInfo {
-    #[allow(dead_code)]
     pub address: String,
     pub name: String,
     pub role: PeripheralRole,

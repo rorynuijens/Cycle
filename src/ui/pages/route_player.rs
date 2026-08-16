@@ -1275,45 +1275,4 @@ impl RoutePlayerPage {
         vbox.append(&value_label);
         (vbox, value_label)
     }
-
-    #[allow(dead_code)]
-    fn metric_card(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
-        let card = gtk::Box::builder()
-            .css_classes(["card"])
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .margin_top(18)
-            .margin_bottom(18)
-            .margin_start(18)
-            .margin_end(18)
-            .valign(gtk::Align::Center)
-            .build();
-
-        vbox.append(
-            &gtk::Label::builder()
-                .label(title)
-                .css_classes(["caption", "dim-label"])
-                .halign(gtk::Align::Start)
-                .build(),
-        );
-
-        let mut classes = vec!["title-1", "numeric"];
-        classes.extend_from_slice(value_css);
-
-        let value_label = gtk::Label::builder()
-            .label(initial)
-            .css_classes(classes)
-            .halign(gtk::Align::Start)
-            .build();
-
-        vbox.append(&value_label);
-        card.append(&vbox);
-
-        (card, value_label)
-    }
 }
