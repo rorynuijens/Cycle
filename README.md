@@ -1,5 +1,9 @@
 # Cycle
 
+This is my hobby project. I am not a coder, so all the code is written by Claude. Yes, I am one of those disliked vibe coders :-). That said, this app serves my needs and has been developed according to the hardware that I have available. If you would like to use this app you are of course free to do so. 
+
+---
+
 Cycle is a native GNOME application for indoor cycling training, built in Rust with GTK4 and libadwaita. It connects to smart trainers and sensors over Bluetooth LE and ANT+, executes structured workouts with automatic resistance control (ERG), records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
 
 The application targets GNOME desktop environments and is distributed as a Flatpak.
