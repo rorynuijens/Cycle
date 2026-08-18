@@ -1,6 +1,6 @@
 # Cycle
 
-This is my hobby project. I am not a coder, so all the code is written by Claude. Yes, I am one of those disliked vibe coders :-). That said, this app serves my needs and has been developed according to the hardware that I have available. If you would like to use this app you are of course free to do so. 
+This is my hobby project. I am not a coder, so all the code is written by Claude. Yes, I am one of those disliked vibe coders :-). That said, this app serves my needs and has been developed according to the hardware that I have available. If you would like to use this app you are of course free to do so. If you have any issues with the app, or if your hardware isn't supported or if you have any feature request, you are free to let me know.
 
 ---
 
