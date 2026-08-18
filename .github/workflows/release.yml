@@ -1,0 +1,242 @@
+name: Release
+
+# Tagging v0.2.0 builds the flatpak, publishes it into the OSTree repo served
+# from the gh-pages branch, and attaches a single-file bundle to the GitHub
+# release. See docs/publishing.md for the one-time GPG key setup.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without the leading v)'
+        required: true
+
+permissions:
+  contents: write
+
+# Two releases must never race: they would both rewrite the gh-pages branch and
+# one would silently drop the other's commit from the OSTree repo.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  APP_ID: io.github.rorynuijens.Cycle
+  BRANCH: stable
+  FLATHUB_REPO: https://dl.flathub.org/repo/flathub.flatpakrepo
+  # Deliberately outside the workspace: the manifest's `type: dir` source copies
+  # the checkout wholesale, and the OSTree repo must not end up inside the build.
+  PAGES: /pages
+
+jobs:
+  release:
+    name: build · publish · release
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:42
+      # flatpak-builder needs bubblewrap, which needs more than the default
+      # container sandbox allows.
+      options: --privileged
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            flatpak flatpak-builder ostree gnupg2 \
+            git tar xz ca-certificates
+
+      - uses: actions/checkout@v4
+
+      # flatpak-builder shells out to git for the `type: dir` source; without
+      # this it refuses to touch a tree owned by a different uid.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory '*'
+
+      - name: Resolve and verify the version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+            version='${{ inputs.version }}'
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error::Tag says $version but Cargo.toml says $cargo_version." \
+                 "Bump Cargo.toml (and Cargo.lock) before tagging."
+            exit 1
+          fi
+
+          # GNOME Software shows the release notes from the metainfo, so a
+          # release without an entry there ships a blank changelog.
+          if ! grep -q "<release version=\"$version\"" \
+                 "data/$APP_ID.metainfo.xml"; then
+            echo "::error::data/$APP_ID.metainfo.xml has no <release version=\"$version\"> entry."
+            exit 1
+          fi
+
+      - name: Import the repo signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ] || [ -z "${GPG_KEY_ID:-}" ]; then
+            echo "::error::FLATPAK_GPG_PRIVATE_KEY / FLATPAK_GPG_KEY_ID secrets are not set." \
+                 "See docs/publishing.md."
+            exit 1
+          fi
+          printf '%s' "$GPG_PRIVATE_KEY" | base64 -d | gpg --batch --import
+          gpg --batch --list-secret-keys "$GPG_KEY_ID" > /dev/null
+
+      # The OSTree repo is cumulative: clients resolve updates against the
+      # commits already published, so the existing gh-pages content has to come
+      # back before the new build is committed into it. Only the content is
+      # fetched, not the history — this branch is republished as a fresh root
+      # commit every time so the git repo does not grow without bound.
+      - name: Fetch the published repo
+        run: |
+          set -euo pipefail
+          git init -b gh-pages "$PAGES"
+          cd "$PAGES"
+          git remote add origin \
+            "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git"
+          if git fetch --depth=1 origin gh-pages; then
+            git checkout FETCH_HEAD -- .
+            echo "Restored $(du -sh repo 2>/dev/null | cut -f1) of existing repo"
+          else
+            echo "No gh-pages branch yet — starting a new repo"
+          fi
+
+      - name: Install the runtime and SDK
+        run: |
+          flatpak remote-add --if-not-exists flathub "$FLATHUB_REPO"
+
+      - name: Build and commit to the repo
+        env:
+          GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          flatpak-builder \
+            --disable-rofiles-fuse \
+            --force-clean \
+            --install-deps-from=flathub \
+            --repo="$PAGES/repo" \
+            --default-branch="$BRANCH" \
+            --gpg-sign="$GPG_KEY_ID" \
+            build-dir "$APP_ID.yml"
+
+      - name: Update the repo metadata
+        env:
+          GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          # --prune drops objects no longer reachable from the kept commits;
+          # --prune-depth=3 keeps the last three releases installable, which is
+          # what makes a rollback possible without blowing up the Pages size
+          # limit. Add --generate-static-deltas here if bandwidth ever matters
+          # more than repo size; it roughly doubles the latter.
+          flatpak build-update-repo "$PAGES/repo" \
+            --title="Cycle" \
+            --default-branch="$BRANCH" \
+            --gpg-sign="$GPG_KEY_ID" \
+            --prune --prune-depth=3
+
+      - name: Write the remote description
+        env:
+          GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          pages_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+
+          gpg --export "$GPG_KEY_ID" > "$PAGES/cycle.gpg"
+          key_line=$(base64 -w0 < "$PAGES/cycle.gpg")
+
+          cat > "$PAGES/cycle.flatpakrepo" <<EOF
+          [Flatpak Repo]
+          Title=Cycle
+          Url=$pages_url/repo/
+          Homepage=https://github.com/${GITHUB_REPOSITORY}
+          Comment=Indoor cycling training with smart trainer control
+          Description=Structured ERG workouts, session recording and training load tracking for GNOME.
+          GPGKey=$key_line
+          EOF
+
+          # An OSTree repo is thousands of small files; Jekyll would try to
+          # process every one of them and time the Pages build out.
+          touch "$PAGES/.nojekyll"
+
+          cat > "$PAGES/index.html" <<EOF
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Cycle — Flatpak repository</title>
+          <style>
+            body { font-family: system-ui, sans-serif; max-width: 40rem;
+                   margin: 4rem auto; padding: 0 1.5rem; line-height: 1.6; }
+            pre  { background: #f4f4f4; padding: 1rem; border-radius: .5rem;
+                   overflow-x: auto; }
+            @media (prefers-color-scheme: dark) {
+              body { background: #1d1d20; color: #f6f5f4; }
+              pre  { background: #2d2d31; }
+              a    { color: #78aeed; }
+            }
+          </style>
+          <h1>Cycle</h1>
+          <p>Indoor cycling training for GNOME — smart trainer control, structured
+             workouts, session recording.</p>
+          <h2>Install</h2>
+          <pre>flatpak remote-add --if-not-exists cycle $pages_url/cycle.flatpakrepo
+          flatpak install cycle $APP_ID</pre>
+          <p>Updates then arrive with <code>flatpak update</code>.</p>
+          <p>Latest version: ${{ steps.version.outputs.version }} —
+             <a href="https://github.com/${GITHUB_REPOSITORY}">source and releases</a></p>
+          EOF
+
+      - name: Publish to gh-pages
+        run: |
+          set -euo pipefail
+          cd "$PAGES"
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Publish Cycle ${{ steps.version.outputs.version }}"
+          # A fresh root commit each release: the OSTree repo carries its own
+          # history, so git history here is pure weight.
+          git push --force origin gh-pages
+
+      - name: Build the standalone bundle
+        run: |
+          # --runtime-repo is what lets a bundle install on a machine that does
+          # not have the GNOME runtime yet; without it the install fails with an
+          # unresolved-dependency error.
+          flatpak build-bundle "$PAGES/repo" \
+            "cycle-${{ steps.version.outputs.version }}.flatpak" \
+            "$APP_ID" "$BRANCH" \
+            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Cycle ${{ steps.version.outputs.version }}
+          files: cycle-${{ steps.version.outputs.version }}.flatpak
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Add the repository once and get updates from then on:
+
+            ```
+            flatpak remote-add --if-not-exists cycle https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/cycle.flatpakrepo
+            flatpak install cycle io.github.rorynuijens.Cycle
+            ```
+
+            Or install the attached bundle directly (no automatic updates):
+
+            ```
+            flatpak install ./cycle-${{ steps.version.outputs.version }}.flatpak
+            ```
