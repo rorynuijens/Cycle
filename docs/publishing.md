@@ -1,110 +1,171 @@
 # Publishing releases
 
-Cycle is distributed from its own Flatpak repository, served as static files
-from the `gh-pages` branch of this repo. Users add the remote once and get
-updates from `flatpak update` from then on, exactly as they would from Flathub.
+Cycle is not on Flathub. It is published from **its own Flatpak repository** — which is just a
+folder of files at a web address that `flatpak` knows how to download from. Users add that address
+once, and `flatpak update` brings them new versions from then on, exactly as it would from Flathub.
 
-`.github/workflows/release.yml` does the work: tag `vX.Y.Z`, and it builds the
-flatpak, commits it into the OSTree repo, republishes `gh-pages`, and attaches a
-single-file `.flatpak` bundle to the GitHub release.
+| | |
+|---|---|
+| Source | `https://github.com/rorynuijens/Cycle` |
+| Flatpak repo | `https://rorynuijens.github.io/Cycle/repo/` |
+| Built by | `.github/workflows/release.yml` |
+
+---
+
+## How it works, in one paragraph
+
+You put a **tag** on a commit — a label saying "this exact code is version 0.1.0". GitHub notices
+the tag and runs the workflow: it compiles the app, adds the result to the Flatpak repository, and
+pushes that repository to a branch called `gh-pages`, which GitHub Pages serves on the web. It also
+creates a release page with a single downloadable `.flatpak` file attached. Each build is stamped
+with a **signing key** so users' computers can check the files really came from you.
 
 ---
 
 ## One-time setup
 
-### 1. Create a repository signing key
+Do this once. It takes about ten minutes.
 
-The key signs the OSTree commits and the repo summary. It is *not* a personal
-identity key — it identifies the repository, so generate a dedicated one and
-leave it without a passphrase (CI cannot type one).
+### 1. Make the signing key
 
-```bash
-gpg --batch --quick-gen-key "Cycle Flatpak Repo <noreply@example.invalid>" \
-    default default never
-gpg --list-keys --with-colons "Cycle Flatpak Repo" | awk -F: '/^fpr/ {print $10; exit}'
-```
-
-That fingerprint is the key ID used below. Back the secret key up somewhere
-durable — losing it means every existing user has to remove and re-add the
-remote:
+On your laptop:
 
 ```bash
-gpg --export-secret-keys --armor <KEYID> > ~/cycle-repo-signing-key.asc
+# create the key — no passphrase, because the build server cannot type one
+gpg --batch --passphrase '' --quick-gen-key \
+    "Cycle Flatpak Repo <noreply@example.invalid>" default default never
+
+# find its ID
+KEYID=$(gpg --list-keys --with-colons "Cycle Flatpak Repo" | awk -F: '/^fpr/ {print $10; exit}')
+echo "Your key ID: $KEYID"
+
+# write out the two values you will paste into GitHub
+echo "$KEYID" > ~/cycle-secret-key-id.txt
+gpg --export-secret-keys "$KEYID" | base64 -w0 > ~/cycle-secret-private-key.txt
+
+# and a backup of the key itself — keep this somewhere safe
+gpg --export-secret-keys --armor "$KEYID" > ~/cycle-repo-signing-key.asc
 ```
 
-### 2. Add the two repository secrets
+**Back up `cycle-repo-signing-key.asc`.** If you lose it, every existing user has to remove and
+re-add the remote before they can update again.
 
-Settings → Secrets and variables → Actions:
+### 2. Add two secrets
 
-| Secret | Value |
+Go to <https://github.com/rorynuijens/Cycle/settings/secrets/actions> and click *New repository
+secret* twice. The names must match exactly.
+
+| Name | Value |
 |---|---|
-| `FLATPAK_GPG_KEY_ID` | the fingerprint from step 1 |
-| `FLATPAK_GPG_PRIVATE_KEY` | `gpg --export-secret-keys <KEYID> \| base64 -w0` |
+| `FLATPAK_GPG_KEY_ID` | contents of `~/cycle-secret-key-id.txt` |
+| `FLATPAK_GPG_PRIVATE_KEY` | contents of `~/cycle-secret-private-key.txt` (one very long line) |
 
-Base64, not armor — it survives the secret store without newline mangling.
+Then delete `~/cycle-secret-private-key.txt` — it is your private key in plain text. Keep the
+`.asc` backup.
 
-### 3. Enable GitHub Pages
+No access token is needed; the workflow uses the one GitHub Actions provides to itself.
 
-Settings → Pages → Source: **Deploy from a branch**, branch `gh-pages`, folder
-`/ (root)`.
+### 3. Turn on Pages — but only after the first release
 
-The branch does not exist until the first release runs, so do this immediately
-after the first successful workflow run.
+The `gh-pages` branch does not exist until the first successful run creates it, so this step comes
+*after* cutting the first tag, not before. Once the workflow has gone green:
+
+<https://github.com/rorynuijens/Cycle/settings/pages> → Source: *Deploy from a branch* →
+Branch `gh-pages`, folder `/ (root)` → Save.
+
+Give it a couple of minutes, then `https://rorynuijens.github.io/Cycle/` should show the install
+page.
 
 ---
 
 ## Cutting a release
 
-1. Bump `version` in `Cargo.toml`, then run a build so `Cargo.lock` picks it up.
-2. Add a `<release version="X.Y.Z" date="...">` entry with real notes to
-   `data/io.github.rorynuijens.Cycle.metainfo.xml`. GNOME Software shows these
-   verbatim; the workflow refuses to publish without one.
-3. If `Cargo.lock` changed at all, regenerate the vendored source list — the
-   flatpak build is offline and fails on a stale one:
-   ```bash
-   python3 flatpak-cargo-generator.py Cargo.lock -o build-aux/cargo-sources.json
+The first one needs **no file edits at all**: `Cargo.toml` already says `0.1.0` and the metainfo
+already has a matching entry, so this works as-is —
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Watch it at <https://github.com/rorynuijens/Cycle/actions>. Expect 15–30 minutes; it compiles
+everything from scratch. Mistakes are caught in the first minute, before the build starts.
+
+For every release after that:
+
+1. Change `version` in `Cargo.toml` (e.g. to `0.2.0`) and run `cargo build` so `Cargo.lock` picks
+   the number up.
+2. Add an entry at the top of the `<releases>` list in
+   `data/io.github.rorynuijens.Cycle.metainfo.xml`:
+   ```xml
+   <release version="0.2.0" date="2026-08-20">
+     <description><p>What changed, in a sentence or two.</p></description>
+   </release>
    ```
-   (from [flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools))
-4. Commit, then tag and push:
+   GNOME Software shows this text verbatim. The workflow refuses to publish without it.
+3. Commit, then tag and push:
    ```bash
-   git tag v0.2.0 && git push origin main v0.2.0
+   git tag v0.2.0
+   git push origin main v0.2.0
    ```
 
-`workflow_dispatch` with an explicit version re-runs the same pipeline if a
-release needs rebuilding.
+The tag, `Cargo.toml` and the metainfo must all agree on the version, or the workflow stops.
+
+**You do not need to regenerate `build-aux/cargo-sources.json` for a version bump.** That file
+lists your *dependencies*, and bumping your own version does not change them. Regenerate it only
+when you add or update a crate — the flatpak build is offline and fails on a stale list:
+
+```bash
+python3 flatpak-cargo-generator.py Cargo.lock -o build-aux/cargo-sources.json
+```
+
+(from [flatpak-builder-tools](https://github.com/flatpak/flatpak-builder-tools))
 
 ---
 
-## What users run
+## Checking it worked, as a user would
+
+Your current copy was installed from a local folder, so remove it first. **This does not delete
+your rides** — they live in `~/.var/app/io.github.rorynuijens.Cycle` and stay put.
 
 ```bash
+flatpak uninstall io.github.rorynuijens.Cycle
 flatpak remote-add --if-not-exists cycle https://rorynuijens.github.io/Cycle/cycle.flatpakrepo
 flatpak install cycle io.github.rorynuijens.Cycle
 ```
 
-Or, without automatic updates, the bundle attached to any release:
+---
+
+## When something goes wrong
+
+Open the failed run under the *Actions* tab. Step names say where it broke:
+
+| Step | Meaning |
+|---|---|
+| *Resolve and verify the version* | the tag, `Cargo.toml` and the metainfo disagree |
+| *Import the repo signing key* | a secret is missing, misnamed, or pasted wrong — it must be the base64 line |
+| *Build and commit to the repo* | a real compile failure, or a stale `cargo-sources.json` |
+| *Publish to gh-pages* | the workflow could not push; check Actions has write permission |
+
+A tag is not permanent. To scrap one and try again:
 
 ```bash
-flatpak install ./cycle-0.2.0.flatpak
+git tag -d v0.1.0                    # delete locally
+git push origin :refs/tags/v0.1.0    # delete on GitHub
 ```
+
+Fix the problem and tag again with the same number.
 
 ---
 
 ## Notes and limits
 
-- **Repo size.** GitHub Pages allows roughly 1 GB per site and 100 GB of
-  bandwidth a month. `build-update-repo --prune-depth=3` keeps the last three
-  releases installable and drops the rest, which holds the repo to a few
-  hundred MB at most. Static deltas are *not* generated — they trade repo size
+- **Repo size.** GitHub Pages allows roughly 1 GB per site and 100 GB of bandwidth a month.
+  `--prune-depth=3` keeps the last three releases installable and drops the rest, which holds this
+  to a few hundred MB. Static deltas are deliberately *not* generated — they trade repository size
   for download size, and size is the scarcer resource here.
-- **`gh-pages` history is disposable.** Each release force-pushes a fresh root
-  commit. The OSTree repo carries its own history, so git history on that branch
-  would only accumulate binary weight.
-- **Reachability.** GitHub itself 404s from some networks (including the
-  developer's). `github.io` is a separate domain and may behave differently —
-  verify `flatpak remote-add` actually works from the network you care about
-  before pointing anyone at it. If it does not, the same repository layout
-  publishes unchanged to Codeberg Pages; only the URL in `cycle.flatpakrepo`
-  changes.
-- **Flathub.** Not used. If that ever changes, nothing here conflicts with a
-  Flathub submission — the manifest is the same one Flathub would build.
+- **`gh-pages` history is disposable.** Each release force-pushes a fresh root commit. The Flatpak
+  repository carries its own history internally; git history on that branch would only accumulate
+  binary weight.
+- **Flathub.** Not used. Nothing here conflicts with a Flathub submission if that ever changes —
+  the manifest is the same one Flathub would build.
