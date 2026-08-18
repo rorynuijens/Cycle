@@ -169,20 +169,34 @@ fn parse_gpx(data: &[u8]) -> Result<Route> {
 
     let text = std::str::from_utf8(data).context("GPX file is not valid UTF-8")?;
     let mut reader = Reader::from_str(text);
-    reader.config_mut().trim_text(true);
+    // Deliberately NOT trim_text: the reader splits character data around every
+    // entity reference, so trimming each piece would eat the spaces on either
+    // side of an `&amp;` inside a route name. Text is accumulated whole and
+    // trimmed once, below.
+    reader.config_mut().trim_text(false);
 
     let mut name = String::from("GPX Route");
     let mut raw_pts: Vec<(f64, f64, f32)> = Vec::new(); // (lat, lng, elevation_m)
     let mut in_name = false;
     let mut in_ele = false;
+    let mut text_buf = String::new();
     let mut current_lat: Option<f64> = None;
     let mut current_lng: Option<f64> = None;
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match e.name().as_ref() {
-                b"name" => in_name = true,
-                b"ele" => in_ele = true,
+            // Only a Start opens a text element — an empty `<name/>` never sends a
+            // matching End, so treating it as an opener would leave the flag stuck
+            // and swallow unrelated text into the name.
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"name" => {
+                    in_name = true;
+                    text_buf.clear();
+                }
+                b"ele" => {
+                    in_ele = true;
+                    text_buf.clear();
+                }
                 b"trkpt" | b"rtept" | b"wpt" => {
                     let lat = e
                         .attributes()
@@ -207,9 +221,43 @@ fn parse_gpx(data: &[u8]) -> Result<Route> {
                 }
                 _ => {}
             },
+            // An empty element carries the same attributes but sends no End, so
+            // trackpoint coordinates are still read from it.
+            Ok(Event::Empty(e)) => {
+                if matches!(e.name().as_ref(), b"trkpt" | b"rtept" | b"wpt") {
+                    let coord = |key: &[u8]| {
+                        e.attributes()
+                            .filter_map(|a| a.ok())
+                            .find(|a| a.key.as_ref() == key)
+                            .and_then(|a| {
+                                std::str::from_utf8(a.value.as_ref())
+                                    .ok()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                            })
+                    };
+                    current_lat = coord(b"lat");
+                    current_lng = coord(b"lon");
+                }
+            }
             Ok(Event::End(e)) => match e.name().as_ref() {
-                b"name" => in_name = false,
-                b"ele" => in_ele = false,
+                b"name" => {
+                    // The first name in the file wins, as before.
+                    if name == "GPX Route" && !text_buf.trim().is_empty() {
+                        name = text_buf.trim().to_string();
+                    }
+                    in_name = false;
+                }
+                b"ele" => {
+                    if let (Some(lat), Some(lng)) = (current_lat, current_lng) {
+                        if let Ok(ele) = text_buf.trim().parse::<f32>() {
+                            // Elevation completes the pending point
+                            raw_pts.push((lat, lng, ele));
+                            current_lat = None;
+                            current_lng = None;
+                        }
+                    }
+                    in_ele = false;
+                }
                 b"trkpt" | b"rtept" | b"wpt" => {
                     if let (Some(lat), Some(lng)) = (current_lat, current_lng) {
                         let ele = raw_pts.last().map(|&(_, _, e)| e).unwrap_or(0.0);
@@ -220,19 +268,18 @@ fn parse_gpx(data: &[u8]) -> Result<Route> {
                 }
                 _ => {}
             },
-            Ok(Event::Text(e)) => {
-                let t = e.unescape().unwrap_or_default();
-                if in_name && name == "GPX Route" {
-                    name = t.trim().to_string();
-                } else if in_ele {
-                    if let (Some(lat), Some(lng)) = (current_lat, current_lng) {
-                        if let Ok(ele) = t.trim().parse::<f32>() {
-                            // Update elevation for the current pending point
-                            raw_pts.push((lat, lng, ele));
-                            current_lat = None;
-                            current_lng = None;
-                            in_ele = false;
-                        }
+            // Character data arrives in pieces: quick-xml ends a Text event at
+            // every entity reference and emits the reference as its own event.
+            // Both are appended so the element's full text survives.
+            Ok(Event::Text(e)) if in_name || in_ele => {
+                if let Ok(decoded) = e.xml10_content() {
+                    text_buf.push_str(&decoded);
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_name || in_ele => {
+                if let Ok(raw) = e.decode() {
+                    if let Ok(resolved) = quick_xml::escape::unescape(&format!("&{raw};")) {
+                        text_buf.push_str(&resolved);
                     }
                 }
             }
@@ -402,5 +449,24 @@ mod tests {
         assert_eq!(route.name, "Test Route");
         assert_eq!(route.points.len(), 3);
         assert!(route.total_distance_m > 10_000.0, "should be > 10 km");
+    }
+
+    // quick-xml 0.41 replaced the single `unescape()` call this parser used with
+    // separate decode and entity-resolution steps. Entity references only appear
+    // in real-world route names, so nothing else would catch getting that wrong.
+    #[test]
+    fn should_resolve_entity_references_in_a_gpx_name() {
+        let gpx = br#"<?xml version="1.0"?>
+<gpx version="1.1">
+  <trk>
+    <name>Alpe d&apos;Huez &amp; Col de Sarenne</name>
+    <trkseg>
+      <trkpt lat="45.0" lon="6.0"><ele>720</ele></trkpt>
+      <trkpt lat="45.1" lon="6.1"><ele>1120</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>"#;
+        let route = parse_gpx(gpx).unwrap();
+        assert_eq!(route.name, "Alpe d'Huez & Col de Sarenne");
     }
 }
