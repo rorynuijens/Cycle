@@ -10,6 +10,63 @@ The application targets GNOME desktop environments and is distributed as a Flatp
 
 ---
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Workout player</b> — a structured workout loaded and ready: target power, the live power, cadence and heart-rate row, and the colour-coded workout graph.<br><br>
+      <img src="docs/screenshots/workout-player.png" alt="Workout player" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <b>Route ride</b> — a GPX course underway, with live gradient, speed, the next climb called out, and the map following the rider.<br><br>
+      <img src="docs/screenshots/route-ride-map.png" alt="Route ride" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Route overview</b> — the whole course on the map with the look-ahead elevation chart beneath it.<br><br>
+      <img src="docs/screenshots/route-ride-overview.png" alt="Route overview" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <b>Route preview</b> — elevation profile, average gradient and route map before committing to the ride.<br><br>
+      <img src="docs/screenshots/route-details.png" alt="Route preview" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Workout library</b> — structured workouts grouped by training category, each with duration, TSS and a shape preview.<br><br>
+      <img src="docs/screenshots/library.png" alt="Workout library" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <b>Training calendar</b> — the week view, showing scheduled sessions with their planned duration and TSS.<br><br>
+      <img src="docs/screenshots/calendar-week.png" alt="Training calendar" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Scheduled workout</b> — the detail dialog for a calendar entry, from which the workout can be loaded or removed.<br><br>
+      <img src="docs/screenshots/calendar-workout-details.png" alt="Scheduled workout" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <b>Fitness</b> — CTL, ATL and TSB over time, wellness synced from Intervals.icu, and time spent in each power and heart-rate zone.<br><br>
+      <img src="docs/screenshots/fitness.png" alt="Fitness" width="100%">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Coaching</b> — the training program with its adjustments, the day's brief, and the athlete's stated goals.<br><br>
+      <img src="docs/screenshots/coaching.png" alt="Coaching" width="100%">
+    </td>
+    <td width="50%" valign="top">
+      <b>Devices</b> — saved trainers and sensors across BLE and ANT+, with automatic reconnection.<br><br>
+      <img src="docs/screenshots/devices.png" alt="Devices" width="100%">
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Features
 
 ### Device connectivity
