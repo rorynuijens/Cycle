@@ -109,6 +109,16 @@ jobs:
           if git fetch --depth=1 origin gh-pages; then
             git checkout FETCH_HEAD -- .
             echo "Restored $(du -sh repo 2>/dev/null | cut -f1) of existing repo"
+            # git does not track empty directories, so a repo restored out of it
+            # is missing every empty one OSTree expects. `build-update-repo
+            # --prune` then fails with:
+            #   error: Listing refs: opendir(refs/remotes): No such file...
+            # This can only bite from the second release onward — the first run
+            # has no gh-pages to restore and creates the repo itself, complete.
+            # Do not replace this with .gitkeep files: a stray file under
+            # refs/ would be read as a ref.
+            mkdir -p repo/refs/heads repo/refs/mirrors repo/refs/remotes \
+                     repo/state repo/tmp/cache repo/extensions
           else
             echo "No gh-pages branch yet — starting a new repo"
           fi
