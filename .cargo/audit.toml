@@ -1,0 +1,20 @@
+# Read by cargo-audit (and so by rustsec/audit-check in CI). This file does not
+# affect builds — cargo only reads config.toml from .cargo/.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack, timing sidechannel key recovery in `rsa`.
+    #
+    # Kept rather than fixed because there is no fixed version upstream: the
+    # advisory has said "no fixed upgrade is available" since 2023-11.
+    #
+    # `rsa` is not compiled into Cycle. It sits in Cargo.lock as an optional
+    # dependency of sqlx's MySQL support, which this project does not enable —
+    # `cargo tree --target all -i rsa` finds nothing, which is why cargo-deny
+    # (which builds the real graph) is happy while cargo-audit (which reads the
+    # lockfile literally) is not.
+    #
+    # Revisit if a fixed `rsa` ships, or if sqlx features ever change: the moment
+    # it enters the build graph this ignore is wrong.
+    "RUSTSEC-2023-0071",
+]

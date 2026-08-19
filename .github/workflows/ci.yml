@@ -27,6 +27,7 @@ jobs:
           dnf install -y \
             gcc pkgconf-pkg-config git tar \
             gtk4-devel libadwaita-devel libshumate-devel glib2-devel \
+            dbus-devel \
             cargo rust clippy rustfmt
 
       - uses: actions/checkout@v4
@@ -46,6 +47,12 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # audit-check reports through a check run, which the workflow's read-only
+    # default token cannot create — it fails with "Resource not accessible by
+    # integration" before it ever gets to the advisories.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
