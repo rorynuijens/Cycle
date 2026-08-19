@@ -88,7 +88,7 @@ pub async fn latest_ftp_entry(pool: &SqlitePool) -> Result<Option<(String, u32, 
 
 /// Persist changes to the (single) athlete profile row.
 pub async fn update_athlete(pool: &SqlitePool, athlete: &AthleteProfile) -> Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE athletes
          SET name = ?, weight_kg = ?, ftp_watts = ?, max_hr = ?, resting_hr = ?
          WHERE id = ?",
@@ -101,6 +101,16 @@ pub async fn update_athlete(pool: &SqlitePool, athlete: &AthleteProfile) -> Resu
     .bind(athlete.id)
     .execute(pool)
     .await?;
+
+    // A mismatched id is not an sqlx error — the UPDATE simply matches nothing
+    // and reports success, which is indistinguishable from a real save at the
+    // call site. Say so loudly instead.
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            "update_athlete matched no row (id={}); profile was not persisted",
+            athlete.id
+        );
+    }
     Ok(())
 }
 
@@ -191,6 +201,28 @@ mod tests {
         let reloaded = load_or_create_athlete(&pool).await.unwrap();
         assert_eq!(reloaded.ftp_watts, 312);
         assert!((reloaded.weight_kg - 68.5).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn should_not_report_success_when_the_athlete_id_matches_no_row() {
+        // The onboarding wizard degrades to id = 0 if the initial load fails.
+        // UPDATE ... WHERE id = 0 touches nothing but still returns Ok, which
+        // is what made a failed save indistinguishable from a real one.
+        let pool = test_pool().await;
+        let real = load_or_create_athlete(&pool).await.unwrap();
+
+        let ghost = AthleteProfile {
+            id: 0,
+            ftp_watts: 999,
+            ..real.clone()
+        };
+        update_athlete(&pool, &ghost).await.unwrap();
+
+        // The stored row must be untouched by a write aimed at a missing id.
+        let reloaded = load_or_create_athlete(&pool).await.unwrap();
+        assert_eq!(reloaded.id, real.id);
+        assert_eq!(reloaded.ftp_watts, real.ftp_watts);
+        assert_ne!(reloaded.ftp_watts, 999);
     }
 
     #[tokio::test]

@@ -18,9 +18,14 @@ pub fn show(
 ) {
     let nav_view = adw::NavigationView::new();
 
+    // content_height is not optional here: every page body lives in a
+    // ScrolledWindow, which reports its *minimum* as its natural height, so a
+    // dialog left to size itself collapses to a sliver. AdwDialog clamps this
+    // down to the parent window on small screens, so an explicit height is safe.
     let dialog = adw::Dialog::builder()
         .title("Welcome to Cycle")
         .content_width(480)
+        .content_height(600)
         .build();
     dialog.set_child(Some(&nav_view));
 
@@ -296,35 +301,49 @@ pub fn show(
         .child(&ai_page_box)
         .build();
 
-    // ── Wire pages into NavigationView ────────────────────────────────────
+    // ── Persistence ───────────────────────────────────────────────────────
+    //
+    // Saving must not hang off any one button. AdwDialog can be dismissed with
+    // Escape or the close button, and until this was split out that threw away
+    // everything the rider had typed. Each step's writes live in an Rc closure
+    // so both the step button and the dialog's `closed` signal can run them.
 
-    nav_view.add(&profile_nav_page);
-    // icu_nav_page and ai_nav_page are pushed on demand
-
-    // Next from profile → push intervals page
-    {
-        let nav = nav_view.clone();
-        let icu_page = icu_nav_page.clone();
+    let save_profile: Rc<dyn Fn()> = {
         let pool_p = pool.clone();
         let rt_p = rt_handle.clone();
-        next_profile_btn.connect_clicked(move |_| {
-            let name_val = name_row.text().trim().to_string();
-            let ftp = ftp_adj.value() as u32;
-            let weight = weight_adj.value() as f32;
-            let max_hr = hr_adj.value() as u32;
+        // The wizard never asks for resting HR, so carry the stored value
+        // through instead of clobbering it with a literal.
+        let resting_hr = athlete.resting_hr;
+        Rc::new(move || {
             let id = athlete_id.get();
+            if id == 0 {
+                // load_or_create_athlete failed during construction. UPDATE ...
+                // WHERE id = 0 matches nothing and still returns Ok, so without
+                // this guard the save is a silent no-op.
+                tracing::error!("onboarding: no athlete row, profile not saved");
+                return;
+            }
 
+            // A SpinRow only writes typed text back to its adjustment on
+            // activate or focus-out. Reading the adjustment straight after a
+            // click therefore returns the *previous* value and silently saves
+            // the wrong number. update() forces the pending text through first.
+            ftp_row.update();
+            weight_row.update();
+            hr_row.update();
+
+            let name_val = name_row.text().trim().to_string();
             let updated = crate::data::athlete::AthleteProfile {
                 id,
-                name: if name_val.trim().is_empty() {
+                name: if name_val.is_empty() {
                     "Athlete".to_string()
                 } else {
                     name_val
                 },
-                ftp_watts: ftp,
-                weight_kg: weight,
-                max_hr,
-                resting_hr: 60,
+                ftp_watts: ftp_row.value() as u32,
+                weight_kg: weight_row.value() as f32,
+                max_hr: hr_row.value() as u32,
+                resting_hr,
             };
 
             let p = pool_p.clone();
@@ -333,7 +352,59 @@ pub fn show(
                     tracing::error!("onboarding update_athlete: {e}");
                 }
             });
+        })
+    };
 
+    let save_icu: Rc<dyn Fn()> = {
+        let pool_i = pool.clone();
+        let rt_i = rt_handle.clone();
+        Rc::new(move || {
+            let key = icu_key_row.text().trim().to_string();
+            if !key.is_empty() {
+                if let Err(e) = keystore::set_secret(keystore::KEY_INTERVALS_API, &key) {
+                    tracing::error!("save intervals.api_key failed: {e}");
+                } else {
+                    tracing::debug!("Intervals.icu API key saved (not logged)");
+                }
+            }
+
+            let id = icu_id_row.text().trim().to_string();
+            let p = pool_i.clone();
+            rt_i.spawn(async move {
+                if let Err(e) = settings::set_intervals_athlete_id(&p, &id).await {
+                    tracing::error!("save intervals.athlete_id failed: {e}");
+                }
+            });
+        })
+    };
+
+    let save_ai: Rc<dyn Fn()> = Rc::new(move || {
+        let key = ai_key_row.text().trim().to_string();
+        if !key.is_empty() {
+            if let Err(e) = keystore::set_secret(keystore::KEY_ANTHROPIC, &key) {
+                tracing::error!("save anthropic.api_key failed: {e}");
+            } else {
+                tracing::debug!("AI provider API key saved (not logged)");
+            }
+        }
+    });
+
+    // ── Wire pages into NavigationView ────────────────────────────────────
+
+    nav_view.add(&profile_nav_page);
+    // icu_nav_page and ai_nav_page are pushed on demand
+
+    // Set once the wizard completes normally, so the dismissal handler does not
+    // repeat writes the finish path has already made.
+    let finished = Rc::new(Cell::new(false));
+
+    // Next from profile → save, push intervals page
+    {
+        let nav = nav_view.clone();
+        let icu_page = icu_nav_page.clone();
+        let save = Rc::clone(&save_profile);
+        next_profile_btn.connect_clicked(move |_| {
+            save();
             nav.push(&icu_page);
         });
     }
@@ -347,53 +418,43 @@ pub fn show(
         });
     }
 
-    // Next from intervals → push AI page, save settings
+    // Next from intervals → save, push AI page
     {
         let nav = nav_view.clone();
         let ai_page = ai_nav_page.clone();
-        let pool_i = pool.clone();
-        let rt_i = rt_handle.clone();
+        let save = Rc::clone(&save_icu);
         next_icu_btn.connect_clicked(move |_| {
-            let key = icu_key_row.text().trim().to_string();
-            let id = icu_id_row.text().trim().to_string();
-            if !key.is_empty() {
-                if let Err(e) = keystore::set_secret(keystore::KEY_INTERVALS_API, &key) {
-                    tracing::error!("save intervals.api_key failed: {e}");
-                } else {
-                    tracing::debug!("Intervals.icu API key saved (not logged)");
-                }
-            }
-            let p = pool_i.clone();
-            rt_i.spawn(async move {
-                let _ = settings::set_intervals_athlete_id(&p, &id).await;
-            });
+            save();
             nav.push(&ai_page);
         });
     }
 
-    // Build the finish handler — shared by both Skip AI and Finish buttons
+    // Finish handler — shared by both Skip AI and Get Started
     let finish = {
         let pool_f = pool.clone();
         let rt_f = rt_handle.clone();
         let on_complete_f = Rc::clone(&on_complete);
+        let save_ai_f = Rc::clone(&save_ai);
+        let finished_f = Rc::clone(&finished);
         // Weak: both buttons that reach this closure are inside the dialog
         // (CLAUDE.md §2.4).
         Rc::new(glib::clone!(
             #[weak]
             dialog,
-            move |api_key: String| {
-                if !api_key.is_empty() {
-                    if let Err(e) = keystore::set_secret(keystore::KEY_ANTHROPIC, &api_key) {
-                        tracing::error!("save anthropic.api_key failed: {e}");
-                    } else {
-                        tracing::debug!("AI provider API key saved (not logged)");
-                    }
+            move |store_key: bool| {
+                if store_key {
+                    save_ai_f();
                 }
+                finished_f.set(true);
+
                 let p = pool_f.clone();
                 let rt = rt_f.clone();
                 rt.spawn(async move {
-                    let _ = settings::mark_first_use_complete(&p).await;
+                    if let Err(e) = settings::mark_first_use_complete(&p).await {
+                        tracing::error!("mark_first_use_complete failed: {e}");
+                    }
                 });
+
                 dialog.close();
                 on_complete_f();
             }
@@ -402,13 +463,32 @@ pub fn show(
 
     let finish_skip = Rc::clone(&finish);
     skip_ai_btn.connect_clicked(move |_| {
-        finish_skip(String::new());
+        finish_skip(false);
     });
 
     finish_btn.connect_clicked(move |_| {
-        let key = ai_key_row.text().trim().to_string();
-        finish(key);
+        finish(true);
     });
+
+    // Dismissing the wizard keeps whatever was entered. first_use_complete is
+    // deliberately NOT set here — the rider did not finish, so the dashboard
+    // should still offer the wizard next time.
+    {
+        let save_profile_c = Rc::clone(&save_profile);
+        let save_icu_c = Rc::clone(&save_icu);
+        let save_ai_c = Rc::clone(&save_ai);
+        let finished_c = Rc::clone(&finished);
+        // The handler is owned by the dialog, so it must not capture the dialog
+        // back — that is the leak described in CLAUDE.md §2.4.
+        dialog.connect_closed(move |_| {
+            if finished_c.get() {
+                return;
+            }
+            save_profile_c();
+            save_icu_c();
+            save_ai_c();
+        });
+    }
 
     // Present
     dialog.present(parent);

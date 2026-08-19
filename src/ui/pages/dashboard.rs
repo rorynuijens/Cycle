@@ -260,6 +260,10 @@ impl DashboardPage {
                 // Snapshot for the deferred UI build: taken now, at reload time,
                 // so it is current. An `Rc` cannot cross `spawn_to_main`.
                 let athlete_cb = athlete.borrow().clone();
+                // The snapshot above is for drawing. The onboarding wizard also
+                // has to *write* the shared cell afterwards, so keep the Rc as
+                // well — `on_done` runs on the main thread and may hold it.
+                let athlete_shared = Rc::clone(&athlete);
                 let on_start = Rc::clone(&on_start);
                 let on_view_fitness = Rc::clone(&on_view_fitness);
                 let on_open_calendar = Rc::clone(&on_open_calendar);
@@ -338,22 +342,56 @@ impl DashboardPage {
                                 .child(&get_started_btn)
                                 .build();
 
-                            let dynamic_ob = dynamic_top.clone();
+                            let rh_ob = Rc::clone(&reload_holder);
+                            let athlete_ob = Rc::clone(&athlete_shared);
                             get_started_btn.connect_clicked(move |btn| {
                                 let root = btn.root().and_downcast::<gtk::Window>();
                                 let pool_w = pool_ob.clone();
                                 let rt_w = rt_ob.clone();
-                                let dynamic_w = dynamic_ob.clone();
+                                let rh_w = Rc::clone(&rh_ob);
+                                let athlete_w = Rc::clone(&athlete_ob);
+                                let pool_re = pool_ob.clone();
+                                let rt_re = rt_ob.clone();
                                 super::onboarding::show(
                                     root.as_ref(),
                                     pool_w,
                                     rt_w,
                                     Rc::new(move || {
-                                        // After wizard, remove the status page so the
-                                        // dashboard reloads to the normal view next visit.
-                                        while let Some(child) = dynamic_w.first_child() {
-                                            dynamic_w.remove(&child);
-                                        }
+                                        // The wizard writes straight to the database,
+                                        // but every page, the workout engine and the
+                                        // Preferences window read the shared athlete
+                                        // cell, which still holds the profile loaded at
+                                        // startup. Leaving it stale is why Preferences
+                                        // opened on the old values and looked like
+                                        // nothing had been saved. Re-read the row, put
+                                        // it in the cell, then redraw.
+                                        let athlete_c = Rc::clone(&athlete_w);
+                                        let rh_c = Rc::clone(&rh_w);
+                                        let pool_c = pool_re.clone();
+                                        crate::ui::spawn_to_main(
+                                            &rt_re,
+                                            async move {
+                                                db::load_or_create_athlete(&pool_c).await
+                                            },
+                                            move |result| {
+                                                match result {
+                                                    Ok(profile) => {
+                                                        *athlete_c.borrow_mut() = profile;
+                                                    }
+                                                    Err(e) => tracing::error!(
+                                                        "reloading profile after setup: {e}"
+                                                    ),
+                                                }
+                                                // Clone the callback out before calling
+                                                // it: reload() rebuilds these widgets and
+                                                // holding the borrow across that risks a
+                                                // re-entrant borrow (CLAUDE.md §2.4).
+                                                let reload = rh_c.borrow().clone();
+                                                if let Some(reload) = reload {
+                                                    reload();
+                                                }
+                                            },
+                                        );
                                     }),
                                 );
                             });
