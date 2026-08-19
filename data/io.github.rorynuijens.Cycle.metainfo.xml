@@ -29,6 +29,47 @@
 
   <launchable type="desktop-id">io.github.rorynuijens.Cycle.desktop</launchable>
 
+  <!--
+    GNOME Software fetches these over the network, so they must be absolute
+    URLs to a public host - it cannot read files from inside the flatpak.
+    Pinned to main rather than a tag so one set serves every release; if a
+    file here is ever renamed, older releases lose their screenshots.
+  -->
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/workout-player.png</image>
+      <caption>Riding a structured workout in ERG mode</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/fitness.png</image>
+      <caption>Fitness, fatigue and form over time</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/calendar-week.png</image>
+      <caption>The training week at a glance</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/library.png</image>
+      <caption>The workout library</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/coaching.png</image>
+      <caption>Coaching notes written for the ride ahead</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/route-ride-map.png</image>
+      <caption>Riding a virtual route</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/calendar-workout-details.png</image>
+      <caption>What a planned session asks of you</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/rorynuijens/Cycle/main/docs/screenshots/devices.png</image>
+      <caption>Pairing a smart trainer and sensors</caption>
+    </screenshot>
+  </screenshots>
+
   <url type="homepage">https://github.com/rorynuijens/cycle</url>
   <url type="bugtracker">https://github.com/rorynuijens/cycle/issues</url>
 
