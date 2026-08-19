@@ -90,6 +90,13 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.0" date="2026-08-19">
+      <description>
+        <p>Cycle now shows screenshots in GNOME Software.</p>
+        <p>Updated a networking library to pick up an upstream thread-safety
+           fix.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-08-19">
       <description>
         <p>Fixed the first-run setup wizard, which opened too small and did not
