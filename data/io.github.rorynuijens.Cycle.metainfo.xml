@@ -90,6 +90,28 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.0" date="2026-08-20">
+      <description>
+        <p>You can now plan a GPX route on the calendar, not just a workout. A
+           planned route counts towards your projected fitness, using an estimate
+           of what riding it will cost.</p>
+        <p>Anything you have planned can be moved. Drag it to another day in the
+           week or month view, or open it and choose Reschedule. Sessions you
+           have already ridden stay where they are.</p>
+        <p>Choosing what to schedule now shows you what you are picking: a
+           workout's shape, length and training load, a route's distance and
+           climbing, and what your training plan expects that day. There is a
+           search box for finding something in a large library.</p>
+        <p>Cycle also asks for less access to your computer than before. It no
+           longer requests any filesystem access at all.</p>
+        <p>Please note: the first time you open this version, your training
+           history is upgraded to a new format automatically. A backup is saved
+           beforehand, in the same folder as your database, named
+           cycle.db.pre-v4 followed by the date. Once upgraded, your data can no
+           longer be opened by Cycle 0.3.0 or earlier — so if you ever go back to
+           an older version, restore that backup alongside it.</p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-08-19">
       <description>
         <p>Cycle now shows screenshots in GNOME Software.</p>
