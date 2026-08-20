@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -86,6 +86,44 @@ const MIGRATIONS: &[Migration] = &[
              'ai.morning_briefing_text',
              'ai.morning_briefing_date'
          )",
+        ],
+    },
+    Migration {
+        version: 4,
+        name: "plan routes on the calendar",
+        statements: &[
+            // A planned day can now hold a GPX route instead of a workout, so
+            // `workout_id` has to become nullable. SQLite cannot drop NOT NULL in
+            // place, so the table is rebuilt. Nothing references `calendar_entries`,
+            // which is what makes the drop safe; all four statements are one
+            // migration so they commit or roll back together.
+            //
+            // The CHECK is the point of the rebuild: a row is a workout or a route,
+            // never both and never neither, so no reader has to handle a third case.
+            "CREATE TABLE calendar_entries_new (
+             id                    INTEGER PRIMARY KEY,
+             workout_id            INTEGER REFERENCES workouts(id),
+             route_id              INTEGER REFERENCES routes(id),
+             scheduled_date        TEXT    NOT NULL,
+             completed             INTEGER NOT NULL DEFAULT 0,
+             program_id            INTEGER REFERENCES programs(id),
+             original_workout_id   INTEGER REFERENCES workouts(id),
+             planned_tss           REAL,
+             planned_duration_secs INTEGER,
+             CHECK ((workout_id IS NOT NULL) <> (route_id IS NOT NULL))
+         )",
+            // Every existing row is a workout, so route_id and the planned_* columns
+            // stay NULL. Ids are carried across deliberately: a program's sessions
+            // and any open dialog refer to entries by id.
+            "INSERT INTO calendar_entries_new
+             (id, workout_id, scheduled_date, completed, program_id, original_workout_id)
+         SELECT id, workout_id, scheduled_date, completed, program_id, original_workout_id
+           FROM calendar_entries",
+            "DROP TABLE calendar_entries",
+            "ALTER TABLE calendar_entries_new RENAME TO calendar_entries",
+            // Every calendar query filters on the date, and until now the schema
+            // carried no indexes at all.
+            "CREATE INDEX idx_calendar_entries_date ON calendar_entries(scheduled_date)",
         ],
     },
 ];
@@ -431,11 +469,20 @@ const BASELINE_COLUMNS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row;
 
     async fn empty_pool() -> SqlitePool {
         SqlitePool::connect("sqlite::memory:")
             .await
             .expect("in-memory sqlite should connect")
+    }
+
+    /// The migration declaring `version`, for tests that step through them.
+    fn migration(version: i32) -> &'static Migration {
+        MIGRATIONS
+            .iter()
+            .find(|m| m.version == version)
+            .unwrap_or_else(|| panic!("migration v{version} should exist"))
     }
 
     /// Columns of a table, as SQLite reports them.
@@ -566,7 +613,11 @@ mod tests {
         // to remove, so v3 drops them.
         let pool = empty_pool().await;
         sqlx::query(BASELINE_TABLES).execute(&pool).await.unwrap();
-        set_user_version(&pool, 2).await.unwrap();
+        set_user_version(&pool, BASELINE_VERSION).await.unwrap();
+        // Actually run v2 rather than just claiming its number: a later migration
+        // reads columns v2 adds, and a fixture that lies about its version turns
+        // that into a failure in this test rather than in the one at fault.
+        apply(&pool, migration(2)).await.unwrap();
 
         let superseded = [
             "ai.suggestion_response",
@@ -824,5 +875,100 @@ mod tests {
                 .any(|c| c == "landed"),
             "the first statement must roll back with the second"
         );
+    }
+    // ── v4: planning routes on the calendar ──────────────────────────────────
+
+    #[tokio::test]
+    async fn should_carry_existing_plans_through_the_v4_table_rebuild() {
+        // v4 rebuilds calendar_entries to make workout_id nullable, and the rebuild
+        // drops the old table. This guards the one destructive step in the schema:
+        // a planned session, the program that put it there, and the workout an
+        // adjustment stamped on it must all survive, under the same row id.
+        let pool = empty_pool().await;
+        sqlx::query(BASELINE_TABLES).execute(&pool).await.unwrap();
+        set_user_version(&pool, BASELINE_VERSION).await.unwrap();
+        apply(&pool, migration(2)).await.unwrap();
+        apply(&pool, migration(3)).await.unwrap();
+
+        sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES ('Threshold', 3600)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO programs (created_at, start_monday, num_weeks, training_days)
+             VALUES ('2026-01-01', '2026-01-05', 4, 'monday')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO calendar_entries
+                 (workout_id, scheduled_date, completed, program_id, original_workout_id)
+             VALUES (1, '2026-03-04', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        apply(&pool, migration(4)).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT id, workout_id, route_id, scheduled_date, completed,
+                    program_id, original_workout_id, planned_tss
+               FROM calendar_entries",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the planned session must survive the rebuild");
+
+        assert_eq!(row.get::<i64, _>("id"), 1, "row ids must be carried across");
+        assert_eq!(row.get::<i64, _>("workout_id"), 1);
+        assert_eq!(row.get::<Option<i64>, _>("route_id"), None);
+        assert_eq!(row.get::<String, _>("scheduled_date"), "2026-03-04");
+        assert_eq!(row.get::<i64, _>("completed"), 1);
+        assert_eq!(row.get::<Option<i64>, _>("program_id"), Some(1));
+        assert_eq!(row.get::<Option<i64>, _>("original_workout_id"), Some(1));
+        assert_eq!(
+            row.get::<Option<f64>, _>("planned_tss"),
+            None,
+            "a migrated workout row carries no stored estimate"
+        );
+        assert_eq!(user_version(&pool).await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_a_calendar_entry_that_is_both_a_workout_and_a_route() {
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES ('W', 3600)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO routes (name, file_name, distance_m, elevation_gain_m, added_at)
+             VALUES ('R', 'r.gpx', 1000, 10, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO calendar_entries (workout_id, route_id, scheduled_date)
+             VALUES (1, 1, '2026-03-04')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("a row may name a workout or a route, never both");
+    }
+
+    #[tokio::test]
+    async fn should_refuse_a_calendar_entry_that_names_neither() {
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+
+        sqlx::query("INSERT INTO calendar_entries (scheduled_date) VALUES ('2026-03-04')")
+            .execute(&pool)
+            .await
+            .expect_err("a row with no workout and no route is not a plan");
     }
 }

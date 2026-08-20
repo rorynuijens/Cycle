@@ -105,6 +105,17 @@ pub type ReloadFn = std::rc::Rc<dyn Fn()>;
 /// made, and the callbacks read it when they fire.
 pub type ReloadHolder = std::rc::Rc<std::cell::RefCell<Option<ReloadFn>>>;
 
+/// Somewhere to put "ride this route", for a page built before it exists.
+///
+/// The calendar can hold a planned route, and opening one offers to ride it —
+/// but the callback that starts a route needs the route player, the trainer
+/// command channel and the SIM settings, all of which are built *after* the
+/// calendar page in `window::build_ui`. Reordering that would mean reordering a
+/// dependency graph; filling a holder afterwards is the same answer this module
+/// already gives for reload callbacks.
+pub type StartRouteHolder =
+    std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<dyn Fn(crate::data::route::Route)>>>>;
+
 /// Banner text for the sensors that have stopped reporting mid-ride, or `None`
 /// while everything is still live.
 ///

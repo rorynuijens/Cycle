@@ -7,7 +7,9 @@
 mod detail;
 mod editor;
 mod routes;
-mod workout_list;
+// The calendar's scheduling picker reuses this module's row helpers rather than
+// growing a second, drifting description of what a workout looks like in a list.
+pub(crate) mod workout_list;
 
 use adw::prelude::*;
 use chrono::Local;

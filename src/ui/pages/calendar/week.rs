@@ -22,6 +22,7 @@ pub fn build_week_view(
     reload_holder: Rc<RefCell<Option<ReloadFn>>>,
     workouts: Rc<Vec<Workout>>,
     on_start_workout: Rc<dyn Fn(Workout)>,
+    on_start_route: crate::ui::StartRouteHolder,
     ftp: u32,
     weight_kg: f32,
     on_toast: Rc<dyn Fn(adw::Toast)>,
@@ -200,6 +201,8 @@ pub fn build_week_view(
                         day_sched,
                         pool_rs.clone(),
                         rt_rs.clone(),
+                        ftp,
+                        weight_kg,
                         reload_fn,
                     );
                 });
@@ -218,10 +221,25 @@ pub fn build_week_view(
 
                         entry_row.append(&color_stripe(category_zone_rgb(&entry.category)));
 
+                        // Drag to another day. Only open plans move: a ridden
+                        // session belongs to the day it was ridden on. Same shape
+                        // as the segment reorder in library/editor.rs, with the
+                        // entry id as the payload instead of a row index.
+                        if !entry.completed {
+                            let drag = gtk::DragSource::new();
+                            drag.set_actions(gtk::gdk::DragAction::MOVE);
+                            let dragged_id = entry.id;
+                            drag.connect_prepare(move |_, _, _| {
+                                Some(gtk::gdk::ContentProvider::for_value(&dragged_id.to_value()))
+                            });
+                            entry_row.add_controller(drag);
+                            entry_row.set_tooltip_text(Some("Drag to move to another day"));
+                        }
+
                         let display_name = if entry.completed {
-                            format!("✓  {}", entry.workout_name)
+                            format!("✓  {}", entry.item.name())
                         } else {
-                            entry.workout_name.clone()
+                            entry.item.name().to_string()
                         };
                         let dur_mins = entry.duration_secs / 60;
                         let tooltip = format!(
@@ -254,6 +272,7 @@ pub fn build_week_view(
                         let rt_d = rt_handle.clone();
                         let workouts_d = Rc::clone(&workouts);
                         let on_start_d = Rc::clone(&on_start_workout);
+                        let on_start_route_d = Rc::clone(&on_start_route);
                         let rh_d = Rc::clone(&reload_holder);
                         btn.connect_clicked(move |b| {
                             let rh_c = Rc::clone(&rh_d);
@@ -269,6 +288,7 @@ pub fn build_week_view(
                                 rt_d.clone(),
                                 Rc::clone(&workouts_d),
                                 Rc::clone(&on_start_d),
+                                Rc::clone(&on_start_route_d),
                                 reload_fn,
                             );
                         });
@@ -567,6 +587,44 @@ pub fn build_week_view(
         }
 
         hbox.append(&chip_box);
+        // Drop a dragged plan onto this day to move it here. The target is the
+        // whole day frame rather than the entry column, so an empty day is just
+        // as easy to hit as a full one.
+        {
+            let drop = gtk::DropTarget::new(i64::static_type(), gtk::gdk::DragAction::MOVE);
+            let pool_dt = pool.clone();
+            let rt_dt = rt_handle.clone();
+            let rh_dt = Rc::clone(&reload_holder);
+            let target_date = day.format("%Y-%m-%d").to_string();
+            drop.connect_drop(move |_, value, _, _| {
+                let Ok(entry_id) = value.get::<i64>() else {
+                    return false;
+                };
+                let pool_c = pool_dt.clone();
+                let date = target_date.clone();
+                let rh_c = Rc::clone(&rh_dt);
+                crate::ui::spawn_to_main(
+                    &rt_dt,
+                    async move { db::reschedule_entry(&pool_c, entry_id, &date).await },
+                    move |res| {
+                        match res {
+                            Ok(true) => {}
+                            Ok(false) => tracing::warn!("entry {entry_id} was not moved"),
+                            Err(e) => tracing::error!("reschedule_entry: {e}"),
+                        }
+                        // Clone the callback out before running it: it rebuilds
+                        // the widget this handler is attached to (CLAUDE.md §2.4).
+                        let reload = rh_c.borrow().clone();
+                        if let Some(reload) = reload {
+                            reload();
+                        }
+                    },
+                );
+                true
+            });
+            day_frame.add_controller(drop);
+        }
+
         day_frame.set_child(Some(&hbox));
         vbox.append(&day_frame);
     }

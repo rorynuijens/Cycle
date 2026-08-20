@@ -4,24 +4,42 @@
 use adw::prelude::*;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use sqlx::SqlitePool;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::data::ai_cache;
 use crate::data::db::{self, CalendarEntry};
+use crate::data::route::Route;
 use crate::data::workout::Workout;
+use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
 
+/// What the rider picked in the scheduling dialog.
+#[derive(Clone, Copy)]
+enum Picked {
+    Workout(i64),
+    /// Carries the route's id; the load estimate needs the GPX and is worked out
+    /// when scheduling, not while building the list.
+    Route(i64),
+}
+
+/// Schedule a workout or a GPX route on a chosen day.
+///
+/// The list shows what each choice actually costs — a workout's shape, duration
+/// and TSS; a route's distance and climbing — because a name alone is not enough
+/// to choose from a library of a hundred.
+#[allow(clippy::too_many_arguments)] // dialog wiring
 pub fn show_schedule_dialog(
     parent: &impl IsA<gtk::Widget>,
     workouts: &[Workout],
     preselect: NaiveDate,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
+    ftp: u32,
+    weight_kg: f32,
     reload: Rc<dyn Fn()>,
 ) {
-    let dialog = adw::AlertDialog::builder()
-        .heading("Schedule Workout")
-        .build();
+    let dialog = adw::AlertDialog::builder().heading("Schedule").build();
     dialog.add_response("cancel", "_Cancel");
     dialog.add_response("schedule", "_Schedule");
     dialog.set_response_appearance("schedule", adw::ResponseAppearance::Suggested);
@@ -46,36 +64,224 @@ pub fn show_schedule_dialog(
     }
     content.append(&cal);
 
-    let sel_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
+    // What the active program wants on the chosen day, filled in below and left
+    // hidden when there is no program to compare against.
+    let plan_hint = gtk::Label::builder()
+        .css_classes(["caption", "dim-label"])
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    content.append(&plan_hint);
+
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search workouts and routes")
+        .build();
+    content.append(&search);
+
+    // The picked item, read by the response handler. Rc<Cell> rather than a
+    // widget lookup so the two lists can share one notion of the selection.
+    let picked: Rc<Cell<Option<Picked>>> = Rc::new(Cell::new(None));
+
+    let workout_list = gtk::ListBox::builder()
+        .css_classes(["boxed-list"])
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    let route_list = gtk::ListBox::builder()
+        .css_classes(["boxed-list"])
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+
+    // ── Workout rows ─────────────────────────────────────────────────────────
+    let mut workout_ids: Vec<i64> = Vec::with_capacity(workouts.len());
+    for w in workouts {
+        let row = adw::ActionRow::builder()
+            .title(glib::markup_escape_text(&w.name))
+            .subtitle(glib::markup_escape_text(
+                &super::super::library::workout_list::row_subtitle(w),
+            ))
+            .build();
+        // The same thumbnail the library list uses, so a workout looks the same
+        // wherever it is chosen.
+        let thumb = WorkoutGraph::new(w, ftp);
+        thumb.widget().set_content_width(84);
+        thumb.widget().set_content_height(42);
+        thumb.widget().set_valign(gtk::Align::Center);
+        row.add_prefix(thumb.widget());
+        let stripe = color_stripe(category_zone_rgb(&w.category));
+        stripe.set_content_height(28);
+        stripe.set_valign(gtk::Align::Center);
+        row.add_prefix(&stripe);
+        workout_list.append(&row);
+        workout_ids.push(w.id);
+    }
+
+    let workouts_group = adw::PreferencesGroup::builder().title("Workouts").build();
+    workouts_group.add(&workout_list);
+    let routes_group = adw::PreferencesGroup::builder().title("Routes").build();
+    routes_group.add(&route_list);
+    // Hidden until routes are known to exist, so a rider with none never sees an
+    // empty heading.
+    routes_group.set_visible(false);
+
+    let lists = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
         .spacing(12)
-        .margin_top(6)
         .build();
-    sel_row.append(
-        &gtk::Label::builder()
-            .label("Workout")
-            .hexpand(true)
-            .halign(gtk::Align::Start)
-            .build(),
-    );
-    let names: Vec<&str> = workouts.iter().map(|w| w.name.as_str()).collect();
-    let name_list = gtk::StringList::new(&names);
-    let dropdown = gtk::DropDown::builder()
-        .model(&name_list)
-        .tooltip_text("Select workout to schedule")
+    lists.append(&workouts_group);
+    lists.append(&routes_group);
+
+    // A ScrolledWindow reports its minimum as its natural height, so without a
+    // floor the whole dialog collapses to a sliver.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(300)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .child(&lists)
         .build();
+    content.append(&scroller);
 
-    sel_row.append(&dropdown);
-    content.append(&sel_row);
+    // ── Selection: one choice across two lists ───────────────────────────────
+    {
+        let picked_c = Rc::clone(&picked);
+        let ids = workout_ids.clone();
+        let other = route_list.clone();
+        workout_list.connect_row_selected(move |_, row| {
+            let Some(row) = row else { return };
+            if let Some(&id) = ids.get(row.index() as usize) {
+                picked_c.set(Some(Picked::Workout(id)));
+                other.unselect_all();
+            }
+        });
+    }
 
-    // The coach's suggestion is read after the dialog is on screen. Reading
-    // it first meant a block_on against SQLite between the click and the
-    // dialog appearing (CLAUDE.md §2.3); the preselection just arrives a
-    // moment later instead.
+    // ── Routes, loaded after the dialog is on screen ─────────────────────────
+    //
+    // Read here rather than before presenting so the click does not wait on
+    // SQLite (CLAUDE.md §2.3).
+    let route_ids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let pool_r = pool.clone();
+        let route_list_c = route_list.clone();
+        let routes_group_c = routes_group.clone();
+        let route_ids_c = Rc::clone(&route_ids);
+        let picked_c = Rc::clone(&picked);
+        let workout_list_c = workout_list.clone();
+        crate::ui::spawn_to_main(
+            &rt_handle,
+            async move { db::load_routes(&pool_r).await },
+            move |result| {
+                let routes = match result {
+                    Ok(r) if !r.is_empty() => r,
+                    Ok(_) => return,
+                    Err(e) => {
+                        tracing::warn!("Could not read your routes: {e}");
+                        return;
+                    }
+                };
+                for r in &routes {
+                    let row = adw::ActionRow::builder()
+                        .title(glib::markup_escape_text(&r.name))
+                        .subtitle(format!(
+                            "{:.1} km · {:.0} m climb",
+                            r.distance_m / 1000.0,
+                            r.elevation_gain_m
+                        ))
+                        .build();
+                    row.add_prefix(&gtk::Image::from_icon_name("map-symbolic"));
+                    route_list_c.append(&row);
+                    route_ids_c.borrow_mut().push(r.id);
+                }
+                routes_group_c.set_visible(true);
+
+                let ids = Rc::clone(&route_ids_c);
+                let picked_sel = Rc::clone(&picked_c);
+                let other = workout_list_c.clone();
+                route_list_c.connect_row_selected(move |_, row| {
+                    let Some(row) = row else { return };
+                    let id = ids.borrow().get(row.index() as usize).copied();
+                    if let Some(id) = id {
+                        picked_sel.set(Some(Picked::Route(id)));
+                        other.unselect_all();
+                    }
+                });
+            },
+        );
+    }
+
+    // ── Search filters both lists ────────────────────────────────────────────
+    {
+        let workout_list_f = workout_list.clone();
+        let route_list_f = route_list.clone();
+        search.connect_search_changed(move |entry| {
+            let needle = entry.text().to_lowercase();
+            for list in [&workout_list_f, &route_list_f] {
+                let mut child = list.first_child();
+                while let Some(row) = child {
+                    child = row.next_sibling();
+                    let matches = needle.is_empty()
+                        || row
+                            .downcast_ref::<adw::ActionRow>()
+                            .map(|r| r.title().to_lowercase().contains(&needle))
+                            .unwrap_or(true);
+                    row.set_visible(matches);
+                }
+            }
+        });
+    }
+
+    // ── What the plan asks for on the chosen day ─────────────────────────────
+    {
+        let pool_p = pool.clone();
+        let rt_p = rt_handle.clone();
+        let plan_hint_c = plan_hint.clone();
+        let cal_p = cal.clone();
+        let update = move || {
+            let dt = cal_p.date();
+            let date = format!(
+                "{:04}-{:02}-{:02}",
+                dt.year(),
+                dt.month(),
+                dt.day_of_month()
+            );
+            let pool_c = pool_p.clone();
+            let hint = plan_hint_c.clone();
+            crate::ui::spawn_to_main(
+                &rt_p,
+                async move {
+                    let program = db::active_program(&pool_c).await.ok().flatten()?;
+                    let sessions = db::load_program_sessions(&pool_c, program.id).await.ok()?;
+                    sessions
+                        .into_iter()
+                        .find(|s| s.date.format("%Y-%m-%d").to_string() == date)
+                        .map(|s| (s.workout_name, s.tss))
+                },
+                move |found| match found {
+                    Some((name, tss)) => {
+                        hint.set_label(&format!(
+                            "Your plan asks for {name} ({tss:.0} TSS) that day"
+                        ));
+                        hint.set_visible(true);
+                    }
+                    None => hint.set_visible(false),
+                },
+            );
+        };
+        update();
+        let update_on_change = update.clone();
+        cal.connect_day_selected(move |_| update_on_change());
+    }
+
+    dialog.set_extra_child(Some(&content));
+
+    // The coach's suggestion is read after the dialog is on screen. Reading it
+    // first meant a block_on against SQLite between the click and the dialog
+    // appearing (CLAUDE.md §2.3); the preselection just arrives a moment later.
     {
         let pool_ai = pool.clone();
-        let dropdown_ai = dropdown.clone();
         let content_ai = content.clone();
+        let list_ai = workout_list.clone();
         let names_ai: Vec<String> = workouts.iter().map(|w| w.name.clone()).collect();
         crate::ui::spawn_to_main(
             &rt_handle,
@@ -91,8 +297,8 @@ pub fn show_schedule_dialog(
                     Ok(Some(name)) if !name.trim().is_empty() => name,
                     Ok(_) => return,
                     Err(e) => {
-                        // Not worth a toast: the rider can still pick a
-                        // workout, they just do not get the shortcut.
+                        // Not worth a toast: the rider can still pick a workout,
+                        // they just do not get the shortcut.
                         tracing::warn!("Could not read the morning brief's workout: {e}");
                         return;
                     }
@@ -103,7 +309,9 @@ pub fn show_schedule_dialog(
                 else {
                     return;
                 };
-                dropdown_ai.set_selected(idx as u32);
+                if let Some(row) = list_ai.row_at_index(idx as i32) {
+                    list_ai.select_row(Some(&row));
+                }
                 content_ai.append(
                     &gtk::Label::builder()
                         .label(format!("Your morning brief: {}", suggestion.trim()))
@@ -115,15 +323,12 @@ pub fn show_schedule_dialog(
         );
     }
 
-    dialog.set_extra_child(Some(&content));
-
-    let workout_ids: Vec<i64> = workouts.iter().map(|w| w.id).collect();
     dialog.connect_response(None, move |_, resp| {
         if resp != "schedule" {
             return;
         }
-        let idx = dropdown.selected() as usize;
-        let Some(&workout_id) = workout_ids.get(idx) else {
+        let Some(choice) = picked.get() else {
+            // Nothing selected: closing without scheduling is the honest outcome.
             return;
         };
         let dt = cal.date();
@@ -133,14 +338,31 @@ pub fn show_schedule_dialog(
             dt.month(),
             dt.day_of_month()
         );
+
         let pool = pool.clone();
         let reload = Rc::clone(&reload);
         crate::ui::spawn_to_main(
             &rt_handle,
-            async move { db::schedule_workout(&pool, workout_id, &date_str, None).await },
+            async move {
+                match choice {
+                    Picked::Workout(id) => db::schedule_workout(&pool, id, &date_str, None)
+                        .await
+                        .map(|_| ()),
+                    Picked::Route(id) => {
+                        // The estimate needs the route's points, so the GPX is
+                        // parsed here — once, off the main thread — and the
+                        // result stored on the row rather than recomputed on
+                        // every calendar redraw.
+                        let (secs, tss) = estimate_route_load(&pool, id, ftp, weight_kg).await?;
+                        db::schedule_route(&pool, id, &date_str, tss, secs)
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            },
             move |res| {
                 if let Err(e) = res {
-                    tracing::error!("schedule_workout failed: {e}");
+                    tracing::error!("scheduling failed: {e}");
                 }
                 reload();
             },
@@ -148,6 +370,30 @@ pub fn show_schedule_dialog(
     });
 
     dialog.present(Some(parent));
+}
+
+/// Read a saved route's GPX from disk.
+async fn load_saved_route(pool: &SqlitePool, route_id: i64) -> anyhow::Result<Route> {
+    let routes = db::load_routes(pool).await?;
+    let saved = routes
+        .into_iter()
+        .find(|r| r.id == route_id)
+        .ok_or_else(|| anyhow::anyhow!("route {route_id} is no longer in the library"))?;
+    Route::from_gpx_path(&db::routes_dir()?.join(&saved.file_name))
+}
+
+/// Parse a saved route's GPX and estimate what riding it will cost.
+///
+/// Returns `(duration_secs, tss)`. Runs off the GTK thread: reading and parsing
+/// a GPX is file I/O plus a full XML pass.
+async fn estimate_route_load(
+    pool: &SqlitePool,
+    route_id: i64,
+    ftp: u32,
+    weight_kg: f32,
+) -> anyhow::Result<(u32, f32)> {
+    let route = load_saved_route(pool, route_id).await?;
+    Ok(route.estimated_load(ftp, weight_kg))
 }
 
 // ── Time off dialog ───────────────────────────────────────────────────────
@@ -305,6 +551,7 @@ pub fn show_time_off_dialog(
 
 // ── Workout detail dialog ─────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)] // dialog wiring
 pub fn show_workout_detail_dialog(
     parent: &impl IsA<gtk::Widget>,
     entry: &CalendarEntry,
@@ -312,6 +559,7 @@ pub fn show_workout_detail_dialog(
     rt_handle: tokio::runtime::Handle,
     workouts: Rc<Vec<Workout>>,
     on_start_workout: Rc<dyn Fn(Workout)>,
+    on_start_route: crate::ui::StartRouteHolder,
     reload: Rc<dyn Fn()>,
 ) {
     let toolbar_view = adw::ToolbarView::new();
@@ -334,7 +582,7 @@ pub fn show_workout_detail_dialog(
         .build();
     title_box.append(
         &gtk::Label::builder()
-            .label(&entry.workout_name)
+            .label(entry.item.name())
             .css_classes(["title-2"])
             .halign(gtk::Align::Start)
             .hexpand(true)
@@ -384,7 +632,10 @@ pub fn show_workout_detail_dialog(
     toolbar_view.set_content(Some(&content));
 
     let dialog = adw::Dialog::builder()
-        .title("Workout Details")
+        .title(match entry.item {
+            db::ScheduledItem::Workout { .. } => "Workout Details",
+            db::ScheduledItem::Route { .. } => "Route Details",
+        })
         .child(&toolbar_view)
         .content_width(420)
         .build();
@@ -399,14 +650,46 @@ pub fn show_workout_detail_dialog(
             .build();
 
         let entry_id = entry.id;
-        let workout_name = entry.workout_name.clone();
-        let workout_id = entry.workout_id;
+        // `None` for a scheduled route: it is ridden in the route player, which
+        // this dialog does not reach, so it gets no Load button.
+        let workout_id = entry.item.workout_id();
 
-        // Load Now
+        // Reschedule — move this entry to another day without losing it.
+        let move_btn = gtk::Button::builder()
+            .label("Reschedule")
+            .css_classes(["pill"])
+            .tooltip_text("Move this session to another day")
+            .build();
+        {
+            let pool_m = pool.clone();
+            let rt_m = rt_handle.clone();
+            let reload_m = Rc::clone(&reload);
+            let current_date = entry.scheduled_date.clone();
+            let move_btn_for_present = move_btn.clone();
+            // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+            move_btn.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                move |_| {
+                    show_reschedule_dialog(
+                        &move_btn_for_present,
+                        entry_id,
+                        &current_date,
+                        pool_m.clone(),
+                        rt_m.clone(),
+                        Rc::clone(&reload_m),
+                        dialog.clone(),
+                    );
+                }
+            ));
+        }
+
+        // Load Now — workouts only.
         let load_btn = gtk::Button::builder()
             .label("Load Now")
             .css_classes(["pill", "suggested-action"])
             .tooltip_text("Load this workout and start riding")
+            .visible(workout_id.is_some())
             .build();
         let workouts_c = Rc::clone(&workouts);
         let on_start_c = Rc::clone(&on_start_workout);
@@ -415,7 +698,8 @@ pub fn show_workout_detail_dialog(
             #[weak]
             dialog,
             move |_| {
-                if let Some(w) = workouts_c.iter().find(|w| w.id == workout_id).cloned() {
+                let Some(wid) = workout_id else { return };
+                if let Some(w) = workouts_c.iter().find(|w| w.id == wid).cloned() {
                     dialog.close();
                     on_start_c(w);
                 }
@@ -466,25 +750,140 @@ pub fn show_workout_detail_dialog(
             }
         ));
 
+        // Ride Route — the route player's equivalent of Load Now.
+        if let db::ScheduledItem::Route { id: route_id, .. } = entry.item {
+            let ride_btn = gtk::Button::builder()
+                .label("Ride Route")
+                .css_classes(["pill", "suggested-action"])
+                .tooltip_text("Load this route and start riding")
+                .build();
+            let pool_rr = pool.clone();
+            let rt_rr = rt_handle.clone();
+            let start_route = Rc::clone(&on_start_route);
+            // Weak: this button is inside the dialog (CLAUDE.md §2.4).
+            ride_btn.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                move |_| {
+                    let pool_c = pool_rr.clone();
+                    let start_route = Rc::clone(&start_route);
+                    // Parsing the GPX is file I/O plus a full XML pass, so it
+                    // happens off the main thread and the player opens after.
+                    crate::ui::spawn_to_main(
+                        &rt_rr,
+                        async move { load_saved_route(&pool_c, route_id).await },
+                        move |res| match res {
+                            Ok(route) => {
+                                let cb = start_route.borrow().clone();
+                                match cb {
+                                    Some(cb) => {
+                                        dialog.close();
+                                        cb(route);
+                                    }
+                                    None => tracing::error!(
+                                        "no route-start callback registered; cannot ride"
+                                    ),
+                                }
+                            }
+                            Err(e) => tracing::error!("could not open route {route_id}: {e}"),
+                        },
+                    );
+                }
+            ));
+            btn_row.append(&ride_btn);
+        }
+
         btn_row.append(&remove_btn);
+        btn_row.append(&move_btn);
         btn_row.append(&load_btn);
         content.append(&btn_row);
 
-        // Hint label for workout name
-        if let Some(w) = workouts.iter().find(|w| w.id == workout_id) {
-            let segments = &w.segments;
-            if !segments.is_empty() {
+        // How many intervals this workout holds. Routes have no segments.
+        if let Some(w) = workout_id.and_then(|id| workouts.iter().find(|w| w.id == id)) {
+            if !w.segments.is_empty() {
                 content.append(
                     &gtk::Label::builder()
-                        .label(format!("{} intervals", segments.len()))
+                        .label(format!("{} intervals", w.segments.len()))
                         .css_classes(["caption", "dim-label"])
                         .halign(gtk::Align::Start)
                         .build(),
                 );
             }
-            let _ = workout_name;
         }
     }
+
+    dialog.present(Some(parent));
+}
+
+/// Ask for a new date for an already-planned entry, and move it there.
+///
+/// `parent_dialog` is the detail dialog this was opened from; it closes once the
+/// move lands so the rider is not left looking at a stale date. It is passed by
+/// value rather than captured weakly because the alert is transient and the host
+/// releases it on close, which breaks the cycle on its own (CLAUDE.md §2.4).
+#[allow(clippy::too_many_arguments)]
+fn show_reschedule_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    entry_id: i64,
+    current_date: &str,
+    pool: SqlitePool,
+    rt_handle: tokio::runtime::Handle,
+    reload: Rc<dyn Fn()>,
+    parent_dialog: adw::Dialog,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Reschedule")
+        .body("Pick the day to move this session to.")
+        .build();
+    dialog.add_response("cancel", "_Cancel");
+    dialog.add_response("move", "_Move");
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("move"));
+    dialog.set_close_response("cancel");
+
+    let calendar = gtk::Calendar::new();
+    if let Ok(d) = NaiveDate::parse_from_str(current_date, "%Y-%m-%d") {
+        if let Ok(dt) =
+            glib::DateTime::from_local(d.year(), d.month() as i32, d.day() as i32, 0, 0, 0.0)
+        {
+            calendar.select_day(&dt);
+        }
+    }
+    dialog.set_extra_child(Some(&calendar));
+
+    dialog.connect_response(None, move |d, response| {
+        if response != "move" {
+            return;
+        }
+        let picked = calendar.date();
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            picked.year(),
+            picked.month(),
+            picked.day_of_month()
+        );
+
+        let pool_c = pool.clone();
+        let reload_c = Rc::clone(&reload);
+        let parent_dialog = parent_dialog.clone();
+        let d = d.clone();
+        crate::ui::spawn_to_main(
+            &rt_handle,
+            async move { db::reschedule_entry(&pool_c, entry_id, &date).await },
+            move |res| {
+                match res {
+                    Ok(true) => {}
+                    // The entry was completed or has since been removed. Say so
+                    // rather than closing as though the move had worked.
+                    Ok(false) => tracing::warn!("entry {entry_id} was not moved"),
+                    Err(e) => tracing::error!("reschedule_entry: {e}"),
+                }
+                d.close();
+                parent_dialog.close();
+                reload_c();
+            },
+        );
+    });
 
     dialog.present(Some(parent));
 }

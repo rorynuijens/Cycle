@@ -71,6 +71,7 @@ impl CalendarPage {
         rt_handle: tokio::runtime::Handle,
         workouts: Vec<Workout>,
         on_start_workout: Rc<dyn Fn(Workout)>,
+        on_start_route: crate::ui::StartRouteHolder,
         athlete: Rc<RefCell<AthleteProfile>>,
         on_toast: Rc<dyn Fn(adw::Toast)>,
         on_go_to_coaching: Rc<dyn Fn()>,
@@ -277,6 +278,7 @@ impl CalendarPage {
             let reload_holder = Rc::clone(&reload_holder);
             let workouts = Rc::clone(&workouts);
             let on_start_workout = Rc::clone(&on_start_workout);
+            let on_start_route = Rc::clone(&on_start_route);
             let on_toast = Rc::clone(&on_toast);
             let coaching_banner_r = coaching_banner.clone();
             let athlete = Rc::clone(&athlete);
@@ -325,6 +327,7 @@ impl CalendarPage {
                 let reload_holder = Rc::clone(&reload_holder);
                 let workouts = Rc::clone(&workouts);
                 let on_start_workout = Rc::clone(&on_start_workout);
+                let on_start_route_build = Rc::clone(&on_start_route);
                 let on_toast = Rc::clone(&on_toast);
                 let on_toast_err = Rc::clone(&on_toast);
 
@@ -369,6 +372,7 @@ impl CalendarPage {
                                 Rc::clone(&reload_holder),
                                 Rc::clone(&workouts),
                                 Rc::clone(&on_start_workout),
+                                Rc::clone(&on_start_route_build),
                                 ftp,
                                 weight_kg,
                                 Rc::clone(&on_toast),
@@ -384,7 +388,9 @@ impl CalendarPage {
                                 Rc::clone(&reload_holder),
                                 Rc::clone(&workouts),
                                 Rc::clone(&on_start_workout),
+                                Rc::clone(&on_start_route_build),
                                 ftp,
+                                weight_kg,
                             ));
                         }
                     },
@@ -469,6 +475,7 @@ impl CalendarPage {
             let pool = pool.clone();
             let rt_handle = rt_handle.clone();
             let workouts_sb = Rc::clone(&workouts);
+            let athlete_sb = Rc::clone(&athlete);
 
             schedule_btn.connect_clicked(move |btn| {
                 // Preselect today when viewing the current month, else the 1st.
@@ -485,6 +492,8 @@ impl CalendarPage {
                     preselect,
                     pool.clone(),
                     rt_handle.clone(),
+                    athlete_sb.borrow().ftp_watts,
+                    athlete_sb.borrow().weight_kg,
                     Rc::clone(&r),
                 );
             });

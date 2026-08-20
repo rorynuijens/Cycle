@@ -12,6 +12,21 @@ const CDA: f32 = 0.32; // combined drag area m²
 /// Half-width of the window used to measure gradient, in metres.
 const GRADIENT_WINDOW_M: f32 = 25.0;
 
+/// Intensity factor assumed when estimating what a route will cost to ride.
+///
+/// A route ride is an endurance effort, not a workout: 0.70 of FTP is the usual
+/// steady pace for one. It is a planning figure, so it is deliberately a single
+/// documented constant rather than something to tune per route — the rider can
+/// see the resulting TSS before scheduling and pick a different day if it looks
+/// wrong.
+const ENDURANCE_IF: f32 = 0.70;
+
+/// Slowest speed an estimate will assume, in m/s (about 3.6 km/h).
+///
+/// Keeps a very steep segment from driving the solved speed to zero and the
+/// estimated duration to infinity.
+const MIN_SPEED_MS: f32 = 1.0;
+
 /// A single point on a GPX route.
 #[derive(Debug, Clone)]
 pub struct RoutePoint {
@@ -149,6 +164,52 @@ impl Route {
                 (w[0].distance_m, w[0].gradient, watts as u32)
             })
             .collect()
+    }
+
+    /// Estimated ride time in seconds and training load (TSS) for this route.
+    ///
+    /// Models the route ridden at a **steady effort** rather than a steady speed:
+    /// power is held at [`ENDURANCE_IF`] × `ftp` and the speed for each segment
+    /// follows from its gradient via [`Route::speed_from_power`], so climbs take
+    /// longer and descents less. That is the opposite assumption to
+    /// [`Route::workout_targets`], which holds speed fixed because ERG mode
+    /// drives the trainer; for *planning* a ride, effort is the thing that stays
+    /// roughly constant.
+    ///
+    /// Because power is steady, normalised power equals the target, so intensity
+    /// factor is `ENDURANCE_IF` exactly and TSS reduces to `IF² × hours × 100`.
+    ///
+    /// `mass_kg` is the rider's weight, matching what the route player passes to
+    /// [`crate::training::route_engine::RouteEngine`], so an estimate and the ride
+    /// it predicts use the same figure.
+    ///
+    /// Returns `(0, 0.0)` for a route with no usable length, or an FTP of zero —
+    /// callers show "unknown", never a fabricated number.
+    pub fn estimated_load(&self, ftp: u32, mass_kg: f32) -> (u32, f32) {
+        if ftp == 0 || mass_kg <= 0.0 || self.points.len() < 2 {
+            return (0, 0.0);
+        }
+
+        let target_watts = ENDURANCE_IF * ftp as f32;
+        let mut secs = 0.0f32;
+
+        for w in self.points.windows(2) {
+            let length_m = w[1].distance_m - w[0].distance_m;
+            if length_m <= 0.0 {
+                continue; // duplicate or out-of-order points; contribute nothing
+            }
+            // A steep enough ramp drives the solved speed towards zero, which would
+            // make the estimate diverge. Floor it at a walking pace: nobody rides a
+            // wall, they get off and push, and either way the day is not longer than
+            // this says.
+            let speed_ms =
+                Self::speed_from_power(target_watts, w[0].gradient, mass_kg).max(MIN_SPEED_MS);
+            secs += length_m / speed_ms;
+        }
+
+        let hours = secs / 3600.0;
+        let tss = ENDURANCE_IF * ENDURANCE_IF * hours * 100.0;
+        (secs as u32, tss)
     }
 }
 
@@ -468,5 +529,102 @@ mod tests {
 </gpx>"#;
         let route = parse_gpx(gpx).unwrap();
         assert_eq!(route.name, "Alpe d'Huez & Col de Sarenne");
+    }
+    // ── estimated_load ───────────────────────────────────────────────────────
+
+    /// A route of `len_m` at a constant `gradient`, sampled every 10 m.
+    fn ramp(len_m: f32, gradient: f32) -> Route {
+        let step = 10.0;
+        let n = (len_m / step) as usize;
+        let points = (0..=n)
+            .map(|i| {
+                let d = i as f32 * step;
+                RoutePoint {
+                    lat: 45.0,
+                    lng: 6.0,
+                    elevation_m: d * gradient,
+                    distance_m: d,
+                    gradient,
+                }
+            })
+            .collect();
+        Route {
+            name: "test".into(),
+            points,
+            total_distance_m: len_m,
+            total_gain_m: (len_m * gradient).max(0.0),
+        }
+    }
+
+    #[test]
+    fn should_estimate_nothing_for_a_route_with_no_points() {
+        let empty = Route {
+            name: "empty".into(),
+            points: vec![],
+            total_distance_m: 0.0,
+            total_gain_m: 0.0,
+        };
+        assert_eq!(empty.estimated_load(250, 75.0), (0, 0.0));
+    }
+
+    #[test]
+    fn should_estimate_nothing_when_ftp_is_unknown() {
+        // A zero FTP would otherwise give a zero target power, an infinite time
+        // and a nonsense TSS. Callers show "unknown" instead.
+        assert_eq!(ramp(10_000.0, 0.0).estimated_load(0, 75.0), (0, 0.0));
+    }
+
+    #[test]
+    fn should_take_longer_and_cost_more_on_a_climb_than_on_the_flat() {
+        let flat = ramp(5_000.0, 0.0).estimated_load(250, 75.0);
+        let climb = ramp(5_000.0, 0.06).estimated_load(250, 75.0);
+        assert!(
+            climb.0 > flat.0,
+            "5 km at 6% must take longer than 5 km flat ({} vs {} s)",
+            climb.0,
+            flat.0
+        );
+        assert!(
+            climb.1 > flat.1,
+            "a longer ride at the same effort is more load ({} vs {} TSS)",
+            climb.1,
+            flat.1
+        );
+    }
+
+    #[test]
+    fn should_score_an_hour_at_the_assumed_effort_as_if_squared_times_100() {
+        // Power is held steady, so IF is exactly ENDURANCE_IF and TSS is a pure
+        // function of time. This pins the arithmetic, not the physics.
+        let (secs, tss) = ramp(20_000.0, 0.0).estimated_load(250, 75.0);
+        let expected = ENDURANCE_IF * ENDURANCE_IF * (secs as f32 / 3600.0) * 100.0;
+        assert!(
+            (tss - expected).abs() < 0.01,
+            "TSS {tss} should be IF² × hours × 100 = {expected}"
+        );
+    }
+
+    #[test]
+    fn should_not_run_away_on_an_unrideably_steep_segment() {
+        // A wall drives the solved speed towards zero; without the floor the
+        // estimate diverges instead of just being large.
+        let (secs, _) = ramp(1_000.0, 0.35).estimated_load(250, 75.0);
+        assert!(secs > 0, "a steep kilometre still takes time");
+        assert!(
+            secs <= 1_000,
+            "1 km must not be estimated slower than the walking floor ({secs} s)"
+        );
+    }
+
+    #[test]
+    fn should_ignore_points_that_do_not_advance() {
+        // Real GPX files repeat a coordinate when a rider pauses. A zero-length
+        // window must contribute nothing rather than divide by zero.
+        let mut route = ramp(1_000.0, 0.0);
+        let dup = route.points[5].clone();
+        route.points.insert(6, dup);
+        let (secs, _) = route.estimated_load(250, 75.0);
+        let (clean_secs, _) = ramp(1_000.0, 0.0).estimated_load(250, 75.0);
+        assert_eq!(secs, clean_secs, "a repeated point must not add time");
     }
 }

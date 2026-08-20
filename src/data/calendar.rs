@@ -195,8 +195,10 @@ mod tests {
     fn scheduled(day: &str, tss: f32, completed: bool) -> CalendarEvent {
         CalendarEvent::Scheduled(CalendarEntry {
             id: 1,
-            workout_id: 1,
-            workout_name: "Endurance 60".into(),
+            item: crate::data::db::ScheduledItem::Workout {
+                id: 1,
+                name: "Endurance 60".into(),
+            },
             scheduled_date: day.into(),
             completed,
             category: WorkoutCategory::Endurance,

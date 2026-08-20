@@ -343,11 +343,16 @@ impl CycleGtkWindow {
             Rc::new(move || stack_for_coaching_nav.set_visible_child_name("coaching"));
         let on_go_to_coaching_dash = Rc::clone(&on_go_to_coaching);
 
+        // Filled in once `on_start_route` exists, further down: the route
+        // player it needs is built after this page (crate::ui::StartRouteHolder).
+        let start_route_holder: crate::ui::StartRouteHolder = Rc::new(RefCell::new(None));
+
         let (calendar_page, calendar_reload) = CalendarPage::new(
             pool.clone(),
             rt_handle.clone(),
             workouts.clone(),
             Rc::clone(&on_library_start),
+            Rc::clone(&start_route_holder),
             Rc::clone(&athlete_rc),
             on_toast_cal,
             on_go_to_coaching,
@@ -489,8 +494,11 @@ impl CycleGtkWindow {
             calendar_icon,
             on_toast_lib,
             Rc::clone(&athlete_rc),
-            on_start_route,
+            Rc::clone(&on_start_route),
         );
+        // The calendar page was built before this callback existed; hand it over
+        // now so a planned route can be ridden from its detail dialog.
+        *start_route_holder.borrow_mut() = Some(Rc::clone(&on_start_route));
         let library_reload = Rc::new(library_reload);
         // The dashboard has already loaded by the time the recovery prompt is
         // answered, so recovery refreshes it explicitly; every other page reloads
