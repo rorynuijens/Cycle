@@ -20,11 +20,15 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
   # Network: Anthropic API, Intervals.icu, OpenStreetMap map tiles
   - --share=network
-  # Lets GIO reach the gvfs daemon directly. Without it every file chooser logs
-  # "The peer-to-peer connection failed ... falling back to the session bus" once
-  # per mount. This is access to the daemon's own socket directory only — file
-  # access still comes from the portal, one file at a time, as the rider picks it.
-  - --filesystem=xdg-run/gvfsd
+  # No --filesystem= entry of any kind, deliberately. This once carried
+  # --filesystem=xdg-run/gvfsd, purely to silence a "peer-to-peer connection
+  # failed, falling back to the session bus" log line from GIO once per mount.
+  # GNOME Software reported that single entry as "Full File System Read/Write
+  # Access" and rated the app Possibly Unsafe / Medium Risk, which is a poor
+  # trade for one warning in a log nobody reads. Verified 2026-08-19 that the
+  # file chooser still works without it: it is the portal chooser, which runs
+  # outside the sandbox and hands back a document-portal path, so it never
+  # needed gvfs. Do not add it back.
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
