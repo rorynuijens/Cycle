@@ -90,7 +90,7 @@
   <content_rating type="oars-1.1" />
 
   <releases>
-    <release version="0.4.0" date="2026-08-20">
+    <release version="0.4.0" date="2026-08-21">
       <description>
         <p>You can now plan a GPX route on the calendar, not just a workout. A
            planned route counts towards your projected fitness, using an estimate
