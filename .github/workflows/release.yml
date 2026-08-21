@@ -125,7 +125,30 @@ jobs:
 
       - name: Install the runtime and SDK
         run: |
+          set -euo pipefail
           flatpak remote-add --if-not-exists flathub "$FLATHUB_REPO"
+          # Flathub can advertise a commit whose objects have not reached the
+          # CDN edge yet. Mid-pull that surfaces as an HTTP 404 on a .filez and
+          # takes the whole release with it — it killed the v0.5.0 run, three
+          # hours after rust-stable/25.08 was republished. Nothing is wrong with
+          # the build when this happens, so retry rather than lose the release.
+          #
+          # Deliberately its own step: --install-deps-only stops before building,
+          # so a genuine build failure below still fails on the first attempt
+          # instead of being retried for half an hour. Versions come from the
+          # manifest, so nothing here has to be kept in step with it.
+          for attempt in 1 2 3; do
+            if flatpak-builder --force-clean --install-deps-from=flathub \
+                 --install-deps-only build-deps "$APP_ID.yml"; then
+              exit 0
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::Could not install build dependencies from Flathub"
+              exit 1
+            fi
+            echo "Flathub pull failed (attempt $attempt) — retrying in 90s"
+            sleep 90
+          done
 
       - name: Build and commit to the repo
         env:
