@@ -32,7 +32,7 @@ impl CalendarEvent {
     /// can reach here (CLAUDE.md §5.2). Callers skip those rather than guess.
     pub fn date(&self) -> Option<NaiveDate> {
         match self {
-            Self::Scheduled(e) => NaiveDate::parse_from_str(&e.scheduled_date, "%Y-%m-%d").ok(),
+            Self::Scheduled(e) => e.date(),
             Self::Session(s, _) => Some(
                 s.session
                     .started_at
@@ -204,6 +204,8 @@ mod tests {
             category: WorkoutCategory::Endurance,
             tss,
             duration_secs: 3600,
+            program_id: None,
+            adjusted_from: None,
         })
     }
 

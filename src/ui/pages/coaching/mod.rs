@@ -4,7 +4,7 @@
 //! cached suggestion come from the database on reload; everything else is driven
 //! by the rider pressing a button.
 
-mod data;
+pub(crate) mod data;
 mod goals;
 mod plan;
 mod program;

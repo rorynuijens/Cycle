@@ -14,6 +14,8 @@ use crate::data::workout::Workout;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
 
+use super::marks::EntryMark;
+
 /// What the rider picked in the scheduling dialog.
 #[derive(Clone, Copy)]
 enum Picked {
@@ -561,6 +563,8 @@ pub fn show_workout_detail_dialog(
     on_start_workout: Rc<dyn Fn(Workout)>,
     on_start_route: crate::ui::StartRouteHolder,
     reload: Rc<dyn Fn()>,
+    on_toast: Rc<dyn Fn(adw::Toast)>,
+    mark: EntryMark,
 ) {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -601,6 +605,16 @@ pub fn show_workout_detail_dialog(
     title_box.append(&cat_label);
     content.append(&title_box);
 
+    if let Some(line) = mark.program_text() {
+        content.append(
+            &gtk::Label::builder()
+                .label(line)
+                .css_classes(["caption", "dim-label"])
+                .halign(gtk::Align::Start)
+                .build(),
+        );
+    }
+
     // Stats row
     let stats_list = gtk::ListBox::builder()
         .css_classes(["boxed-list"])
@@ -628,6 +642,105 @@ pub fn show_workout_detail_dialog(
                 .build(),
         );
     }
+
+    // ── What the program wants changed ───────────────────────────────────────
+    //
+    // Deliberately not a suggested-action: the row below already has one (Load
+    // Now / Ride Route), and the HIG allows only one per view. The card carries
+    // its own emphasis through the icon and the accent group instead.
+    let easing_list = gtk::ListBox::builder()
+        .css_classes(["boxed-list"])
+        .selection_mode(gtk::SelectionMode::None)
+        .visible(false)
+        .build();
+
+    // A session can be both: eased once already, and the rules still want it
+    // easier. Both rows show, because the rider needs the way back as much as
+    // the way forward — `original_workout_id` keeps pointing at what the
+    // program first asked for however many times it is eased.
+    if let Some(original) = &mark.adjusted_from {
+        let row = adw::ActionRow::builder()
+            .title("Eased by your program")
+            .subtitle(format!("Originally {original}"))
+            .build();
+        let icon = gtk::Image::builder()
+            .icon_name("object-select-symbolic")
+            .css_classes(["success"])
+            .build();
+        icon.update_property(&[gtk::accessible::Property::Label("Already eased")]);
+        row.add_prefix(&icon);
+
+        let undo_btn = gtk::Button::builder()
+            .label("Undo")
+            .css_classes(["pill"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Put this session back to what your program planned")
+            .build();
+        row.add_suffix(&undo_btn);
+        easing_list.append(&row);
+        easing_list.set_visible(true);
+
+        let pool_u = pool.clone();
+        let rt_u = rt_handle.clone();
+        let reload_u = Rc::clone(&reload);
+        let toast_u = Rc::clone(&on_toast);
+        let entry_id = entry.id;
+        undo_btn.connect_clicked(move |_| {
+            super::actions::undo_easing(
+                pool_u.clone(),
+                &rt_u,
+                entry_id,
+                Rc::clone(&toast_u),
+                Rc::clone(&reload_u),
+            );
+        });
+    }
+
+    if let Some(suggestion) = &mark.suggestion {
+        let row = adw::ActionRow::builder()
+            .title(format!("{} → {}", entry.item.name(), suggestion.to_name))
+            .subtitle(&suggestion.reason)
+            .subtitle_lines(0)
+            .build();
+        let icon = gtk::Image::builder()
+            .icon_name("view-refresh-symbolic")
+            .css_classes(["warning"])
+            .build();
+        icon.update_property(&[gtk::accessible::Property::Label(
+            "Your program suggests easing this session",
+        )]);
+        row.add_prefix(&icon);
+
+        let apply_btn = gtk::Button::builder()
+            .label("Apply")
+            .css_classes(["pill"])
+            .valign(gtk::Align::Center)
+            .tooltip_text(format!("Ease this session to {}", suggestion.to_name))
+            .build();
+        row.add_suffix(&apply_btn);
+        easing_list.append(&row);
+        easing_list.set_visible(true);
+
+        let pool_a = pool.clone();
+        let rt_a = rt_handle.clone();
+        let reload_a = Rc::clone(&reload);
+        let toast_a = Rc::clone(&on_toast);
+        let entry_id = entry.id;
+        let to_id = suggestion.to_workout_id;
+        let to_name = suggestion.to_name.clone();
+        apply_btn.connect_clicked(move |_| {
+            super::actions::apply_easing(
+                pool_a.clone(),
+                &rt_a,
+                entry_id,
+                to_id,
+                to_name.clone(),
+                Rc::clone(&toast_a),
+                Rc::clone(&reload_a),
+            );
+        });
+    }
+    content.append(&easing_list);
 
     toolbar_view.set_content(Some(&content));
 

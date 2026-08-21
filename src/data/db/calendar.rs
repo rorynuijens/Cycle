@@ -52,6 +52,23 @@ pub struct CalendarEntry {
     /// mean parsing a GPX per calendar cell.
     pub tss: f32,
     pub duration_secs: u32,
+    /// The training program this entry belongs to, or `None` for anything
+    /// scheduled by hand. Routes are never part of a program.
+    pub program_id: Option<i64>,
+    /// The name of the workout the program originally asked for, when this
+    /// entry has since been eased. `None` when it still stands as planned.
+    pub adjusted_from: Option<String>,
+}
+
+impl CalendarEntry {
+    /// The scheduled day, or `None` if the stored text is not a date.
+    ///
+    /// The column is text, so a corrupted or hand-edited row can hold anything
+    /// (CLAUDE.md §5.2); callers treat that as an entry with no day rather than
+    /// panicking on it.
+    pub fn date(&self) -> Option<chrono::NaiveDate> {
+        chrono::NaiveDate::parse_from_str(&self.scheduled_date, "%Y-%m-%d").ok()
+    }
 }
 
 /// Mark all incomplete calendar entries for a given workout and date as done.
@@ -77,17 +94,20 @@ pub async fn load_calendar_entries_between(
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<CalendarEntry>> {
-    // LEFT JOIN on both sides: an inner join on `workouts` would silently drop
-    // every scheduled route, which looks exactly like the plan losing entries.
+    // Every join is LEFT: an inner join on `workouts` would silently drop every
+    // scheduled route, which looks exactly like the plan losing entries, and the
+    // same goes for `orig` — only an eased entry has an original to join to.
     let rows = sqlx::query(
         "SELECT ce.id, ce.workout_id, ce.route_id,
                 w.name AS workout_name, r.name AS route_name,
                 ce.scheduled_date, ce.completed,
                 w.category, w.tss, w.duration_secs,
-                ce.planned_tss, ce.planned_duration_secs
+                ce.planned_tss, ce.planned_duration_secs,
+                ce.program_id, orig.name AS original_name
          FROM calendar_entries ce
-         LEFT JOIN workouts w ON ce.workout_id = w.id
-         LEFT JOIN routes   r ON ce.route_id   = r.id
+         LEFT JOIN workouts w    ON ce.workout_id          = w.id
+         LEFT JOIN routes   r    ON ce.route_id            = r.id
+         LEFT JOIN workouts orig ON ce.original_workout_id = orig.id
          WHERE ce.scheduled_date >= ? AND ce.scheduled_date <= ?
          ORDER BY ce.scheduled_date",
     )
@@ -154,6 +174,8 @@ fn row_to_entry(r: &sqlx::sqlite::SqliteRow) -> Option<CalendarEntry> {
         category,
         tss,
         duration_secs,
+        program_id: r.get("program_id"),
+        adjusted_from: r.get("original_name"),
     })
 }
 
@@ -356,6 +378,96 @@ mod tests {
         load_calendar_entries_between(pool, "2000-01-01", "2100-01-01")
             .await
             .unwrap()
+    }
+
+    async fn a_program(pool: &SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO programs (created_at, start_monday, num_weeks, training_days, active)
+             VALUES ('2026-03-01T00:00:00Z', '2026-03-02', 8, 'Mon,Wed,Fri', 1)",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    // ── the program's claim on an entry ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_report_which_program_owns_an_entry() {
+        let pool = test_pool().await;
+        let p = a_program(&pool).await;
+        let owned = a_workout(&pool, "Threshold 2x20").await;
+        let hand = a_workout(&pool, "Coffee Ride").await;
+        schedule_workout(&pool, owned, "2026-03-04", Some(p))
+            .await
+            .unwrap();
+        schedule_workout(&pool, hand, "2026-03-05", None)
+            .await
+            .unwrap();
+
+        let found = entries(&pool).await;
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].program_id, Some(p));
+        assert_eq!(found[1].program_id, None);
+    }
+
+    #[tokio::test]
+    async fn should_report_a_scheduled_route_as_owned_by_no_program() {
+        // `schedule_route` takes no program id at all — a route is never part
+        // of a program, and the calendar relies on that to skip marking them.
+        let pool = test_pool().await;
+        let r = a_route(&pool, "Alpe d'Huez").await;
+        schedule_route(&pool, r, "2026-03-05", 118.0, 7200)
+            .await
+            .unwrap();
+
+        let found = entries(&pool).await;
+        assert_eq!(found[0].program_id, None);
+        assert_eq!(found[0].adjusted_from, None);
+    }
+
+    #[tokio::test]
+    async fn should_name_the_workout_an_eased_entry_came_from() {
+        let pool = test_pool().await;
+        let p = a_program(&pool).await;
+        let hard = a_workout(&pool, "Threshold 2x20").await;
+        let easy = a_workout(&pool, "Sweet Spot 3x12").await;
+        let id = schedule_workout(&pool, hard, "2026-03-04", Some(p))
+            .await
+            .unwrap();
+
+        let before = entries(&pool).await;
+        assert_eq!(before[0].adjusted_from, None);
+
+        crate::data::db::apply_adjustment(&pool, id, easy)
+            .await
+            .unwrap();
+
+        let after = entries(&pool).await;
+        assert_eq!(after[0].item.name(), "Sweet Spot 3x12");
+        assert_eq!(after[0].adjusted_from.as_deref(), Some("Threshold 2x20"));
+    }
+
+    #[tokio::test]
+    async fn should_keep_returning_entries_that_were_never_eased() {
+        // Guards the third LEFT JOIN the same way the route test guards the
+        // first two: an inner join on `orig` would return only eased entries,
+        // silently emptying the calendar for everyone else.
+        let pool = test_pool().await;
+        let p = a_program(&pool).await;
+        let w = a_workout(&pool, "Endurance 90").await;
+        let r = a_route(&pool, "Ventoux").await;
+        schedule_workout(&pool, w, "2026-03-04", Some(p))
+            .await
+            .unwrap();
+        schedule_route(&pool, r, "2026-03-05", 118.0, 7200)
+            .await
+            .unwrap();
+
+        let found = entries(&pool).await;
+        assert_eq!(found.len(), 2, "no entry may be dropped by the orig join");
+        assert!(found.iter().all(|e| e.adjusted_from.is_none()));
     }
 
     // ── routes on the calendar ───────────────────────────────────────────────

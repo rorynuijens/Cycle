@@ -21,9 +21,7 @@ use std::rc::Rc;
 
 use crate::data::{athlete::AthleteProfile, db, workout::Workout};
 use crate::training::fitness::TsbBand;
-use crate::training::program::{
-    decided, status, suggest, Adjustment, CoachVerdict, Phase, ProgramStatus,
-};
+use crate::training::program::{plan_view, Adjustment, CoachVerdict, Phase, ProgramStatus};
 
 use super::data::{load_plan_data, PlanData};
 use super::program::week_start;
@@ -156,7 +154,19 @@ impl PlanCard {
             async move { db::revert_adjustment(&pool, entry_id).await },
             move |result| {
                 match result {
-                    Ok(()) => card.reload(),
+                    Ok(true) => card.reload(),
+                    // The entry was ridden or removed since the row was drawn.
+                    // Reloading is still right — it makes the stale row go away.
+                    Ok(false) => {
+                        tracing::warn!("adjustment {entry_id} was no longer revertible");
+                        on_toast(
+                            adw::Toast::builder()
+                                .title("That session has already been ridden")
+                                .timeout(5)
+                                .build(),
+                        );
+                        card.reload();
+                    }
                     Err(e) => {
                         tracing::error!("reverting adjustment {entry_id}: {e}");
                         on_toast(
@@ -236,14 +246,13 @@ impl PlanCard {
         self.rebuild_btn.set_visible(true);
         self.end_btn.set_visible(true);
 
-        let state = status(&program, &data.sessions, today);
-        let past = decided(&data.sessions, today);
         // The brief says how hard today should be; these rules decide what
         // that means for the plan, and are the only thing that produces an
-        // adjustment. One authority, so the rider gets one answer.
-        let adjustments = suggest(
-            &state,
-            &past,
+        // adjustment. One authority, so the rider gets one answer — the
+        // calendar reads the same `plan_view`.
+        let (state, adjustments) = plan_view(
+            &program,
+            &data.sessions,
             &data.metrics,
             &data.wellness,
             &self.workouts,
@@ -477,7 +486,11 @@ impl PlanCard {
                         match db::apply_adjustment(&pool_write, adj.entry_id, adj.to_workout_id)
                             .await
                         {
-                            Ok(()) => applied += 1,
+                            Ok(true) => applied += 1,
+                            Ok(false) => tracing::warn!(
+                                "adjustment to {} changed nothing — already ridden or gone",
+                                adj.entry_id
+                            ),
                             Err(e) => {
                                 tracing::error!("applying adjustment to {}: {e}", adj.entry_id)
                             }
@@ -840,7 +853,7 @@ fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
 mod tests {
     use super::*;
     use crate::data::workout::WorkoutCategory;
-    use crate::training::program::{PlannedSession, Program};
+    use crate::training::program::{status, PlannedSession, Program};
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")

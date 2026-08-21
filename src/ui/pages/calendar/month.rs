@@ -13,7 +13,8 @@ use crate::data::db::{self, CalendarEntry};
 use crate::data::workout::Workout;
 use crate::ui::widgets::zone_color::category_zone_rgb;
 
-use super::ReloadFn;
+use super::marks::{EntryMark, ProgramOverlay};
+use super::{reload_fn, ReloadFn};
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_month_grid(
@@ -28,6 +29,8 @@ pub fn build_month_grid(
     on_start_route: crate::ui::StartRouteHolder,
     ftp: u32,
     weight_kg: f32,
+    on_toast: Rc<dyn Fn(adw::Toast)>,
+    overlay: Rc<ProgramOverlay>,
 ) -> gtk::Grid {
     // vexpand: week rows share the viewport's spare height so cells grow
     // with the window instead of huddling at natural size.
@@ -77,7 +80,7 @@ pub fn build_month_grid(
 
         let items: Vec<MonthCellItem> = day_events
             .iter()
-            .map(|e| MonthCellItem::from_event(e, ftp))
+            .map(|e| MonthCellItem::from_event(e, ftp, &overlay))
             .collect();
         let day_totals = totals(day_events.iter().copied(), ftp);
         week.done_tss += day_totals.done_tss;
@@ -85,30 +88,15 @@ pub fn build_month_grid(
         week.scheduled += day_totals.scheduled;
         week.scheduled_done += day_totals.scheduled_done;
 
-        let (cell, item_labels) = make_day_cell(day_num, is_today, &items);
+        let (cell, item_widgets) = make_day_cell(day_num, is_today, &items);
         cell.set_vexpand(true);
-
-        // Helper: the page-wide reload, resolved at click time.
-        let make_reload = {
-            let rh = Rc::clone(&reload_holder);
-            move || -> Rc<dyn Fn()> {
-                let rh = Rc::clone(&rh);
-                Rc::new(move || {
-                    // Clone out before calling: reload rebuilds this grid.
-                    let f = rh.borrow().clone();
-                    if let Some(f) = f {
-                        f();
-                    }
-                })
-            }
-        };
 
         // ── Each planned item opens itself ───────────────────────────────────
         //
         // One gesture per label rather than one for the cell: a cell-wide
         // handler can only open a single entry, so a day with two plans always
         // opened the first.
-        for (label, item) in item_labels.iter().zip(items.iter()) {
+        for (row_widget, item) in item_widgets.iter().zip(items.iter()) {
             let Some(entry) = item.entry.clone() else {
                 continue;
             };
@@ -118,7 +106,9 @@ pub fn build_month_grid(
             let workouts_i = Rc::clone(&workouts);
             let on_start_i = Rc::clone(&on_start_workout);
             let on_start_route_i = Rc::clone(&on_start_route);
-            let make_reload_i = make_reload.clone();
+            let rh_i = Rc::clone(&reload_holder);
+            let toast_i = Rc::clone(&on_toast);
+            let mark = item.mark.clone();
             gesture.connect_released(move |g, _, _, _| {
                 let Some(widget) = g.widget() else { return };
                 super::dialogs::show_workout_detail_dialog(
@@ -129,11 +119,13 @@ pub fn build_month_grid(
                     Rc::clone(&workouts_i),
                     Rc::clone(&on_start_i),
                     Rc::clone(&on_start_route_i),
-                    make_reload_i(),
+                    reload_fn(&rh_i),
+                    Rc::clone(&toast_i),
+                    mark.clone(),
                 );
             });
-            label.add_controller(gesture);
-            label.set_tooltip_text(Some(&format!("{} — click to open", item.label)));
+            row_widget.add_controller(gesture);
+            row_widget.set_tooltip_text(Some(&item.tooltip()));
         }
 
         // ── Empty future day: click anywhere in it to schedule ───────────────
@@ -144,7 +136,7 @@ pub fn build_month_grid(
             let pool_c = pool.clone();
             let rt_c = rt_handle.clone();
             let workouts_c = Rc::clone(&workouts);
-            let make_reload_c = make_reload.clone();
+            let rh_c = Rc::clone(&reload_holder);
             gesture.connect_released(move |g, _, _, _| {
                 let Some(widget) = g.widget() else { return };
                 super::dialogs::show_schedule_dialog(
@@ -155,7 +147,7 @@ pub fn build_month_grid(
                     rt_c.clone(),
                     ftp,
                     weight_kg,
-                    make_reload_c(),
+                    reload_fn(&rh_c),
                 );
             });
             cell.add_controller(gesture);
@@ -167,14 +159,14 @@ pub fn build_month_grid(
             let pool_dt = pool.clone();
             let rt_dt = rt_handle.clone();
             let target_date = date.format("%Y-%m-%d").to_string();
-            let make_reload_dt = make_reload.clone();
+            let rh_dt = Rc::clone(&reload_holder);
             drop.connect_drop(move |_, value, _, _| {
                 let Ok(entry_id) = value.get::<i64>() else {
                     return false;
                 };
                 let pool_c = pool_dt.clone();
                 let date = target_date.clone();
-                let reload = make_reload_dt();
+                let reload = reload_fn(&rh_dt);
                 crate::ui::spawn_to_main(
                     &rt_dt,
                     async move { db::reschedule_entry(&pool_c, entry_id, &date).await },
@@ -214,8 +206,11 @@ fn make_day_cell(
     day_num: u32,
     is_today: bool,
     items: &[MonthCellItem],
-) -> (gtk::Frame, Vec<gtk::Label>) {
-    let mut item_labels: Vec<gtk::Label> = Vec::new();
+) -> (gtk::Frame, Vec<gtk::Box>) {
+    // A row per item rather than a bare label: the program's dot and its
+    // easing badge sit beside the name, and the gesture and drag source move
+    // onto the row so the whole thing is one target.
+    let mut item_rows: Vec<gtk::Box> = Vec::new();
     let frame = gtk::Frame::new(None);
     if is_today {
         frame.add_css_class("card");
@@ -253,16 +248,45 @@ fn make_day_cell(
             );
             break;
         }
-        let label = gtk::Label::builder()
-            .label(&item.label)
-            .halign(gtk::Align::Start)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(if item.dimmed {
-                vec!["dim-label", "caption"]
-            } else {
-                vec!["caption"]
-            })
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
             .build();
+
+        if item.mark.program_week.is_some() {
+            row.append(
+                &gtk::Label::builder()
+                    .label("\u{2022}")
+                    .css_classes(["accent", "caption"])
+                    .build(),
+            );
+        }
+
+        row.append(
+            &gtk::Label::builder()
+                .label(&item.label)
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(if item.dimmed {
+                    vec!["dim-label", "caption"]
+                } else {
+                    vec!["caption"]
+                })
+                .build(),
+        );
+
+        // The program wants this day changed. A cell is far too tight for a
+        // button, so this is a signpost to the detail dialog, where Apply is.
+        if item.mark.suggestion.is_some() {
+            row.append(
+                &gtk::Image::builder()
+                    .icon_name("view-refresh-symbolic")
+                    .pixel_size(12)
+                    .css_classes(["warning"])
+                    .build(),
+            );
+        }
 
         // An open plan can be dragged straight out of the cell to another day.
         // Completed ones stay put: they record what was actually ridden.
@@ -273,11 +297,11 @@ fn make_day_cell(
             drag.connect_prepare(move |_, _, _| {
                 Some(gtk::gdk::ContentProvider::for_value(&dragged_id.to_value()))
             });
-            label.add_controller(drag);
+            row.add_controller(drag);
         }
 
-        vbox.append(&label);
-        item_labels.push(label);
+        vbox.append(&row);
+        item_rows.push(row);
     }
 
     // Spacer keeps the day number pinned to the top and the load bar to
@@ -300,7 +324,7 @@ fn make_day_cell(
     }
 
     frame.set_child(Some(&vbox));
-    (frame, item_labels)
+    (frame, item_rows)
 }
 
 // ── Month cell item ───────────────────────────────────────────────────────────
@@ -318,10 +342,31 @@ struct MonthCellItem {
     /// item can be dragged to another day and opened on its own, instead of the
     /// whole cell standing in for whichever entry happened to be first.
     entry: Option<CalendarEntry>,
+    /// What the training program has to say about this item.
+    mark: EntryMark,
 }
 
 impl MonthCellItem {
-    fn from_event(event: &CalendarEvent, ftp: u32) -> Self {
+    /// The cell's tooltip: a month cell shows a dot and an icon, and this is
+    /// where they are spelled out.
+    fn tooltip(&self) -> String {
+        let mut text = format!("{} — click to open", self.label);
+        if let Some(line) = self.mark.program_text() {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        if let Some(s) = &self.mark.suggestion {
+            text.push_str(&format!(
+                "\nYour program suggests easing this to {}",
+                s.to_name
+            ));
+        } else if let Some(original) = &self.mark.adjusted_from {
+            text.push_str(&format!("\nEased from {original}"));
+        }
+        text
+    }
+
+    fn from_event(event: &CalendarEvent, ftp: u32, overlay: &ProgramOverlay) -> Self {
         let load = event.load(ftp);
         match event {
             CalendarEvent::Scheduled(e) => MonthCellItem {
@@ -335,6 +380,7 @@ impl MonthCellItem {
                 planned_tss: load.planned_tss,
                 color: category_zone_rgb(&e.category),
                 entry: Some((*e).clone()),
+                mark: overlay.mark(e),
             },
             CalendarEvent::Session(_, name) => MonthCellItem {
                 label: name
@@ -347,6 +393,7 @@ impl MonthCellItem {
                 planned_tss: load.planned_tss,
                 color: None,
                 entry: None,
+                mark: EntryMark::default(),
             },
             CalendarEvent::IcuActivity(a) => MonthCellItem {
                 label: if a.name.trim().is_empty() {
@@ -359,6 +406,7 @@ impl MonthCellItem {
                 planned_tss: load.planned_tss,
                 color: None,
                 entry: None,
+                mark: EntryMark::default(),
             },
             CalendarEvent::TimeOff(_) => MonthCellItem {
                 label: "Time off".to_string(),
@@ -367,6 +415,7 @@ impl MonthCellItem {
                 planned_tss: load.planned_tss,
                 color: None,
                 entry: None,
+                mark: EntryMark::default(),
             },
         }
     }

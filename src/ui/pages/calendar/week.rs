@@ -11,7 +11,20 @@ use crate::data::db;
 use crate::data::workout::Workout;
 use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
 
-use super::ReloadFn;
+use super::marks::ProgramOverlay;
+use super::{reload_fn, ReloadFn};
+
+/// A small accent bullet marking an entry as part of the training program.
+///
+/// A dot rather than a word because it has to survive a dense day without
+/// pushing the workout's name out of view; the week row spells it out
+/// underneath, and the tooltip says it in full.
+fn program_dot() -> gtk::Label {
+    gtk::Label::builder()
+        .label("\u{2022}")
+        .css_classes(["accent", "caption"])
+        .build()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_week_view(
@@ -26,6 +39,7 @@ pub fn build_week_view(
     ftp: u32,
     weight_kg: f32,
     on_toast: Rc<dyn Fn(adw::Toast)>,
+    overlay: Rc<ProgramOverlay>,
 ) -> gtk::Box {
     let vbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -137,9 +151,7 @@ pub fn build_week_view(
                         if let Err(e) = res {
                             tracing::error!("delete_time_off: {e}");
                         }
-                        if let Some(reload) = rh_to.borrow().as_ref() {
-                            reload();
-                        }
+                        reload_fn(&rh_to)();
                     },
                 );
             });
@@ -190,11 +202,7 @@ pub fn build_week_view(
                 let workouts_rs = Rc::clone(&workouts);
                 rest_btn.connect_clicked(move |btn| {
                     let rh_c = Rc::clone(&rh_rs);
-                    let reload_fn: Rc<dyn Fn()> = Rc::new(move || {
-                        if let Some(f) = rh_c.borrow().as_ref() {
-                            f();
-                        }
-                    });
+                    let reload_fn: Rc<dyn Fn()> = reload_fn(&rh_c);
                     super::dialogs::show_schedule_dialog(
                         btn,
                         &workouts_rs,
@@ -221,6 +229,11 @@ pub fn build_week_view(
 
                         entry_row.append(&color_stripe(category_zone_rgb(&entry.category)));
 
+                        let mark = overlay.mark(entry);
+                        if mark.program_week.is_some() {
+                            entry_row.append(&program_dot());
+                        }
+
                         // Drag to another day. Only open plans move: a ridden
                         // session belongs to the day it was ridden on. Same shape
                         // as the segment reorder in library/editor.rs, with the
@@ -242,12 +255,16 @@ pub fn build_week_view(
                             entry.item.name().to_string()
                         };
                         let dur_mins = entry.duration_secs / 60;
-                        let tooltip = format!(
+                        let mut tooltip = format!(
                             "{} min · TSS {:.0} · {}",
                             dur_mins,
                             entry.tss,
                             entry.category.label()
                         );
+                        if let Some(line) = mark.program_text() {
+                            tooltip.push('\n');
+                            tooltip.push_str(&line);
+                        }
 
                         let btn = gtk::Button::builder()
                             .css_classes(["flat"])
@@ -265,7 +282,35 @@ pub fn build_week_view(
                                 vec!["caption"]
                             })
                             .build();
-                        btn.set_child(Some(&lbl));
+
+                        // The name, with the plan's own words underneath it —
+                        // the month grid has only room for the dot.
+                        let btn_body = gtk::Box::builder()
+                            .orientation(gtk::Orientation::Vertical)
+                            .spacing(0)
+                            .build();
+                        btn_body.append(&lbl);
+                        if let Some(line) = mark.program_text() {
+                            btn_body.append(
+                                &gtk::Label::builder()
+                                    .label(line)
+                                    .halign(gtk::Align::Start)
+                                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                                    .css_classes(["caption", "dim-label"])
+                                    .build(),
+                            );
+                        }
+                        if let Some(original) = &mark.adjusted_from {
+                            btn_body.append(
+                                &gtk::Label::builder()
+                                    .label(format!("Eased from {original}"))
+                                    .halign(gtk::Align::Start)
+                                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                                    .css_classes(["caption", "success"])
+                                    .build(),
+                            );
+                        }
+                        btn.set_child(Some(&btn_body));
 
                         let entry_clone = (*entry).clone();
                         let pool_d = pool.clone();
@@ -274,13 +319,11 @@ pub fn build_week_view(
                         let on_start_d = Rc::clone(&on_start_workout);
                         let on_start_route_d = Rc::clone(&on_start_route);
                         let rh_d = Rc::clone(&reload_holder);
+                        let toast_d = Rc::clone(&on_toast);
+                        let mark_d = mark.clone();
                         btn.connect_clicked(move |b| {
                             let rh_c = Rc::clone(&rh_d);
-                            let reload_fn: Rc<dyn Fn()> = Rc::new(move || {
-                                if let Some(f) = rh_c.borrow().as_ref() {
-                                    f();
-                                }
-                            });
+                            let reload_fn: Rc<dyn Fn()> = reload_fn(&rh_c);
                             super::dialogs::show_workout_detail_dialog(
                                 b,
                                 &entry_clone,
@@ -290,6 +333,8 @@ pub fn build_week_view(
                                 Rc::clone(&on_start_d),
                                 Rc::clone(&on_start_route_d),
                                 reload_fn,
+                                Rc::clone(&toast_d),
+                                mark_d.clone(),
                             );
                         });
 
@@ -305,6 +350,137 @@ pub fn build_week_view(
                         );
 
                         chip_box.append(&entry_row);
+
+                        // ── What the program wants changed about this day ─────
+                        if let Some(suggestion) = &mark.suggestion {
+                            let advice_row = gtk::Box::builder()
+                                .orientation(gtk::Orientation::Horizontal)
+                                .spacing(6)
+                                .margin_start(12)
+                                .margin_bottom(6)
+                                .build();
+
+                            advice_row.append(
+                                &gtk::Image::builder()
+                                    .icon_name("view-refresh-symbolic")
+                                    .css_classes(["warning"])
+                                    .valign(gtk::Align::Start)
+                                    .build(),
+                            );
+
+                            let advice_text = gtk::Box::builder()
+                                .orientation(gtk::Orientation::Vertical)
+                                .hexpand(true)
+                                .build();
+                            advice_text.append(
+                                &gtk::Label::builder()
+                                    .label(format!("Ease to {}", suggestion.to_name))
+                                    .halign(gtk::Align::Start)
+                                    .css_classes(["caption-heading"])
+                                    .build(),
+                            );
+                            advice_text.append(
+                                &gtk::Label::builder()
+                                    .label(&suggestion.reason)
+                                    .halign(gtk::Align::Start)
+                                    .xalign(0.0)
+                                    .wrap(true)
+                                    .css_classes(["caption", "dim-label"])
+                                    .build(),
+                            );
+                            advice_row.append(&advice_text);
+
+                            let apply_btn = gtk::Button::builder()
+                                .label("Apply")
+                                .css_classes(["pill", "caption"])
+                                .valign(gtk::Align::Center)
+                                .tooltip_text(format!(
+                                    "Ease this session to {}",
+                                    suggestion.to_name
+                                ))
+                                .build();
+
+                            let pool_a = pool.clone();
+                            let rt_a = rt_handle.clone();
+                            let rh_a = Rc::clone(&reload_holder);
+                            let toast_a = Rc::clone(&on_toast);
+                            let entry_id = entry.id;
+                            let to_id = suggestion.to_workout_id;
+                            let to_name = suggestion.to_name.clone();
+                            apply_btn.connect_clicked(move |_| {
+                                super::actions::apply_easing(
+                                    pool_a.clone(),
+                                    &rt_a,
+                                    entry_id,
+                                    to_id,
+                                    to_name.clone(),
+                                    Rc::clone(&toast_a),
+                                    reload_fn(&rh_a),
+                                );
+                            });
+                            advice_row.append(&apply_btn);
+
+                            // Already eased once and the rules want it easier
+                            // still: without this the row offers only a way
+                            // further down, and the way back is a click away in
+                            // the detail dialog with nothing pointing at it.
+                            if mark.adjusted_from.is_some() {
+                                let undo_btn = gtk::Button::builder()
+                                    .label("Undo")
+                                    .css_classes(["pill", "caption"])
+                                    .valign(gtk::Align::Center)
+                                    .tooltip_text(
+                                        "Put this session back to what your program planned",
+                                    )
+                                    .build();
+                                let pool_u = pool.clone();
+                                let rt_u = rt_handle.clone();
+                                let rh_u = Rc::clone(&reload_holder);
+                                let toast_u = Rc::clone(&on_toast);
+                                let entry_id = entry.id;
+                                undo_btn.connect_clicked(move |_| {
+                                    super::actions::undo_easing(
+                                        pool_u.clone(),
+                                        &rt_u,
+                                        entry_id,
+                                        Rc::clone(&toast_u),
+                                        reload_fn(&rh_u),
+                                    );
+                                });
+                                advice_row.append(&undo_btn);
+                            }
+
+                            chip_box.append(&advice_row);
+                        } else if mark.adjusted_from.is_some() {
+                            let undo_row = gtk::Box::builder()
+                                .orientation(gtk::Orientation::Horizontal)
+                                .margin_start(12)
+                                .margin_bottom(6)
+                                .build();
+                            let undo_btn = gtk::Button::builder()
+                                .label("Undo")
+                                .css_classes(["pill", "caption"])
+                                .halign(gtk::Align::Start)
+                                .tooltip_text("Put this session back to what your program planned")
+                                .build();
+
+                            let pool_u = pool.clone();
+                            let rt_u = rt_handle.clone();
+                            let rh_u = Rc::clone(&reload_holder);
+                            let toast_u = Rc::clone(&on_toast);
+                            let entry_id = entry.id;
+                            undo_btn.connect_clicked(move |_| {
+                                super::actions::undo_easing(
+                                    pool_u.clone(),
+                                    &rt_u,
+                                    entry_id,
+                                    Rc::clone(&toast_u),
+                                    reload_fn(&rh_u),
+                                );
+                            });
+                            undo_row.append(&undo_btn);
+                            chip_box.append(&undo_row);
+                        }
                     }
 
                     CalendarEvent::Session(session, workout_name) => {
@@ -436,9 +612,7 @@ pub fn build_week_view(
                                             if let Err(e) = res {
                                                 tracing::error!("delete_session: {e}");
                                             }
-                                            if let Some(f) = rh_c.borrow().as_ref() {
-                                                f();
-                                            }
+                                            reload_fn(&rh_c)();
                                         },
                                     );
                                 },
@@ -569,9 +743,7 @@ pub fn build_week_view(
                                                         .timeout(3)
                                                         .build(),
                                                 );
-                                                if let Some(f) = rh_c.borrow().as_ref() {
-                                                    f();
-                                                }
+                                                reload_fn(&rh_c)();
                                             }
                                         },
                                     );

@@ -1,7 +1,9 @@
 //! The Calendar page: what is planned, what was ridden, and the gap between them.
 
+mod actions;
 mod detail;
 mod dialogs;
+pub(crate) mod marks;
 mod month;
 mod week;
 
@@ -17,8 +19,27 @@ use crate::data::athlete::AthleteProfile;
 use crate::data::calendar::{month_bounds, month_label, CalendarEvent};
 use crate::data::db::{self};
 use crate::data::workout::Workout;
+use crate::training::program::{plan_view, CoachVerdict};
+use crate::ui::brief_store::BriefStore;
 
+use self::marks::ProgramOverlay;
 use crate::ui::ReloadFn;
+
+/// The page-wide reload, resolved at click time rather than at build time.
+///
+/// The closure a row needs does not exist while that row is being built — see
+/// [`crate::ui::ReloadHolder`]. Cloning the inner `Rc` out before calling it
+/// matters: reload rebuilds the very widget whose handler is running, and
+/// holding the `RefCell` borrow across that is a panic waiting to happen.
+fn reload_fn(holder: &Rc<RefCell<Option<ReloadFn>>>) -> Rc<dyn Fn()> {
+    let holder = Rc::clone(holder);
+    Rc::new(move || {
+        let f = holder.borrow().clone();
+        if let Some(f) = f {
+            f();
+        }
+    })
+}
 
 /// Everything the calendar draws for one visible range.
 struct CalendarData {
@@ -26,6 +47,11 @@ struct CalendarData {
     /// "ask the coach" banner, so it is not limited to the visible range.
     upcoming: i64,
     events: Vec<CalendarEvent>,
+    /// The program's raw state, or `None` when the rider follows no program.
+    /// The rules are not run here: they are pure and cheap, and running them on
+    /// the main thread keeps the workout library off this future, which has to
+    /// be `Send`.
+    plan: Option<crate::ui::pages::coaching::data::PlanData>,
 }
 
 /// Load one visible range off the GTK main thread (CLAUDE.md §2.3), merging the
@@ -33,8 +59,10 @@ struct CalendarData {
 async fn load_calendar_data(
     pool: &SqlitePool,
     today: &str,
+    today_date: NaiveDate,
     start: NaiveDate,
     end: NaiveDate,
+    ftp: u32,
 ) -> anyhow::Result<CalendarData> {
     let start_s = start.format("%Y-%m-%d").to_string();
     let end_s = end.format("%Y-%m-%d").to_string();
@@ -55,11 +83,27 @@ async fn load_calendar_data(
     events.extend(icu_activities.into_iter().map(CalendarEvent::IcuActivity));
     events.extend(time_off.into_iter().map(CalendarEvent::TimeOff));
 
-    Ok(CalendarData { upcoming, events })
+    // Only pay for the program's inputs when there is a program to describe.
+    let plan = match db::active_program(pool).await? {
+        Some(_) => {
+            Some(crate::ui::pages::coaching::data::load_plan_data(pool, today_date, ftp).await?)
+        }
+        None => None,
+    };
+
+    Ok(CalendarData {
+        upcoming,
+        events,
+        plan,
+    })
 }
 
 pub struct CalendarPage {
     root: gtk::Box,
+    /// The morning brief's read on today. It is a reason for the program to
+    /// ease, never a way to pick a session — see `training::program::suggest`.
+    verdict: Rc<Cell<CoachVerdict>>,
+    reload: ReloadFn,
 }
 
 impl CalendarPage {
@@ -76,6 +120,7 @@ impl CalendarPage {
         on_toast: Rc<dyn Fn(adw::Toast)>,
         on_go_to_coaching: Rc<dyn Fn()>,
     ) -> (Self, Rc<dyn Fn()>) {
+        let verdict: Rc<Cell<CoachVerdict>> = Rc::new(Cell::new(CoachVerdict::default()));
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
@@ -282,6 +327,7 @@ impl CalendarPage {
             let on_toast = Rc::clone(&on_toast);
             let coaching_banner_r = coaching_banner.clone();
             let athlete = Rc::clone(&athlete);
+            let verdict = Rc::clone(&verdict);
 
             Rc::new(move || {
                 // Fresh each render: TSS on every row is scaled by FTP, so a
@@ -315,7 +361,11 @@ impl CalendarPage {
                 // Reads run on the tokio runtime and the view is rebuilt on the
                 // GTK main thread, so navigation never blocks the GLib loop
                 // (CLAUDE.md §2.3).
-                let today_str = Local::now().format("%Y-%m-%d").to_string();
+                // Recomputed per render, not captured at construction: the app
+                // is left open across midnight and "today" must move with it.
+                let now = Local::now();
+                let today_str = now.format("%Y-%m-%d").to_string();
+                let today_date = now.date_naive();
 
                 // Per-invocation clones for the async result handler (this closure is Fn).
                 let dynamic = dynamic.clone();
@@ -332,16 +382,31 @@ impl CalendarPage {
                 let on_toast_err = Rc::clone(&on_toast);
 
                 let pool_load = pool.clone();
+                let today_date_load = today_date;
+                let workouts_marks = Rc::clone(&workouts);
+                let verdict_now = verdict.get();
                 crate::ui::spawn_to_main(
                     &rt_handle,
                     async move {
-                        load_calendar_data(&pool_load, &today_str, start_date, end_date).await
+                        load_calendar_data(
+                            &pool_load,
+                            &today_str,
+                            today_date_load,
+                            start_date,
+                            end_date,
+                            ftp,
+                        )
+                        .await
                     },
                     move |result| {
                         // A failed load must not redraw the month as empty — a
                         // blank calendar reads as "nothing planned", which would
                         // have the rider schedule over work already on the books.
-                        let CalendarData { upcoming, events } = match result {
+                        let CalendarData {
+                            upcoming,
+                            events,
+                            plan,
+                        } = match result {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("Could not load the calendar: {e}");
@@ -357,6 +422,29 @@ impl CalendarPage {
 
                         // Show coaching banner when no upcoming scheduled workouts exist.
                         coaching_banner_r.set_revealed(upcoming == 0);
+
+                        // The rules run here, on the main thread: they are pure
+                        // and cheap, and this is the one place with both the
+                        // workout library and the brief's verdict to hand.
+                        let overlay = Rc::new(
+                            plan.and_then(|data| {
+                                let program = data.program?;
+                                let (_, adjustments) = plan_view(
+                                    &program,
+                                    &data.sessions,
+                                    &data.metrics,
+                                    &data.wellness,
+                                    &workouts_marks,
+                                    today_date_load,
+                                    verdict_now,
+                                );
+                                Some(ProgramOverlay {
+                                    program: Some(program),
+                                    adjustment: adjustments.into_iter().next(),
+                                })
+                            })
+                            .unwrap_or_default(),
+                        );
 
                         while let Some(child) = dynamic.first_child() {
                             dynamic.remove(&child);
@@ -376,6 +464,7 @@ impl CalendarPage {
                                 ftp,
                                 weight_kg,
                                 Rc::clone(&on_toast),
+                                Rc::clone(&overlay),
                             ));
                         } else {
                             let (year, month) = current_month.get();
@@ -391,6 +480,8 @@ impl CalendarPage {
                                 Rc::clone(&on_start_route_build),
                                 ftp,
                                 weight_kg,
+                                Rc::clone(&on_toast),
+                                Rc::clone(&overlay),
                             ));
                         }
                     },
@@ -655,10 +746,42 @@ impl CalendarPage {
         // Initial load
         reload();
 
-        (Self { root }, reload)
+        (
+            Self {
+                root,
+                verdict,
+                reload: Rc::clone(&reload),
+            },
+            reload,
+        )
     }
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// Tell the calendar what the morning brief made of today.
+    ///
+    /// Only reloads when the value actually changed: the brief store notifies
+    /// its observers on every state transition, most of which say nothing new
+    /// about the plan and must not cost a round of queries. Same reasoning as
+    /// `PlanCard::set_verdict`.
+    pub fn set_verdict(&self, verdict: CoachVerdict) {
+        if self.verdict.get() == verdict {
+            return;
+        }
+        self.verdict.set(verdict);
+        (self.reload)();
+    }
+
+    /// Follow the brief store, so an easing appears on the calendar as soon as
+    /// the morning brief lands.
+    pub fn observe_brief(self: &Rc<Self>, store: &Rc<BriefStore>) {
+        let page = Rc::downgrade(self);
+        store.observe(move |state: &crate::ui::brief_store::BriefState| {
+            if let Some(page) = page.upgrade() {
+                page.set_verdict(state.brief.as_ref().map(|b| b.verdict).unwrap_or_default());
+            }
+        });
     }
 }

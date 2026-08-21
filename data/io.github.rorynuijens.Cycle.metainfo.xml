@@ -90,6 +90,22 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.5.0" date="2026-08-21">
+      <description>
+        <p>Your calendar now shows which sessions belong to your training
+           program. Look for the accent dot in the month view; the week view
+           spells out which week of the plan each session falls in.</p>
+        <p>When your program wants to ease a session — because your form is dug
+           in, your resting heart rate is up, or you have missed a run of
+           sessions — the calendar says so on the day itself, explains why, and
+           lets you apply the change without leaving the page. Changed your
+           mind? Undo puts the session back to what the plan originally asked
+           for.</p>
+        <p>As before, adjustments only ever make a session easier, and only ever
+           the next one: your form is worked out afresh every day, so deciding
+           Thursday's session today would be guessing.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-08-21">
       <description>
         <p>You can now plan a GPX route on the calendar, not just a workout. A

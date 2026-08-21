@@ -451,6 +451,27 @@ pub fn suggest(
     }]
 }
 
+/// The program's current state and what it proposes changing, in one call.
+///
+/// Two surfaces ask this question now — the Coaching page's card and the
+/// calendar — and they must never answer it differently. Bundling the three
+/// steps here means neither can accidentally call [`suggest`] with a
+/// differently-derived [`ProgramStatus`].
+pub fn plan_view(
+    program: &Program,
+    sessions: &[PlannedSession],
+    metrics: &LoadMetrics,
+    wellness: &[WellnessEntry],
+    library: &[Workout],
+    today: NaiveDate,
+    verdict: CoachVerdict,
+) -> (ProgramStatus, Vec<Adjustment>) {
+    let state = status(program, sessions, today);
+    let past = decided(sessions, today);
+    let adjustments = suggest(&state, &past, metrics, wellness, library, today, verdict);
+    (state, adjustments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +517,41 @@ mod tests {
             today,
             CoachVerdict::Proceed,
         )
+    }
+
+    #[test]
+    fn plan_view_should_agree_with_calling_the_three_steps_separately() {
+        // The calendar and the Coaching card both go through `plan_view`; this
+        // is what stops it drifting from the pieces the rules are tested on.
+        let today = date(2026, 8, 12);
+        let sessions = vec![
+            session(1, date(2026, 8, 10), WorkoutCategory::Endurance, false),
+            session(2, today, WorkoutCategory::Threshold, false),
+            session(3, date(2026, 8, 14), WorkoutCategory::Vo2Max, false),
+        ];
+        let m = metrics(-22.0);
+        let w = wellness(&[], today);
+        let lib = library();
+        let prog = program(8);
+
+        let (state, adjustments) =
+            plan_view(&prog, &sessions, &m, &w, &lib, today, CoachVerdict::Proceed);
+
+        let expected_state = status(&prog, &sessions, today);
+        let expected = suggest(
+            &expected_state,
+            &decided(&sessions, today),
+            &m,
+            &w,
+            &lib,
+            today,
+            CoachVerdict::Proceed,
+        );
+
+        assert_eq!(state, expected_state);
+        assert_eq!(adjustments, expected);
+        // And it is actually exercising the interesting path, not two empties.
+        assert_eq!(adjustments.len(), 1);
     }
 
     fn session(id: i64, d: NaiveDate, cat: WorkoutCategory, completed: bool) -> PlannedSession {

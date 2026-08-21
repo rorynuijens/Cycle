@@ -357,6 +357,11 @@ impl CycleGtkWindow {
             on_toast_cal,
             on_go_to_coaching,
         );
+        let calendar_page = Rc::new(calendar_page);
+        // The brief's verdict is one of the inputs the program's easing rules
+        // read, so the calendar has to hear about it the same way the Coaching
+        // card does — otherwise a badge only appears on the next navigation.
+        calendar_page.observe_brief(&brief_store);
 
         // ── Fitness page ──────────────────────────────────────────────────────
         let toast_overlay_for_fitness = self.toast_overlay.clone();

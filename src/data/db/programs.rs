@@ -132,8 +132,17 @@ pub async fn load_program_sessions(
 /// `original_workout_id` is written only when it is still empty, so easing a
 /// session twice keeps pointing at what the program first asked for rather
 /// than at the previous adjustment.
-pub async fn apply_adjustment(pool: &SqlitePool, entry_id: i64, new_workout_id: i64) -> Result<()> {
-    sqlx::query(
+///
+/// Returns whether anything actually changed. It can legitimately be `false` —
+/// the entry may have been ridden or deleted since the suggestion was drawn,
+/// and two surfaces now offer the button — and a caller that reports success
+/// regardless would tell the rider their session was eased when it was not.
+pub async fn apply_adjustment(
+    pool: &SqlitePool,
+    entry_id: i64,
+    new_workout_id: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
         "UPDATE calendar_entries
             SET original_workout_id = COALESCE(original_workout_id, workout_id),
                 workout_id = ?
@@ -143,12 +152,15 @@ pub async fn apply_adjustment(pool: &SqlitePool, entry_id: i64, new_workout_id: 
     .bind(entry_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Put a scheduled session back to what the program originally asked for.
-pub async fn revert_adjustment(pool: &SqlitePool, entry_id: i64) -> Result<()> {
-    sqlx::query(
+///
+/// Returns whether anything changed, for the same reason as
+/// [`apply_adjustment`].
+pub async fn revert_adjustment(pool: &SqlitePool, entry_id: i64) -> Result<bool> {
+    let result = sqlx::query(
         "UPDATE calendar_entries
             SET workout_id = original_workout_id,
                 original_workout_id = NULL
@@ -157,7 +169,7 @@ pub async fn revert_adjustment(pool: &SqlitePool, entry_id: i64) -> Result<()> {
     .bind(entry_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Clear a program's future, unridden sessions, ready for a rebuilt plan.
