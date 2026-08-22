@@ -123,68 +123,73 @@ jobs:
             echo "No gh-pages branch yet — starting a new repo"
           fi
 
-      # TEMPORARY — delete this whole step once Flathub is whole again.
+      # TEMPORARY — see "Removing the pin" at the bottom of this comment.
       #
-      # The head commit of rust-stable/25.08 (4d0c0a79, version 1.98.0) is
-      # advertised by the summary but is missing one content object at the CDN
-      # edge:
+      # Flathub advertises rust-stable/25.08 at commit 4d0c0a79 (version
+      # 1.98.0) but is missing one content object of it at the CDN edge:
       #
       #   objects/06/0fdf65e0a1042c0db51bf9d009048f9f07e047b422e0e736c5d8ad35ac3a9c.filez
       #
-      # The ref resolves, the pull gets ~492 MB of 556 MB, then dies on that
-      # 404. It has been this way since 2026-08-21 and it is what killed the
-      # first v0.5.0 run. The retry below cannot help: the object is absent,
-      # not slow.
+      # The ref resolves, the pull reaches ~492 MB of 556 MB, then dies on that
+      # 404. It has been so since 2026-08-21 and it killed two v0.5.0 runs.
+      # Retrying cannot help: the object is absent, not slow.
       #
-      # The parent commit (385427f6, version 1.97.1) is complete — verified by
-      # pulling it in full and walking the tree with `ostree ls -R`, no missing
-      # objects. Pull that one explicitly and deploy it from the local cache;
-      # --install-deps-only below then finds rust-stable already installed and
-      # leaves it alone.
+      # The parent commit 385427f6 (version 1.97.1) is whole — it pulls clean
+      # and `ostree ls -R` walks the tree with nothing missing. The two differ
+      # by a rust and rust-analyzer bump this app does not depend on.
       #
-      # This goes through ostree because `flatpak install` has no --commit
-      # (only `update` and `remote-info` have it). `REF@COMMIT` pulls one
-      # specific commit; --no-pull then deploys exactly what was pulled.
+      # Installing the pinned commit is not enough on its own: a first attempt
+      # pinned it and then let `flatpak-builder --install-deps-only` run, which
+      # does not leave an installed extension alone — it UPDATES it to the
+      # advertised head and fails on the same object. So every dependency is
+      # installed here by hand and flatpak-builder is never given
+      # --install-deps-from, which is its only dependency-management flag.
+      # Without it, it builds against what is installed and never contacts
+      # Flathub. `flatpak mask` is the belt-and-braces: it disables updates and
+      # automatic installation for that ref, so nothing can drag it forward.
       #
-      # Before deleting, check the object has come back:
+      # The pin itself goes through ostree because `flatpak install` has no
+      # --commit — only `update` and `remote-info` carry it, and neither helps
+      # for something not yet installed. `REF@COMMIT` pulls one specific
+      # commit; --no-pull then deploys precisely what was pulled.
+      #
+      # Removing the pin, once this comes back 200:
       #   curl -sI https://dl.flathub.org/repo/objects/06/0fdf65e0a1042c0db51bf9d009048f9f07e047b422e0e736c5d8ad35ac3a9c.filez
-      - name: Pin rust-stable to a known-good commit (temporary)
+      # then delete this step, drop the `flatpak mask`, and restore
+      # `--install-deps-from=flathub` on the build step below.
+      - name: Install build dependencies, with rust-stable pinned (temporary)
         env:
+          RUST_EXT: org.freedesktop.Sdk.Extension.rust-stable
           RUST_EXT_REF: runtime/org.freedesktop.Sdk.Extension.rust-stable/x86_64/25.08
           RUST_EXT_COMMIT: 385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a
         run: |
           set -euo pipefail
           flatpak remote-add --if-not-exists flathub "$FLATHUB_REPO"
-          ostree --repo=/var/lib/flatpak/repo pull flathub "$RUST_EXT_REF@$RUST_EXT_COMMIT"
-          flatpak install -y --noninteractive --no-pull flathub "$RUST_EXT_REF"
-          flatpak info org.freedesktop.Sdk.Extension.rust-stable//25.08
 
-      - name: Install the runtime and SDK
-        run: |
-          set -euo pipefail
-          flatpak remote-add --if-not-exists flathub "$FLATHUB_REPO"
-          # Flathub can advertise a commit whose objects have not reached the
-          # CDN edge yet. Mid-pull that surfaces as an HTTP 404 on a .filez and
-          # takes the whole release with it — it killed the v0.5.0 run, three
-          # hours after rust-stable/25.08 was republished. Nothing is wrong with
-          # the build when this happens, so retry rather than lose the release.
-          #
-          # Deliberately its own step: --install-deps-only stops before building,
-          # so a genuine build failure below still fails on the first attempt
-          # instead of being retried for half an hour. Versions come from the
-          # manifest, so nothing here has to be kept in step with it.
+          # The runtime and SDK are fine on Flathub; only rust-stable is broken.
+          # Retry these, because an ordinary CDN blip here is still possible.
           for attempt in 1 2 3; do
-            if flatpak-builder --force-clean --install-deps-from=flathub \
-                 --install-deps-only build-deps "$APP_ID.yml"; then
-              exit 0
+            if flatpak install -y --noninteractive flathub \
+                 org.gnome.Platform//50 org.gnome.Sdk//50; then
+              break
             fi
             if [ "$attempt" = 3 ]; then
-              echo "::error::Could not install build dependencies from Flathub"
+              echo "::error::Could not install the GNOME runtime and SDK"
               exit 1
             fi
             echo "Flathub pull failed (attempt $attempt) — retrying in 90s"
             sleep 90
           done
+
+          # The pin: one specific commit, deployed from what was just pulled.
+          ostree --repo=/var/lib/flatpak/repo pull flathub "$RUST_EXT_REF@$RUST_EXT_COMMIT"
+          flatpak install -y --noninteractive --no-pull flathub "$RUST_EXT_REF"
+          flatpak mask "$RUST_EXT"
+
+          echo "--- what the build will use ---"
+          flatpak list --columns=application,branch,version,active
+          test "$(flatpak info --show-commit "$RUST_EXT//25.08")" = "$RUST_EXT_COMMIT" \
+            || { echo "::error::rust-stable is not on the pinned commit"; exit 1; }
 
       - name: Build and commit to the repo
         env:
@@ -193,7 +198,6 @@ jobs:
           flatpak-builder \
             --disable-rofiles-fuse \
             --force-clean \
-            --install-deps-from=flathub \
             --repo="$PAGES/repo" \
             --default-branch="$BRANCH" \
             --gpg-sign="$GPG_KEY_ID" \
