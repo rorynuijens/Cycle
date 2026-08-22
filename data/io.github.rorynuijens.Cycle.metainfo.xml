@@ -90,7 +90,7 @@
   <content_rating type="oars-1.1" />
 
   <releases>
-    <release version="0.5.0" date="2026-08-21">
+    <release version="0.5.0" date="2026-08-22">
       <description>
         <p>Your calendar now shows which sessions belong to your training
            program. Look for the accent dot in the month view; the week view

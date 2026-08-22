@@ -123,6 +123,42 @@ jobs:
             echo "No gh-pages branch yet — starting a new repo"
           fi
 
+      # TEMPORARY — delete this whole step once Flathub is whole again.
+      #
+      # The head commit of rust-stable/25.08 (4d0c0a79, version 1.98.0) is
+      # advertised by the summary but is missing one content object at the CDN
+      # edge:
+      #
+      #   objects/06/0fdf65e0a1042c0db51bf9d009048f9f07e047b422e0e736c5d8ad35ac3a9c.filez
+      #
+      # The ref resolves, the pull gets ~492 MB of 556 MB, then dies on that
+      # 404. It has been this way since 2026-08-21 and it is what killed the
+      # first v0.5.0 run. The retry below cannot help: the object is absent,
+      # not slow.
+      #
+      # The parent commit (385427f6, version 1.97.1) is complete — verified by
+      # pulling it in full and walking the tree with `ostree ls -R`, no missing
+      # objects. Pull that one explicitly and deploy it from the local cache;
+      # --install-deps-only below then finds rust-stable already installed and
+      # leaves it alone.
+      #
+      # This goes through ostree because `flatpak install` has no --commit
+      # (only `update` and `remote-info` have it). `REF@COMMIT` pulls one
+      # specific commit; --no-pull then deploys exactly what was pulled.
+      #
+      # Before deleting, check the object has come back:
+      #   curl -sI https://dl.flathub.org/repo/objects/06/0fdf65e0a1042c0db51bf9d009048f9f07e047b422e0e736c5d8ad35ac3a9c.filez
+      - name: Pin rust-stable to a known-good commit (temporary)
+        env:
+          RUST_EXT_REF: runtime/org.freedesktop.Sdk.Extension.rust-stable/x86_64/25.08
+          RUST_EXT_COMMIT: 385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a
+        run: |
+          set -euo pipefail
+          flatpak remote-add --if-not-exists flathub "$FLATHUB_REPO"
+          ostree --repo=/var/lib/flatpak/repo pull flathub "$RUST_EXT_REF@$RUST_EXT_COMMIT"
+          flatpak install -y --noninteractive --no-pull flathub "$RUST_EXT_REF"
+          flatpak info org.freedesktop.Sdk.Extension.rust-stable//25.08
+
       - name: Install the runtime and SDK
         run: |
           set -euo pipefail
