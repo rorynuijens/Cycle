@@ -90,6 +90,29 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.0" date="2026-08-27">
+      <description>
+        <p>You can now mark a planned session done yourself. Most riding happens
+           away from this app, and until now a session only closed if you rode
+           that exact workout here, on the day it was planned. Open a day on the
+           calendar, or use the week list or your program card, and say the
+           session happened. Ticked the wrong day, or changed your mind? Mark it
+           not done again.</p>
+        <p>Marking a session done settles your plan and nothing else. It banks no
+           training load: your fitness is worked out from rides that were
+           actually recorded, never from the calendar. The day's load bar will
+           fill in, because that is your plan's own accounting — but your fitness
+           and form do not move.</p>
+        <p>Missed sessions are now counted over the last fortnight rather than
+           over the whole program. If you started a plan with a date already in
+           the past, it was counting sessions you never had the chance to ride,
+           and that number could never come down however well you trained. Your
+           coach is told the same fortnight, so it plans around the rider you are
+           now rather than one who appears to have stopped.</p>
+        <p>On the week view, Undo now has a row of its own instead of sitting
+           beside Apply, where it was not clear which change it would undo.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-22">
       <description>
         <p>Your calendar now shows which sessions belong to your training
