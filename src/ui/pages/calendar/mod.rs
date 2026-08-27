@@ -1,6 +1,9 @@
 //! The Calendar page: what is planned, what was ridden, and the gap between them.
 
-mod actions;
+// Not private: the coaching card offers the same three settlements as the
+// calendar does, and one home for them is the only way the toasts, the logging
+// and the reload stay identical wherever the rider presses the button.
+pub(crate) mod actions;
 mod detail;
 mod dialogs;
 pub(crate) mod marks;

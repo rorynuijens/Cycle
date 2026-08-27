@@ -349,56 +349,140 @@ pub fn build_week_view(
                                 .build(),
                         );
 
+                        // Settle the day by hand. Most of the rider's training
+                        // happens away from this app, and until those rides close
+                        // their own days this tick is the only way to tell the
+                        // program a planned session actually happened. It offers
+                        // itself on future days too: riding Thursday's session on
+                        // Tuesday is exactly the case that needs it, which is why
+                        // the wording is never about "today".
+                        let done_btn = gtk::Button::builder()
+                            .icon_name("object-select-symbolic")
+                            .css_classes(if entry.completed {
+                                vec!["flat", "circular", "success"]
+                            } else {
+                                vec!["flat", "circular"]
+                            })
+                            .valign(gtk::Align::Center)
+                            .tooltip_text(if entry.completed {
+                                "Put this session back to not done"
+                            } else {
+                                "Mark this session done without riding it here"
+                            })
+                            .build();
+
+                        // Nothing here captures `entry_row` or the button: greying
+                        // the row out optimistically on click would leave a handler
+                        // holding a strong reference to the widget that owns it
+                        // (CLAUDE.md §2.4). The reload redraws the row instead.
+                        let pool_m = pool.clone();
+                        let rt_m = rt_handle.clone();
+                        let rh_m = Rc::clone(&reload_holder);
+                        let toast_m = Rc::clone(&on_toast);
+                        let done_entry_id = entry.id;
+                        let now_done = entry.completed;
+                        done_btn.connect_clicked(move |_| {
+                            super::actions::set_session_done(
+                                pool_m.clone(),
+                                &rt_m,
+                                done_entry_id,
+                                !now_done,
+                                Rc::clone(&toast_m),
+                                reload_fn(&rh_m),
+                                // The reload rebuilds this row from the database.
+                                None,
+                            );
+                        });
+                        entry_row.append(&done_btn);
+
                         chip_box.append(&entry_row);
 
                         // ── What the program wants changed about this day ─────
+                        //
+                        // Two independent rows, not one row carrying two buttons.
+                        // Apply refers to the suggestion written beside it; Undo
+                        // to an ease applied some time ago, which the chip body
+                        // mentions several lines further up. Sharing a row read as
+                        // though Undo took back the very thing Apply was offering.
+                        // Same boxed list as the detail dialog, so a session that
+                        // is both eased and being eased again says the same thing
+                        // in both places.
+                        let advice_list = gtk::ListBox::builder()
+                            .css_classes(["boxed-list"])
+                            .selection_mode(gtk::SelectionMode::None)
+                            .visible(false)
+                            .margin_start(12)
+                            .margin_bottom(6)
+                            .build();
+
+                        if let Some(original) = &mark.adjusted_from {
+                            let row = adw::ActionRow::builder()
+                                .title("Eased by your program")
+                                .subtitle(format!("Originally {original}"))
+                                .subtitle_lines(0)
+                                .build();
+                            let icon = gtk::Image::builder()
+                                .icon_name("object-select-symbolic")
+                                .css_classes(["success"])
+                                .build();
+                            icon.update_property(&[gtk::accessible::Property::Label(
+                                "Already eased",
+                            )]);
+                            row.add_prefix(&icon);
+
+                            let undo_btn = gtk::Button::builder()
+                                .label("Undo")
+                                .css_classes(["pill"])
+                                .valign(gtk::Align::Center)
+                                .tooltip_text("Put this session back to what your program planned")
+                                .build();
+                            row.add_suffix(&undo_btn);
+                            advice_list.append(&row);
+                            advice_list.set_visible(true);
+
+                            let pool_u = pool.clone();
+                            let rt_u = rt_handle.clone();
+                            let rh_u = Rc::clone(&reload_holder);
+                            let toast_u = Rc::clone(&on_toast);
+                            let entry_id = entry.id;
+                            undo_btn.connect_clicked(move |_| {
+                                super::actions::undo_easing(
+                                    pool_u.clone(),
+                                    &rt_u,
+                                    entry_id,
+                                    Rc::clone(&toast_u),
+                                    reload_fn(&rh_u),
+                                );
+                            });
+                        }
+
                         if let Some(suggestion) = &mark.suggestion {
-                            let advice_row = gtk::Box::builder()
-                                .orientation(gtk::Orientation::Horizontal)
-                                .spacing(6)
-                                .margin_start(12)
-                                .margin_bottom(6)
+                            let row = adw::ActionRow::builder()
+                                .title(format!("Ease to {}", suggestion.to_name))
+                                .subtitle(&suggestion.reason)
+                                .subtitle_lines(0)
                                 .build();
-
-                            advice_row.append(
-                                &gtk::Image::builder()
-                                    .icon_name("view-refresh-symbolic")
-                                    .css_classes(["warning"])
-                                    .valign(gtk::Align::Start)
-                                    .build(),
-                            );
-
-                            let advice_text = gtk::Box::builder()
-                                .orientation(gtk::Orientation::Vertical)
-                                .hexpand(true)
+                            let icon = gtk::Image::builder()
+                                .icon_name("view-refresh-symbolic")
+                                .css_classes(["warning"])
                                 .build();
-                            advice_text.append(
-                                &gtk::Label::builder()
-                                    .label(format!("Ease to {}", suggestion.to_name))
-                                    .halign(gtk::Align::Start)
-                                    .css_classes(["caption-heading"])
-                                    .build(),
-                            );
-                            advice_text.append(
-                                &gtk::Label::builder()
-                                    .label(&suggestion.reason)
-                                    .halign(gtk::Align::Start)
-                                    .xalign(0.0)
-                                    .wrap(true)
-                                    .css_classes(["caption", "dim-label"])
-                                    .build(),
-                            );
-                            advice_row.append(&advice_text);
+                            icon.update_property(&[gtk::accessible::Property::Label(
+                                "Your program suggests easing this session",
+                            )]);
+                            row.add_prefix(&icon);
 
                             let apply_btn = gtk::Button::builder()
                                 .label("Apply")
-                                .css_classes(["pill", "caption"])
+                                .css_classes(["pill"])
                                 .valign(gtk::Align::Center)
                                 .tooltip_text(format!(
                                     "Ease this session to {}",
                                     suggestion.to_name
                                 ))
                                 .build();
+                            row.add_suffix(&apply_btn);
+                            advice_list.append(&row);
+                            advice_list.set_visible(true);
 
                             let pool_a = pool.clone();
                             let rt_a = rt_handle.clone();
@@ -418,69 +502,9 @@ pub fn build_week_view(
                                     reload_fn(&rh_a),
                                 );
                             });
-                            advice_row.append(&apply_btn);
-
-                            // Already eased once and the rules want it easier
-                            // still: without this the row offers only a way
-                            // further down, and the way back is a click away in
-                            // the detail dialog with nothing pointing at it.
-                            if mark.adjusted_from.is_some() {
-                                let undo_btn = gtk::Button::builder()
-                                    .label("Undo")
-                                    .css_classes(["pill", "caption"])
-                                    .valign(gtk::Align::Center)
-                                    .tooltip_text(
-                                        "Put this session back to what your program planned",
-                                    )
-                                    .build();
-                                let pool_u = pool.clone();
-                                let rt_u = rt_handle.clone();
-                                let rh_u = Rc::clone(&reload_holder);
-                                let toast_u = Rc::clone(&on_toast);
-                                let entry_id = entry.id;
-                                undo_btn.connect_clicked(move |_| {
-                                    super::actions::undo_easing(
-                                        pool_u.clone(),
-                                        &rt_u,
-                                        entry_id,
-                                        Rc::clone(&toast_u),
-                                        reload_fn(&rh_u),
-                                    );
-                                });
-                                advice_row.append(&undo_btn);
-                            }
-
-                            chip_box.append(&advice_row);
-                        } else if mark.adjusted_from.is_some() {
-                            let undo_row = gtk::Box::builder()
-                                .orientation(gtk::Orientation::Horizontal)
-                                .margin_start(12)
-                                .margin_bottom(6)
-                                .build();
-                            let undo_btn = gtk::Button::builder()
-                                .label("Undo")
-                                .css_classes(["pill", "caption"])
-                                .halign(gtk::Align::Start)
-                                .tooltip_text("Put this session back to what your program planned")
-                                .build();
-
-                            let pool_u = pool.clone();
-                            let rt_u = rt_handle.clone();
-                            let rh_u = Rc::clone(&reload_holder);
-                            let toast_u = Rc::clone(&on_toast);
-                            let entry_id = entry.id;
-                            undo_btn.connect_clicked(move |_| {
-                                super::actions::undo_easing(
-                                    pool_u.clone(),
-                                    &rt_u,
-                                    entry_id,
-                                    Rc::clone(&toast_u),
-                                    reload_fn(&rh_u),
-                                );
-                            });
-                            undo_row.append(&undo_btn);
-                            chip_box.append(&undo_row);
                         }
+
+                        chip_box.append(&advice_list);
                     }
 
                     CalendarEvent::Session(session, workout_name) => {

@@ -242,7 +242,7 @@ pub async fn adopt_orphan_entries(pool: &SqlitePool, program_id: i64) -> Result<
 mod tests {
     use super::*;
     use crate::data::db::testing::*;
-    use crate::data::db::{save_workout, schedule_workout};
+    use crate::data::db::{save_workout, schedule_workout, set_entry_completed};
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
@@ -406,11 +406,7 @@ mod tests {
     async fn should_refuse_to_rewrite_a_session_already_ridden() {
         let pool = test_pool().await;
         let (program, original, entry) = program_with_one_session(&pool).await;
-        sqlx::query("UPDATE calendar_entries SET completed = 1 WHERE id = ?")
-            .bind(entry)
-            .execute(&pool)
-            .await
-            .unwrap();
+        set_entry_completed(&pool, entry, true).await.unwrap();
         let easier = workout_named(&pool, "Sweet Spot", WorkoutCategory::SweetSpot).await;
 
         apply_adjustment(&pool, entry, easier).await.unwrap();
@@ -438,11 +434,7 @@ mod tests {
         schedule_workout(&pool, w, "2026-08-14", Some(program))
             .await
             .unwrap();
-        sqlx::query("UPDATE calendar_entries SET completed = 1 WHERE id = ?")
-            .bind(done)
-            .execute(&pool)
-            .await
-            .unwrap();
+        set_entry_completed(&pool, done, true).await.unwrap();
 
         let removed = clear_future_sessions(&pool, program, date(2026, 8, 10))
             .await
@@ -515,11 +507,7 @@ mod tests {
         schedule_workout(&pool, w, "2026-09-25", None)
             .await
             .unwrap();
-        sqlx::query("UPDATE calendar_entries SET completed = 1 WHERE id = ?")
-            .bind(ridden)
-            .execute(&pool)
-            .await
-            .unwrap();
+        set_entry_completed(&pool, ridden, true).await.unwrap();
 
         let program = save_program(&pool, date(2026, 6, 15), 15, "monday")
             .await

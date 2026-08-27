@@ -16,6 +16,37 @@ use crate::ui::widgets::zone_color::{category_zone_rgb, color_stripe};
 
 use super::marks::EntryMark;
 
+/// Dress the completion row for a state, whether it is being built or redrawn.
+///
+/// One function for both, because the dialog stays open across a change: two
+/// copies of this — one at build time, one in the click handler — is how a row
+/// ends up saying "Marked done" beside a button offering "Mark done".
+fn dress_done_row(row: &adw::ActionRow, icon: &gtk::Image, btn: &gtk::Button, done: bool) {
+    row.set_title(if done { "Marked done" } else { "Not done yet" });
+    row.set_subtitle(if done {
+        "This session counts towards your program."
+    } else {
+        "Rode this away from the app? Count it towards your program."
+    });
+    icon.set_icon_name(Some(if done {
+        "object-select-symbolic"
+    } else {
+        "media-playlist-consecutive-symbolic"
+    }));
+    icon.set_css_classes(if done { &["success"] } else { &["dim-label"] });
+    icon.update_property(&[gtk::accessible::Property::Label(if done {
+        "Marked done"
+    } else {
+        "Not done yet"
+    })]);
+    btn.set_label(if done { "Mark not done" } else { "Mark done" });
+    btn.set_tooltip_text(Some(if done {
+        "Put this session back to not done"
+    } else {
+        "Mark this session done without riding it here"
+    }));
+}
+
 /// What the rider picked in the scheduling dialog.
 #[derive(Clone, Copy)]
 enum Picked {
@@ -633,14 +664,81 @@ pub fn show_workout_detail_dialog(
     stats_list.append(&tss_row);
     content.append(&stats_list);
 
-    if entry.completed {
-        content.append(
-            &gtk::Label::builder()
-                .label("✓ Completed")
-                .css_classes(["success", "heading"])
-                .halign(gtk::Align::Start)
-                .build(),
-        );
+    // ── Done, or not done ────────────────────────────────────────────────────
+    //
+    // A row rather than a label, because it has to work in both directions: the
+    // way back matters as much as the way in, and the button row further down is
+    // hidden entirely once an entry is completed, so an un-mark control placed
+    // there would vanish exactly when it is wanted.
+    //
+    // Ticking this settles the session against the plan and nothing else. No
+    // training load is banked — fitness comes from recorded rides, never from
+    // calendar entries.
+    let done_list = gtk::ListBox::builder()
+        .css_classes(["boxed-list"])
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    let done_row = adw::ActionRow::builder().subtitle_lines(0).build();
+    let done_icon = gtk::Image::new();
+    done_row.add_prefix(&done_icon);
+    let done_btn = gtk::Button::builder()
+        .css_classes(["pill"])
+        .valign(gtk::Align::Center)
+        .build();
+    done_row.add_suffix(&done_btn);
+    dress_done_row(&done_row, &done_icon, &done_btn, entry.completed);
+    done_list.append(&done_row);
+    content.append(&done_list);
+
+    {
+        // The dialog does not close on a change, so it has to redraw itself:
+        // `reload` refreshes the calendar underneath, and would leave this row
+        // stating the opposite of what was just written.
+        //
+        // Every widget is held weakly. The handler lives on a button the dialog
+        // owns, and the dialog owns the row it sits in, so a strong capture here
+        // is a reference cycle with nothing to collect it (CLAUDE.md §2.4). The
+        // button comes back as the handler's own argument, weakly, for the same
+        // reason.
+        let row_w = done_row.downgrade();
+        let icon_w = done_icon.downgrade();
+        let btn_w = done_btn.downgrade();
+        // The row is a toggle and the rider may press it twice, so the state
+        // has to live somewhere that survives the first press. The entry this
+        // dialog was opened with is a snapshot and stops being true.
+        let state = Rc::new(Cell::new(entry.completed));
+
+        let pool_d = pool.clone();
+        let rt_d = rt_handle.clone();
+        let reload_d = Rc::clone(&reload);
+        let toast_d = Rc::clone(&on_toast);
+        let entry_id = entry.id;
+        done_btn.connect_clicked(move |_| {
+            let want = !state.get();
+
+            let (row_w, icon_w, btn_w) = (row_w.clone(), icon_w.clone(), btn_w.clone());
+            let state = Rc::clone(&state);
+            // Only on a write that landed: an entry deleted underneath us must
+            // leave the row alone and let the toast explain.
+            let on_settled: Rc<dyn Fn(bool)> = Rc::new(move |now| {
+                state.set(now);
+                if let (Some(row), Some(icon), Some(btn)) =
+                    (row_w.upgrade(), icon_w.upgrade(), btn_w.upgrade())
+                {
+                    dress_done_row(&row, &icon, &btn, now);
+                }
+            });
+
+            super::actions::set_session_done(
+                pool_d.clone(),
+                &rt_d,
+                entry_id,
+                want,
+                Rc::clone(&toast_d),
+                Rc::clone(&reload_d),
+                Some(on_settled),
+            );
+        });
     }
 
     // ── What the program wants changed ───────────────────────────────────────

@@ -270,6 +270,49 @@ pub async fn reschedule_entry(pool: &SqlitePool, entry_id: i64, new_date: &str) 
     Ok(true)
 }
 
+/// Mark a planned entry done, or put it back to not done.
+///
+/// This is the rider's own hand on the tick box, so unlike its neighbour
+/// [`reschedule_entry`] it deliberately carries **no `completed = 0` guard**: it
+/// has to work in both directions, and adding one for symmetry would make
+/// un-marking silently do nothing.
+///
+/// Closing a session this way settles it against the *plan* and nothing else. It
+/// banks no training load: CTL and TSB are computed from recorded sessions and
+/// Intervals activities, never from calendar entries. The day's load bar does
+/// move from planned to done, because that is plan accounting rather than
+/// fitness.
+///
+/// Returns whether a row with that id was found — not whether its value changed.
+/// Marking an already-done session done reports `true`, because SQLite counts
+/// rows the statement visited. `false` means the entry is gone, which at a call
+/// site is indistinguishable from a real save unless it is checked here.
+pub async fn set_entry_completed(
+    pool: &SqlitePool,
+    entry_id: i64,
+    completed: bool,
+) -> Result<bool> {
+    let result = sqlx::query("UPDATE calendar_entries SET completed = ? WHERE id = ?")
+        .bind(completed)
+        .bind(entry_id)
+        .execute(pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        tracing::warn!("set_entry_completed matched no entry (id={entry_id}); nothing changed");
+        return Ok(false);
+    }
+    // Logged because nothing distinguishes a hand-tick from the ride-finish tick
+    // in `complete_today_calendar_entry`: un-marking a session that really was
+    // ridden returns it to the missed list, where it can earn an easing it has
+    // not deserved. One slightly easy session is the accepted trade, but a bug
+    // report should be able to show it happened.
+    if !completed {
+        tracing::info!("Session marked not done by hand (id={entry_id})");
+    }
+    Ok(true)
+}
+
 /// A workout scheduled for a specific day, with its completion state.
 pub struct TodayEntry {
     pub workout: Workout,
@@ -591,5 +634,71 @@ mod tests {
         // the caller cannot tell a save from a silent no-op.
         let pool = test_pool().await;
         assert!(!reschedule_entry(&pool, 9999, "2026-03-09").await.unwrap());
+    }
+    // ── the rider's own hand on the tick box ─────────────────────────────────
+
+    #[tokio::test]
+    async fn should_mark_a_planned_session_done() {
+        let pool = test_pool().await;
+        let w = a_workout(&pool, "Tempo 20").await;
+        let id = schedule_workout(&pool, w, "2026-03-04", None)
+            .await
+            .unwrap();
+
+        assert!(set_entry_completed(&pool, id, true).await.unwrap());
+        assert!(entries(&pool).await[0].completed);
+    }
+
+    #[tokio::test]
+    async fn should_put_a_session_back_to_not_done() {
+        // The guard test. `set_entry_completed` deliberately has no
+        // `AND completed = 0` clause, unlike `reschedule_entry` next to it.
+        // Adding one for symmetry would break exactly this, and silently.
+        let pool = test_pool().await;
+        let w = a_workout(&pool, "Tempo 20").await;
+        let id = schedule_workout(&pool, w, "2026-03-04", None)
+            .await
+            .unwrap();
+        set_entry_completed(&pool, id, true).await.unwrap();
+
+        assert!(set_entry_completed(&pool, id, false).await.unwrap());
+        assert!(!entries(&pool).await[0].completed);
+    }
+
+    #[tokio::test]
+    async fn should_report_that_nothing_changed_when_marking_an_unknown_entry() {
+        let pool = test_pool().await;
+        assert!(!set_entry_completed(&pool, 9999, true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn should_report_success_when_marking_an_already_done_session_done() {
+        // SQLite counts the rows an UPDATE visited, not the ones whose value
+        // actually changed, so this is `true`. Pinned so it is not "optimised"
+        // into `false` on the assumption that it reports a state change.
+        let pool = test_pool().await;
+        let w = a_workout(&pool, "Tempo 20").await;
+        let id = schedule_workout(&pool, w, "2026-03-04", None)
+            .await
+            .unwrap();
+        set_entry_completed(&pool, id, true).await.unwrap();
+
+        assert!(set_entry_completed(&pool, id, true).await.unwrap());
+        assert!(entries(&pool).await[0].completed);
+    }
+
+    #[tokio::test]
+    async fn should_still_refuse_to_move_a_session_marked_done_by_hand() {
+        // The two guards compose: ticking a session by hand makes it as immovable
+        // as riding it does.
+        let pool = test_pool().await;
+        let w = a_workout(&pool, "Tempo 20").await;
+        let id = schedule_workout(&pool, w, "2026-03-04", None)
+            .await
+            .unwrap();
+        set_entry_completed(&pool, id, true).await.unwrap();
+
+        assert!(!reschedule_entry(&pool, id, "2026-03-09").await.unwrap());
+        assert_eq!(entries(&pool).await[0].scheduled_date, "2026-03-04");
     }
 }
