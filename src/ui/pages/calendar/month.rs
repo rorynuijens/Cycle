@@ -355,13 +355,22 @@ impl MonthCellItem {
             text.push('\n');
             text.push_str(&line);
         }
+        // Two independent facts, not two branches: a session can have been eased
+        // once already and still be one the rules want easier. `dialogs.rs` and
+        // `week.rs` both say both; the tooltip was the last place that did not.
+        if let Some(original) = &self.mark.adjusted_from {
+            text.push_str(&format!("\nEased from {original}"));
+        }
         if let Some(s) = &self.mark.suggestion {
             text.push_str(&format!(
                 "\nYour program suggests easing this to {}",
                 s.to_name
             ));
-        } else if let Some(original) = &self.mark.adjusted_from {
-            text.push_str(&format!("\nEased from {original}"));
+        }
+        // Read from the entry, never from `dimmed`: sessions and Intervals
+        // activities are dimmed too, and neither is a plan that was ticked off.
+        if self.entry.as_ref().is_some_and(|e| e.completed) {
+            text.push_str("\nMarked done");
         }
         text
     }
@@ -458,3 +467,84 @@ pub fn load_bar(done_tss: f32, planned_tss: f32, rgb: Option<(f64, f64, f64)>) -
 }
 
 // ── Build time-off context string for AI prompts ──────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::db::ScheduledItem;
+    use crate::data::workout::WorkoutCategory;
+    use crate::ui::pages::calendar::marks::Suggestion;
+
+    fn entry(completed: bool) -> CalendarEntry {
+        CalendarEntry {
+            id: 1,
+            item: ScheduledItem::Workout {
+                id: 100,
+                name: "Threshold 2x20".into(),
+            },
+            scheduled_date: "2026-08-12".into(),
+            completed,
+            category: WorkoutCategory::Threshold,
+            tss: 85.0,
+            duration_secs: 3600,
+            program_id: Some(7),
+            adjusted_from: None,
+        }
+    }
+
+    fn item(completed: bool, mark: EntryMark) -> MonthCellItem {
+        MonthCellItem {
+            label: "Threshold 2x20".into(),
+            dimmed: completed,
+            done_tss: 0.0,
+            planned_tss: 85.0,
+            color: None,
+            entry: Some(entry(completed)),
+            mark,
+        }
+    }
+
+    fn a_suggestion() -> Suggestion {
+        Suggestion {
+            to_workout_id: 9,
+            to_name: "Endurance 60".into(),
+            reason: "You have missed two sessions in a row.".into(),
+        }
+    }
+
+    #[test]
+    fn should_mention_both_the_easing_applied_and_the_one_suggested() {
+        // An entry can be both, because `original_workout_id` keeps pointing at
+        // what the program first asked for however many times it is eased. This
+        // tooltip used to name only the suggestion.
+        let mark = EntryMark {
+            program_week: Some((2, 8)),
+            adjusted_from: Some("VO₂Max Blocks".into()),
+            suggestion: Some(a_suggestion()),
+        };
+
+        let text = item(false, mark).tooltip();
+
+        assert!(text.contains("Eased from VO₂Max Blocks"), "{text}");
+        assert!(
+            text.contains("suggests easing this to Endurance 60"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn should_say_a_session_is_marked_done_in_the_tooltip() {
+        let text = item(true, EntryMark::default()).tooltip();
+
+        assert!(text.contains("Marked done"), "{text}");
+    }
+
+    #[test]
+    fn should_say_nothing_about_easing_when_the_program_has_no_view_on_a_day() {
+        let text = item(false, EntryMark::default()).tooltip();
+
+        assert!(!text.contains("Eased"), "{text}");
+        assert!(!text.contains("suggests"), "{text}");
+        assert!(!text.contains("Marked done"), "{text}");
+    }
+}
