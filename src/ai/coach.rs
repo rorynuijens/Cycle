@@ -181,8 +181,14 @@ pub struct ProgramRevisionContext {
     /// Weeks still to plan, counted from the week after this one.
     pub weeks_remaining: u32,
     pub completed: usize,
+    /// Sessions missed in the last fortnight, not over the whole program.
+    ///
+    /// The window is deliberate: a program adopted with a start date in the past
+    /// carries sessions that were never rideable, and an all-time count would
+    /// have the coach plan around a rider who looks like they stopped training.
+    /// The prompt says "in the last fortnight" out loud for the same reason.
     pub missed: usize,
-    /// The most recently missed sessions, newest last: "Wed 5 Aug — Threshold".
+    /// The most recently missed sessions, newest first: "Wed 5 Aug — Threshold".
     pub recent_missed: Vec<String>,
     pub wellness: Vec<WellnessSnapshot>,
     /// Dates the rider has already said they will not be training.
@@ -277,7 +283,7 @@ GOALS:
 THE PROGRAM SO FAR:
 - The rider is in week {current_week}.
 - Sessions completed: {completed}
-- Sessions missed: {missed}
+- Sessions missed in the last fortnight: {missed}
 
 RECENTLY MISSED SESSIONS:
 {missed_list}

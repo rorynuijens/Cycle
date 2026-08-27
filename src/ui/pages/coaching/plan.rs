@@ -26,6 +26,14 @@ use crate::training::program::{plan_view, Adjustment, CoachVerdict, Phase, Progr
 use super::data::{load_plan_data, PlanData};
 use super::program::week_start;
 
+/// How many missed sessions the card offers to close, at most.
+///
+/// The window in [`crate::training::program`] already keeps this to a fortnight;
+/// this is the second bound, for the fortnight that went badly. The summary row
+/// above them states the true count, so nothing is hidden — the rows are the
+/// quick way to close the recent ones, not an inventory.
+const MISSED_ROWS_SHOWN: usize = 5;
+
 pub struct PlanCard {
     root: gtk::Box,
     group: adw::PreferencesGroup,
@@ -281,7 +289,34 @@ impl PlanCard {
         )
     }
 
-    fn render_progress(&self, state: &ProgramStatus, tsb: f64, today: NaiveDate) {
+    /// What to say about sessions the rider did not ride, or `None` when there
+    /// is nothing to say.
+    ///
+    /// Reads [`ProgramStatus::missed_recent`], not `missed`: a program adopted
+    /// with a start date in the past carries sessions that were never rideable,
+    /// and a count including those can never come down however well the rider
+    /// trains. Pure and separate from the row it fills so the wording — the most
+    /// rider-visible sentence the card says — can be tested without GTK.
+    fn missed_summary(state: &ProgramStatus, today: NaiveDate) -> Option<(String, String)> {
+        let last = state.missed_recent.last()?.date;
+        let count = state.missed_recent.len();
+        Some((
+            format!(
+                "{count} session{} missed in the last fortnight",
+                if count == 1 { "" } else { "s" }
+            ),
+            // Saying so plainly, because the plan will not try to claw them
+            // back and the rider should know that is deliberate.
+            format!(
+                "Most recently {} ({}). Missed sessions are not rescheduled — \
+                 the plan carries on from here.",
+                last.format("%-d %B"),
+                days_ago(last, today)
+            ),
+        ))
+    }
+
+    fn render_progress(self: &Rc<Self>, state: &ProgramStatus, tsb: f64, today: NaiveDate) {
         let row = adw::ActionRow::builder()
             .title(format!(
                 "{} of {} sessions completed",
@@ -294,22 +329,10 @@ impl PlanCard {
             .build();
         self.add_row(row);
 
-        if !state.missed.is_empty() {
-            let last = state.missed.last().expect("checked non-empty").date;
+        if let Some((title, subtitle)) = Self::missed_summary(state, today) {
             let row = adw::ActionRow::builder()
-                .title(format!(
-                    "{} session{} missed",
-                    state.missed.len(),
-                    if state.missed.len() == 1 { "" } else { "s" }
-                ))
-                // Saying so plainly, because the plan will not try to claw them
-                // back and the rider should know that is deliberate.
-                .subtitle(format!(
-                    "Most recently {} ({}). Missed sessions are not rescheduled — \
-                     the plan carries on from here.",
-                    last.format("%-d %B"),
-                    days_ago(last, today)
-                ))
+                .title(title)
+                .subtitle(subtitle)
                 .subtitle_lines(3)
                 .build();
             row.add_prefix(
@@ -319,7 +342,80 @@ impl PlanCard {
                     .build(),
             );
             self.add_row(row);
+            self.render_missed_sessions(state, today);
         }
+    }
+
+    /// The missed sessions themselves, each with a way to close it.
+    ///
+    /// Most of this rider's training happens outdoors, so a session the program
+    /// calls missed was often ridden — just not here. Without these rows the
+    /// card states a problem and offers no way out of it, and the count above
+    /// stays wrong for a fortnight whatever the rider does.
+    ///
+    /// Most recent first, and capped: the summary row above carries the true
+    /// count, so a bad fortnight does not push the adjustments off the card.
+    fn render_missed_sessions(self: &Rc<Self>, state: &ProgramStatus, today: NaiveDate) {
+        for session in state.missed_recent.iter().rev().take(MISSED_ROWS_SHOWN) {
+            let row = adw::ActionRow::builder()
+                .title(format!(
+                    "{}  {}",
+                    session.date.format("%a %-d %b"),
+                    session.workout_name
+                ))
+                .subtitle(days_ago(session.date, today))
+                .build();
+            let icon = gtk::Image::builder()
+                .icon_name("media-playlist-consecutive-symbolic")
+                .css_classes(["dim-label"])
+                .build();
+            icon.update_property(&[gtk::accessible::Property::Label("Not done yet")]);
+            row.add_prefix(&icon);
+
+            let done = gtk::Button::builder()
+                .label("Mark done")
+                .css_classes(["flat"])
+                .valign(gtk::Align::Center)
+                .tooltip_text("Mark this session done without riding it here")
+                .build();
+
+            // Weak, not strong: this row is rebuilt on every reload, and a
+            // strong capture would put the card inside a widget the card owns
+            // (CLAUDE.md §2.4).
+            let card = Rc::downgrade(self);
+            let entry_id = session.entry_id;
+            done.connect_clicked(move |_| {
+                let Some(card) = card.upgrade() else { return };
+                card.set_done(entry_id, true);
+            });
+            row.add_suffix(&done);
+
+            self.add_row(row);
+        }
+    }
+
+    /// Settle a missed session against the plan.
+    ///
+    /// Goes through the calendar's shared action so the toast, the logging and
+    /// the reload read the same here as they do on the week list and in the day
+    /// detail dialog. Only one direction from this card: the way back lives
+    /// beside the session on the calendar, where the rider can see the day.
+    fn set_done(self: &Rc<Self>, entry_id: i64, done: bool) {
+        let card = Rc::clone(self);
+        // Strong, and deliberately so: this closure is held by the pending task
+        // and dropped with it, never by a widget the card owns.
+        let reload: Rc<dyn Fn()> = Rc::new(move || card.reload());
+
+        crate::ui::pages::calendar::actions::set_session_done(
+            self.pool.clone(),
+            &self.rt_handle.clone(),
+            entry_id,
+            done,
+            Rc::clone(&self.on_toast),
+            reload,
+            // The reload rebuilds the card's rows from the database.
+            None,
+        );
     }
 
     fn render_adjustments(self: &Rc<Self>, adjustments: &[Adjustment], state: &ProgramStatus) {
@@ -420,7 +516,9 @@ impl PlanCard {
                 "Every planned session has been ridden or has passed.".to_string(),
             );
         }
-        if !state.missed.is_empty() {
+        // The recent ones only: a rider being told "you have missed sessions"
+        // about a fortnight they trained through would rightly ignore the card.
+        if !state.missed_recent.is_empty() {
             return (
                 "The plan still fits",
                 "You have missed sessions, but your form says you can take the next \
@@ -747,6 +845,11 @@ async fn rebuild_program(
 
     // The training days the program was built around; a program adopted from a
     // bare calendar has none recorded, so the days it actually uses stand in.
+    //
+    // The one place that reads the *whole* missed history rather than the recent
+    // fortnight, and it must stay that way: this is inferring which weekdays the
+    // rider trains on, and a fortnight of dates would hand the coach a training
+    // week built from two data points.
     let training_days: Vec<String> = if program.training_days.trim().is_empty() {
         let mut days: Vec<String> = state
             .upcoming
@@ -770,8 +873,11 @@ async fn rebuild_program(
             .collect()
     };
 
+    // The fortnight, not the whole history: the coach is being asked what to do
+    // next, and a list reaching back to sessions that predate the program would
+    // have it plan around a rider who stopped training months ago.
     let recent_missed: Vec<String> = state
-        .missed
+        .missed_recent
         .iter()
         .rev()
         .take(6)
@@ -789,7 +895,7 @@ async fn rebuild_program(
         current_week: state.week,
         weeks_remaining: state.total_weeks.saturating_sub(state.week),
         completed: state.completed,
-        missed: state.missed.len(),
+        missed: state.missed_recent.len(),
         recent_missed,
         wellness: wellness_snapshots(&data.wellness),
         time_off: data
@@ -915,6 +1021,54 @@ mod tests {
         let state = status(&program(), &sessions, date(2026, 8, 12));
         let (title, _) = PlanCard::nothing_to_change(&state);
         assert_eq!(title, "No sessions left to adjust");
+    }
+
+    #[test]
+    fn should_count_only_recent_missed_sessions_in_the_missed_row() {
+        // The live case this release exists for: a program adopted with a start
+        // date in the past carries sessions that were never rideable, and the
+        // card used to count them forever.
+        let today = date(2026, 8, 12);
+        let sessions = vec![
+            session(1, date(2026, 6, 16), false), // predates the program
+            session(2, date(2026, 8, 5), false),
+            session(3, date(2026, 8, 10), false),
+        ];
+        let state = status(&program(), &sessions, today);
+
+        assert_eq!(state.missed.len(), 3, "the full history is still there");
+        let (title, subtitle) =
+            PlanCard::missed_summary(&state, today).expect("two were missed recently");
+        assert_eq!(title, "2 sessions missed in the last fortnight");
+        assert!(subtitle.contains("Most recently 10 August (2 days ago)"));
+    }
+
+    #[test]
+    fn should_say_session_singular_when_only_one_was_missed_recently() {
+        let today = date(2026, 8, 12);
+        let sessions = vec![session(1, date(2026, 8, 10), false)];
+        let state = status(&program(), &sessions, today);
+
+        let (title, _) = PlanCard::missed_summary(&state, today).expect("one was missed");
+        assert_eq!(title, "1 session missed in the last fortnight");
+    }
+
+    #[test]
+    fn should_not_claim_missed_work_when_the_last_miss_was_a_month_ago() {
+        // The companion to `should_promise_not_to_claw_back_missed_work`, which
+        // survives the window only because its miss is seven days back. Nothing
+        // recent was missed here, so the card must say neither the missed row
+        // nor the "you have missed sessions" verdict.
+        let today = date(2026, 8, 12);
+        let sessions = vec![
+            session(1, date(2026, 7, 12), false), // a month ago
+            session(2, date(2026, 8, 14), false), // still to come
+        ];
+        let state = status(&program(), &sessions, today);
+
+        assert!(PlanCard::missed_summary(&state, today).is_none());
+        let (_, subtitle) = PlanCard::nothing_to_change(&state);
+        assert!(subtitle.contains("ride it as written"), "got: {subtitle}");
     }
 
     #[test]

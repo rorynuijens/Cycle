@@ -34,6 +34,19 @@ const BLOCK_WEEKS: u32 = 4;
 /// session assumes was never made.
 const MISSED_RUN_FOR_EASING: usize = 2;
 
+/// How far back a missed session still counts as missed.
+///
+/// Without a window, `missed` only ever grows: a program adopted with a start
+/// date in the past carries sessions that were never rideable, and the card ends
+/// up reporting a number that can never come down. A fortnight is what a rider
+/// means by "recently" — long enough that a bad week still shows, short enough
+/// that last season is not held against them.
+///
+/// Deliberately equal to, but independent of, `analytics::WELLNESS_WINDOW_DAYS`:
+/// that one is the width of a sparkline, and shortening a chart must not quietly
+/// change what the coach is told.
+const MISSED_RECENT_DAYS: i64 = 14;
+
 /// How far resting heart rate must sit above its own recent average to read as
 /// a body under strain rather than day-to-day variation.
 ///
@@ -100,7 +113,17 @@ pub struct ProgramStatus {
     pub planned: usize,
     pub completed: usize,
     /// Past sessions that were never ridden, oldest first.
+    ///
+    /// The whole history. Read this when you need every day the program has ever
+    /// used — inferring training days from a bare calendar, for instance — and
+    /// [`Self::missed_recent`] when you are telling the rider, or the coach, how
+    /// they are doing.
     pub missed: Vec<PlannedSession>,
+    /// The last [`MISSED_RECENT_DAYS`] of `missed`, oldest first.
+    ///
+    /// Derived from `missed` rather than filtered afresh, so the two can never
+    /// disagree about what missing a session means.
+    pub missed_recent: Vec<PlannedSession>,
     /// Sessions still to come, soonest first.
     pub upcoming: Vec<PlannedSession>,
 }
@@ -257,6 +280,11 @@ pub fn status(program: &Program, sessions: &[PlannedSession], today: NaiveDate) 
         .filter(|s| s.date < today && !s.completed)
         .cloned()
         .collect();
+    let missed_recent: Vec<PlannedSession> = missed
+        .iter()
+        .filter(|s| (today - s.date).num_days() <= MISSED_RECENT_DAYS)
+        .cloned()
+        .collect();
     let upcoming: Vec<PlannedSession> = ordered
         .iter()
         .filter(|s| s.date >= today && !s.completed)
@@ -271,6 +299,7 @@ pub fn status(program: &Program, sessions: &[PlannedSession], today: NaiveDate) 
         planned: ordered.len(),
         completed,
         missed,
+        missed_recent,
         upcoming,
     }
 }
@@ -688,6 +717,67 @@ mod tests {
     }
 
     #[test]
+    fn should_list_only_the_last_fortnights_missed_sessions_as_recent() {
+        use WorkoutCategory::*;
+        let today = date(2026, 8, 24);
+        let sessions = vec![
+            session(1, date(2026, 6, 16), Endurance, false), // long gone
+            session(2, date(2026, 8, 6), Tempo, false),      // 18 days back
+            session(3, date(2026, 8, 12), Threshold, false), // 12 days back
+            session(4, date(2026, 8, 19), Vo2Max, false),    // 5 days back
+        ];
+        let s = status(&program(15), &sessions, today);
+
+        assert_eq!(s.missed.len(), 4, "the full history is untouched");
+        let recent: Vec<i64> = s.missed_recent.iter().map(|s| s.entry_id).collect();
+        assert_eq!(recent, vec![3, 4]);
+    }
+
+    #[test]
+    fn should_keep_the_full_missed_history_alongside_the_recent_one() {
+        // The two fields answer different questions, and nothing may quietly
+        // lose the long view: a program adopted from a bare calendar infers its
+        // training days from every day it ever used.
+        use WorkoutCategory::*;
+        let sessions = vec![
+            session(1, date(2026, 6, 16), Endurance, false),
+            session(2, date(2026, 8, 19), Vo2Max, false),
+        ];
+        let s = status(&program(15), &sessions, date(2026, 8, 24));
+
+        assert_eq!(s.missed.len(), 2);
+        assert_eq!(s.missed_recent.len(), 1);
+        assert!(s.missed.len() > s.missed_recent.len());
+    }
+
+    #[test]
+    fn should_count_a_session_missed_exactly_fourteen_days_ago_as_recent() {
+        let sessions = vec![session(
+            1,
+            date(2026, 8, 10),
+            WorkoutCategory::Threshold,
+            false,
+        )];
+        let s = status(&program(15), &sessions, date(2026, 8, 24));
+
+        assert_eq!(s.missed_recent.len(), 1, "the boundary is inclusive");
+    }
+
+    #[test]
+    fn should_drop_a_session_missed_fifteen_days_ago_from_recent() {
+        let sessions = vec![session(
+            1,
+            date(2026, 8, 9),
+            WorkoutCategory::Threshold,
+            false,
+        )];
+        let s = status(&program(15), &sessions, date(2026, 8, 24));
+
+        assert!(s.missed_recent.is_empty());
+        assert_eq!(s.missed.len(), 1, "still missed, just no longer recent");
+    }
+
+    #[test]
     fn should_treat_todays_unridden_session_as_upcoming_not_missed() {
         // The day is not over — nothing has been missed yet.
         let sessions = vec![session(
@@ -849,6 +939,28 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].reason, Reason::MissedRun { count: 2 }));
+    }
+
+    #[test]
+    fn should_stop_easing_once_the_missed_sessions_are_marked_done() {
+        // The claim 0.6.0 rests on. Windowing `missed` only makes the card
+        // honest; what actually stops a false easing is the rider closing those
+        // sessions by hand, which empties the run `suggest` reads.
+        use WorkoutCategory::*;
+        let today = date(2026, 8, 10);
+        let ridden_outdoors = vec![
+            session(1, date(2026, 8, 5), Tempo, true),
+            session(2, date(2026, 8, 7), Tempo, true),
+            session(3, date(2026, 8, 12), Vo2Max, false),
+        ];
+        let s = status(&program(12), &ridden_outdoors, today);
+        let past = decided(&ridden_outdoors, today);
+        let out = suggest_local(&s, &past, &metrics(5.0), &[], &library(), today);
+
+        assert!(
+            out.is_empty(),
+            "nothing was missed, so nothing should be eased"
+        );
     }
 
     #[test]
