@@ -90,6 +90,20 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.1" date="2026-08-28">
+      <description>
+        <p>Your ANT+ trainer is found again when you switch it on after opening
+           Cycle. The ANT stick was only ever given 25 seconds to look for it,
+           and once that ran out it quietly stopped listening for the rest of
+           the session. A trainer woken a minute later was never seen, and
+           pressing Scan did not bring it back — the only cure was restarting
+           the app with the trainer already awake.</p>
+        <p>Cycle now keeps looking for as long as it is open, and if a search
+           does stop, it notices and starts it again. Your heart rate strap and
+           cadence sensor were affected in the same way and are fixed with it,
+           so switching any of them on late now works.</p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-08-27">
       <description>
         <p>You can now mark a planned session done yourself. Most riding happens
