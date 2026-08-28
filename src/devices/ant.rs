@@ -71,10 +71,31 @@ const MSG_ASSIGN_CHANNEL: u8 = 0x42;
 const MSG_SET_CHANNEL_ID: u8 = 0x51;
 const MSG_SET_CHANNEL_RF_FREQ: u8 = 0x45;
 const MSG_SET_CHANNEL_PERIOD: u8 = 0x43;
+const MSG_SET_SEARCH_TIMEOUT: u8 = 0x44;
 const MSG_OPEN_CHANNEL: u8 = 0x4B;
 const MSG_CLOSE_CHANNEL: u8 = 0x4C;
 const MSG_BROADCAST_DATA: u8 = 0x4E;
 const MSG_ACKNOWLEDGED_DATA: u8 = 0x4F;
+/// The stick's channel response message — it answers commands on this id, and
+/// also volunteers channel events (a search giving up, a channel closing).
+const MSG_CHANNEL_RESPONSE: u8 = 0x40;
+
+/// High-priority search timeout, in 2.5 s units. 0xFF means "search forever".
+///
+/// The stick's own default is 10, i.e. 25 seconds, after which the channel
+/// stops listening and closes itself. That default is wrong for every sensor
+/// here: an ANT+ trainer only starts broadcasting once it is woken, which is
+/// routinely minutes after the app is launched, and a rider is not expected to
+/// have their trainer spinning before they open the app.
+const SEARCH_TIMEOUT_INFINITE: u8 = 0xFF;
+
+/// A channel response frame carries this in its message-id byte when the stick
+/// is reporting an event rather than answering a command we sent.
+const RESPONSE_IS_EVENT: u8 = 0x01;
+/// The channel searched for its allotted time, heard nothing, and gave up.
+const EVENT_RX_SEARCH_TIMEOUT: u8 = 0x01;
+/// The channel is now closed and will hear nothing further.
+const EVENT_CHANNEL_CLOSED: u8 = 0x07;
 
 /// ANT+ managed network key (public, published by Garmin for ANT+ device profiles).
 const ANT_PLUS_NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
@@ -378,6 +399,13 @@ impl AntStick {
             MSG_SET_CHANNEL_PERIOD,
             &[channel, plsb, pmsb],
         ));
+        // Search until the device turns up, however long that takes — see
+        // `SEARCH_TIMEOUT_INFINITE`. Without this the stick gives the trainer
+        // 25 seconds and then shuts the channel behind our back.
+        ok &= self.write(&encode_message(
+            MSG_SET_SEARCH_TIMEOUT,
+            &[channel, SEARCH_TIMEOUT_INFINITE],
+        ));
         ok & self.write(&encode_message(MSG_OPEN_CHANNEL, &[channel]))
     }
 
@@ -462,6 +490,32 @@ fn for_each_frame(buf: &[u8], mut f: impl FnMut(u8, &[u8])) {
     }
 }
 
+/// The device type and messaging period a channel is configured with, so a
+/// channel that has stopped listening can be brought back up exactly as it was.
+/// `None` for a channel number this build never opens.
+fn channel_config(channel: u8) -> Option<(u8, u16)> {
+    match channel {
+        FEC_CHANNEL => Some((FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD)),
+        CADENCE_CHANNEL => Some((SC_DEVICE_TYPE, SC_CHANNEL_PERIOD)),
+        HR_CHANNEL => Some((HR_DEVICE_TYPE, HR_CHANNEL_PERIOD)),
+        _ => None,
+    }
+}
+
+/// The channel number from a channel response frame that says the channel has
+/// stopped listening, or `None` for any other response.
+///
+/// A channel that times out its search, or is closed, is inert: it will never
+/// report a device again, and the stick says so only through this one message.
+/// Ignoring it is how a trainer switched on late stays invisible for the rest
+/// of the run.
+fn dead_channel_event(data: &[u8]) -> Option<u8> {
+    if data.len() < 3 || data[1] != RESPONSE_IS_EVENT {
+        return None;
+    }
+    matches!(data[2], EVENT_RX_SEARCH_TIMEOUT | EVENT_CHANNEL_CLOSED).then_some(data[0])
+}
+
 /// ANT thread entry point. Runs until a `Shutdown` command or the channel closes.
 pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut stick: Option<AntStick> = None;
@@ -512,9 +566,11 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                             discovered = false;
                             hr_discovered = false;
                             // A scan is the rider asking for a muted device back.
+                            let mut fec_reopened = false;
                             if fec_muted {
                                 fec_muted = false;
                                 s.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
+                                fec_reopened = true;
                             }
                             if hr_muted {
                                 hr_muted = false;
@@ -522,6 +578,13 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                             }
                             if !channel_open {
                                 channel_open = s.open_channels();
+                            } else if !connected && !fec_reopened {
+                                // Pressing Scan with no trainer found is the
+                                // rider saying "look again", so re-arm the FE-C
+                                // search on its own. The other channels keep
+                                // whatever they have already paired: restarting
+                                // those would throw away a live strap.
+                                s.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
                             }
                         }
                         None => tracing::warn!("ANT scan requested but no stick available"),
@@ -707,6 +770,30 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             continue;
         }
         for_each_frame(&buf[..n], |msg_id, data| {
+            // A channel that has given up searching is dead until it is opened
+            // again, and nothing else on the stick will mention it. Reopen it
+            // here or the device on that channel is lost for the whole run.
+            if msg_id == MSG_CHANNEL_RESPONSE {
+                if let Some(channel) = dead_channel_event(data) {
+                    let muted = match channel {
+                        FEC_CHANNEL => fec_muted,
+                        HR_CHANNEL => hr_muted,
+                        _ => false,
+                    };
+                    // A channel the rider muted by disconnecting that device
+                    // is meant to be shut. Leave it that way.
+                    if !muted {
+                        if let Some((device_type, period)) = channel_config(channel) {
+                            tracing::info!(
+                                "ANT ch{channel} stopped listening (event 0x{:02x}) — reopening",
+                                data[2]
+                            );
+                            s.open_channel(channel, device_type, period);
+                        }
+                    }
+                }
+                return;
+            }
             if msg_id != MSG_BROADCAST_DATA || data.len() < 9 {
                 return;
             }
@@ -831,6 +918,83 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Channel recovery ────────────────────────────────────────────────────
+    // A channel that stops searching is inert, and the stick reports that once
+    // and never again. Missing it left a trainer switched on late invisible for
+    // the rest of the run.
+
+    #[test]
+    fn should_report_the_channel_when_its_search_times_out() {
+        let data = [FEC_CHANNEL, RESPONSE_IS_EVENT, EVENT_RX_SEARCH_TIMEOUT];
+        assert_eq!(dead_channel_event(&data), Some(FEC_CHANNEL));
+    }
+
+    #[test]
+    fn should_report_the_channel_when_it_is_closed() {
+        let data = [HR_CHANNEL, RESPONSE_IS_EVENT, EVENT_CHANNEL_CLOSED];
+        assert_eq!(dead_channel_event(&data), Some(HR_CHANNEL));
+    }
+
+    #[test]
+    fn should_ignore_an_event_that_leaves_the_channel_listening() {
+        // 0x03 = EVENT_TX, which says nothing about the channel being alive or
+        // dead. Reopening on it would restart the search on a working channel.
+        let data = [FEC_CHANNEL, RESPONSE_IS_EVENT, 0x03];
+        assert_eq!(dead_channel_event(&data), None);
+    }
+
+    #[test]
+    fn should_ignore_a_reply_to_a_command_rather_than_an_event() {
+        // Message id 0x51 = our own SET_CHANNEL_ID being acknowledged. Only a
+        // message id of 0x01 marks the frame as an event.
+        let data = [FEC_CHANNEL, MSG_SET_CHANNEL_ID, 0x00];
+        assert_eq!(dead_channel_event(&data), None);
+    }
+
+    #[test]
+    fn should_ignore_a_truncated_channel_response() {
+        assert_eq!(dead_channel_event(&[]), None);
+        assert_eq!(dead_channel_event(&[FEC_CHANNEL]), None);
+        assert_eq!(dead_channel_event(&[FEC_CHANNEL, RESPONSE_IS_EVENT]), None);
+    }
+
+    #[test]
+    fn should_know_how_to_reopen_every_channel_it_opens() {
+        assert_eq!(
+            channel_config(FEC_CHANNEL),
+            Some((FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD))
+        );
+        assert_eq!(
+            channel_config(CADENCE_CHANNEL),
+            Some((SC_DEVICE_TYPE, SC_CHANNEL_PERIOD))
+        );
+        assert_eq!(
+            channel_config(HR_CHANNEL),
+            Some((HR_DEVICE_TYPE, HR_CHANNEL_PERIOD))
+        );
+    }
+
+    #[test]
+    fn should_not_reopen_a_channel_this_build_never_opened() {
+        assert_eq!(channel_config(0x07), None);
+    }
+
+    #[test]
+    fn should_ask_the_stick_to_search_forever() {
+        // 0xFF is the only value that means "no timeout"; the stick's default
+        // of 10 gives the trainer 25 seconds and then shuts the channel.
+        assert_eq!(SEARCH_TIMEOUT_INFINITE, 0xFF);
+        let msg = encode_message(
+            MSG_SET_SEARCH_TIMEOUT,
+            &[FEC_CHANNEL, SEARCH_TIMEOUT_INFINITE],
+        );
+        assert_eq!(
+            msg[..4],
+            [ANT_SYNC, 0x02, MSG_SET_SEARCH_TIMEOUT, FEC_CHANNEL]
+        );
+        assert_eq!(msg[4], 0xFF);
+    }
 
     // ── Address routing ─────────────────────────────────────────────────────
     // The HR strap and the trainer share a stick but nothing else. Conflating
