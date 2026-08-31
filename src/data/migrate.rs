@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -124,6 +124,47 @@ const MIGRATIONS: &[Migration] = &[
             // Every calendar query filters on the date, and until now the schema
             // carried no indexes at all.
             "CREATE INDEX idx_calendar_entries_date ON calendar_entries(scheduled_date)",
+        ],
+    },
+    Migration {
+        version: 5,
+        name: "step back one ease at a time",
+        statements: &[
+            // One row per ease actually applied, newest last. `original_workout_id`
+            // stays and keeps naming where the chain started — the day still says
+            // what the program first asked for, while Undo walks back a rung at a
+            // time. Storing only the origin (what v2 did) collapses a chain of eases
+            // to one value; storing only the chain loses the origin as soon as the
+            // last step is undone. They are two different facts.
+            //
+            // Both cascades are load-bearing. On `entry_id`: SQLite reuses row ids,
+            // so a chain outliving its deleted entry could later attach itself to a
+            // new entry that happens to take the same id. On `from_workout_id`:
+            // without it, a library workout that some day was once eased away from
+            // could never be deleted again — blocking a delete to preserve an undo
+            // rung is the wrong trade.
+            "CREATE TABLE calendar_entry_adjustments (
+             id              INTEGER PRIMARY KEY,
+             entry_id        INTEGER NOT NULL REFERENCES calendar_entries(id) ON DELETE CASCADE,
+             from_workout_id INTEGER NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+             applied_at      TEXT    NOT NULL
+         )",
+            "CREATE INDEX idx_entry_adjustments_entry ON calendar_entry_adjustments(entry_id, id)",
+            // Carry an install that is mid-ease across as a one-step chain, so its
+            // Undo keeps working. `scheduled_date` stands in for the applied time,
+            // which was never recorded; it is only ever used for ordering, and one
+            // row cannot be out of order.
+            //
+            // The NOT EXISTS makes a re-run a no-op. Every other statement in this
+            // file is naturally idempotent and `is_already_applied` forgives the
+            // ones that are not, but an unguarded INSERT would quietly double the
+            // chain on a database re-migrated after being restored mid-upgrade.
+            "INSERT INTO calendar_entry_adjustments (entry_id, from_workout_id, applied_at)
+         SELECT ce.id, ce.original_workout_id, ce.scheduled_date
+           FROM calendar_entries ce
+          WHERE ce.original_workout_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM calendar_entry_adjustments a
+                             WHERE a.entry_id = ce.id)",
         ],
     },
 ];
@@ -934,6 +975,185 @@ mod tests {
             "a migrated workout row carries no stored estimate"
         );
         assert_eq!(user_version(&pool).await.unwrap(), 4);
+    }
+
+    /// Walk a database up to v4 with one eased entry on it, ready for v5.
+    async fn pool_at_v4_with_an_eased_entry() -> SqlitePool {
+        let pool = empty_pool().await;
+        sqlx::query(BASELINE_TABLES).execute(&pool).await.unwrap();
+        set_user_version(&pool, BASELINE_VERSION).await.unwrap();
+        for version in [2, 3, 4] {
+            apply(&pool, migration(version)).await.unwrap();
+        }
+        sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES ('Threshold 3x10', 3600)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES ('VO2Max Blocks', 3300)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Eased once already: it now holds Threshold, and the program asked for VO2Max.
+        sqlx::query(
+            "INSERT INTO calendar_entries (workout_id, scheduled_date, original_workout_id)
+             VALUES (1, '2026-03-04', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn should_carry_an_entry_already_eased_into_the_new_chain() {
+        // An install upgrading mid-ease must keep its Undo working: v5 reads the
+        // step from the chain table, so a single `original_workout_id` that predates
+        // the table has to arrive in it.
+        let pool = pool_at_v4_with_an_eased_entry().await;
+
+        apply(&pool, migration(5)).await.unwrap();
+
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT entry_id, from_workout_id FROM calendar_entry_adjustments ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, 2)],
+            "the one ease already applied becomes a one-step chain back to VO2Max Blocks"
+        );
+
+        let original: Option<i64> =
+            sqlx::query_scalar("SELECT original_workout_id FROM calendar_entries")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            original,
+            Some(2),
+            "the origin column stays: the day still names what the program first asked for"
+        );
+        assert_eq!(user_version(&pool).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn should_not_double_the_chain_when_v5_is_applied_twice() {
+        // `is_already_applied` deliberately lets a re-run through, which a database
+        // restored between the write and the version bump will do. Every other
+        // statement in v5 is idempotent on its own; the backfill only is because of
+        // its NOT EXISTS, and this is the test that says so.
+        let pool = pool_at_v4_with_an_eased_entry().await;
+
+        apply(&pool, migration(5)).await.unwrap();
+        apply(&pool, migration(5)).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_entry_adjustments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "the second run must add nothing");
+    }
+
+    #[tokio::test]
+    async fn should_drop_the_ease_chain_when_its_planned_day_is_deleted() {
+        // SQLite reuses row ids. A chain outliving its entry would be inherited by
+        // whichever new entry next took that id, so the day would open already
+        // offering to undo an ease that was applied to something else.
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES ('Threshold', 3600)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO calendar_entries (workout_id, scheduled_date) VALUES (1, '2026-03-04')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO calendar_entry_adjustments (entry_id, from_workout_id, applied_at)
+             VALUES (1, 1, '2026-03-04')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM calendar_entries WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_entry_adjustments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "the chain goes with the day");
+    }
+
+    #[tokio::test]
+    async fn should_let_a_workout_once_eased_away_from_still_be_deleted() {
+        // The plan protects the workout an entry currently holds, but a workout it
+        // has moved off is only named by the chain. Blocking a library delete to
+        // preserve an undo rung would be the wrong trade.
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+        for name in ["Threshold", "Sweet Spot"] {
+            sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES (?, 3600)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // The entry now holds Sweet Spot, having been eased down from Threshold.
+        sqlx::query(
+            "INSERT INTO calendar_entries (workout_id, scheduled_date) VALUES (2, '2026-03-04')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO calendar_entry_adjustments (entry_id, from_workout_id, applied_at)
+             VALUES (1, 1, '2026-03-04')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM workouts WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("a workout only an undo step names must stay deletable");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_entry_adjustments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "the rung goes with the workout it named");
+    }
+
+    #[tokio::test]
+    async fn should_leave_the_chain_empty_for_a_plan_that_was_never_eased() {
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO workouts (name, duration_secs) VALUES ('Endurance', 3600)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO calendar_entries (workout_id, scheduled_date) VALUES (1, '2026-03-04')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM calendar_entry_adjustments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
