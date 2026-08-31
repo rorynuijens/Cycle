@@ -40,6 +40,12 @@ pub struct PlanData {
     /// `None` when the rider is not following a program.
     pub program: Option<crate::training::program::Program>,
     pub sessions: Vec<crate::training::program::PlannedSession>,
+    /// The days real training happened on, over the whole history.
+    ///
+    /// The program uses this to tell a day the rider rode through from one they
+    /// skipped, without asking them (see
+    /// [`crate::training::matching::trained_days`]).
+    pub trained: std::collections::HashSet<NaiveDate>,
     pub metrics: crate::training::fitness::LoadMetrics,
     pub wellness: Vec<db::WellnessEntry>,
     /// Scheduled workouts belonging to no program: first, last, and how many.
@@ -64,6 +70,10 @@ pub async fn load_plan_data(
     // it reads the same history the Fitness page does.
     let records = db::load_session_summaries(pool).await?;
     let intervals_pairs = db::load_intervals_tss_pairs(pool).await?;
+    // Unlinked, so a ride this app recorded and then uploaded is not read from
+    // both sources — harmless for a set of dates, but the same rule everywhere.
+    let activities = db::load_unlinked_intervals_activities(pool).await?;
+    let trained = crate::training::matching::trained_days(&records, &activities);
     let metrics = crate::training::fitness::compute_load_metrics(
         &records,
         &intervals_pairs,
@@ -74,6 +84,7 @@ pub async fn load_plan_data(
     Ok(PlanData {
         program,
         sessions,
+        trained,
         metrics,
         wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS.max(14)).await?,
         orphans: db::orphan_entry_span(pool).await?,

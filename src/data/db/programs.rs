@@ -113,6 +113,7 @@ pub async fn load_program_sessions(
             continue;
         };
         sessions.push(PlannedSession {
+            trained: false,
             entry_id: r.get("id"),
             date,
             workout_id: r.get("workout_id"),

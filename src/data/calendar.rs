@@ -48,11 +48,25 @@ impl CalendarEvent {
     ///
     /// `fallback_ftp` scores rides recorded before FTP was stamped on them;
     /// a stamped ride is scored against the FTP it was actually ridden at.
-    pub fn load(&self, fallback_ftp: u32) -> EventLoad {
+    ///
+    /// `measured_ride_on_day` is the day this event sits in, not the event
+    /// itself — see [`has_measured_ride`]. A planned session's TSS is an
+    /// *estimate* standing in for a ride nobody recorded; once a real ride with
+    /// a load figure is on the same day, banking the estimate as well counts one
+    /// session's training twice. Callers therefore have to know the day before
+    /// they can score any event on it, which is deliberate: this used to be a
+    /// per-event decision, and a day both ridden and ticked read as the sum of
+    /// the ride and the plan's guess at it.
+    pub fn load(&self, fallback_ftp: u32, measured_ride_on_day: bool) -> EventLoad {
         match self {
             Self::Scheduled(e) => EventLoad {
-                // A completed plan has been banked; an open one is still ahead.
-                done_tss: if e.completed { e.tss } else { 0.0 },
+                // A completed plan has been banked; an open one is still ahead —
+                // unless something really ridden already accounts for the day.
+                done_tss: if e.completed && !measured_ride_on_day {
+                    e.tss
+                } else {
+                    0.0
+                },
                 planned_tss: if e.completed { 0.0 } else { e.tss },
                 is_scheduled: true,
                 is_complete: e.completed,
@@ -109,14 +123,44 @@ impl LoadTotals {
     }
 }
 
-/// Sum the load across `events`.
+/// True when something actually ridden on this day carries measured training load.
+///
+/// A ride that synced without any load figure deliberately does not count: it
+/// would suppress the plan's estimate while contributing nothing in its place,
+/// leaving the day reading zero.
+pub fn has_measured_ride<'a>(
+    events: impl IntoIterator<Item = &'a CalendarEvent>,
+    fallback_ftp: u32,
+) -> bool {
+    events.into_iter().any(|event| match event {
+        CalendarEvent::Session(s, _) => s.session.tss(fallback_ftp).unwrap_or(0.0) > 0.0,
+        CalendarEvent::IcuActivity(a) => a.tss.unwrap_or(0.0) > 0.0,
+        CalendarEvent::Scheduled(_) | CalendarEvent::TimeOff(_) => false,
+    })
+}
+
+/// Sum the load across `events` — a day, a week or a month.
+///
+/// The estimate-versus-ride rule in [`CalendarEvent::load`] is decided per
+/// **date** rather than across the whole set, so a Tuesday ride cannot silence
+/// Wednesday's plan. That grouping happens here rather than being left to
+/// callers: getting it wrong is silent, and shows up only as a load bar that is
+/// quietly too small.
 pub fn totals<'a>(
     events: impl IntoIterator<Item = &'a CalendarEvent>,
     fallback_ftp: u32,
 ) -> LoadTotals {
+    let events: Vec<&CalendarEvent> = events.into_iter().collect();
+    let ridden: std::collections::HashSet<NaiveDate> = events
+        .iter()
+        .filter(|e| has_measured_ride([**e], fallback_ftp))
+        .filter_map(|e| e.date())
+        .collect();
+
     let mut t = LoadTotals::default();
     for event in events {
-        let load = event.load(fallback_ftp);
+        let measured = event.date().is_some_and(|d| ridden.contains(&d));
+        let load = event.load(fallback_ftp, measured);
         t.done_tss += load.done_tss;
         t.planned_tss += load.planned_tss;
         if load.is_scheduled {
@@ -312,7 +356,7 @@ mod tests {
 
     #[test]
     fn should_count_an_open_plan_as_still_ahead() {
-        let load = scheduled("2026-08-05", 60.0, false).load(250);
+        let load = scheduled("2026-08-05", 60.0, false).load(250, false);
         assert_eq!(load.planned_tss, 60.0);
         assert_eq!(load.done_tss, 0.0);
         assert!(load.is_scheduled);
@@ -321,7 +365,7 @@ mod tests {
 
     #[test]
     fn should_count_a_completed_plan_as_banked() {
-        let load = scheduled("2026-08-05", 60.0, true).load(250);
+        let load = scheduled("2026-08-05", 60.0, true).load(250, false);
         assert_eq!(load.done_tss, 60.0);
         assert_eq!(
             load.planned_tss, 0.0,
@@ -332,15 +376,64 @@ mod tests {
 
     #[test]
     fn should_count_a_synced_activity_as_banked_and_unscheduled() {
-        let load = icu(date(2026, 8, 5), Some(42.0)).load(250);
+        let load = icu(date(2026, 8, 5), Some(42.0)).load(250, false);
         assert_eq!(load.done_tss, 42.0);
         assert!(!load.is_scheduled, "a synced ride was never on the plan");
         assert!(load.is_complete);
     }
 
     #[test]
+    fn should_bank_nothing_for_a_plan_on_a_day_that_was_really_ridden() {
+        // The ride is on this day as its own event and already contributes its
+        // measured TSS. Banking the plan's estimate as well would show 4 August
+        // as 125 for a 93 TSS ride.
+        let event = scheduled("2026-08-04", 31.9, true);
+        assert_eq!(event.load(250, true).done_tss, 0.0);
+    }
+
+    #[test]
+    fn should_still_bank_the_estimate_for_a_day_ticked_with_nothing_ridden() {
+        // Nothing else on the day carries the load, so the plan's figure is the
+        // only account of it. This is 0.6.0's behaviour, and it stays.
+        let event = scheduled("2026-08-05", 31.9, true);
+        assert_eq!(event.load(250, false).done_tss, 31.9);
+    }
+
+    #[test]
+    fn should_count_a_ridden_day_once_not_twice() {
+        // The rule holds however the day was closed: the plan's estimate is a
+        // stand-in for a ride nobody recorded, and there is a recorded ride here.
+        let day = date(2026, 8, 4);
+        let events = vec![scheduled("2026-08-04", 31.9, true), icu(day, Some(93.0))];
+        assert_eq!(
+            totals(&events, 250).done_tss,
+            93.0,
+            "the ride's measured load, not the ride plus the plan's guess at it"
+        );
+    }
+
+    #[test]
+    fn should_keep_the_estimate_when_the_days_ride_carries_no_load_figure() {
+        // Suppressing the estimate for a ride that scored nothing would leave
+        // the day reading zero, which is worse than an estimate.
+        let day = date(2026, 8, 4);
+        let events = vec![scheduled("2026-08-04", 31.9, true), icu(day, None)];
+        assert_eq!(totals(&events, 250).done_tss, 31.9);
+    }
+
+    #[test]
+    fn should_not_let_one_days_ride_silence_another_days_plan() {
+        // The guard on `day_totals` being day-scoped: these two events do not
+        // share a date, so the 5th's plan still stands on its own.
+        assert!(!has_measured_ride(
+            [&scheduled("2026-08-05", 31.9, true)],
+            250
+        ));
+    }
+
+    #[test]
     fn should_contribute_no_load_for_an_activity_with_no_tss() {
-        assert_eq!(icu(date(2026, 8, 5), None).load(250).done_tss, 0.0);
+        assert_eq!(icu(date(2026, 8, 5), None).load(250, false).done_tss, 0.0);
     }
 
     #[test]
@@ -349,7 +442,7 @@ mod tests {
             date: date(2026, 8, 5),
             notes: "holiday".into(),
         })
-        .load(250);
+        .load(250, false);
         assert_eq!(load, EventLoad::default());
         assert!(!load.is_scheduled);
     }
@@ -364,8 +457,8 @@ mod tests {
         let stamped = CalendarEvent::Session(record, name);
         // An hour at a stamped FTP of 250 is ~100 TSS regardless of the
         // fallback, so raising the profile FTP must not deflate past work.
-        let at_stamped = stamped.load(250).done_tss;
-        let with_higher_fallback = stamped.load(400).done_tss;
+        let at_stamped = stamped.load(250, false).done_tss;
+        let with_higher_fallback = stamped.load(400, false).done_tss;
         assert!((at_stamped - with_higher_fallback).abs() < 0.01);
         assert!(at_stamped > 95.0 && at_stamped < 105.0, "{at_stamped}");
     }

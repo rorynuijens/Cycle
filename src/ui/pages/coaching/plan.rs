@@ -261,6 +261,7 @@ impl PlanCard {
         let (state, adjustments) = plan_view(
             &program,
             &data.sessions,
+            &data.trained,
             &data.metrics,
             &data.wellness,
             &self.workouts,
@@ -976,6 +977,7 @@ mod tests {
 
     fn session(id: i64, d: NaiveDate, completed: bool) -> PlannedSession {
         PlannedSession {
+            trained: false,
             entry_id: id,
             date: d,
             workout_id: id,

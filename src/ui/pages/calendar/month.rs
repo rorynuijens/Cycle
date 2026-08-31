@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::data::calendar::{
-    days_in_month, first_weekday_column, group_by_date, totals, CalendarEvent,
+    days_in_month, first_weekday_column, group_by_date, has_measured_ride, totals, CalendarEvent,
 };
 use crate::data::db::{self, CalendarEntry};
 use crate::data::workout::Workout;
@@ -78,9 +78,13 @@ pub fn build_month_grid(
         let is_today = date == today;
         let day_events = by_day.get(&date).map(Vec::as_slice).unwrap_or(&[]);
 
+        // Decided once for the day and handed to every item on it: whether a
+        // planned session banks its estimate depends on what else shares the
+        // date, not on the entry alone (see `CalendarEvent::load`).
+        let measured = has_measured_ride(day_events.iter().copied(), ftp);
         let items: Vec<MonthCellItem> = day_events
             .iter()
-            .map(|e| MonthCellItem::from_event(e, ftp, &overlay))
+            .map(|e| MonthCellItem::from_event(e, ftp, &overlay, measured))
             .collect();
         let day_totals = totals(day_events.iter().copied(), ftp);
         week.done_tss += day_totals.done_tss;
@@ -96,6 +100,11 @@ pub fn build_month_grid(
         // One gesture per label rather than one for the cell: a cell-wide
         // handler can only open a single entry, so a day with two plans always
         // opened the first.
+        // The rides actually done on this day, shown inside whichever entry's
+        // dialog is opened. Computed once per day rather than per entry: two
+        // planned sessions on one day were ridden through by the same rides.
+        let day_rides = crate::training::matching::rides_on(date, day_events.iter().copied(), ftp);
+
         for (row_widget, item) in item_widgets.iter().zip(items.iter()) {
             let Some(entry) = item.entry.clone() else {
                 continue;
@@ -109,6 +118,7 @@ pub fn build_month_grid(
             let rh_i = Rc::clone(&reload_holder);
             let toast_i = Rc::clone(&on_toast);
             let mark = item.mark.clone();
+            let rides_i = day_rides.clone();
             gesture.connect_released(move |g, _, _, _| {
                 let Some(widget) = g.widget() else { return };
                 super::dialogs::show_workout_detail_dialog(
@@ -122,6 +132,7 @@ pub fn build_month_grid(
                     reload_fn(&rh_i),
                     Rc::clone(&toast_i),
                     mark.clone(),
+                    rides_i.clone(),
                 );
             });
             row_widget.add_controller(gesture);
@@ -375,8 +386,13 @@ impl MonthCellItem {
         text
     }
 
-    fn from_event(event: &CalendarEvent, ftp: u32, overlay: &ProgramOverlay) -> Self {
-        let load = event.load(ftp);
+    fn from_event(
+        event: &CalendarEvent,
+        ftp: u32,
+        overlay: &ProgramOverlay,
+        measured_ride_on_day: bool,
+    ) -> Self {
+        let load = event.load(ftp, measured_ride_on_day);
         match event {
             CalendarEvent::Scheduled(e) => MonthCellItem {
                 label: if e.completed {

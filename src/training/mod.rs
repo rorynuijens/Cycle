@@ -4,6 +4,7 @@ pub mod cues;
 pub mod engine;
 pub mod fitness;
 pub mod load;
+pub mod matching;
 pub mod program;
 pub mod progression;
 pub mod recommend;

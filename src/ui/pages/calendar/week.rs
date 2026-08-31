@@ -54,6 +54,9 @@ pub fn build_week_view(
         let day_events = by_day.get(&day).map(Vec::as_slice).unwrap_or(&[]);
         let is_today = day == today;
         let is_past = day < today;
+        // What the rider actually rode on this day. Same list for every entry
+        // on the day.
+        let day_rides = crate::training::matching::rides_on(day, day_events.iter().copied(), ftp);
 
         let day_frame = gtk::Frame::new(None);
         if is_today {
@@ -321,6 +324,7 @@ pub fn build_week_view(
                         let rh_d = Rc::clone(&reload_holder);
                         let toast_d = Rc::clone(&on_toast);
                         let mark_d = mark.clone();
+                        let rides_d = day_rides.clone();
                         btn.connect_clicked(move |b| {
                             let rh_c = Rc::clone(&rh_d);
                             let reload_fn: Rc<dyn Fn()> = reload_fn(&rh_c);
@@ -335,6 +339,7 @@ pub fn build_week_view(
                                 reload_fn,
                                 Rc::clone(&toast_d),
                                 mark_d.clone(),
+                                rides_d.clone(),
                             );
                         });
 

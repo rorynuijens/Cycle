@@ -26,7 +26,7 @@ fn dress_done_row(row: &adw::ActionRow, icon: &gtk::Image, btn: &gtk::Button, do
     row.set_subtitle(if done {
         "This session counts towards your program."
     } else {
-        "Rode this away from the app? Count it towards your program."
+        "Rode this away from the app? Mark it done here."
     });
     icon.set_icon_name(Some(if done {
         "object-select-symbolic"
@@ -596,6 +596,7 @@ pub fn show_workout_detail_dialog(
     reload: Rc<dyn Fn()>,
     on_toast: Rc<dyn Fn(adw::Toast)>,
     mark: EntryMark,
+    rides: Vec<crate::training::matching::DayRide>,
 ) {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -664,6 +665,56 @@ pub fn show_workout_detail_dialog(
     stats_list.append(&tss_row);
     content.append(&stats_list);
 
+    // ── What you actually rode that day ──────────────────────────────────────
+    //
+    // Stated, not asked. The program reads a day with real training on it as
+    // trained by itself (`training::matching::trained_days`), so there is
+    // nothing here for the rider to confirm — this only says what the app is
+    // already going on, so a day that stops counting as missed does not do so
+    // silently.
+    //
+    // It was briefly a list of buttons asking which ride "was" the planned
+    // session. On a day holding an 89-minute road ride against a planned
+    // 30-minute recovery spin there is no honest answer to that, and the
+    // question only existed because `completed` had two states and needed a
+    // third.
+    if !rides.is_empty() {
+        let rides_list = gtk::ListBox::builder()
+            .css_classes(["boxed-list"])
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        for ride in &rides {
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&ride.name))
+                .subtitle(ride.summary())
+                .subtitle_lines(0)
+                .build();
+            let icon = gtk::Image::from_icon_name("emblem-shared-symbolic");
+            icon.set_css_classes(&["accent"]);
+            icon.update_property(&[gtk::accessible::Property::Label(
+                "A ride you did on this day",
+            )]);
+            row.add_prefix(&icon);
+            rides_list.append(&row);
+        }
+        content.append(
+            &gtk::Label::builder()
+                .label("You rode this day")
+                .halign(gtk::Align::Start)
+                .css_classes(["heading"])
+                .build(),
+        );
+        content.append(&rides_list);
+        content.append(
+            &gtk::Label::builder()
+                .label("This day counts as trained, whether or not you did the planned session.")
+                .halign(gtk::Align::Start)
+                .wrap(true)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
+
     // ── Done, or not done ────────────────────────────────────────────────────
     //
     // A row rather than a label, because it has to work in both directions: the
@@ -671,9 +722,8 @@ pub fn show_workout_detail_dialog(
     // hidden entirely once an entry is completed, so an un-mark control placed
     // there would vanish exactly when it is wanted.
     //
-    // Ticking this settles the session against the plan and nothing else. No
-    // training load is banked — fitness comes from recorded rides, never from
-    // calendar entries.
+    // This says whether the *planned session* was done, which is a narrower
+    // question than whether the day was trained on. Nothing above depends on it.
     let done_list = gtk::ListBox::builder()
         .css_classes(["boxed-list"])
         .selection_mode(gtk::SelectionMode::None)

@@ -115,8 +115,12 @@ pub fn undo_easing(
 ///
 /// Settles the session against the *plan* only. It banks no training load —
 /// fitness is computed from recorded rides, never from calendar entries — so
-/// this closes the day without pretending a ride happened. Real rides start
-/// closing their own days in 0.7.0.
+/// this closes the day without pretending a ride happened.
+///
+/// A day the rider really rode does not need this: the program reads such a day
+/// as trained on its own (see [`crate::training::matching::trained_days`]), and
+/// its load bar already carries the ride. This is for a session ridden somewhere
+/// the app cannot see.
 ///
 /// `on_settled` is called with the new state once the write lands, and only
 /// then. The week list and the coaching card pass `None`: `reload` rebuilds

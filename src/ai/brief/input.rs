@@ -368,6 +368,7 @@ mod tests {
 
     fn session(date: NaiveDate, completed: bool) -> PlannedSession {
         PlannedSession {
+            trained: false,
             entry_id: 1,
             date,
             workout_id: 1,

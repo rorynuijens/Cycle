@@ -435,6 +435,7 @@ impl CalendarPage {
                                 let (_, adjustments) = plan_view(
                                     &program,
                                     &data.sessions,
+                                    &data.trained,
                                     &data.metrics,
                                     &data.wellness,
                                     &workouts_marks,

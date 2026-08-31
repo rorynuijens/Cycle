@@ -81,10 +81,51 @@ pub struct PlannedSession {
     pub category: WorkoutCategory,
     pub tss: f32,
     pub duration_secs: u32,
+    /// Whether the rider marked *this planned session* done.
     pub completed: bool,
+    /// Whether real training happened on this day, whatever the plan asked for.
+    ///
+    /// Separate from `completed` because they answer different questions. A
+    /// 90-minute road ride on a day the plan wanted 30 minutes of recovery did
+    /// not complete that session — but it is emphatically not a day the rider
+    /// skipped, and counting it as missed is what had the program easing this
+    /// rider's training for a reason that was never true.
+    ///
+    /// Filled in by [`mark_trained`] from
+    /// [`crate::training::matching::trained_days`]; the database cannot know it,
+    /// because it is a fact about rides rather than about the plan.
+    pub trained: bool,
     /// The workout the program originally asked for, when this entry has
     /// already been eased.
     pub adjusted_from: Option<String>,
+}
+
+impl PlannedSession {
+    /// Whether this planned day is settled — nothing more is expected of it.
+    ///
+    /// True when the session was done, and also when the day was simply trained
+    /// on. Everything that asks "was this missed?" asks this instead, so the two
+    /// answers can never drift apart.
+    pub fn settled(&self) -> bool {
+        self.completed || self.trained
+    }
+}
+
+/// Note which planned days had real training on them.
+///
+/// Kept out of the database layer on purpose: which days were trained is a fact
+/// about rides, and the plan's own tables know nothing about rides.
+pub fn mark_trained(
+    sessions: &[PlannedSession],
+    trained: &std::collections::HashSet<NaiveDate>,
+) -> Vec<PlannedSession> {
+    sessions
+        .iter()
+        .map(|s| PlannedSession {
+            trained: trained.contains(&s.date),
+            ..s.clone()
+        })
+        .collect()
 }
 
 /// Where a week sits in the build/recover cycle.
@@ -135,7 +176,7 @@ impl ProgramStatus {
     /// who missed two a fortnight ago and has ridden everything since scores
     /// zero.
     pub fn missed_run(&self, decided: &[PlannedSession]) -> usize {
-        decided.iter().rev().take_while(|s| !s.completed).count()
+        decided.iter().rev().take_while(|s| !s.settled()).count()
     }
 }
 
@@ -277,7 +318,7 @@ pub fn status(program: &Program, sessions: &[PlannedSession], today: NaiveDate) 
     let completed = ordered.iter().filter(|s| s.completed).count();
     let missed: Vec<PlannedSession> = ordered
         .iter()
-        .filter(|s| s.date < today && !s.completed)
+        .filter(|s| s.date < today && !s.settled())
         .cloned()
         .collect();
     let missed_recent: Vec<PlannedSession> = missed
@@ -486,15 +527,21 @@ pub fn suggest(
 /// calendar — and they must never answer it differently. Bundling the three
 /// steps here means neither can accidentally call [`suggest`] with a
 /// differently-derived [`ProgramStatus`].
+#[allow(clippy::too_many_arguments)] // one call, threading the plan's whole world
 pub fn plan_view(
     program: &Program,
     sessions: &[PlannedSession],
+    trained: &std::collections::HashSet<NaiveDate>,
     metrics: &LoadMetrics,
     wellness: &[WellnessEntry],
     library: &[Workout],
     today: NaiveDate,
     verdict: CoachVerdict,
 ) -> (ProgramStatus, Vec<Adjustment>) {
+    // Annotate first, so `status` and `decided` cannot disagree about which days
+    // were trained.
+    let sessions = mark_trained(sessions, trained);
+    let sessions = sessions.as_slice();
     let state = status(program, sessions, today);
     let past = decided(sessions, today);
     let adjustments = suggest(&state, &past, metrics, wellness, library, today, verdict);
@@ -505,6 +552,7 @@ pub fn plan_view(
 mod tests {
     use super::*;
     use crate::data::workout::Segment;
+    use std::collections::HashSet;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
@@ -563,8 +611,16 @@ mod tests {
         let lib = library();
         let prog = program(8);
 
-        let (state, adjustments) =
-            plan_view(&prog, &sessions, &m, &w, &lib, today, CoachVerdict::Proceed);
+        let (state, adjustments) = plan_view(
+            &prog,
+            &sessions,
+            &Default::default(),
+            &m,
+            &w,
+            &lib,
+            today,
+            CoachVerdict::Proceed,
+        );
 
         let expected_state = status(&prog, &sessions, today);
         let expected = suggest(
@@ -585,6 +641,7 @@ mod tests {
 
     fn session(id: i64, d: NaiveDate, cat: WorkoutCategory, completed: bool) -> PlannedSession {
         PlannedSession {
+            trained: false,
             entry_id: id,
             date: d,
             workout_id: id * 10,
@@ -696,6 +753,70 @@ mod tests {
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_not_count_a_day_that_was_ridden_as_missed() {
+        // The bug this whole release exists for: this rider trains mostly
+        // outdoors, and every outdoor day read as a skipped session.
+        let sessions = vec![
+            session(1, date(2026, 8, 4), WorkoutCategory::Tempo, false),
+            session(2, date(2026, 8, 5), WorkoutCategory::Recovery, false),
+        ];
+        let marked = mark_trained(&sessions, &HashSet::from([date(2026, 8, 4)]));
+
+        let s = status(&program(12), &marked, date(2026, 8, 10));
+        assert_eq!(
+            s.missed.iter().map(|m| m.date).collect::<Vec<_>>(),
+            vec![date(2026, 8, 5)],
+            "the 4th was ridden through; only the 5th was skipped"
+        );
+    }
+
+    #[test]
+    fn should_keep_a_ridden_day_out_of_the_completed_tally() {
+        // Riding *something* is not doing the planned session. The two answers
+        // stay separate; only "missed" merges them.
+        let sessions = vec![session(1, date(2026, 8, 4), WorkoutCategory::Tempo, false)];
+        let marked = mark_trained(&sessions, &HashSet::from([date(2026, 8, 4)]));
+
+        let s = status(&program(12), &marked, date(2026, 8, 10));
+        assert_eq!(s.completed, 0, "the planned session was still not done");
+        assert!(s.missed.is_empty(), "but the day was not skipped either");
+    }
+
+    #[test]
+    fn should_break_the_missed_run_on_a_day_that_was_ridden() {
+        // `missed_run` is what eases every hard session at two in a row, so a
+        // ridden day has to break it or the plan keeps backing off for a reason
+        // that is not true.
+        let sessions = vec![
+            session(1, date(2026, 8, 4), WorkoutCategory::Threshold, false),
+            session(2, date(2026, 8, 6), WorkoutCategory::Threshold, false),
+            session(3, date(2026, 8, 8), WorkoutCategory::Threshold, false),
+        ];
+        let marked = mark_trained(&sessions, &HashSet::from([date(2026, 8, 8)]));
+        let past = decided(&marked, date(2026, 8, 10));
+        let s = status(&program(12), &marked, date(2026, 8, 10));
+
+        assert_eq!(
+            s.missed_run(&past),
+            0,
+            "the most recent planned day was ridden through"
+        );
+    }
+
+    #[test]
+    fn should_still_count_a_run_of_days_with_no_riding_at_all() {
+        let sessions = vec![
+            session(1, date(2026, 8, 4), WorkoutCategory::Threshold, false),
+            session(2, date(2026, 8, 6), WorkoutCategory::Threshold, false),
+        ];
+        let marked = mark_trained(&sessions, &HashSet::from([date(2026, 8, 1)]));
+        let past = decided(&marked, date(2026, 8, 10));
+        let s = status(&program(12), &marked, date(2026, 8, 10));
+
+        assert_eq!(s.missed_run(&past), 2, "neither day was ridden");
+    }
 
     #[test]
     fn should_split_sessions_into_missed_and_upcoming() {
