@@ -283,6 +283,28 @@ fn build_context(
         total_sessions: data.records.len() + data.icu_count as usize,
         recent_sessions,
         wellness: wellness_snapshots(&data.wellness),
+        // Computed here rather than in the prompt: the arithmetic is a
+        // training concept and `ai` only formats it (CLAUDE.md §2.6).
+        //
+        // Measured on the newest reading that exists rather than on `today`.
+        // Insisting on today's would blank this block on exactly the mornings
+        // it matters most — the overnight sync has not run, the numbers are two
+        // days old, and a coach reading raw rows is precisely then most likely
+        // to miss the outlier. The heading above dates the reading, so nothing
+        // is passed off as this morning's.
+        wellness_readings: data
+            .wellness
+            .iter()
+            .map(|w| w.date)
+            .max()
+            .map(|latest| {
+                crate::training::analytics::wellness_readings(
+                    &data.wellness,
+                    latest,
+                    crate::training::analytics::MIN_WELLNESS_READINGS,
+                )
+            })
+            .unwrap_or_default(),
         goals: data.goals.clone(),
         athlete_context: data.athlete_context.clone(),
         // Only offered when the brief may choose, but built either way: the

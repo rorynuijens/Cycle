@@ -25,7 +25,7 @@ use chrono::NaiveDate;
 
 use crate::data::db::WellnessEntry;
 use crate::data::workout::{Workout, WorkoutCategory};
-use crate::training::analytics::build_wellness_series;
+use crate::training::analytics::{build_wellness_series, wellness_baseline, MIN_WELLNESS_READINGS};
 use crate::training::fitness::{LoadMetrics, TsbBand};
 
 /// Weeks in a block: three building, then one easier.
@@ -60,9 +60,6 @@ const RESTING_HR_ELEVATION: f32 = 0.05;
 
 /// A sleep score at or below this reads as a bad night rather than a normal one.
 const POOR_SLEEP_SCORE: f32 = 50.0;
-
-/// Readings needed before a wellness baseline means anything.
-const MIN_WELLNESS_READINGS: usize = 4;
 
 /// How far *below* baseline a resting heart rate reads as genuinely recovered.
 ///
@@ -495,24 +492,6 @@ fn wellness_reason(wellness: &[WellnessEntry], today: NaiveDate) -> Option<Reaso
     None
 }
 
-/// The baseline for one wellness signal, over the window ending the day before
-/// `day`.
-///
-/// Ends the day before on purpose: a baseline that includes today's reading is
-/// diluted by the very number being tested against it.
-fn wellness_baseline(
-    wellness: &[WellnessEntry],
-    day: NaiveDate,
-    extract: impl Fn(&WellnessEntry) -> Option<f32>,
-) -> Option<f32> {
-    let prior = day.pred_opt()?;
-    let vals: Vec<f32> = build_wellness_series(wellness, prior, extract)
-        .into_iter()
-        .filter(|&v| v > 0.0)
-        .collect();
-    (vals.len() >= MIN_WELLNESS_READINGS).then(|| vals.iter().sum::<f32>() / vals.len() as f32)
-}
-
 /// Whether every wellness signal recorded for `day` says the rider is recovered,
 /// and enough of them exist to mean it.
 ///
@@ -531,11 +510,16 @@ fn is_strong_morning(wellness: &[WellnessEntry], day: NaiveDate) -> bool {
 
     if let (Some(rhr), Some(base)) = (
         entry.resting_hr.map(|v| v as f32),
-        wellness_baseline(wellness, day, |e| e.resting_hr.map(|v| v as f32)),
+        wellness_baseline(wellness, day, MIN_WELLNESS_READINGS, |e| {
+            e.resting_hr.map(|v| v as f32)
+        }),
     ) {
         signals.push(rhr < base * (1.0 - RESTING_HR_SUPPRESSION));
     }
-    if let (Some(hrv), Some(base)) = (entry.hrv, wellness_baseline(wellness, day, |e| e.hrv)) {
+    if let (Some(hrv), Some(base)) = (
+        entry.hrv,
+        wellness_baseline(wellness, day, MIN_WELLNESS_READINGS, |e| e.hrv),
+    ) {
         signals.push(hrv > base * (1.0 + HRV_ELEVATION));
     }
     if let Some(score) = entry.sleep_score {

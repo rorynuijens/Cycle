@@ -8,6 +8,7 @@
 
 use crate::ai::coach::{RecentSession, WellnessSnapshot, WorkoutOption};
 use crate::data::{athlete::AthleteProfile, db::AthleteGoal};
+use crate::training::analytics::SignalReading;
 
 // ── The markers ───────────────────────────────────────────────────────────────
 
@@ -26,6 +27,14 @@ pub const MARKER_VERDICT: &str = "VERDICT:";
 /// The line carrying a freely chosen workout. Only ever asked for when no
 /// program owns the day.
 pub const MARKER_RECOMMENDED: &str = "RECOMMENDED_WORKOUT:";
+
+/// How far from a norm a wellness signal has to sit before it is called out as
+/// pointing the wrong way.
+///
+/// Low on purpose. This does not decide anything — the rules do that — it only
+/// decides whether a line is worth the coach's attention, and a signal 5 % off
+/// its own norm is worth a glance.
+const ADVERSE_DEVIATION_PCT: f32 = 5.0;
 
 // ── The context ───────────────────────────────────────────────────────────────
 
@@ -90,6 +99,12 @@ pub struct BriefContext {
     pub recent_sessions: Vec<RecentSession>,
     /// Recent wellness, newest first. The first entry is this morning's.
     pub wellness: Vec<WellnessSnapshot>,
+    /// Today's signals already measured against the rider's own norms.
+    ///
+    /// Sent as well as the daily rows, not instead of them. The rows are the
+    /// evidence; these are the subtraction — which is the step a model reading
+    /// a column of numbers will sometimes simply not do.
+    pub wellness_readings: Vec<SignalReading>,
     pub goals: Vec<AthleteGoal>,
     pub athlete_context: String,
     pub plan: TodayPlan,
@@ -161,6 +176,64 @@ fn wellness_header(wellness: &[WellnessSnapshot], today: &str) -> String {
             date = w.date
         ),
     }
+}
+
+/// Today's wellness signals as deviations from the rider's own norms.
+///
+/// Empty when nothing can be measured — a norm that does not exist yet is not a
+/// fact, and an empty block says less than a made-up one.
+///
+/// This exists because of a measured failure: handed a week of HRV rows with
+/// 31 sitting under a 44-49 norm, every local model tested and one remote one
+/// described the rider as well recovered. Form (TSB) arrived pre-computed with
+/// a verdict attached and was read correctly; wellness arrived as a table and
+/// was not. This closes that gap.
+fn format_wellness_readings(readings: &[SignalReading], date: Option<&str>) -> String {
+    if readings.is_empty() {
+        return String::new();
+    }
+
+    let lines = readings
+        .iter()
+        .map(|r| {
+            let direction = if r.deviation_pct >= 0.0 {
+                "ABOVE"
+            } else {
+                "BELOW"
+            };
+            format!(
+                "  - {} {:.0} — {:.0}% {} their recent norm of {:.0}",
+                r.label,
+                r.latest,
+                r.deviation_pct.abs(),
+                direction,
+                r.baseline
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let adverse = readings
+        .iter()
+        .filter(|r| r.is_adverse(ADVERSE_DEVIATION_PCT))
+        .count();
+    let verdict = match adverse {
+        0 => "None of these is pointing the wrong way.".to_string(),
+        n if n == readings.len() => format!(
+            "All {n} of these are pointing the wrong way — weigh that against the \
+             form number above, which lags them."
+        ),
+        n => format!(
+            "{n} of these {total} are pointing the wrong way — weigh that against \
+             the form number above, which lags them.",
+            total = readings.len()
+        ),
+    };
+
+    let when = date
+        .map(|d| format!(" (reading of {d})"))
+        .unwrap_or_default();
+    format!("\nMEASURED AGAINST THIS RIDER'S OWN NORMS{when}:\n{lines}\n{verdict}\n")
 }
 
 fn format_sessions(sessions: &[RecentSession]) -> String {
@@ -460,6 +533,7 @@ WEEKLY TSS (oldest → newest):
 
 {wellness_header}
 {wellness}
+{wellness_readings}
 
 RECENT TRAINING (last 4 weeks, newest first):
 {sessions}
@@ -507,6 +581,10 @@ PROCEED means today's plan suits the athlete as it stands. EASE means train, but
         week_tss = format_week_tss(&ctx.week_tss),
         wellness_header = wellness_header(&ctx.wellness, &ctx.today),
         wellness = format_wellness(&ctx.wellness),
+        wellness_readings = format_wellness_readings(
+            &ctx.wellness_readings,
+            ctx.wellness.first().map(|w| w.date.as_str()),
+        ),
         sessions = format_sessions(&ctx.recent_sessions),
         cross_training = cross_training,
         time_off = time_off,
@@ -553,6 +631,83 @@ mod tests {
             tss: 60.0,
             category: "Endurance".into(),
         }
+    }
+
+    fn reading(
+        label: &'static str,
+        latest: f32,
+        baseline: f32,
+        higher_is_worse: bool,
+    ) -> SignalReading {
+        SignalReading {
+            label,
+            latest,
+            baseline,
+            deviation_pct: (latest - baseline) / baseline * 100.0,
+            higher_is_worse,
+        }
+    }
+
+    #[test]
+    fn should_state_how_far_each_signal_sits_from_its_own_norm() {
+        // The real morning that started this: HRV 31 against a 47 norm read as
+        // "excellent recovery" by every local model given only the daily rows.
+        let mut c = ctx();
+        c.wellness_readings = vec![reading("HRV", 31.0, 47.0, false)];
+        let prompt = build_brief_prompt(&c);
+        assert!(
+            prompt.contains("HRV 31 — 34% BELOW their recent norm of 47"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn should_count_the_signals_pointing_the_wrong_way() {
+        let mut c = ctx();
+        c.wellness_readings = vec![
+            reading("HRV", 31.0, 47.0, false),
+            reading("Resting HR", 55.0, 50.0, true),
+            reading("Sleep score", 37.0, 80.0, false),
+        ];
+        let prompt = build_brief_prompt(&c);
+        assert!(
+            prompt.contains("All 3 of these are pointing the wrong way"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn should_say_so_when_every_signal_is_in_the_good_direction() {
+        let mut c = ctx();
+        c.wellness_readings = vec![
+            reading("HRV", 60.0, 47.0, false),
+            reading("Resting HR", 45.0, 50.0, true),
+        ];
+        let prompt = build_brief_prompt(&c);
+        assert!(
+            prompt.contains("None of these is pointing the wrong way"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn should_not_invent_a_norms_block_when_there_is_nothing_to_measure() {
+        // A deviation from a baseline that does not exist yet is not a fact.
+        let prompt = build_brief_prompt(&ctx());
+        assert!(!prompt.contains("MEASURED AGAINST"), "{prompt}");
+    }
+
+    #[test]
+    fn should_read_a_signal_that_is_off_its_norm_the_harmless_way_as_fine() {
+        // Resting HR below baseline is good news; the count must not flag it.
+        let mut c = ctx();
+        c.wellness_readings = vec![reading("Resting HR", 45.0, 50.0, true)];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("Resting HR 45 — 10% BELOW"), "{prompt}");
+        assert!(
+            prompt.contains("None of these is pointing the wrong way"),
+            "{prompt}"
+        );
     }
 
     fn wellness_on(date: &str) -> WellnessSnapshot {
@@ -608,6 +763,7 @@ mod tests {
             total_sessions: 120,
             recent_sessions: Vec::new(),
             wellness: Vec::new(),
+            wellness_readings: Vec::new(),
             goals: Vec::new(),
             athlete_context: String::new(),
             plan: TodayPlan::Open,

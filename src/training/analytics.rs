@@ -325,6 +325,116 @@ pub fn build_wellness_series(
     vals
 }
 
+/// Readings needed before a wellness baseline means anything.
+///
+/// An average of two mornings is not a norm, and a deviation measured against
+/// one is noise wearing a percentage sign.
+pub const MIN_WELLNESS_READINGS: usize = 4;
+
+/// One wellness signal read against its own recent baseline.
+///
+/// The number and its context in one value, because handing them over
+/// separately is what went wrong: a coach — human or otherwise — given a column
+/// of HRV readings and asked to spot the outlier will sometimes just not, while
+/// one told "34 % below your norm" cannot miss it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalReading {
+    /// Rider-facing name, e.g. "HRV".
+    pub label: &'static str,
+    pub latest: f32,
+    /// The mean of this signal over the window ending the day before.
+    pub baseline: f32,
+    /// Signed percentage away from `baseline`; positive is above it.
+    pub deviation_pct: f32,
+    /// Whether being above the baseline is the direction that means trouble.
+    /// True for resting heart rate, false for HRV and sleep score.
+    pub higher_is_worse: bool,
+}
+
+impl SignalReading {
+    /// Whether this reading sits the wrong side of its baseline by `threshold`
+    /// percent or more.
+    pub fn is_adverse(&self, threshold: f32) -> bool {
+        if self.higher_is_worse {
+            self.deviation_pct >= threshold
+        } else {
+            self.deviation_pct <= -threshold
+        }
+    }
+}
+
+/// The mean of one wellness signal over the window ending the day before `day`.
+///
+/// Ends the day before on purpose: a baseline that includes the reading being
+/// tested against it is diluted by that reading. Returns `None` until there are
+/// `min_readings` of them, because an average of two mornings is not a norm.
+pub fn wellness_baseline(
+    wellness: &[WellnessEntry],
+    day: NaiveDate,
+    min_readings: usize,
+    extract: impl Fn(&WellnessEntry) -> Option<f32>,
+) -> Option<f32> {
+    let prior = day.pred_opt()?;
+    let vals: Vec<f32> = build_wellness_series(wellness, prior, extract)
+        .into_iter()
+        .filter(|&v| v > 0.0)
+        .collect();
+    (vals.len() >= min_readings).then(|| vals.iter().sum::<f32>() / vals.len() as f32)
+}
+
+/// Every wellness signal recorded for `day`, each against its own baseline.
+///
+/// Only signals that have both a reading for the day and a settled baseline
+/// appear: a deviation from a norm that does not exist yet is not a fact.
+pub fn wellness_readings(
+    wellness: &[WellnessEntry],
+    day: NaiveDate,
+    min_readings: usize,
+) -> Vec<SignalReading> {
+    let Some(entry) = wellness.iter().find(|e| e.date == day) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut add = |label, latest: Option<f32>, higher_is_worse, base: Option<f32>| {
+        if let (Some(latest), Some(baseline)) = (latest.filter(|&v| v > 0.0), base) {
+            if baseline > 0.0 {
+                out.push(SignalReading {
+                    label,
+                    latest,
+                    baseline,
+                    deviation_pct: (latest - baseline) / baseline * 100.0,
+                    higher_is_worse,
+                });
+            }
+        }
+    };
+
+    add(
+        "HRV",
+        entry.hrv,
+        false,
+        wellness_baseline(wellness, day, min_readings, |e| e.hrv),
+    );
+    add(
+        "Resting HR",
+        entry.resting_hr.map(|v| v as f32),
+        true,
+        wellness_baseline(wellness, day, min_readings, |e| {
+            e.resting_hr.map(|v| v as f32)
+        }),
+    );
+    add(
+        "Sleep score",
+        entry.sleep_score.map(|v| v as f32),
+        false,
+        wellness_baseline(wellness, day, min_readings, |e| {
+            e.sleep_score.map(|v| v as f32)
+        }),
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
