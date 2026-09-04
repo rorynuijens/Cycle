@@ -90,6 +90,25 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.7.1" date="2026-09-04">
+      <description>
+        <p>Your coach now reads your wellness numbers properly. Each morning's
+           HRV, resting heart rate and sleep score are measured against your own
+           recent normal before they are sent, so a reading well below where you
+           usually sit is pointed out as exactly that, instead of being left in a
+           table for the coach to notice on its own. On this rider's own data it
+           changed the advice for the day.</p>
+        <p>A reading from an earlier day is no longer described as this
+           morning's. If your watch has not synced yet, your coach is now told
+           which day the numbers are from, and to weigh them accordingly.</p>
+        <p>Your program can now suggest a slightly harder session, not only an
+           easier one. On a morning when every recovery signal agrees you are
+           ready — two mornings running, and on fresh form — it will offer to
+           step today's session up one level. It will not touch a rest day, will
+           not make an already hard session harder, and any sign at all that you
+           are tired takes priority over it.</p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-09-04">
       <description>
         <p>Your outdoor rides now count towards your plan. A day you actually
