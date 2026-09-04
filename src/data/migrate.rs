@@ -513,9 +513,7 @@ mod tests {
     use sqlx::Row;
 
     async fn empty_pool() -> SqlitePool {
-        SqlitePool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory sqlite should connect")
+        crate::data::db::testing::empty_memory_pool().await
     }
 
     /// The migration declaring `version`, for tests that step through them.

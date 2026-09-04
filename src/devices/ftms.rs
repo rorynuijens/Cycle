@@ -26,6 +26,13 @@ pub const MAX_PLAUSIBLE_POWER_W: u32 = 3000;
 pub const MAX_PLAUSIBLE_CADENCE_RPM: u32 = 250;
 /// The medical maximum for a heart rate.
 pub const MAX_PLAUSIBLE_HR_BPM: u32 = 250;
+/// Comfortably above any speed a bicycle reaches, paced or descending.
+///
+/// Speed is the one reading this app never measures itself — both transports
+/// take the trainer's word for it — so a full-scale uint16 arrives as 655 km/h
+/// and a mangled one as anything at all. It is fed to distance and to the
+/// average in the ride summary, where a single bad sample does not average out.
+pub const MAX_PLAUSIBLE_SPEED_KMH: f32 = 150.0;
 
 /// Ceiling on an ERG target this app will ask a trainer to hold (CLAUDE.md §5.1).
 ///
@@ -103,8 +110,8 @@ impl Fields<'_> {
 /// Parse raw bytes from an Indoor Bike Data GATT notification
 /// (FTMS spec §4.9.1).
 ///
-/// Power, cadence and heart rate are clamped to physiologically plausible
-/// ranges — the trainer is untrusted hardware (CLAUDE.md §5.1).
+/// Speed, power, cadence and heart rate are clamped to physiologically
+/// plausible ranges — the trainer is untrusted hardware (CLAUDE.md §5.1).
 ///
 /// Returns `None` only for a packet too short to hold the flags. A packet that
 /// ends part-way through its declared fields keeps whatever was read before the
@@ -133,7 +140,7 @@ fn read_fields(flags: u16, f: &mut Fields, out: &mut IndoorBikeData) -> Option<(
     // Bit 0 is "More Data": unlike every other flag, the field is present when
     // the bit is *clear*.
     if flags & 0x0001 == 0 {
-        out.speed_kmh = Some(f.u16()? as f32 / 100.0);
+        out.speed_kmh = Some((f.u16()? as f32 / 100.0).min(MAX_PLAUSIBLE_SPEED_KMH));
     }
     if flags & 0x0002 != 0 {
         f.u16()?; // average speed
@@ -682,5 +689,129 @@ mod tests {
             set_simulation_command(-45.0),
             vec![0x11, 0x00, 0x00, 0x30, 0xF8, 40, 51]
         );
+    }
+
+    #[test]
+    fn should_clamp_an_implausible_speed_to_150_kmh() {
+        // Flags 0x0000: bit 0 clear, so instantaneous speed is present.
+        // 0xFFFF = 655.35 km/h — a full-scale field from a trainer that lost
+        // the plot. Found by the property test below, not by anyone's guess.
+        let data = &[0x00, 0x00, 0xFF, 0xFF];
+        let result = parse_indoor_bike_data(data).unwrap();
+        assert_eq!(result.speed_kmh, Some(MAX_PLAUSIBLE_SPEED_KMH));
+    }
+
+    #[test]
+    fn should_keep_a_real_speed_untouched() {
+        // 0x0BB8 = 3000 → 30.00 km/h, well inside the ceiling.
+        let data = &[0x00, 0x00, 0xB8, 0x0B];
+        assert_eq!(parse_indoor_bike_data(data).unwrap().speed_kmh, Some(30.0));
+    }
+}
+
+/// Generative tests over the BLE parsing and command boundary.
+///
+/// The example-based tests above check the packets someone thought to write
+/// down. These search for the ones nobody did: every parser here is fed bytes
+/// from untrusted hardware (CLAUDE.md §5.1), and the properties asserted are the
+/// two that must hold for *every* input — it never panics, and nothing it
+/// returns is outside the range its documentation promises.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Packets as a glitching or hostile trainer might send them: any length up
+    /// to a little over the longest real Indoor Bike Data packet, any contents.
+    fn any_packet() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(any::<u8>(), 0..40)
+    }
+
+    /// Grades including the values a route file should never contain but might.
+    fn any_grade() -> impl Strategy<Value = f32> {
+        prop_oneof![
+            8 => -100.0f32..100.0f32,
+            1 => Just(f32::NAN),
+            1 => Just(f32::INFINITY),
+            1 => Just(f32::NEG_INFINITY),
+            1 => Just(f32::MAX),
+            1 => Just(f32::MIN),
+        ]
+    }
+
+    proptest! {
+        /// No packet, however malformed or truncated, may panic a parser.
+        #[test]
+        fn should_never_panic_on_any_packet(data in any_packet()) {
+            let _ = parse_indoor_bike_data(&data);
+            let _ = parse_hr_measurement(&data);
+            let _ = parse_cycling_power_measurement(&data);
+            let _ = parse_csc_measurement(&data);
+        }
+
+        /// Every reading Indoor Bike Data yields is inside its ceiling.
+        ///
+        /// This is the property the header comment on those constants claims:
+        /// clamping happens at the parse, so no caller can forget to. It held
+        /// for power, cadence and heart rate and not for speed, which is how
+        /// [`MAX_PLAUSIBLE_SPEED_KMH`] came to exist.
+        #[test]
+        fn should_clamp_every_indoor_bike_reading(data in any_packet()) {
+            let Some(d) = parse_indoor_bike_data(&data) else { return Ok(()) };
+            if let Some(w) = d.power_watts {
+                prop_assert!(w <= MAX_PLAUSIBLE_POWER_W, "power {w}");
+            }
+            if let Some(c) = d.cadence_rpm {
+                prop_assert!(c <= MAX_PLAUSIBLE_CADENCE_RPM, "cadence {c}");
+            }
+            if let Some(h) = d.heart_rate_bpm {
+                prop_assert!(h <= MAX_PLAUSIBLE_HR_BPM, "hr {h}");
+            }
+            if let Some(v) = d.speed_kmh {
+                prop_assert!(v.is_finite(), "speed {v} is not finite");
+                prop_assert!((0.0..=MAX_PLAUSIBLE_SPEED_KMH).contains(&v), "speed {v}");
+            }
+        }
+
+        /// A heart rate strap is untrusted in both of its packet formats.
+        #[test]
+        fn should_clamp_every_heart_rate(data in any_packet()) {
+            if let Some(hr) = parse_hr_measurement(&data) {
+                prop_assert!(hr <= MAX_PLAUSIBLE_HR_BPM, "hr {hr}");
+            }
+        }
+
+        /// Two successive crank samples can never imply a superhuman cadence,
+        /// whatever the counters do — including wrapping, or going backwards.
+        #[test]
+        fn should_clamp_every_derived_cadence(
+            pr in any::<u16>(), pt in any::<u16>(),
+            cr in any::<u16>(), ct in any::<u16>(),
+        ) {
+            if let Some(rpm) = compute_cadence_rpm(pr, pt, cr, ct) {
+                prop_assert!(rpm <= MAX_PLAUSIBLE_CADENCE_RPM, "cadence {rpm}");
+            }
+        }
+
+        /// The SIM grade that leaves for the trainer stays inside ±20 %,
+        /// for every grade a route could hand it — NaN and infinity included.
+        #[test]
+        fn should_clamp_every_simulation_grade(grade in any_grade()) {
+            let cmd = set_simulation_command(grade);
+            prop_assert_eq!(cmd.len(), 7);
+            let encoded = i16::from_le_bytes([cmd[3], cmd[4]]);
+            prop_assert!((-2000..=2000).contains(&encoded), "grade encoded as {}", encoded);
+        }
+
+        /// An ERG target inside the ceiling survives encoding unchanged — the
+        /// clamp belongs to the caller that reaches the hardware, so this
+        /// guards the encoding rather than the limit.
+        #[test]
+        fn should_encode_every_erg_target_losslessly(watts in 0u16..=MAX_ERG_TARGET_W) {
+            let cmd = set_target_power_command(watts);
+            prop_assert_eq!(cmd.len(), 3);
+            prop_assert_eq!(cmd[0], 0x05);
+            prop_assert_eq!(u16::from_le_bytes([cmd[1], cmd[2]]), watts);
+        }
     }
 }

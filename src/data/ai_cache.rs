@@ -120,9 +120,9 @@ mod tests {
     use super::*;
 
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory sqlite should connect");
+        // One connection: a pool of them shares one in-memory database and
+        // races on its schema lock. See `db::testing::empty_memory_pool`.
+        let pool = crate::data::db::testing::empty_memory_pool().await;
         crate::data::migrate::run(&pool)
             .await
             .expect("migration should succeed");

@@ -628,3 +628,124 @@ mod tests {
         assert_eq!(secs, clean_secs, "a repeated point must not add time");
     }
 }
+
+/// Generative tests over GPX import and the virtual-speed physics.
+///
+/// A `.gpx` is a file the rider downloaded from somewhere, so it is untrusted
+/// input in exactly the sense CLAUDE.md §5.3 means. The physics model is not
+/// untrusted, but it is fed by one: a route with two points in the same place,
+/// or a vertical step between them, reaches it as a division no example test
+/// thought to write down.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// GPX-shaped text: real tags in any order, with numbers that a well-formed
+    /// file would never carry. Fragments rather than random bytes, so the parser
+    /// is exercised past its first rejection.
+    fn any_gpx() -> impl Strategy<Value = String> {
+        let fragment = prop_oneof![
+            Just("<gpx>"),
+            Just("</gpx>"),
+            Just("<trk>"),
+            Just("</trk>"),
+            Just("<trkseg>"),
+            Just("</trkseg>"),
+            Just("<trkpt lat=\""),
+            Just("\" lon=\""),
+            Just("\">"),
+            Just("</trkpt>"),
+            Just("<ele>"),
+            Just("</ele>"),
+            Just("<name>x</name>"),
+            Just("0"),
+            Just("-0"),
+            Just("51.5"),
+            Just("-0.12"),
+            Just("9e99"),
+            Just("-9e99"),
+            Just("NaN"),
+            Just("inf"),
+            Just("1e-40"),
+            Just("."),
+            Just(""),
+            Just("&#x41;"),
+            Just("\u{0}"),
+        ];
+        proptest::collection::vec(fragment, 0..40).prop_map(|parts| parts.concat())
+    }
+
+    /// Distances to sample a route at, including outside it in both directions.
+    fn any_distance() -> impl Strategy<Value = f32> {
+        prop_oneof![
+            4 => 0.0f32..200_000.0f32,
+            1 => Just(0.0f32),
+            1 => Just(-1.0f32),
+            1 => Just(f32::MAX),
+        ]
+    }
+
+    proptest! {
+        /// No GPX file may panic the parser, and one it accepts must describe a
+        /// route the rest of the app can do arithmetic on.
+        #[test]
+        fn should_accept_only_routes_that_are_finite(doc in any_gpx()) {
+            let Ok(route) = parse_gpx(doc.as_bytes()) else { return Ok(()) };
+            prop_assert!(route.total_distance_m.is_finite(), "distance not finite");
+            prop_assert!(route.total_distance_m >= 0.0, "negative distance");
+            prop_assert!(route.total_gain_m.is_finite(), "gain not finite");
+            prop_assert!(route.total_gain_m >= 0.0, "negative gain");
+            for p in &route.points {
+                prop_assert!(p.distance_m.is_finite(), "point distance not finite");
+                prop_assert!(p.elevation_m.is_finite(), "point elevation not finite");
+                prop_assert!(p.gradient.is_finite(), "point gradient not finite");
+            }
+        }
+
+        /// Sampling a route anywhere — before its start, past its end — answers
+        /// with a number. The player asks for these every frame.
+        #[test]
+        fn should_sample_any_route_at_any_distance(doc in any_gpx(), d in any_distance()) {
+            let Ok(route) = parse_gpx(doc.as_bytes()) else { return Ok(()) };
+            prop_assert!(route.elevation_at(d).is_finite(), "elevation at {} not finite", d);
+            prop_assert!(route.gradient_at(d).is_finite(), "gradient at {} not finite", d);
+        }
+
+        /// An accepted route yields a load estimate the calendar can show.
+        #[test]
+        fn should_estimate_a_plausible_load_for_any_route(doc in any_gpx()) {
+            let Ok(route) = parse_gpx(doc.as_bytes()) else { return Ok(()) };
+            let (tss, hours) = route.estimated_load(250, 75.0);
+            prop_assert!(hours.is_finite(), "duration not finite");
+            prop_assert!(hours >= 0.0, "negative duration {}", hours);
+            prop_assert!(tss < 10_000, "implausible TSS {}", tss);
+        }
+
+        /// The physics model answers with a real number for every gradient a
+        /// route can present, at every speed and rider mass.
+        #[test]
+        fn should_stay_finite_across_the_physics_model(
+            speed_ms in 0.0f32..30.0f32,
+            gradient in -1.0f32..1.0f32,
+            mass_kg in 30.0f32..200.0f32,
+        ) {
+            let power = Route::power_at(speed_ms, gradient, mass_kg);
+            prop_assert!(power.is_finite(), "power {} not finite", power);
+        }
+
+        /// Solving the model backwards never returns a negative or impossible
+        /// speed — the route player integrates this into distance ridden.
+        #[test]
+        fn should_solve_a_plausible_speed_for_any_power(
+            power_watts in 0.0f32..2000.0f32,
+            gradient in -1.0f32..1.0f32,
+            mass_kg in 30.0f32..200.0f32,
+        ) {
+            let speed = Route::speed_from_power(power_watts, gradient, mass_kg);
+            prop_assert!(speed.is_finite(), "speed {} not finite", speed);
+            prop_assert!(speed >= 0.0, "negative speed {}", speed);
+            prop_assert!(speed < 50.0, "implausible speed {} m/s", speed);
+        }
+    }
+}

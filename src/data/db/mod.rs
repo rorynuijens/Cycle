@@ -107,12 +107,28 @@ pub(crate) mod testing {
     use super::*;
     use crate::data::workout::{Segment, Workout, WorkoutCategory};
 
+    /// An in-memory database with no schema, for tests that migrate it
+    /// themselves. Never touches the real XDG path (see CLAUDE.md §3.5).
+    ///
+    /// One connection, deliberately. sqlx gives every connection in a pool the
+    /// *same* in-memory database, so a pool of them is a concurrency test
+    /// nobody asked for: a second connection reading `PRAGMA user_version`
+    /// while the first is inside a transaction fails with SQLITE_LOCKED,
+    /// "database schema is locked". That surfaced as a migration test failing
+    /// one run in four — the kind of intermittent red that teaches a suite to
+    /// be re-run rather than believed.
+    pub(crate) async fn empty_memory_pool() -> SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite should connect")
+    }
+
     /// Build a fresh, fully-migrated in-memory database for each test.
     /// Never touches the real XDG path (see CLAUDE.md §3.5).
     pub(crate) async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:")
-            .await
-            .expect("in-memory sqlite should connect");
+        let pool = empty_memory_pool().await;
         migrate(&pool).await.expect("migration should succeed");
         pool
     }

@@ -8,7 +8,7 @@ description = "Indoor cycling training app"
 publish = false
 # Keep cargo's file scan out of meson/flatpak-builder artifact dirs — _build can
 # contain an unreadable host-filesystem snapshot that breaks fingerprinting
-exclude = ["_build", ".flatpak-builder", "build-aux"]
+exclude = ["_build", "build-dir", ".flatpak-builder", "build-aux"]
 
 [[bin]]
 name = "cycle"
@@ -70,6 +70,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 
 # --- GPX parsing (route simulation) ---
 quick-xml = { version = "0.41", features = ["serialize"] }
+
+[dev-dependencies]
+# Generative tests for every boundary that takes bytes this app did not write:
+# BLE/ANT+ packets, GPX and FIT files. Example-based tests only cover the cases
+# someone thought of; these search for the ones nobody did.
+proptest = "1"
 
 [build-dependencies]
 # Compiles data/cycle.gresource.xml into the binary at build time

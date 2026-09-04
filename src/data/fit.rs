@@ -551,6 +551,44 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
 ///
 /// Extracts per-second records (power, HR, cadence, speed) and session timestamps.
 /// Returns an error if the file is malformed, too large, or contains no activity data.
+/// Check a FIT file really contains what its header claims, before parsing it.
+///
+/// `fitparser` 0.6.1 takes the header's declared size on trust: it slices
+/// `input[0..header_size - 2]` to check the header CRC (`de/mod.rs:129`) without
+/// first confirming the file is that long. A `.fit` truncated by a dropped
+/// upload — or one byte of header corruption — panics the process rather than
+/// returning the parse error the importer is written to handle. An import is a
+/// toast, never a crash (CLAUDE.md §5.3), so the file is checked here.
+///
+/// The header is 12 or 14 bytes: size, protocol, profile, a little-endian data
+/// length, then the ASCII tag `.FIT`, then a CRC in the 14-byte form.
+fn validate_fit_header(bytes: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() >= 12,
+        "not a FIT file (only {} bytes)",
+        bytes.len()
+    );
+    anyhow::ensure!(
+        &bytes[8..12] == b".FIT",
+        "not a FIT file (missing .FIT tag)"
+    );
+
+    let header_size = bytes[0] as usize;
+    anyhow::ensure!(
+        header_size >= 12,
+        "FIT header claims an impossible size ({header_size} bytes)"
+    );
+    // The record stream, plus the two-byte file CRC that follows it.
+    let data_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let declared = header_size + data_size + 2;
+    anyhow::ensure!(
+        declared <= bytes.len(),
+        "FIT file is incomplete — it declares {declared} bytes but is {}",
+        bytes.len()
+    );
+    Ok(())
+}
+
 pub fn import_fit_file(path: &Path) -> Result<Session> {
     let bytes = std::fs::read(path)?;
     anyhow::ensure!(
@@ -558,6 +596,8 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
         "FIT file too large ({} bytes — maximum 50 MB)",
         bytes.len()
     );
+
+    validate_fit_header(&bytes)?;
 
     let records =
         fitparser::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("FIT parse error: {e}"))?;
@@ -1196,5 +1236,127 @@ mod tests {
     #[test]
     fn should_fall_back_to_ride_for_an_empty_name() {
         assert!(suggested_filename(&ride(1, false), "  ").starts_with("Ride-"));
+    }
+    #[test]
+    fn should_refuse_a_truncated_fit_file_instead_of_panicking() {
+        // Half an upload. fitparser reads the header's declared size and slices
+        // the buffer by it, so this crashed the process before the guard.
+        let full = encode(60, false);
+        let half = &full[..full.len() / 2];
+        let dir = std::env::temp_dir().join("cycle-fit-truncated");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("truncated.fit");
+        std::fs::write(&path, half).expect("write");
+
+        let err = import_fit_file(&path).expect_err("a truncated file must be refused");
+        assert!(err.to_string().contains("incomplete"), "got: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn should_refuse_a_header_claiming_a_size_the_file_does_not_have() {
+        // One byte of corruption in the header size is enough: 109 bytes of
+        // header claimed, 14 present.
+        let mut bytes = encode(10, false);
+        bytes[0] = 109;
+        assert!(validate_fit_header(&bytes).is_err());
+    }
+
+    #[test]
+    fn should_refuse_a_file_that_is_not_fit_at_all() {
+        assert!(validate_fit_header(b"this is a text file, not a ride").is_err());
+        assert!(validate_fit_header(b"short").is_err());
+    }
+
+    #[test]
+    fn should_accept_the_header_this_app_writes() {
+        assert!(validate_fit_header(&encode(10, true)).is_ok());
+    }
+
+    /// Generative tests over FIT import.
+    ///
+    /// A `.fit` reaches this app from a head unit, from Garmin Connect or from
+    /// intervals.icu, and a ride that round-trips through three services is a
+    /// file this app did not write. These corrupt a file it *did* write — the
+    /// only reliable way to get a nearly-valid FIT — and check that damage is
+    /// reported rather than parsed into a ride.
+    ///
+    /// Nested inside `tests` to reuse its `ride`/`profile` fixtures.
+    mod property_tests {
+        use super::*;
+        use crate::devices::ftms::{
+            MAX_PLAUSIBLE_CADENCE_RPM, MAX_PLAUSIBLE_HR_BPM, MAX_PLAUSIBLE_POWER_W,
+            MAX_PLAUSIBLE_SPEED_KMH,
+        };
+        use proptest::prelude::*;
+
+        /// A directory of this test's own: proptest runs its cases in sequence,
+        /// but two tests sharing one path would race.
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join("cycle-fit-property");
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            dir.join(name)
+        }
+
+        /// A valid FIT file, then damaged: truncated part-way, with some bytes
+        /// overwritten. Both are what a half-finished upload actually looks like.
+        fn any_damaged_fit() -> impl Strategy<Value = Vec<u8>> {
+            (1u32..40, any::<bool>()).prop_flat_map(|(points, gps)| {
+                let bytes = encode(points, gps);
+                let len = bytes.len();
+                (
+                    Just(bytes),
+                    0..=len,
+                    proptest::collection::vec((0..len, any::<u8>()), 0..8),
+                )
+                    .prop_map(|(mut bytes, truncate_to, edits)| {
+                        for (at, byte) in edits {
+                            bytes[at] = byte;
+                        }
+                        bytes.truncate(truncate_to);
+                        bytes
+                    })
+            })
+        }
+
+        proptest! {
+            /// No damaged file panics the importer, and one it accepts carries
+            /// only readings the rest of the app can use: a ride imported here
+            /// goes straight into TSS, CTL and the coach's prompt.
+            #[test]
+            fn should_never_import_a_ride_it_cannot_stand_behind(bytes in any_damaged_fit()) {
+                let path = scratch("damaged.fit");
+                std::fs::write(&path, &bytes).expect("write");
+                let Ok(session) = import_fit_file(&path) else { return Ok(()) };
+                for p in &session.data_points {
+                    if let Some(w) = p.power_watts {
+                        prop_assert!(w <= MAX_PLAUSIBLE_POWER_W, "power {}", w);
+                    }
+                    if let Some(c) = p.cadence_rpm {
+                        prop_assert!(c <= MAX_PLAUSIBLE_CADENCE_RPM, "cadence {}", c);
+                    }
+                    if let Some(h) = p.heart_rate_bpm {
+                        prop_assert!(h <= MAX_PLAUSIBLE_HR_BPM, "hr {}", h);
+                    }
+                    if let Some(v) = p.speed_kmh {
+                        prop_assert!(v.is_finite(), "speed {} not finite", v);
+                        prop_assert!(
+                            (0.0..=MAX_PLAUSIBLE_SPEED_KMH).contains(&v),
+                            "speed {}",
+                            v
+                        );
+                    }
+                }
+            }
+
+            /// A file this app wrote always reads back, at every ride length.
+            #[test]
+            fn should_round_trip_a_ride_of_any_length(points in 1u32..200, gps in any::<bool>()) {
+                let path = scratch("roundtrip.fit");
+                std::fs::write(&path, encode(points, gps)).expect("write");
+                let session = import_fit_file(&path).expect("our own file must parse");
+                prop_assert_eq!(session.data_points.len(), points as usize);
+            }
+        }
     }
 }

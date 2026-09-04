@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use async_channel::Sender;
 
 use crate::data::session::{LiveReadings, ReadingSource};
-use crate::devices::ftms::{compute_cadence_rpm, MAX_PLAUSIBLE_HR_BPM, MAX_PLAUSIBLE_POWER_W};
+use crate::devices::ftms::{
+    compute_cadence_rpm, MAX_PLAUSIBLE_CADENCE_RPM, MAX_PLAUSIBLE_HR_BPM, MAX_PLAUSIBLE_POWER_W,
+    MAX_PLAUSIBLE_SPEED_KMH,
+};
 use crate::devices::manager::{DeviceEvent, DeviceType};
 use crate::devices::peripheral::Transport;
 
@@ -203,7 +206,7 @@ fn parse_specific_trainer(payload: &[u8]) -> Option<LiveReadings> {
     }
     let cadence = match payload[2] {
         0xFF => None,
-        rpm => Some(rpm as u32),
+        rpm => Some((rpm as u32).min(MAX_PLAUSIBLE_CADENCE_RPM)), // CLAUDE.md §5.1
     };
     let inst_power = (payload[5] as u16) | (((payload[6] & 0x0F) as u16) << 8);
     let power = if inst_power == 0x0FFF {
@@ -231,12 +234,15 @@ fn parse_general_fe(payload: &[u8]) -> Option<LiveReadings> {
     } else {
         Some(speed_raw as f64 * 0.001 * 3.6)
     };
+    // CLAUDE.md §5.1 — the same ceiling the BLE path applies, so a trainer
+    // cannot report a different maximum depending on which radio it is on.
+    let speed_kmh = speed_kmh.map(|s| (s as f32).min(MAX_PLAUSIBLE_SPEED_KMH));
     let heart_rate_bpm = match payload[6] {
         0x00 | 0xFF => None,
-        hr => Some(hr as u32),
+        hr => Some((hr as u32).min(MAX_PLAUSIBLE_HR_BPM)), // CLAUDE.md §5.1
     };
     Some(LiveReadings {
-        speed_kmh: speed_kmh.map(|s| s as f32),
+        speed_kmh,
         heart_rate_bpm,
         source: ReadingSource::Ant,
         ..Default::default()
@@ -1155,5 +1161,163 @@ mod tests {
         let mut ids = Vec::new();
         for_each_frame(&buf, |id, _| ids.push(id));
         assert_eq!(ids, vec![MSG_RESET_SYSTEM, MSG_OPEN_CHANNEL]);
+    }
+
+    #[test]
+    fn should_clamp_an_implausible_ant_cadence() {
+        // Specific Trainer page, cadence 0xFE = 254 rpm. 0xFF means "invalid",
+        // so 254 is the highest a trainer can claim — and the BLE path has
+        // clamped it to 250 all along.
+        let page = [PAGE_SPECIFIC_TRAINER, 0x00, 0xFE, 0, 0, 0, 0, 0];
+        let readings = parse_specific_trainer(&page).unwrap();
+        assert_eq!(readings.cadence_rpm, Some(MAX_PLAUSIBLE_CADENCE_RPM));
+    }
+
+    #[test]
+    fn should_clamp_an_implausible_ant_speed() {
+        // General FE page, speed 0xFFFE mm/s = 235.9 km/h. 0xFFFF is the
+        // "invalid" marker, so this is the fastest a trainer can report.
+        let page = [PAGE_GENERAL_FE, 0, 0, 0, 0xFE, 0xFF, 0x00, 0];
+        let readings = parse_general_fe(&page).unwrap();
+        assert_eq!(readings.speed_kmh, Some(MAX_PLAUSIBLE_SPEED_KMH));
+    }
+
+    #[test]
+    fn should_clamp_an_implausible_general_fe_heart_rate() {
+        // The FE-C page carries its own HR field, separate from the strap's,
+        // and it was the one reading on either transport still unclamped.
+        let page = [PAGE_GENERAL_FE, 0, 0, 0, 0, 0, 0xFB, 0];
+        let readings = parse_general_fe(&page).unwrap();
+        assert_eq!(readings.heart_rate_bpm, Some(MAX_PLAUSIBLE_HR_BPM));
+    }
+}
+
+/// Generative tests over the ANT+ parsing and command boundary.
+///
+/// The stick hands over whatever arrived on the air, so both layers here are
+/// untrusted: the byte stream frames are cut out of, and the 8-byte pages
+/// inside them. See the module note on `ftms::property_tests` for why these sit
+/// alongside the example-based tests rather than replacing them.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A USB read as it arrives: mostly noise, but with sync bytes often enough
+    /// that whole frames really are cut out and handed to the page parsers.
+    fn any_usb_read() -> impl Strategy<Value = Vec<u8>> {
+        let byte = prop_oneof![3 => Just(ANT_SYNC), 1 => Just(0u8), 8 => any::<u8>()];
+        proptest::collection::vec(byte, 0..64)
+    }
+
+    /// An 8-byte page, weighted so the pages this app decodes actually turn up.
+    fn any_page() -> impl Strategy<Value = Vec<u8>> {
+        let first = prop_oneof![
+            1 => Just(PAGE_GENERAL_FE),
+            1 => Just(PAGE_SPECIFIC_TRAINER),
+            1 => any::<u8>(),
+        ];
+        (first, proptest::collection::vec(any::<u8>(), 7))
+            .prop_map(|(head, rest)| std::iter::once(head).chain(rest).collect())
+    }
+
+    fn any_grade() -> impl Strategy<Value = f32> {
+        prop_oneof![
+            8 => -100.0f32..100.0f32,
+            1 => Just(f32::NAN),
+            1 => Just(f32::INFINITY),
+            1 => Just(f32::NEG_INFINITY),
+            1 => Just(f32::MAX),
+            1 => Just(f32::MIN),
+        ]
+    }
+
+    proptest! {
+        /// Framing never panics, and never hands out a slice it invented: a
+        /// frame body has to have come from inside the buffer it was cut from.
+        #[test]
+        fn should_frame_any_usb_read_without_panicking(buf in any_usb_read()) {
+            let mut lengths = Vec::new();
+            for_each_frame(&buf, |_id, data| lengths.push(data.len()));
+            for len in lengths {
+                prop_assert!(len <= buf.len(), "frame body {len} exceeds buffer {}", buf.len());
+            }
+        }
+
+        /// Every page parser survives arbitrary bytes at every length, not only
+        /// the 8 the callers happen to pass.
+        #[test]
+        fn should_never_panic_on_any_page(page in proptest::collection::vec(any::<u8>(), 0..16)) {
+            let _ = parse_specific_trainer(&page);
+            let _ = parse_general_fe(&page);
+            let _ = parse_ant_heart_rate(&page);
+            let _ = parse_speed_cadence(&page);
+            let _ = dead_channel_event(&page);
+        }
+
+        /// The ANT+ path applies the same ceilings as the BLE path.
+        ///
+        /// It did not: a Specific Trainer page reported cadence up to 254 rpm
+        /// where FTMS clamped at 250, and General FE speed was unclamped
+        /// entirely. A rider's numbers should not depend on which radio the
+        /// trainer happened to connect over.
+        #[test]
+        fn should_clamp_every_ant_reading(page in any_page()) {
+            for readings in [parse_specific_trainer(&page), parse_general_fe(&page)]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(w) = readings.power_watts {
+                    prop_assert!(w <= MAX_PLAUSIBLE_POWER_W, "power {w}");
+                }
+                if let Some(c) = readings.cadence_rpm {
+                    prop_assert!(c <= MAX_PLAUSIBLE_CADENCE_RPM, "cadence {c}");
+                }
+                if let Some(v) = readings.speed_kmh {
+                    prop_assert!(v.is_finite(), "speed {v} is not finite");
+                    prop_assert!((0.0..=MAX_PLAUSIBLE_SPEED_KMH).contains(&v), "speed {v}");
+                }
+                if let Some(h) = readings.heart_rate_bpm {
+                    prop_assert!(h <= MAX_PLAUSIBLE_HR_BPM, "hr {h}");
+                }
+            }
+            if let Some(bpm) = parse_ant_heart_rate(&page) {
+                prop_assert!(bpm <= MAX_PLAUSIBLE_HR_BPM, "hr {bpm}");
+            }
+        }
+
+        /// Track Resistance stays inside ±20 % for any grade, so a broken route
+        /// can never ask the trainer for a wall.
+        #[test]
+        fn should_clamp_every_track_resistance_grade(grade in any_grade()) {
+            let page = build_track_resistance_page(grade);
+            prop_assert_eq!(page[0], PAGE_TRACK_RESISTANCE);
+            let raw = u16::from_le_bytes([page[6], page[7]]);
+            prop_assert!((18_000..=22_000).contains(&raw), "grade encoded as {}", raw);
+        }
+
+        /// Target power encodes in 0.25 W units without wrapping, for every
+        /// target inside the ceiling the manager clamps to.
+        #[test]
+        fn should_encode_every_erg_target_in_quarter_watts(
+            watts in 0u16..=crate::devices::ftms::MAX_ERG_TARGET_W,
+        ) {
+            let page = build_target_power_page(watts);
+            prop_assert_eq!(page[0], PAGE_TARGET_POWER);
+            prop_assert_eq!(u16::from_le_bytes([page[6], page[7]]), watts * 4);
+        }
+
+        /// A message survives its own framing: what `encode_message` writes is
+        /// exactly what `for_each_frame` reads back, for any payload.
+        #[test]
+        fn should_round_trip_any_message_through_framing(
+            id in any::<u8>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let encoded = encode_message(id, &payload);
+            let mut seen = Vec::new();
+            for_each_frame(&encoded, |msg_id, data| seen.push((msg_id, data.to_vec())));
+            prop_assert_eq!(seen, vec![(id, payload)]);
+        }
     }
 }

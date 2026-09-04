@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn should_skip_an_in_memory_database() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::data::db::testing::empty_memory_pool().await;
         sqlx::query("CREATE TABLE t (x INTEGER)")
             .execute(&pool)
             .await

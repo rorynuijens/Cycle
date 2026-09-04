@@ -18,6 +18,14 @@ const MAX_SEGMENT_SECS: u32 = 6 * 60 * 60;
 /// Longest total a structured workout may declare. Also keeps the duration sum
 /// in [`build_workout`] clear of overflowing the `u32` it is accumulated into.
 const MAX_WORKOUT_SECS: u32 = 24 * 60 * 60;
+/// Ceiling on a segment's target, as a percentage of FTP.
+///
+/// Well above a real sprint interval (a hard one asks for 200–250 %), and low
+/// enough that no accepted workout can carry a target the engine would send to
+/// a trainer as a wall. A `Power="99999999999999999999"` parses to `f32`
+/// infinity rather than failing, and an infinite target reaches TSS — where it
+/// stops being a bad import and becomes a NaN in the rider's training load.
+const MAX_SEGMENT_POWER_PCT: f32 = 400.0;
 
 /// Parse a `.zwo` file (Zwift XML format) into a `Workout`.
 pub fn parse_zwo(content: &str) -> Result<Workout> {
@@ -31,8 +39,15 @@ pub fn parse_zwo(content: &str) -> Result<Workout> {
     let start = content
         .find("<workout>")
         .context("<workout> element not found")?;
-    let end = content.find("</workout>").context("</workout> not found")?;
-    let body = &content[start + 9..end]; // skip "<workout>"
+    // Search for the close from the open, not from the start of the file: a
+    // document carrying `</workout>` first is malformed rather than empty, and
+    // slicing it from the later index to the earlier one panics.
+    let body_start = start + "<workout>".len();
+    let end = content[body_start..]
+        .find("</workout>")
+        .map(|rel| body_start + rel)
+        .context("</workout> not found")?;
+    let body = &content[body_start..end];
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut pos = 0;
@@ -238,6 +253,18 @@ fn build_workout(name: String, description: String, segments: Vec<Segment>) -> R
             longest.duration_secs
         );
     }
+    let implausible = |pct: f32| !pct.is_finite() || !(0.0..=MAX_SEGMENT_POWER_PCT).contains(&pct);
+    if let Some(bad) = segments
+        .iter()
+        .find(|s| implausible(s.power_low_pct) || implausible(s.power_high_pct))
+    {
+        bail!(
+            "workout asks for {:.0}–{:.0} % of FTP, outside the 0–{MAX_SEGMENT_POWER_PCT:.0} % a workout may target",
+            bad.power_low_pct,
+            bad.power_high_pct
+        );
+    }
+
     let total: u64 = segments.iter().map(|s| u64::from(s.duration_secs)).sum();
     anyhow::ensure!(
         total <= u64::from(MAX_WORKOUT_SECS),
@@ -447,5 +474,196 @@ mod tests {
     #[test]
     fn should_return_error_for_empty_zwo() {
         assert!(parse_zwo("<workout_file><workout></workout></workout_file>").is_err());
+    }
+
+    #[test]
+    fn should_refuse_a_zwo_whose_closing_tag_comes_first() {
+        // This panicked: `</workout>` was found at index 0 and `<workout>` at
+        // 10, and the body was sliced from 19 to 0. A hand-edited or truncated
+        // file is a toast, never a crash (CLAUDE.md §5.3).
+        assert!(parse_zwo("</workout><workout>").is_err());
+    }
+
+    #[test]
+    fn should_read_a_workout_whose_body_contains_the_closing_tag_text() {
+        // The close is searched for from the open, so a `</workout>` earlier in
+        // the file cannot be mistaken for the body's end.
+        let zwo = "</workout><workout><SteadyState Duration=\"600\" Power=\"0.75\"/></workout>";
+        let workout = parse_zwo(zwo).unwrap();
+        assert_eq!(workout.duration_secs, 600);
+    }
+
+    #[test]
+    fn should_refuse_a_power_target_that_parses_to_infinity() {
+        // `"99999999999999999999".parse::<f32>()` succeeds, returning inf — so
+        // this reached TSS as `inf` and would have been stored against the ride.
+        let zwo =
+            "<workout><SteadyState Duration=\"600\" Power=\"99999999999999999999\"/></workout>";
+        let err = parse_zwo(zwo).expect_err("an infinite target must be refused");
+        assert!(err.to_string().contains("% of FTP"), "got: {err}");
+    }
+
+    #[test]
+    fn should_refuse_a_power_target_that_is_not_a_number() {
+        let zwo = "<workout><SteadyState Duration=\"600\" Power=\"NaN\"/></workout>";
+        assert!(parse_zwo(zwo).is_err());
+    }
+
+    #[test]
+    fn should_refuse_a_negative_power_target() {
+        let zwo = "<workout><SteadyState Duration=\"600\" Power=\"-1.5\"/></workout>";
+        assert!(parse_zwo(zwo).is_err());
+    }
+
+    #[test]
+    fn should_accept_a_hard_sprint_target() {
+        // 250 % of FTP is a real sprint interval, and must still import.
+        let zwo = "<workout><SteadyState Duration=\"15\" Power=\"2.5\"/></workout>";
+        let workout = parse_zwo(zwo).expect("a sprint is a legitimate workout");
+        assert_eq!(workout.segments[0].power_high_pct, 250.0);
+    }
+}
+
+/// Generative tests over workout file import.
+///
+/// A `.zwo` or `.erg` arrives from wherever the rider found it, and the guards
+/// in [`build_workout`] exist because a 60-byte file can ask for eight billion
+/// segments. The example tests check the guards against files someone wrote to
+/// trip them; these check that nothing gets past them by another route.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// ZWO-shaped text, including repeat counts and durations no real workout
+    /// carries.
+    fn any_zwo() -> impl Strategy<Value = String> {
+        let fragment = prop_oneof![
+            Just("<workout_file>"),
+            Just("</workout_file>"),
+            Just("<name>x</name>"),
+            Just("<description>d</description>"),
+            Just("<workout>"),
+            Just("</workout>"),
+            Just("<SteadyState Duration=\""),
+            Just("<Warmup Duration=\""),
+            Just("<IntervalsT Repeat=\""),
+            Just("<Ramp Duration=\""),
+            Just("\" Power=\""),
+            Just("\" PowerLow=\""),
+            Just("\" PowerHigh=\""),
+            Just("\" OnDuration=\""),
+            Just("\" OffDuration=\""),
+            Just("\"/>"),
+            Just("\">"),
+            Just("0"),
+            Just("-1"),
+            Just("300"),
+            Just("4000000000"),
+            Just("99999999999999999999"),
+            Just("0.75"),
+            Just("NaN"),
+            Just("1e40"),
+            Just(""),
+            Just("\u{0}"),
+        ];
+        proptest::collection::vec(fragment, 0..40).prop_map(|parts| parts.concat())
+    }
+
+    /// ERG-shaped text: a course header, then minute/percent pairs.
+    fn any_erg() -> impl Strategy<Value = String> {
+        let line = prop_oneof![
+            Just("[COURSE HEADER]\n"),
+            Just("[END COURSE HEADER]\n"),
+            Just("[COURSE DATA]\n"),
+            Just("[END COURSE DATA]\n"),
+            Just("DESCRIPTION = x\n"),
+            Just("FILE NAME = y\n"),
+            Just("MINUTES PERCENT\n"),
+            Just("0\t50\n"),
+            Just("10\t100\n"),
+            Just("-5\t80\n"),
+            Just("1e40\t1e40\n"),
+            Just("NaN\tNaN\n"),
+            Just("99999999\t99999999\n"),
+            Just("\n"),
+            Just("garbage\n"),
+            Just("\u{0}\n"),
+        ];
+        proptest::collection::vec(line, 0..40).prop_map(|parts| parts.concat())
+    }
+
+    /// The guards every accepted workout must satisfy, whichever format it
+    /// arrived in. A workout past any of these reaches the engine, the
+    /// calendar's load estimate and the trainer.
+    fn assert_within_guards(w: &Workout) -> Result<(), TestCaseError> {
+        prop_assert!(
+            w.segments.len() <= MAX_SEGMENTS,
+            "{} segments",
+            w.segments.len()
+        );
+        prop_assert!(
+            w.duration_secs <= MAX_WORKOUT_SECS,
+            "{}s long",
+            w.duration_secs
+        );
+        prop_assert!(w.tss.is_finite(), "TSS {} not finite", w.tss);
+        prop_assert!(w.tss >= 0.0, "negative TSS {}", w.tss);
+        let summed: u64 = w.segments.iter().map(|s| u64::from(s.duration_secs)).sum();
+        prop_assert_eq!(
+            summed,
+            u64::from(w.duration_secs),
+            "duration disagrees with segments"
+        );
+        for s in &w.segments {
+            prop_assert!(
+                s.duration_secs <= MAX_SEGMENT_SECS,
+                "{}s segment",
+                s.duration_secs
+            );
+            prop_assert!(s.power_low_pct.is_finite(), "power_low not finite");
+            prop_assert!(s.power_high_pct.is_finite(), "power_high not finite");
+            prop_assert!(
+                s.power_low_pct >= 0.0,
+                "negative power_low {}",
+                s.power_low_pct
+            );
+            prop_assert!(
+                s.power_high_pct >= 0.0,
+                "negative power_high {}",
+                s.power_high_pct
+            );
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// No `.zwo`, however malformed, panics the parser or gets past a guard.
+        #[test]
+        fn should_hold_every_guard_on_any_zwo(content in any_zwo()) {
+            if let Ok(w) = parse_zwo(&content) {
+                assert_within_guards(&w)?;
+            }
+        }
+
+        /// The same, for the `.erg` / `.mrc` format.
+        #[test]
+        fn should_hold_every_guard_on_any_erg(content in any_erg()) {
+            if let Ok(w) = parse_erg(&content) {
+                assert_within_guards(&w)?;
+            }
+        }
+
+        /// Arbitrary text is not a workout file. It may be rejected; it may not
+        /// panic, and it may not produce a workout that breaks a guard.
+        #[test]
+        fn should_survive_text_that_is_not_a_workout_file(content in ".{0,400}") {
+            if let Ok(w) = parse_zwo(&content) {
+                assert_within_guards(&w)?;
+            }
+            if let Ok(w) = parse_erg(&content) {
+                assert_within_guards(&w)?;
+            }
+        }
     }
 }
