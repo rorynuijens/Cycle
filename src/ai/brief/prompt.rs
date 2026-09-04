@@ -140,6 +140,29 @@ fn format_wellness(wellness: &[WellnessSnapshot]) -> String {
         .join("\n")
 }
 
+/// The wellness heading, which must not claim a reading the athlete does not have.
+///
+/// The first line was described as "this morning" unconditionally. When the
+/// overnight sync has not run — or the watch was not worn — the newest entry can
+/// be days old, and the brief was then written as though a stale HRV were
+/// today's: a resting HR from two days ago read as evidence the athlete is
+/// recovered now. Say which it actually is, and let the coach discount it.
+fn wellness_header(wellness: &[WellnessSnapshot], today: &str) -> String {
+    match wellness.first() {
+        // format_wellness says "no wellness data available"; no claim to make.
+        None => "WELLNESS (last 7 days):".to_string(),
+        Some(w) if w.date == today => {
+            "WELLNESS (last 7 days, newest first — the first line is this morning):".to_string()
+        }
+        Some(w) => format!(
+            "WELLNESS (last 7 days, newest first). There is no reading for today ({today}) \
+             yet — the newest is from {date}, so treat it as that day's and not as this \
+             morning's:",
+            date = w.date
+        ),
+    }
+}
+
 fn format_sessions(sessions: &[RecentSession]) -> String {
     if sessions.is_empty() {
         return "  No sessions recorded in the last 4 weeks.".to_string();
@@ -435,7 +458,7 @@ TRAINING STATUS (as of {today}):
 WEEKLY TSS (oldest → newest):
 {week_tss}
 
-WELLNESS (last 7 days, newest first — the first line is this morning):
+{wellness_header}
 {wellness}
 
 RECENT TRAINING (last 4 weeks, newest first):
@@ -482,6 +505,7 @@ PROCEED means today's plan suits the athlete as it stands. EASE means train, but
         trend = trend,
         total_sessions = ctx.total_sessions,
         week_tss = format_week_tss(&ctx.week_tss),
+        wellness_header = wellness_header(&ctx.wellness, &ctx.today),
         wellness = format_wellness(&ctx.wellness),
         sessions = format_sessions(&ctx.recent_sessions),
         cross_training = cross_training,
@@ -529,6 +553,48 @@ mod tests {
             tss: 60.0,
             category: "Endurance".into(),
         }
+    }
+
+    fn wellness_on(date: &str) -> WellnessSnapshot {
+        WellnessSnapshot {
+            date: date.into(),
+            hrv: Some(31.0),
+            resting_hr: Some(55),
+            sleep_hours: Some(6.9),
+            sleep_score: Some(37),
+            steps: Some(162),
+            calories: None,
+        }
+    }
+
+    #[test]
+    fn should_call_the_first_line_this_morning_when_it_is_todays_reading() {
+        let mut c = ctx();
+        c.wellness = vec![wellness_on("2026-08-11")];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("the first line is this morning"));
+    }
+
+    #[test]
+    fn should_date_the_newest_reading_when_today_has_none() {
+        // The bug this replaces: a reading from two days ago was announced as
+        // "this morning", so a stale HRV read as evidence of recovery now.
+        let mut c = ctx();
+        c.wellness = vec![wellness_on("2026-08-09")];
+        let prompt = build_brief_prompt(&c);
+        assert!(!prompt.contains("the first line is this morning"));
+        assert!(prompt.contains("no reading for today (2026-08-11)"));
+        assert!(prompt.contains("the newest is from 2026-08-09"));
+    }
+
+    #[test]
+    fn should_claim_nothing_about_this_morning_when_there_is_no_wellness_at_all() {
+        // "this morning" still appears in the READINESS instructions; what must
+        // not appear is the claim that a wellness line holds today's reading.
+        let c = ctx();
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("WELLNESS (last 7 days):"));
+        assert!(!prompt.contains("the first line is this morning"));
     }
 
     fn ctx() -> BriefContext {
