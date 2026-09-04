@@ -14,9 +14,12 @@
 //! * **A missed session is gone.** Nothing is ever moved or stacked to catch
 //!   up. Training load is a rolling average, and riding two hard days back to
 //!   back to repay a debt is how people get hurt.
-//! * **Adjustments only ever ease.** No rule here adds work. The worst case for
-//!   easing a session wrongly is a slightly light day; the worst case for
-//!   adding one is an injury.
+//! * **Easing is cheap, adding is not.** Any single warning is enough to ease a
+//!   session: the worst case for easing wrongly is a slightly light day. Exactly
+//!   one rule adds work, and it is held to a much higher bar — every wellness
+//!   signal it can see agreeing, two mornings running, on a rider whose form is
+//!   already fresh — because the worst case for adding wrongly is an injury. It
+//!   will not sharpen a session that is already hard.
 
 use chrono::NaiveDate;
 
@@ -60,6 +63,33 @@ const POOR_SLEEP_SCORE: f32 = 50.0;
 
 /// Readings needed before a wellness baseline means anything.
 const MIN_WELLNESS_READINGS: usize = 4;
+
+/// How far *below* baseline a resting heart rate reads as genuinely recovered.
+///
+/// Deliberately not the mirror of [`RESTING_HR_ELEVATION`]. A resting HR 5 %
+/// above baseline is a warning worth easing for; 3 % below is a real signal in
+/// its own right rather than merely the absence of a warning. Evidence that
+/// justifies taking work away does not automatically justify adding it.
+const RESTING_HR_SUPPRESSION: f32 = 0.03;
+
+/// A sleep score at or above this reads as a genuinely good night, rather than
+/// merely not a bad one.
+const GOOD_SLEEP_SCORE: f32 = 75.0;
+
+/// How far above its baseline an HRV reading reads as recovered.
+const HRV_ELEVATION: f32 = 0.05;
+
+/// Wellness signals that must be present, and agree, for a morning to count.
+///
+/// One signal is not a morning. A good sleep score on its own says the watch
+/// was worn, not that the rider is ready.
+const SIGNALS_FOR_STRONG_MORNING: usize = 2;
+
+/// Consecutive strong mornings before the plan will add work.
+///
+/// One good night is noise — a late dinner or a quiet day moves every one of
+/// these numbers. Two in a row is the shortest run that is not.
+const STRONG_MORNINGS_FOR_PUSH: usize = 2;
 
 /// A program the rider is following.
 #[derive(Debug, Clone, PartialEq)]
@@ -210,8 +240,10 @@ pub enum CoachVerdict {
     Rest,
 }
 
-/// Why a session is being eased. Each variant carries what it was measured
+/// Why a session is being adjusted. Each variant carries what it was measured
 /// from, so the card can show the rider the number behind the advice.
+///
+/// All but [`Self::Primed`] ease; that one alone adds work.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Reason {
     /// Form is dug in.
@@ -220,6 +252,11 @@ pub enum Reason {
     WellnessDip { resting_hr_pct: Option<f32> },
     /// Sessions were missed back to back.
     MissedRun { count: usize },
+    /// Every wellness signal available agreed the rider is recovered, for
+    /// [`STRONG_MORNINGS_FOR_PUSH`] mornings running, on already-fresh form.
+    ///
+    /// The only reason here that adds work rather than removing it.
+    Primed { mornings: usize },
     /// The morning brief read today's signals as a day to ride lighter.
     ///
     /// Deliberately carries nothing: [`Reason`] is `Copy`, which [`suggest`]
@@ -250,6 +287,11 @@ impl Reason {
                 "You have missed {count} sessions in a row. Easing back in beats \
                  picking up where the plan assumed you would be."
             ),
+            Self::Primed { mornings } => format!(
+                "Your recovery signals have all read strong for {mornings} mornings \
+                 running, and your form is fresh. This is a day your body can take \
+                 a little more than the plan asked for."
+            ),
             Self::CoachAdvised => "Your morning brief read today's signals as a day to \
                                    ride lighter."
                 .to_string(),
@@ -273,6 +315,10 @@ impl Reason {
             Self::WellnessDip { .. } => 2,
             Self::MissedRun { .. } => 1,
             Self::CoachAdvised => 0,
+            // Never ranked against the others: it is only ever produced when
+            // none of them apply, because anything that eases outranks wanting
+            // to add work by definition.
+            Self::Primed { .. } => 0,
         }
     }
 }
@@ -378,6 +424,24 @@ pub fn ease(category: WorkoutCategory) -> Option<WorkoutCategory> {
     }
 }
 
+/// One rung *up* the intensity ladder, for the categories where proposing that
+/// is defensible coaching.
+///
+/// Deliberately not the inverse of [`ease`]. A recovery day is easy on purpose
+/// and the plan put it there; a session that is already hard is hard enough.
+/// Feeling good is a reason to put some quality into an easy ride, never a
+/// reason to sharpen one that was already going to hurt — so the ladder stops
+/// at the first hard rung instead of climbing through it.
+pub fn push(category: WorkoutCategory) -> Option<WorkoutCategory> {
+    use WorkoutCategory::*;
+    match category {
+        Endurance => Some(Tempo),
+        Tempo => Some(SweetSpot),
+        SweetSpot => Some(Threshold),
+        Recovery | Threshold | Vo2Max | Anaerobic | Custom => None,
+    }
+}
+
 /// True for the categories that demand a rider be ready for them.
 pub fn is_hard(category: WorkoutCategory) -> bool {
     matches!(
@@ -429,6 +493,130 @@ fn wellness_reason(wellness: &[WellnessEntry], today: NaiveDate) -> Option<Reaso
     }
 
     None
+}
+
+/// The baseline for one wellness signal, over the window ending the day before
+/// `day`.
+///
+/// Ends the day before on purpose: a baseline that includes today's reading is
+/// diluted by the very number being tested against it.
+fn wellness_baseline(
+    wellness: &[WellnessEntry],
+    day: NaiveDate,
+    extract: impl Fn(&WellnessEntry) -> Option<f32>,
+) -> Option<f32> {
+    let prior = day.pred_opt()?;
+    let vals: Vec<f32> = build_wellness_series(wellness, prior, extract)
+        .into_iter()
+        .filter(|&v| v > 0.0)
+        .collect();
+    (vals.len() >= MIN_WELLNESS_READINGS).then(|| vals.iter().sum::<f32>() / vals.len() as f32)
+}
+
+/// Whether every wellness signal recorded for `day` says the rider is recovered,
+/// and enough of them exist to mean it.
+///
+/// Stricter than the inverse of [`wellness_reason`], which fires on any single
+/// warning. A warning is allowed to be lonely because the cost of believing one
+/// wrongly is a light day. This is not allowed to be lonely, because the cost of
+/// believing it wrongly is a hard session on a body that did not want one.
+fn is_strong_morning(wellness: &[WellnessEntry], day: NaiveDate) -> bool {
+    // The reading must be for this day. Falling back to the most recent one is
+    // how a two-day-old HRV comes to be read as this morning's.
+    let Some(entry) = wellness.iter().find(|e| e.date == day) else {
+        return false;
+    };
+
+    let mut signals: Vec<bool> = Vec::new();
+
+    if let (Some(rhr), Some(base)) = (
+        entry.resting_hr.map(|v| v as f32),
+        wellness_baseline(wellness, day, |e| e.resting_hr.map(|v| v as f32)),
+    ) {
+        signals.push(rhr < base * (1.0 - RESTING_HR_SUPPRESSION));
+    }
+    if let (Some(hrv), Some(base)) = (entry.hrv, wellness_baseline(wellness, day, |e| e.hrv)) {
+        signals.push(hrv > base * (1.0 + HRV_ELEVATION));
+    }
+    if let Some(score) = entry.sleep_score {
+        signals.push(score as f32 >= GOOD_SLEEP_SCORE);
+    }
+
+    signals.len() >= SIGNALS_FOR_STRONG_MORNING && signals.iter().all(|&s| s)
+}
+
+/// The one path that proposes more work than the program wrote.
+///
+/// Every gate here is a way of saying "not on this evidence". They are separate
+/// rather than one condition because each answers a different objection: that
+/// the signals are stale, that the session was already moved, that the rider is
+/// actually tired, that one good night proved nothing, that the week has had its
+/// addition already, and that the session was hard to begin with.
+fn push_suggestion(
+    status: &ProgramStatus,
+    decided: &[PlannedSession],
+    target: &PlannedSession,
+    metrics: &LoadMetrics,
+    wellness: &[WellnessEntry],
+    library: &[Workout],
+    today: NaiveDate,
+) -> Vec<Adjustment> {
+    // This morning's signals speak for this morning. A session two days out
+    // would be ridden on evidence that does not exist yet.
+    if target.date != today {
+        return Vec::new();
+    }
+
+    // A session the rules have already moved is not one to move again. It also
+    // keeps this from undoing an ease by the back door.
+    if target.adjusted_from.is_some() {
+        return Vec::new();
+    }
+
+    if !TsbBand::of(metrics.tsb()).is_fresh() {
+        return Vec::new();
+    }
+
+    let strong = (0..STRONG_MORNINGS_FOR_PUSH as i64).all(|back| {
+        today
+            .checked_sub_signed(chrono::Duration::days(back))
+            .is_some_and(|day| is_strong_morning(wellness, day))
+    });
+    if !strong {
+        return Vec::new();
+    }
+
+    // One addition per rolling week. Two in quick succession is a ramp the
+    // program never planned and nothing here is tracking the cost of.
+    let adjusted_recently = decided
+        .iter()
+        .chain(status.upcoming.iter())
+        .any(|s| s.adjusted_from.is_some() && (today - s.date).num_days().abs() < 7);
+    if adjusted_recently {
+        return Vec::new();
+    }
+
+    let Some(harder) = push(target.category) else {
+        return Vec::new();
+    };
+    let Some(replacement) = pick_replacement(library, harder, target.duration_secs) else {
+        return Vec::new();
+    };
+    if replacement.id == target.workout_id {
+        return Vec::new();
+    }
+
+    vec![Adjustment {
+        entry_id: target.entry_id,
+        date: target.date,
+        from_workout_id: target.workout_id,
+        from_name: target.workout_name.clone(),
+        to_workout_id: replacement.id,
+        to_name: replacement.name.clone(),
+        reason: Reason::Primed {
+            mornings: STRONG_MORNINGS_FOR_PUSH,
+        },
+    }]
 }
 
 /// What, if anything, should change about the sessions still to come.
@@ -487,7 +675,10 @@ pub fn suggest(
     }
 
     let Some(reason) = reasons.into_iter().max_by_key(|r| r.severity()) else {
-        return Vec::new();
+        // Nothing wants this session easier. The only branch that adds work,
+        // and it is reachable only from here — so an easing reason of any kind,
+        // however weak, always outranks wanting to push.
+        return push_suggestion(status, decided, target, metrics, wellness, library, today);
     };
 
     // Missing sessions is a reason to be careful with hard work, not a reason
@@ -1010,6 +1201,250 @@ mod tests {
     fn should_find_nothing_when_the_library_has_no_such_workout() {
         let library = vec![workout(1, WorkoutCategory::Endurance, 3600)];
         assert!(pick_replacement(&library, WorkoutCategory::Tempo, 3600).is_none());
+    }
+
+    // ── Adding work on a strong morning ───────────────────────────────────────
+
+    /// A status whose next session is *today's* — the only day a push may touch.
+    fn today_status(category: WorkoutCategory, today: NaiveDate) -> ProgramStatus {
+        let sessions = vec![session(1, today, category, false)];
+        status(&program(12), &sessions, today)
+    }
+
+    /// `strong` mornings ending today, on top of a settled ordinary baseline.
+    fn strong_wellness(today: NaiveDate, strong: i64) -> Vec<WellnessEntry> {
+        let ordinary = |ago: i64| WellnessEntry {
+            date: today - chrono::Duration::days(ago),
+            hrv: Some(50.0),
+            resting_hr: Some(50),
+            sleep_secs: None,
+            sleep_score: Some(70),
+            steps: None,
+            calories: None,
+        };
+        let recovered = |ago: i64| WellnessEntry {
+            hrv: Some(60.0),
+            resting_hr: Some(45),
+            sleep_score: Some(88),
+            ..ordinary(ago)
+        };
+        (strong..strong + 6)
+            .map(ordinary)
+            .chain((0..strong).map(recovered))
+            .collect()
+    }
+
+    #[test]
+    fn should_step_up_todays_session_when_every_signal_is_strong_two_mornings_running() {
+        let today = date(2026, 8, 5);
+        let s = today_status(WorkoutCategory::Endurance, today);
+        let out = suggest_local(
+            &s,
+            &[],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].reason, Reason::Primed { mornings: 2 }));
+        assert_eq!(out[0].to_name, "Tempo 60");
+    }
+
+    #[test]
+    fn should_not_step_up_when_only_one_morning_is_strong() {
+        // One good night is a late dinner, not a training decision.
+        let today = date(2026, 8, 5);
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(
+            &s,
+            &[],
+            &metrics(12.0),
+            &strong_wellness(today, 1),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_not_step_up_when_form_is_not_fresh() {
+        // Every wellness signal can agree and still not outvote a TSB of zero.
+        let today = date(2026, 8, 5);
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(
+            &s,
+            &[],
+            &metrics(0.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_not_step_up_a_session_that_is_already_hard() {
+        let today = date(2026, 8, 5);
+        let s = today_status(WorkoutCategory::Threshold, today);
+        assert!(suggest_local(
+            &s,
+            &[],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_not_step_up_a_recovery_day_the_plan_put_there_on_purpose() {
+        let today = date(2026, 8, 5);
+        let s = today_status(WorkoutCategory::Recovery, today);
+        assert!(suggest_local(
+            &s,
+            &[],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_not_step_up_a_session_the_rules_have_already_moved() {
+        let today = date(2026, 8, 5);
+        let mut sessions = vec![session(1, today, WorkoutCategory::Endurance, false)];
+        sessions[0].adjusted_from = Some("Tempo 60".into());
+        let s = status(&program(12), &sessions, today);
+        assert!(suggest_local(
+            &s,
+            &[],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_not_step_up_a_session_that_is_not_todays() {
+        // ready_status puts the session tomorrow. This morning's signals say
+        // nothing about a ride that happens after another night's sleep.
+        let today = date(2026, 8, 5);
+        let s = ready_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(
+            &s,
+            &[],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_not_step_up_twice_in_one_rolling_week() {
+        let today = date(2026, 8, 5);
+        let mut earlier = session(
+            2,
+            today - chrono::Duration::days(3),
+            WorkoutCategory::Tempo,
+            true,
+        );
+        earlier.adjusted_from = Some("Endurance 60".into());
+        let sessions = vec![
+            earlier.clone(),
+            session(1, today, WorkoutCategory::Endurance, false),
+        ];
+        let s = status(&program(12), &sessions, today);
+        assert!(suggest_local(
+            &s,
+            &[earlier],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn should_ease_rather_than_add_when_any_warning_applies_at_all() {
+        // Strong wellness and fresh form, but sessions were missed back to back.
+        // The weakest easing reason still outranks wanting to push.
+        let today = date(2026, 8, 5);
+        let missed_a = session(
+            8,
+            today - chrono::Duration::days(4),
+            WorkoutCategory::Threshold,
+            false,
+        );
+        let missed_b = session(
+            9,
+            today - chrono::Duration::days(2),
+            WorkoutCategory::Threshold,
+            false,
+        );
+        let sessions = vec![
+            missed_a.clone(),
+            missed_b.clone(),
+            session(1, today, WorkoutCategory::Endurance, false),
+        ];
+        let s = status(&program(12), &sessions, today);
+        let out = suggest_local(
+            &s,
+            &[missed_a, missed_b],
+            &metrics(12.0),
+            &strong_wellness(today, 2),
+            &library(),
+            today,
+        );
+        assert!(out
+            .iter()
+            .all(|a| !matches!(a.reason, Reason::Primed { .. })));
+    }
+
+    #[test]
+    fn should_climb_one_rung_and_stop_at_the_first_hard_one() {
+        use WorkoutCategory::*;
+        assert_eq!(push(Endurance), Some(Tempo));
+        assert_eq!(push(Tempo), Some(SweetSpot));
+        assert_eq!(push(SweetSpot), Some(Threshold));
+        // Already hard, or deliberately easy: nothing above these.
+        assert_eq!(push(Threshold), None);
+        assert_eq!(push(Vo2Max), None);
+        assert_eq!(push(Anaerobic), None);
+        assert_eq!(push(Recovery), None);
+        assert_eq!(push(Custom), None);
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_when_one_signal_disagrees() {
+        let today = date(2026, 8, 5);
+        let mut w = strong_wellness(today, 2);
+        // Slept badly last night; everything else still looks recovered.
+        w.last_mut().expect("today's entry").sleep_score = Some(40);
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(&s, &[], &metrics(12.0), &w, &library(), today).is_empty());
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_when_there_is_no_reading_for_it() {
+        // The staleness trap: yesterday was strong and today has no entry at
+        // all. Reading yesterday's numbers as this morning's is the mistake.
+        let today = date(2026, 8, 5);
+        let w: Vec<WellnessEntry> = strong_wellness(today, 2)
+            .into_iter()
+            .filter(|e| e.date != today)
+            .collect();
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(&s, &[], &metrics(12.0), &w, &library(), today).is_empty());
     }
 
     // ── The rules ─────────────────────────────────────────────────────────────

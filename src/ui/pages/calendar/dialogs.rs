@@ -94,7 +94,8 @@ fn dress_easing_rows(
     if let (true, Some(suggestion)) = (offering, &state.mark.suggestion) {
         apply_row.set_title(&format!("{} → {}", state.entry_name, suggestion.to_name));
         apply_btn.set_tooltip_text(Some(&format!(
-            "Ease this session to {}",
+            "{} this session to {}",
+            if suggestion.harder { "Step up" } else { "Ease" },
             suggestion.to_name
         )));
     }

@@ -65,14 +65,21 @@ pub struct PlanCard {
     on_toast: Rc<dyn Fn(adw::Toast)>,
 }
 
-/// The badge line for an eased session: where the plan started, and where one
-/// Undo lands when that is somewhere else.
+/// The badge line for an adjusted session: where the plan started, and where
+/// one Undo lands when that is somewhere else.
 ///
-/// After a single ease those are the same workout, and the line says it once.
+/// After a single adjustment those are the same workout, and the line says it
+/// once.
+///
+/// Worded neutrally because the stored state does not record which way the
+/// session moved — only the name it moved from. Now that the program can step a
+/// session *up* as well as down, "Eased from" was wrong half the time it
+/// mattered. Saying "Adjusted from" costs the common case a little precision
+/// and never states the opposite of what happened.
 fn easing_subtitle(original: &str, previous_step: Option<&str>) -> String {
     match previous_step {
-        Some(step) if step != original => format!("Eased from {original} · back to {step}"),
-        _ => format!("Eased from {original}"),
+        Some(step) if step != original => format!("Adjusted from {original} · back to {step}"),
+        _ => format!("Adjusted from {original}"),
     }
 }
 
@@ -1121,7 +1128,7 @@ mod tests {
     fn should_name_the_step_below_in_the_badge_line() {
         assert_eq!(
             easing_subtitle("Endurance 60", Some("Recovery Ride")),
-            "Eased from Endurance 60 · back to Recovery Ride"
+            "Adjusted from Endurance 60 · back to Recovery Ride"
         );
     }
 
@@ -1129,11 +1136,11 @@ mod tests {
     fn should_say_the_workout_once_when_one_press_goes_home() {
         assert_eq!(
             easing_subtitle("Endurance 60", Some("Endurance 60")),
-            "Eased from Endurance 60"
+            "Adjusted from Endurance 60"
         );
         assert_eq!(
             easing_subtitle("Endurance 60", None),
-            "Eased from Endurance 60"
+            "Adjusted from Endurance 60"
         );
     }
 }

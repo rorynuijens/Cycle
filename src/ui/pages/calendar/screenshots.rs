@@ -251,6 +251,7 @@ fn screenshots() {
             suggestion: Some(Suggestion {
                 to_workout_id: 2,
                 to_name: "Recovery Ride".into(),
+                harder: false,
                 reason: "Your form is -18 and last night's sleep was poor.".into(),
             }),
             ..eased_twice_mark()

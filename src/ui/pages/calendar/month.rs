@@ -371,11 +371,12 @@ impl MonthCellItem {
         // once already and still be one the rules want easier. `dialogs.rs` and
         // `week.rs` both say both; the tooltip was the last place that did not.
         if let Some(original) = &self.mark.adjusted_from {
-            text.push_str(&format!("\nEased from {original}"));
+            text.push_str(&format!("\nAdjusted from {original}"));
         }
         if let Some(s) = &self.mark.suggestion {
             text.push_str(&format!(
-                "\nYour program suggests easing this to {}",
+                "\nYour program suggests {} this to {}",
+                if s.harder { "stepping up" } else { "easing" },
                 s.to_name
             ));
         }
@@ -526,6 +527,7 @@ mod tests {
         Suggestion {
             to_workout_id: 9,
             to_name: "Endurance 60".into(),
+            harder: false,
             reason: "You have missed two sessions in a row.".into(),
         }
     }
@@ -544,7 +546,7 @@ mod tests {
 
         let text = item(false, mark).tooltip();
 
-        assert!(text.contains("Eased from VO₂Max Blocks"), "{text}");
+        assert!(text.contains("Adjusted from VO₂Max Blocks"), "{text}");
         assert!(
             text.contains("suggests easing this to Endurance 60"),
             "{text}"
@@ -562,7 +564,7 @@ mod tests {
     fn should_say_nothing_about_easing_when_the_program_has_no_view_on_a_day() {
         let text = item(false, EntryMark::default()).tooltip();
 
-        assert!(!text.contains("Eased"), "{text}");
+        assert!(!text.contains("Adjusted from"), "{text}");
         assert!(!text.contains("suggests"), "{text}");
         assert!(!text.contains("Marked done"), "{text}");
     }

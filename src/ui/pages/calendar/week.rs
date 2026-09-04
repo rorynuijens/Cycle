@@ -471,7 +471,15 @@ pub fn build_week_view(
 
                         if let Some(suggestion) = &mark.suggestion {
                             let row = adw::ActionRow::builder()
-                                .title(format!("Ease to {}", suggestion.to_name))
+                                .title(format!(
+                                    "{} {}",
+                                    if suggestion.harder {
+                                        "Step up to"
+                                    } else {
+                                        "Ease to"
+                                    },
+                                    suggestion.to_name
+                                ))
                                 .subtitle(&suggestion.reason)
                                 .subtitle_lines(0)
                                 .build();

@@ -12,11 +12,17 @@
 use crate::data::db::CalendarEntry;
 use crate::training::program::{week_of, Adjustment, Program};
 
-/// An easing the program is proposing for this entry, ready to apply.
+/// An adjustment the program is proposing for this entry, ready to apply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Suggestion {
     pub to_workout_id: i64,
     pub to_name: String,
+    /// Whether this proposes *more* work than the plan wrote.
+    ///
+    /// Carried rather than derived: the widgets that word this only ever see
+    /// the two workout names, and "Ease this to Tempo" on a session being
+    /// stepped up is worse than no wording at all.
+    pub harder: bool,
     /// The rider-facing sentence explaining why — [`crate::training::program::Reason::text`].
     pub reason: String,
 }
@@ -33,7 +39,7 @@ pub struct EntryMark {
     /// Undo steps back one ease at a time, so on a session eased twice this
     /// names the middle workout while `adjusted_from` still names the first.
     pub previous_step_name: Option<String>,
-    /// An easing waiting to be applied.
+    /// An adjustment waiting to be applied, in either direction.
     pub suggestion: Option<Suggestion>,
 }
 
@@ -52,7 +58,7 @@ impl EntryMark {
             .or(self.adjusted_from.as_deref())
     }
 
-    /// The heading for the "already eased" row.
+    /// The heading for the "already adjusted" row.
     ///
     /// Naming the destination is what makes a chain of eases legible: a session
     /// eased twice goes back somewhere that is *not* what the subtitle calls the
@@ -67,7 +73,7 @@ impl EntryMark {
             Some(target) if Some(target) != self.adjusted_from.as_deref() => {
                 format!("Undo goes back to {target}")
             }
-            _ => "Eased by your program".to_string(),
+            _ => "Adjusted by your program".to_string(),
         }
     }
 }
@@ -121,6 +127,7 @@ pub fn mark_for(
         .map(|a| Suggestion {
             to_workout_id: a.to_workout_id,
             to_name: a.to_name.clone(),
+            harder: matches!(a.reason, crate::training::program::Reason::Primed { .. }),
             reason: a.reason.text(),
         });
 
@@ -317,7 +324,7 @@ mod tests {
             previous_step_name: Some("Threshold 2x20".into()),
             ..EntryMark::default()
         };
-        assert_eq!(mark.undo_title(), "Eased by your program");
+        assert_eq!(mark.undo_title(), "Adjusted by your program");
     }
 
     #[test]
@@ -329,13 +336,16 @@ mod tests {
             ..EntryMark::default()
         };
         assert_eq!(mark.undo_target(), Some("Threshold 2x20"));
-        assert_eq!(mark.undo_title(), "Eased by your program");
+        assert_eq!(mark.undo_title(), "Adjusted by your program");
     }
 
     #[test]
     fn should_name_nothing_when_it_can_name_nothing() {
         assert_eq!(EntryMark::default().undo_target(), None);
-        assert_eq!(EntryMark::default().undo_title(), "Eased by your program");
+        assert_eq!(
+            EntryMark::default().undo_title(),
+            "Adjusted by your program"
+        );
     }
 
     #[test]
