@@ -208,6 +208,51 @@ fn eased_twice_mark() -> EntryMark {
     }
 }
 
+/// The ride cockpit, dressed with live numbers.
+///
+/// Sited here rather than beside `player.rs` because GTK may only be
+/// initialised once per process: every shot has to run inside the one `#[test]`
+/// below, whatever page it is of.
+fn shoot_player(name: &str, width: i32, height: i32) {
+    use crate::data::session::LiveReadings;
+
+    let athlete = crate::data::athlete::AthleteProfile {
+        ftp_watts: 200,
+        ..crate::data::athlete::AthleteProfile::default()
+    };
+    let w = workout(9, "Aerobic Foundation", WorkoutCategory::Endurance, 46.0);
+    let page = crate::ui::pages::player::PlayerPage::new(&w, &athlete);
+
+    page.add_connected_device("AA:BB", "Elite Drivo");
+    page.add_connected_device("CC:DD", "Wahoo TICKR");
+    // The labels are written by the tick, not by `set_readings` — that only
+    // stores. Drive one snapshot through so the cockpit shows real numbers,
+    // which is the whole point of looking at it.
+    let readings = LiveReadings {
+        power_watts: Some(187),
+        heart_rate_bpm: Some(142),
+        cadence_rpm: Some(88),
+        speed_kmh: Some(31.4),
+        resistance_target_watts: Some(180),
+        ..Default::default()
+    };
+    page.set_readings(readings.clone());
+    page.update_from_snapshot(&crate::training::engine::EngineSnapshot {
+        state: crate::training::engine::EngineState::Running,
+        elapsed_secs: 1284,
+        remaining_secs: 2316,
+        segment_index: 3,
+        segment_elapsed_secs: 96,
+        segment_remaining_secs: 324,
+        target_power_watts: 180,
+        intensity_pct: 100,
+        readings,
+    });
+
+    let window = adw::Window::builder().content(page.widget()).build();
+    shoot(&window, width, height, name);
+}
+
 // ── The shots ────────────────────────────────────────────────────────────────
 
 /// Render every shot, in one test on one thread.
@@ -216,11 +261,19 @@ fn eased_twice_mark() -> EntryMark {
 /// thread, and GTK refuses to be initialised from a second one. So the whole
 /// set runs in sequence here, which also lets the theme be switched partway
 /// through rather than started twice.
+
 #[test]
 #[ignore = "a tool for reviewing UI, not an assertion"]
 fn screenshots() {
     start();
     theme(false);
+
+    // The ride cockpit. Rendered at three sizes: a big window, an ordinary one,
+    // and a small one — the last is the check that a taller number block plus a
+    // graph floor still fits without a scrollbar (the cockpit sizing rule).
+    shoot_player("10-player-1400x900", 1400, 900);
+    shoot_player("11-player-1100x780", 1100, 780);
+    shoot_player("12-player-900x700", 900, 700);
 
     // Two eases deep: the day names its origin, the button names one rung back.
     shoot_detail_dialog(

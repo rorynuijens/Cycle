@@ -18,6 +18,13 @@ use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
 use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 
+/// Minimum height for the workout profile strip, in pixels.
+///
+/// The floor from the cockpit sizing rule: enough that the shape of the session
+/// is legible at a glance, small enough that it can never be what the page is
+/// mostly made of. Spare height goes to the numbers instead.
+const GRAPH_FLOOR_PX: i32 = 180;
+
 pub struct PlayerPage {
     root: gtk::Box,
     power_label: gtk::Label,
@@ -173,19 +180,28 @@ impl PlayerPage {
         inner.append(&header_row);
 
         // ── Hero row: target | live power | interval countdown ───────────────
-        // Power is the page's reason to exist — it gets the `display` class
-        // (CLAUDE.md §1.5) and the centre column; the machine-set target and
-        // the interval countdown flank it.
+        // Power is the page's reason to exist — it gets the largest class in the
+        // cockpit scale and the centre column; the machine-set target and the
+        // interval countdown flank it.
+        //
+        // This row and the secondary one below both `vexpand`, so spare height
+        // flows into the numbers. It used to flow into the graph, which was the
+        // only expanding child: on a large window the chart grew to nearly half
+        // the page while the numbers stayed at their minimum, which is backwards
+        // for a page read at arm's length mid-effort.
         let hero_grid = gtk::Grid::builder()
             .column_spacing(12)
             .column_homogeneous(true)
+            .vexpand(true)
+            .valign(gtk::Align::Center)
             .build();
 
         let (target_box, target_label) =
-            Self::metric_column("Target", "— W", &["title-1", "numeric", "accent"]);
+            Self::metric_column("Target", "— W", &["cockpit-major", "numeric", "accent"]);
         hero_grid.attach(&target_box, 0, 0, 1, 1);
 
-        let (power_box, power_label) = Self::metric_column("Power", "— W", &["display", "numeric"]);
+        let (power_box, power_label) =
+            Self::metric_column("Power", "— W", &["cockpit-hero", "numeric"]);
         hero_grid.attach(&power_box, 1, 0, 1, 1);
 
         let interval_box = gtk::Box::builder()
@@ -200,7 +216,7 @@ impl PlayerPage {
             .build();
         let interval_label = gtk::Label::builder()
             .label("—")
-            .css_classes(["title-1", "numeric"])
+            .css_classes(["cockpit-major", "numeric"])
             .build();
         let segment_progress = gtk::ProgressBar::builder().fraction(0.0).build();
         segment_progress.add_css_class("accent");
@@ -244,17 +260,19 @@ impl PlayerPage {
         let secondary_grid = gtk::Grid::builder()
             .column_spacing(12)
             .column_homogeneous(true)
+            .vexpand(true)
+            .valign(gtk::Align::Center)
             .build();
         let (hr_box, hr_label) =
-            Self::metric_column("Heart Rate", "— bpm", &["title-2", "numeric"]);
+            Self::metric_column("Heart Rate", "— bpm", &["cockpit-metric", "numeric"]);
         let (cadence_box, cadence_label) =
-            Self::metric_column("Cadence", "— rpm", &["title-2", "numeric"]);
+            Self::metric_column("Cadence", "— rpm", &["cockpit-metric", "numeric"]);
         let (elapsed_box, elapsed_label) =
-            Self::metric_column("Elapsed", "0:00", &["title-2", "numeric"]);
+            Self::metric_column("Elapsed", "0:00", &["cockpit-metric", "numeric"]);
         let (remaining_box, remaining_label) = Self::metric_column(
             "Remaining",
             &WorkoutEngine::format_duration(workout.duration_secs),
-            &["title-2", "numeric"],
+            &["cockpit-metric", "numeric"],
         );
         secondary_grid.attach(&hr_box, 0, 0, 1, 1);
         secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
@@ -262,9 +280,17 @@ impl PlayerPage {
         secondary_grid.attach(&remaining_box, 3, 0, 1, 1);
         inner.append(&secondary_grid);
 
-        // ── Workout power profile graph (absorbs spare height) ───────────────
+        // ── Workout power profile: a reference strip, not the page ───────────
+        // A small floor and no `vexpand` — the inverse of the cockpit rule in
+        // [`PlayerPage::set_fullscreen`]'s notes, and deliberately so. The
+        // profile answers "what is coming", which is worth a glance between
+        // efforts; the numbers answer "how am I doing right now", which is
+        // worth the rest of the page. A fixed *floor* is safe where a fixed
+        // *request* is not: it sets a minimum the page can always meet, and
+        // never a minimum height the window has to grow to satisfy.
         let graph = WorkoutGraph::new(workout, athlete.ftp_watts);
-        graph.widget().set_vexpand(true);
+        graph.widget().set_vexpand(false);
+        graph.widget().set_size_request(-1, GRAPH_FLOOR_PX);
         inner.append(graph.widget());
 
         // ── Whole-workout progress bar ───────────────────────────────────────

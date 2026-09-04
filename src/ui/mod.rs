@@ -8,12 +8,32 @@ pub mod window;
 
 /// App-wide stylesheet defining the `display` typography class from the
 /// CLAUDE.md §1.5 type scale (hero numbers, e.g. live power), which libadwaita
-/// itself does not ship. Sizes are relative so the class follows the user's
-/// system font size; no colours are defined, so both themes work unchanged.
+/// itself does not ship, plus the three cockpit classes above it.
+///
+/// The cockpit scale exists because the ride page is read at arm's length, on a
+/// bike, by someone breathing hard — Adwaita's `title-2` is a fine label on a
+/// desk and unreadable there. `display` stops being big enough once the numbers
+/// are the point of the page rather than an accent on it.
+///
+/// Sizes are relative, never pixels, so every one of these still follows the
+/// user's system font size (CLAUDE.md §1.5); no colours are defined, so both
+/// themes work unchanged.
 const APP_CSS: &str = "
 .display {
     font-size: 400%;
     font-weight: 800;
+}
+.cockpit-hero {
+    font-size: 620%;
+    font-weight: 800;
+}
+.cockpit-major {
+    font-size: 300%;
+    font-weight: 700;
+}
+.cockpit-metric {
+    font-size: 210%;
+    font-weight: 700;
 }
 ";
 
