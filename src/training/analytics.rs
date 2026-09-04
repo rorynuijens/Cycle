@@ -1113,4 +1113,29 @@ mod tests {
             .collect();
         assert!(wellness_readings(&wellness, today, MIN_WELLNESS_READINGS).is_empty());
     }
+
+    #[test]
+    fn should_add_up_the_months_work_from_both_sources() {
+        // Placed on the first of the month, the edge the ride is counted from.
+        let today = date(2026, 8, 5);
+        let first = month_start_of(today);
+        let records = [record_on(first, &[200; 60], &[])];
+        let icu = [icu_on(first, 100, 600)];
+        let totals = compute_volume_totals(&records, &icu, today);
+        assert!(
+            (totals.month_kj - 72.0).abs() < 0.01,
+            "expected 72 kJ, got {}",
+            totals.month_kj
+        );
+    }
+
+    #[test]
+    fn should_leave_last_months_work_out_of_this_months_total() {
+        let today = date(2026, 8, 5);
+        let last_month = month_start_of(today) - Duration::days(1);
+        let records = [record_on(last_month, &[200; 60], &[])];
+        let icu = [icu_on(last_month, 100, 600)];
+        let totals = compute_volume_totals(&records, &icu, today);
+        assert_eq!(totals.month_kj, 0.0);
+    }
 }

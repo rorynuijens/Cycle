@@ -628,4 +628,43 @@ mod tests {
         }
         assert_eq!(engine.elapsed_secs, 10);
     }
+
+    /// A route carrying two points almost on top of each other, which is what a
+    /// GPX with a stationary pause in it looks like.
+    fn route_with_doubled_point(second: f32, third: f32) -> Route {
+        let at = |lat: f64, lng: f64, distance_m: f32| RoutePoint {
+            lat,
+            lng,
+            elevation_m: 100.0,
+            distance_m,
+            gradient: 0.0,
+        };
+        Route {
+            name: "Doubled".into(),
+            points: vec![
+                at(51.0, -0.1, 0.0),
+                at(51.5, -0.5, second),
+                at(52.0, -0.9, third),
+                at(53.0, -1.0, 1000.0),
+            ],
+            total_distance_m: 1000.0,
+            total_gain_m: 0.0,
+        }
+    }
+
+    #[test]
+    fn should_sit_on_the_earlier_point_when_two_share_a_position() {
+        // 5 cm apart: there is no meaningful distance to interpolate along, and
+        // dividing by it would be dividing by nearly nothing.
+        let engine = RouteEngine::new(route_with_doubled_point(500.0, 500.05), 5.0, 80.0);
+        assert_at(engine.position_at(500.02), 51.5, -0.5);
+    }
+
+    #[test]
+    fn should_still_interpolate_across_a_span_the_guard_allows() {
+        // Exactly the guard's width: the rule is "closer than", so 0.1 m is
+        // still a span to interpolate along, and half way along it is half way.
+        let engine = RouteEngine::new(route_with_doubled_point(0.1, 1000.0), 5.0, 80.0);
+        assert_at(engine.position_at(0.05), 51.25, -0.3);
+    }
 }

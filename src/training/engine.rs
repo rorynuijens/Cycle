@@ -716,4 +716,110 @@ mod tests {
         // The closing cool-down, run all the way out.
         assert_eq!(engine.segment_at(u32::MAX), (last, 600));
     }
+
+    // ── What tick asks the trainer for ──────────────────────────────────────
+    //
+    // `tick` runs once a second for the whole ride and decides the watts the
+    // trainer is actually told to hold. Ten of its comparisons could be flipped
+    // without a test objecting, including every branch of the ERG ramp.
+
+    /// Sample workout, warm-up first: 50 % of a 250 W FTP is a 125 W target.
+    const WARM_UP_TARGET_W: u32 = 125;
+
+    #[test]
+    fn should_stop_a_ride_that_has_run_out_of_workout() {
+        let mut engine = make_engine();
+        engine.pause_offset = Duration::from_secs(engine.workout.duration_secs as u64);
+        engine.start();
+        let snapshot = engine.tick(LiveReadings::default());
+        assert_eq!(snapshot.state, EngineState::Completed);
+    }
+
+    #[test]
+    fn should_keep_running_a_second_short_of_the_end() {
+        let mut engine = make_engine();
+        engine.pause_offset = Duration::from_secs(engine.workout.duration_secs as u64 - 2);
+        engine.start();
+        assert_eq!(
+            engine.tick(LiveReadings::default()).state,
+            EngineState::Running
+        );
+    }
+
+    #[test]
+    fn should_send_the_first_target_without_ramping_up_to_it() {
+        // A held target of 0 means "nothing asked for yet" rather than "0 W",
+        // so the first target of the ride goes out as it stands. Ramping up
+        // from zero would leave the rider soft-pedalling through the opening.
+        let mut engine = make_engine();
+        engine.erg_ramp_rate = 20;
+        engine.start();
+        engine.tick(LiveReadings::default());
+        assert_eq!(engine.current_erg_target, WARM_UP_TARGET_W);
+    }
+
+    #[test]
+    fn should_climb_to_a_higher_target_at_the_ramp_rate() {
+        let mut engine = make_engine();
+        engine.erg_ramp_rate = 20;
+        engine.current_erg_target = 100;
+        engine.start();
+        engine.tick(LiveReadings::default());
+        assert_eq!(engine.current_erg_target, 120, "one second of ramp is 20 W");
+        engine.tick(LiveReadings::default());
+        assert_eq!(
+            engine.current_erg_target, WARM_UP_TARGET_W,
+            "the last 5 W is less than a step, so it lands exactly rather than overshooting"
+        );
+    }
+
+    #[test]
+    fn should_fall_to_a_lower_target_at_the_ramp_rate() {
+        let mut engine = make_engine();
+        engine.erg_ramp_rate = 20;
+        engine.current_erg_target = 200;
+        engine.start();
+        engine.tick(LiveReadings::default());
+        assert_eq!(engine.current_erg_target, 180);
+    }
+
+    #[test]
+    fn should_go_straight_to_the_target_when_ramping_is_off() {
+        let mut engine = make_engine();
+        engine.erg_ramp_rate = 0;
+        engine.current_erg_target = 300;
+        engine.start();
+        engine.tick(LiveReadings::default());
+        assert_eq!(engine.current_erg_target, WARM_UP_TARGET_W);
+    }
+
+    #[test]
+    fn should_ask_the_trainer_for_nothing_new_while_paused() {
+        let mut engine = make_engine();
+        engine.erg_ramp_rate = 20;
+        engine.start();
+        engine.tick(LiveReadings::default());
+        engine.pause();
+        engine.current_erg_target = 100;
+        engine.tick(LiveReadings::default());
+        assert_eq!(
+            engine.current_erg_target, 100,
+            "a paused ride holds whatever the trainer was last given"
+        );
+    }
+
+    #[test]
+    fn should_record_a_data_point_only_while_the_ride_is_running() {
+        let mut engine = make_engine();
+        engine.start();
+        engine.tick(LiveReadings::default());
+        assert_eq!(engine.session.data_points.len(), 1);
+        engine.pause();
+        engine.tick(LiveReadings::default());
+        assert_eq!(
+            engine.session.data_points.len(),
+            1,
+            "a paused ride is not being ridden, and records nothing"
+        );
+    }
 }
