@@ -90,6 +90,33 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.7.0" date="2026-09-04">
+      <description>
+        <p>Your outdoor rides now count towards your plan. A day you actually
+           trained on is no longer read as a missed session, whatever your plan
+           had asked for that day — Cycle already holds the ride and no longer
+           needs to be told about it. Nothing to tap, and nothing claims a road
+           ride was an interval workout: opening the day shows you what it
+           found. On this rider's own history it turned twelve missed sessions
+           into eight, and only the genuinely skipped days are still counted.</p>
+        <p>When your program eases a session more than once, Undo now steps back
+           one change at a time instead of jumping straight to the original.
+           Before, the workout in between was lost and could not be reached from
+           either direction. The row tells you where a press will land, while
+           still naming what your program first asked for.</p>
+        <p>Opening a planned workout on the calendar now shows its power
+           profile, so you can see the shape of a session where you decide
+           whether to ride it — including on days you have already finished.</p>
+        <p>The load shown for a day you marked done no longer counts the same
+           training twice when a real ride is sitting on it.</p>
+        <p>Please note: the first time you open this version, your training
+           history is upgraded to a new format automatically. A backup is saved
+           beforehand, in the same folder as your database, named
+           cycle.db.pre-v5 followed by the date. Once upgraded, your data can no
+           longer be opened by Cycle 0.6.1 or earlier — so if you ever go back to
+           an older version, restore that backup alongside it.</p>
+      </description>
+    </release>
     <release version="0.6.1" date="2026-08-28">
       <description>
         <p>Your ANT+ trainer is found again when you switch it on after opening
