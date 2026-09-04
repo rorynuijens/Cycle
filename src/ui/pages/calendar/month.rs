@@ -505,6 +505,7 @@ mod tests {
             duration_secs: 3600,
             program_id: Some(7),
             adjusted_from: None,
+            previous_step_name: None,
         }
     }
 
@@ -536,6 +537,7 @@ mod tests {
         let mark = EntryMark {
             program_week: Some((2, 8)),
             adjusted_from: Some("VO₂Max Blocks".into()),
+            previous_step_name: None,
             suggestion: Some(a_suggestion()),
         };
 

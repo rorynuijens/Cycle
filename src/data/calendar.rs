@@ -250,6 +250,7 @@ mod tests {
             duration_secs: 3600,
             program_id: None,
             adjusted_from: None,
+            previous_step_name: None,
         })
     }
 

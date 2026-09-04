@@ -16,6 +16,15 @@ use sqlx::SqlitePool;
 use crate::data::db;
 
 /// Swap a planned session for the easier one the program suggested.
+///
+/// `on_settled` is fired only once the write has landed, for the same reason as
+/// [`set_session_done`]: the detail dialog stays on screen holding the entry it
+/// was opened with, and after an ease its rows describe a plan that no longer
+/// exists. With Undo now walking back one rung at a time this is not cosmetic —
+/// a second press read off a stale row would reason about the wrong step.
+///
+/// The week list and the coaching card pass `None`; `reload` rebuilds them.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_easing(
     pool: SqlitePool,
     rt_handle: &tokio::runtime::Handle,
@@ -24,6 +33,7 @@ pub fn apply_easing(
     to_name: String,
     on_toast: Rc<dyn Fn(adw::Toast)>,
     reload: Rc<dyn Fn()>,
+    on_settled: Option<Rc<dyn Fn()>>,
 ) {
     crate::ui::spawn_to_main(
         rt_handle,
@@ -31,6 +41,9 @@ pub fn apply_easing(
         move |result| {
             match result {
                 Ok(true) => {
+                    if let Some(settled) = &on_settled {
+                        settled();
+                    }
                     on_toast(
                         adw::Toast::builder()
                             .title(format!("Eased to {to_name}"))
@@ -65,13 +78,20 @@ pub fn apply_easing(
     );
 }
 
-/// Put a session back to what the program originally asked for.
+/// Step a session back one ease, towards what the program originally asked for.
+///
+/// One rung per press, not the whole way home: a session eased twice needs two
+/// presses, and the button says where each one lands
+/// ([`super::marks::EntryMark::undo_label`]). `on_settled` is as in
+/// [`apply_easing`] — and matters more here, because the next press has to be
+/// offered from the state the last one left.
 pub fn undo_easing(
     pool: SqlitePool,
     rt_handle: &tokio::runtime::Handle,
     entry_id: i64,
     on_toast: Rc<dyn Fn(adw::Toast)>,
     reload: Rc<dyn Fn()>,
+    on_settled: Option<Rc<dyn Fn()>>,
 ) {
     crate::ui::spawn_to_main(
         rt_handle,
@@ -79,9 +99,12 @@ pub fn undo_easing(
         move |result| {
             match result {
                 Ok(true) => {
+                    if let Some(settled) = &on_settled {
+                        settled();
+                    }
                     on_toast(
                         adw::Toast::builder()
-                            .title("Session put back as planned")
+                            .title("Session put back a step")
                             .timeout(5)
                             .build(),
                     );

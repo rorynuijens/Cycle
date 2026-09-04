@@ -58,6 +58,12 @@ pub struct CalendarEntry {
     /// The name of the workout the program originally asked for, when this
     /// entry has since been eased. `None` when it still stands as planned.
     pub adjusted_from: Option<String>,
+    /// The name of the workout this entry held before the most recent ease —
+    /// where an Undo puts it back to. `None` when it has never been eased.
+    ///
+    /// The same as `adjusted_from` after one ease, and different after two:
+    /// the day still names its origin while Undo walks back a rung at a time.
+    pub previous_step_name: Option<String>,
 }
 
 impl CalendarEntry {
@@ -88,35 +94,68 @@ pub async fn complete_today_calendar_entry(
     Ok(())
 }
 
+/// Everything [`row_to_entry`] reads, up to but not including the WHERE clause.
+///
+/// Shared rather than repeated so the range read and the single-entry read
+/// cannot drift: a column added to one and forgotten in the other reads as a
+/// missing-column error at runtime, from whichever call site is rarer.
+///
+/// Every join is LEFT: an inner join on `workouts` would silently drop every
+/// scheduled route, which looks exactly like the plan losing entries, and the
+/// same goes for `orig` — only an eased entry has an original to join to.
+///
+/// `prev` is the newest rung of the easing chain — the workout this entry held
+/// before the most recent ease. `orig` is where the chain started. They are the
+/// same only until a session is eased twice.
+const ENTRY_SELECT: &str = "SELECT ce.id, ce.workout_id, ce.route_id,
+                w.name AS workout_name, r.name AS route_name,
+                ce.scheduled_date, ce.completed,
+                w.category, w.tss, w.duration_secs,
+                ce.planned_tss, ce.planned_duration_secs,
+                ce.program_id, orig.name AS original_name,
+                prev.name AS previous_step_name
+         FROM calendar_entries ce
+         LEFT JOIN workouts w    ON ce.workout_id          = w.id
+         LEFT JOIN routes   r    ON ce.route_id            = r.id
+         LEFT JOIN workouts orig ON ce.original_workout_id = orig.id
+         LEFT JOIN workouts prev ON prev.id = (
+             SELECT from_workout_id FROM calendar_entry_adjustments
+              WHERE entry_id = ce.id ORDER BY id DESC LIMIT 1)";
+
 /// Load calendar entries whose `scheduled_date` falls within [start_date, end_date] inclusive.
 pub async fn load_calendar_entries_between(
     pool: &SqlitePool,
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<CalendarEntry>> {
-    // Every join is LEFT: an inner join on `workouts` would silently drop every
-    // scheduled route, which looks exactly like the plan losing entries, and the
-    // same goes for `orig` — only an eased entry has an original to join to.
-    let rows = sqlx::query(
-        "SELECT ce.id, ce.workout_id, ce.route_id,
-                w.name AS workout_name, r.name AS route_name,
-                ce.scheduled_date, ce.completed,
-                w.category, w.tss, w.duration_secs,
-                ce.planned_tss, ce.planned_duration_secs,
-                ce.program_id, orig.name AS original_name
-         FROM calendar_entries ce
-         LEFT JOIN workouts w    ON ce.workout_id          = w.id
-         LEFT JOIN routes   r    ON ce.route_id            = r.id
-         LEFT JOIN workouts orig ON ce.original_workout_id = orig.id
+    let rows = sqlx::query(&format!(
+        "{ENTRY_SELECT}
          WHERE ce.scheduled_date >= ? AND ce.scheduled_date <= ?
-         ORDER BY ce.scheduled_date",
-    )
+         ORDER BY ce.scheduled_date"
+    ))
     .bind(start_date)
     .bind(end_date)
     .fetch_all(pool)
     .await?;
 
     Ok(rows.iter().filter_map(row_to_entry).collect())
+}
+
+/// Re-read one entry after a write, for a surface that stays on screen.
+///
+/// The detail dialog is opened with a snapshot and does not close when the
+/// rider eases or undoes from inside it, so it has to ask again to know what it
+/// is now showing. `None` means the entry has been deleted, or points at a
+/// workout or route that has.
+pub async fn load_calendar_entry_by_id(
+    pool: &SqlitePool,
+    entry_id: i64,
+) -> Result<Option<CalendarEntry>> {
+    let row = sqlx::query(&format!("{ENTRY_SELECT} WHERE ce.id = ?"))
+        .bind(entry_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().and_then(row_to_entry))
 }
 
 /// Build an entry from a joined row, or `None` if the row names nothing that
@@ -176,6 +215,7 @@ fn row_to_entry(r: &sqlx::sqlite::SqliteRow) -> Option<CalendarEntry> {
         duration_secs,
         program_id: r.get("program_id"),
         adjusted_from: r.get("original_name"),
+        previous_step_name: r.get("previous_step_name"),
     })
 }
 
@@ -490,6 +530,71 @@ mod tests {
         let after = entries(&pool).await;
         assert_eq!(after[0].item.name(), "Sweet Spot 3x12");
         assert_eq!(after[0].adjusted_from.as_deref(), Some("Threshold 2x20"));
+    }
+
+    #[tokio::test]
+    async fn should_name_the_step_below_as_well_as_the_origin() {
+        let pool = test_pool().await;
+        let p = a_program(&pool).await;
+        let hard = a_workout(&pool, "Threshold 2x20").await;
+        let middle = a_workout(&pool, "Sweet Spot 3x12").await;
+        let easy = a_workout(&pool, "Endurance 60").await;
+        let id = schedule_workout(&pool, hard, "2026-03-04", Some(p))
+            .await
+            .unwrap();
+
+        crate::data::db::apply_adjustment(&pool, id, middle)
+            .await
+            .unwrap();
+        crate::data::db::apply_adjustment(&pool, id, easy)
+            .await
+            .unwrap();
+
+        let after = entries(&pool).await;
+        assert_eq!(after[0].item.name(), "Endurance 60");
+        assert_eq!(
+            after[0].adjusted_from.as_deref(),
+            Some("Threshold 2x20"),
+            "the badge names where the plan started"
+        );
+        assert_eq!(
+            after[0].previous_step_name.as_deref(),
+            Some("Sweet Spot 3x12"),
+            "the Undo button names one rung down"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_read_one_entry_back_by_id() {
+        // The detail dialog re-reads the entry it is showing after a write, so
+        // this has to return everything the range read does — including the
+        // chain columns the rows are dressed from.
+        let pool = test_pool().await;
+        let p = a_program(&pool).await;
+        let hard = a_workout(&pool, "Threshold 2x20").await;
+        let easy = a_workout(&pool, "Sweet Spot 3x12").await;
+        let id = schedule_workout(&pool, hard, "2026-03-04", Some(p))
+            .await
+            .unwrap();
+        crate::data::db::apply_adjustment(&pool, id, easy)
+            .await
+            .unwrap();
+
+        let found = load_calendar_entry_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(found.item.name(), "Sweet Spot 3x12");
+        assert_eq!(found.adjusted_from.as_deref(), Some("Threshold 2x20"));
+        assert_eq!(found.previous_step_name.as_deref(), Some("Threshold 2x20"));
+        assert_eq!(found.program_id, Some(p));
+    }
+
+    #[tokio::test]
+    async fn should_report_a_deleted_entry_as_gone_rather_than_failing() {
+        let pool = test_pool().await;
+        assert!(load_calendar_entry_by_id(&pool, 4242)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

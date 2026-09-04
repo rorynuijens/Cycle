@@ -28,6 +28,11 @@ pub struct EntryMark {
     pub program_week: Option<(u32, u32)>,
     /// The workout the program originally asked for, when this has been eased.
     pub adjusted_from: Option<String>,
+    /// The workout an Undo puts back — the rung below, not the origin.
+    ///
+    /// Undo steps back one ease at a time, so on a session eased twice this
+    /// names the middle workout while `adjusted_from` still names the first.
+    pub previous_step_name: Option<String>,
     /// An easing waiting to be applied.
     pub suggestion: Option<Suggestion>,
 }
@@ -37,6 +42,33 @@ impl EntryMark {
     pub fn program_text(&self) -> Option<String> {
         self.program_week
             .map(|(week, total)| format!("Part of your program · week {week} of {total}"))
+    }
+
+    /// The workout one Undo puts back — the rung below, or the origin when
+    /// there is no chain (one step back from a single ease is home).
+    pub fn undo_target(&self) -> Option<&str> {
+        self.previous_step_name
+            .as_deref()
+            .or(self.adjusted_from.as_deref())
+    }
+
+    /// The heading for the "already eased" row.
+    ///
+    /// Naming the destination is what makes a chain of eases legible: a session
+    /// eased twice goes back somewhere that is *not* what the subtitle calls the
+    /// origin, and a bare "Undo" cannot say which. It lives in the row rather
+    /// than on the button because a button carrying a workout name truncates to
+    /// "Undo — back to R…" at every width the app actually has.
+    ///
+    /// While the two coincide — a single ease, where one press goes home — the
+    /// row says nothing extra, rather than printing the same workout name twice.
+    pub fn undo_title(&self) -> String {
+        match self.undo_target() {
+            Some(target) if Some(target) != self.adjusted_from.as_deref() => {
+                format!("Undo goes back to {target}")
+            }
+            _ => "Eased by your program".to_string(),
+        }
     }
 }
 
@@ -95,6 +127,7 @@ pub fn mark_for(
     EntryMark {
         program_week,
         adjusted_from: entry.adjusted_from.clone(),
+        previous_step_name: entry.previous_step_name.clone(),
         suggestion,
     }
 }
@@ -134,6 +167,7 @@ mod tests {
             duration_secs: 3600,
             program_id,
             adjusted_from: None,
+            previous_step_name: None,
         }
     }
 
@@ -151,6 +185,7 @@ mod tests {
             duration_secs: 5400,
             program_id: None,
             adjusted_from: None,
+            previous_step_name: None,
         }
     }
 
@@ -251,6 +286,71 @@ mod tests {
         let mark = mark_for(&e, Some(&program()), None);
         assert_eq!(mark.adjusted_from.as_deref(), Some("Threshold 2x20"));
         assert_ne!(mark, EntryMark::default());
+    }
+
+    #[test]
+    fn should_carry_the_step_below_as_well_as_the_origin() {
+        let mut e = entry(1, "2026-08-12", Some(7));
+        e.adjusted_from = Some("Threshold 2x20".into());
+        e.previous_step_name = Some("Sweet Spot 3x12".into());
+        let mark = mark_for(&e, Some(&program()), None);
+        assert_eq!(mark.previous_step_name.as_deref(), Some("Sweet Spot 3x12"));
+    }
+
+    #[test]
+    fn should_name_the_step_the_undo_lands_on() {
+        let mark = EntryMark {
+            adjusted_from: Some("Threshold 2x20".into()),
+            previous_step_name: Some("Sweet Spot 3x12".into()),
+            ..EntryMark::default()
+        };
+        assert_eq!(mark.undo_target(), Some("Sweet Spot 3x12"));
+        assert_eq!(mark.undo_title(), "Undo goes back to Sweet Spot 3x12");
+    }
+
+    #[test]
+    fn should_stay_quiet_when_one_press_goes_all_the_way_home() {
+        // Eased once: the step below and the origin are the same workout, and
+        // naming it in both the title and the subtitle says it twice.
+        let mark = EntryMark {
+            adjusted_from: Some("Threshold 2x20".into()),
+            previous_step_name: Some("Threshold 2x20".into()),
+            ..EntryMark::default()
+        };
+        assert_eq!(mark.undo_title(), "Eased by your program");
+    }
+
+    #[test]
+    fn should_fall_back_to_the_origin_when_there_is_no_chain() {
+        // A database eased before v5 knows only where the plan started, and one
+        // step back from a single ease is the origin anyway.
+        let mark = EntryMark {
+            adjusted_from: Some("Threshold 2x20".into()),
+            ..EntryMark::default()
+        };
+        assert_eq!(mark.undo_target(), Some("Threshold 2x20"));
+        assert_eq!(mark.undo_title(), "Eased by your program");
+    }
+
+    #[test]
+    fn should_name_nothing_when_it_can_name_nothing() {
+        assert_eq!(EntryMark::default().undo_target(), None);
+        assert_eq!(EntryMark::default().undo_title(), "Eased by your program");
+    }
+
+    #[test]
+    fn should_offer_no_undo_target_on_a_completed_entry() {
+        // `mark_for` short-circuits on a completed entry, and the button that
+        // reads this is hidden there — but a label naming a workout the day was
+        // never put back to would be wrong if it ever were not.
+        let mut e = entry(1, "2026-08-12", Some(7));
+        e.completed = true;
+        e.adjusted_from = Some("Threshold 2x20".into());
+        e.previous_step_name = Some("Sweet Spot 3x12".into());
+
+        let mark = mark_for(&e, Some(&program()), None);
+        assert_eq!(mark.previous_step_name, None);
+        assert_eq!(mark.undo_target(), None);
     }
 
     #[test]

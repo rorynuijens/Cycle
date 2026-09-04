@@ -422,7 +422,7 @@ pub fn build_week_view(
 
                         if let Some(original) = &mark.adjusted_from {
                             let row = adw::ActionRow::builder()
-                                .title("Eased by your program")
+                                .title(mark.undo_title())
                                 .subtitle(format!("Originally {original}"))
                                 .subtitle_lines(0)
                                 .build();
@@ -435,11 +435,17 @@ pub fn build_week_view(
                             )]);
                             row.add_prefix(&icon);
 
+                            // The button stays a verb. Where the press lands
+                            // is the row's title — a chip this narrow truncates
+                            // a workout name on a button to nothing useful.
                             let undo_btn = gtk::Button::builder()
                                 .label("Undo")
                                 .css_classes(["pill"])
                                 .valign(gtk::Align::Center)
-                                .tooltip_text("Put this session back to what your program planned")
+                                .tooltip_text(format!(
+                                    "Put this session back one step, to {}",
+                                    mark.undo_target().unwrap_or(original)
+                                ))
                                 .build();
                             row.add_suffix(&undo_btn);
                             advice_list.append(&row);
@@ -457,6 +463,7 @@ pub fn build_week_view(
                                     entry_id,
                                     Rc::clone(&toast_u),
                                     reload_fn(&rh_u),
+                                    None,
                                 );
                             });
                         }
@@ -505,6 +512,7 @@ pub fn build_week_view(
                                     to_name.clone(),
                                     Rc::clone(&toast_a),
                                     reload_fn(&rh_a),
+                                    None,
                                 );
                             });
                         }

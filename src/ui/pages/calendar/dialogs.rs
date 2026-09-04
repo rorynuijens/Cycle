@@ -47,6 +47,61 @@ fn dress_done_row(row: &adw::ActionRow, icon: &gtk::Image, btn: &gtk::Button, do
     }));
 }
 
+/// What the easing rows are currently saying, so a redraw can restate it.
+///
+/// The dialog is opened with a snapshot and stays open across a write, so this
+/// is the one place that tracks what has changed since.
+struct EasingState {
+    /// The workout now on the day — it changes under the dialog when eased.
+    entry_name: String,
+    mark: EntryMark,
+    /// Whether the suggestion the dialog opened with is still on offer.
+    suggestion_standing: bool,
+}
+
+/// Dress both easing rows for a state, whether building or redrawing.
+///
+/// One function for both, for the reason given on [`dress_done_row`]: two
+/// copies drift, and here the drift is an Undo button naming a workout the
+/// entry has already been put back to.
+fn dress_easing_rows(
+    list: &gtk::ListBox,
+    undo_row: &adw::ActionRow,
+    undo_btn: &gtk::Button,
+    apply_row: &adw::ActionRow,
+    apply_btn: &gtk::Button,
+    state: &EasingState,
+) {
+    let eased = state.mark.adjusted_from.is_some();
+    undo_row.set_visible(eased);
+    if let Some(original) = &state.mark.adjusted_from {
+        // The row names the rung, the subtitle names the origin: after two eases
+        // those are different workouts, and the rider needs both — where the
+        // plan started, and where one press lands. The destination is in the row
+        // rather than on the button because a button carrying a workout name
+        // truncates to "Undo — back to R…" at every width this dialog has.
+        undo_row.set_title(&state.mark.undo_title());
+        undo_row.set_subtitle(&format!("Originally {original}"));
+        undo_btn.set_label("Undo");
+        undo_btn.set_tooltip_text(Some(&format!(
+            "Put this session back one step, to {}",
+            state.mark.undo_target().unwrap_or(original.as_str())
+        )));
+    }
+
+    let offering = state.suggestion_standing;
+    apply_row.set_visible(offering);
+    if let (true, Some(suggestion)) = (offering, &state.mark.suggestion) {
+        apply_row.set_title(&format!("{} → {}", state.entry_name, suggestion.to_name));
+        apply_btn.set_tooltip_text(Some(&format!(
+            "Ease this session to {}",
+            suggestion.to_name
+        )));
+    }
+
+    list.set_visible(eased || offering);
+}
+
 /// What the rider picked in the scheduling dialog.
 #[derive(Clone, Copy)]
 enum Picked {
@@ -803,35 +858,135 @@ pub fn show_workout_detail_dialog(
         .build();
 
     // A session can be both: eased once already, and the rules still want it
-    // easier. Both rows show, because the rider needs the way back as much as
-    // the way forward — `original_workout_id` keeps pointing at what the
-    // program first asked for however many times it is eased.
-    if let Some(original) = &mark.adjusted_from {
-        let row = adw::ActionRow::builder()
-            .title("Eased by your program")
-            .subtitle(format!("Originally {original}"))
-            .build();
-        let icon = gtk::Image::builder()
-            .icon_name("object-select-symbolic")
-            .css_classes(["success"])
-            .build();
-        icon.update_property(&[gtk::accessible::Property::Label("Already eased")]);
-        row.add_prefix(&icon);
+    // easier. Both rows exist, because the rider needs the way back as much as
+    // the way forward.
+    //
+    // They are built unconditionally and hidden, never appended conditionally.
+    // The dialog stays open across a change, so a session that gains an
+    // "already eased" state by being eased from right here needs a row waiting
+    // to be dressed — building it only when the opening snapshot called for it
+    // is how the rider ends up pressing Apply and seeing nothing happen.
+    let undo_row = adw::ActionRow::builder()
+        .subtitle_lines(0)
+        .visible(false)
+        .build();
+    let undo_icon = gtk::Image::builder()
+        .icon_name("object-select-symbolic")
+        .css_classes(["success"])
+        .build();
+    undo_icon.update_property(&[gtk::accessible::Property::Label("Already eased")]);
+    undo_row.add_prefix(&undo_icon);
+    let undo_btn = gtk::Button::builder()
+        .css_classes(["pill"])
+        .valign(gtk::Align::Center)
+        .build();
+    undo_row.add_suffix(&undo_btn);
+    easing_list.append(&undo_row);
 
-        let undo_btn = gtk::Button::builder()
-            .label("Undo")
-            .css_classes(["pill"])
-            .valign(gtk::Align::Center)
-            .tooltip_text("Put this session back to what your program planned")
-            .build();
-        row.add_suffix(&undo_btn);
-        easing_list.append(&row);
-        easing_list.set_visible(true);
+    let apply_row = adw::ActionRow::builder()
+        .subtitle(
+            mark.suggestion
+                .as_ref()
+                .map(|s| s.reason.as_str())
+                .unwrap_or_default(),
+        )
+        .subtitle_lines(0)
+        .visible(false)
+        .build();
+    let apply_icon = gtk::Image::builder()
+        .icon_name("view-refresh-symbolic")
+        .css_classes(["warning"])
+        .build();
+    apply_icon.update_property(&[gtk::accessible::Property::Label(
+        "Your program suggests easing this session",
+    )]);
+    apply_row.add_prefix(&apply_icon);
+    let apply_btn = gtk::Button::builder()
+        .label("Apply")
+        .css_classes(["pill"])
+        .valign(gtk::Align::Center)
+        .build();
+    apply_row.add_suffix(&apply_btn);
+    easing_list.append(&apply_row);
 
+    let easing_state = Rc::new(RefCell::new(EasingState {
+        entry_name: entry.item.name().to_string(),
+        mark: mark.clone(),
+        suggestion_standing: mark.suggestion.is_some(),
+    }));
+
+    // Built before the dialog and holding only weak widget references: a strong
+    // capture would put the rows inside a closure the rows themselves reach
+    // (CLAUDE.md §2.4).
+    let redraw_easing: Rc<dyn Fn()> = {
+        let list_w = easing_list.downgrade();
+        let undo_row_w = undo_row.downgrade();
+        let undo_btn_w = undo_btn.downgrade();
+        let apply_row_w = apply_row.downgrade();
+        let apply_btn_w = apply_btn.downgrade();
+        let state = Rc::clone(&easing_state);
+        Rc::new(move || {
+            if let (Some(list), Some(ur), Some(ub), Some(ar), Some(ab)) = (
+                list_w.upgrade(),
+                undo_row_w.upgrade(),
+                undo_btn_w.upgrade(),
+                apply_row_w.upgrade(),
+                apply_btn_w.upgrade(),
+            ) {
+                dress_easing_rows(&list, &ur, &ub, &ar, &ab, &state.borrow());
+            }
+        })
+    };
+    redraw_easing();
+
+    // Re-read the entry after a write and dress the rows from what came back.
+    //
+    // Only the entry is re-read. Recomputing the suggestion would need the whole
+    // `plan_view` — program, sessions, metrics, wellness, verdict — none of
+    // which this dialog holds; `reload` rebuilds the surfaces that do.
+    let refresh_easing: Rc<dyn Fn()> = {
+        let pool_r = pool.clone();
+        let rt_r = rt_handle.clone();
+        let state = Rc::clone(&easing_state);
+        let redraw = Rc::clone(&redraw_easing);
+        let entry_id = entry.id;
+        Rc::new(move || {
+            let pool_c = pool_r.clone();
+            let state = Rc::clone(&state);
+            let redraw = Rc::clone(&redraw);
+            crate::ui::spawn_to_main(
+                &rt_r,
+                async move { db::load_calendar_entry_by_id(&pool_c, entry_id).await },
+                move |res| {
+                    match res {
+                        Ok(Some(fresh)) => {
+                            let mut st = state.borrow_mut();
+                            st.entry_name = fresh.item.name().to_string();
+                            st.mark.adjusted_from = fresh.adjusted_from;
+                            st.mark.previous_step_name = fresh.previous_step_name;
+                            // Dropped before the redraw: the closure borrows the
+                            // same cell, and a live borrow here would panic.
+                            drop(st);
+                            redraw();
+                        }
+                        // Deleted from under the dialog. The toast and `reload`
+                        // already say so; redrawing from a guess would not.
+                        Ok(None) => {
+                            tracing::warn!("entry {entry_id} is gone; rows left as they are")
+                        }
+                        Err(e) => tracing::error!("re-reading entry {entry_id}: {e}"),
+                    }
+                },
+            );
+        })
+    };
+
+    {
         let pool_u = pool.clone();
         let rt_u = rt_handle.clone();
         let reload_u = Rc::clone(&reload);
         let toast_u = Rc::clone(&on_toast);
+        let refresh_u = Rc::clone(&refresh_easing);
         let entry_id = entry.id;
         undo_btn.connect_clicked(move |_| {
             super::actions::undo_easing(
@@ -840,51 +995,41 @@ pub fn show_workout_detail_dialog(
                 entry_id,
                 Rc::clone(&toast_u),
                 Rc::clone(&reload_u),
+                Some(Rc::clone(&refresh_u)),
             );
         });
     }
 
-    if let Some(suggestion) = &mark.suggestion {
-        let row = adw::ActionRow::builder()
-            .title(format!("{} → {}", entry.item.name(), suggestion.to_name))
-            .subtitle(&suggestion.reason)
-            .subtitle_lines(0)
-            .build();
-        let icon = gtk::Image::builder()
-            .icon_name("view-refresh-symbolic")
-            .css_classes(["warning"])
-            .build();
-        icon.update_property(&[gtk::accessible::Property::Label(
-            "Your program suggests easing this session",
-        )]);
-        row.add_prefix(&icon);
-
-        let apply_btn = gtk::Button::builder()
-            .label("Apply")
-            .css_classes(["pill"])
-            .valign(gtk::Align::Center)
-            .tooltip_text(format!("Ease this session to {}", suggestion.to_name))
-            .build();
-        row.add_suffix(&apply_btn);
-        easing_list.append(&row);
-        easing_list.set_visible(true);
-
+    if let Some(suggestion) = mark.suggestion.clone() {
         let pool_a = pool.clone();
         let rt_a = rt_handle.clone();
         let reload_a = Rc::clone(&reload);
         let toast_a = Rc::clone(&on_toast);
+        let refresh_a = Rc::clone(&refresh_easing);
+        let state_a = Rc::clone(&easing_state);
         let entry_id = entry.id;
-        let to_id = suggestion.to_workout_id;
-        let to_name = suggestion.to_name.clone();
         apply_btn.connect_clicked(move |_| {
+            let state_a = Rc::clone(&state_a);
+            let refresh_a = Rc::clone(&refresh_a);
+            let on_settled: Rc<dyn Fn()> = Rc::new(move || {
+                // The offer is spent. It cannot be recomputed here, and leaving
+                // it on screen invites a second press that would ease the same
+                // day twice, in one step the program never proposed.
+                //
+                // Only the flag is set here; the redraw waits for the re-read,
+                // so the rows change once rather than blanking and coming back.
+                state_a.borrow_mut().suggestion_standing = false;
+                refresh_a();
+            });
             super::actions::apply_easing(
                 pool_a.clone(),
                 &rt_a,
                 entry_id,
-                to_id,
-                to_name.clone(),
+                suggestion.to_workout_id,
+                suggestion.to_name.clone(),
                 Rc::clone(&toast_a),
                 Rc::clone(&reload_a),
+                Some(on_settled),
             );
         });
     }

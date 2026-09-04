@@ -98,6 +98,13 @@ pub struct PlannedSession {
     /// The workout the program originally asked for, when this entry has
     /// already been eased.
     pub adjusted_from: Option<String>,
+    /// The workout this entry held before the most recent ease — where an Undo
+    /// would put it back to.
+    ///
+    /// Distinct from `adjusted_from`: after two eases the origin is two rungs
+    /// down and Undo only walks one. They coincide after a single ease, which
+    /// is why the difference went unnoticed until a session was eased twice.
+    pub previous_step_name: Option<String>,
 }
 
 impl PlannedSession {
@@ -651,6 +658,7 @@ mod tests {
             duration_secs: 3600,
             completed,
             adjusted_from: None,
+            previous_step_name: None,
         }
     }
 

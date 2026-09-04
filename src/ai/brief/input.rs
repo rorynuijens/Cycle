@@ -378,6 +378,7 @@ mod tests {
             duration_secs: 3600,
             completed,
             adjusted_from: None,
+            previous_step_name: None,
         }
     }
 

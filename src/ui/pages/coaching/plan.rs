@@ -65,6 +65,17 @@ pub struct PlanCard {
     on_toast: Rc<dyn Fn(adw::Toast)>,
 }
 
+/// The badge line for an eased session: where the plan started, and where one
+/// Undo lands when that is somewhere else.
+///
+/// After a single ease those are the same workout, and the line says it once.
+fn easing_subtitle(original: &str, previous_step: Option<&str>) -> String {
+    match previous_step {
+        Some(step) if step != original => format!("Eased from {original} · back to {step}"),
+        _ => format!("Eased from {original}"),
+    }
+}
+
 impl PlanCard {
     pub fn new(
         pool: SqlitePool,
@@ -471,7 +482,10 @@ impl PlanCard {
                     session.date.format("%a %-d %b"),
                     session.workout_name
                 ))
-                .subtitle(format!("Eased from {original}"))
+                .subtitle(easing_subtitle(
+                    &original,
+                    session.previous_step_name.as_deref(),
+                ))
                 .build();
             row.add_prefix(
                 &gtk::Image::builder()
@@ -480,11 +494,18 @@ impl PlanCard {
                     .build(),
             );
 
+            // One press, one rung. Where it lands is said in the subtitle, not
+            // on the button: this row's title is already the session's own name
+            // and date, and a button carrying a second workout name truncates.
+            let back_to = session
+                .previous_step_name
+                .clone()
+                .unwrap_or_else(|| original.clone());
             let undo = gtk::Button::builder()
                 .label("Undo")
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
-                .tooltip_text(format!("Put {original} back on this day"))
+                .tooltip_text(format!("Put {back_to} back on this day"))
                 .build();
 
             // Weak, not strong: this row is rebuilt on every reload, and a
@@ -987,6 +1008,7 @@ mod tests {
             duration_secs: 3600,
             completed,
             adjusted_from: None,
+            previous_step_name: None,
         }
     }
 
@@ -1093,5 +1115,25 @@ mod tests {
         assert_eq!(days_ago(date(2026, 8, 11), today), "yesterday");
         assert_eq!(days_ago(date(2026, 8, 9), today), "3 days ago");
         assert_eq!(days_ago(date(2026, 7, 29), today), "2 weeks ago");
+    }
+
+    #[test]
+    fn should_name_the_step_below_in_the_badge_line() {
+        assert_eq!(
+            easing_subtitle("Endurance 60", Some("Recovery Ride")),
+            "Eased from Endurance 60 · back to Recovery Ride"
+        );
+    }
+
+    #[test]
+    fn should_say_the_workout_once_when_one_press_goes_home() {
+        assert_eq!(
+            easing_subtitle("Endurance 60", Some("Endurance 60")),
+            "Eased from Endurance 60"
+        );
+        assert_eq!(
+            easing_subtitle("Endurance 60", None),
+            "Eased from Endurance 60"
+        );
     }
 }
