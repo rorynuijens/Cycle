@@ -90,6 +90,18 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.7.2" date="2026-09-04">
+      <description>
+        <p>The numbers on the ride screen are much bigger. Your live power, and
+           the heart rate, cadence and time beneath it, now grow to fill the
+           space instead of staying small — so they can be read from the bike,
+           at arm's length, while you are working hard.</p>
+        <p>The workout profile below them is now a strip rather than half the
+           page. It used to take every spare pixel, which meant the larger your
+           window, the bigger the chart grew and the more cramped the numbers
+           looked. That is the other way round now.</p>
+      </description>
+    </release>
     <release version="0.7.1" date="2026-09-04">
       <description>
         <p>Your coach now reads your wellness numbers properly. Each morning's
