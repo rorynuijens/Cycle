@@ -10,6 +10,12 @@ pub(crate) mod marks;
 mod month;
 mod week;
 
+// Test-only: renders these pages' real widgets to PNG, because GNOME denies
+// every screenshot route on this machine. Sited here rather than under `ui/` so
+// it can reach `dialogs` without making it public for a tool.
+#[cfg(test)]
+mod screenshots;
+
 use adw::prelude::*;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gtk::glib;
