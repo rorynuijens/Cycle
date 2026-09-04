@@ -133,6 +133,7 @@ pub fn build_month_grid(
                     Rc::clone(&toast_i),
                     mark.clone(),
                     rides_i.clone(),
+                    ftp,
                 );
             });
             row_widget.add_controller(gesture);

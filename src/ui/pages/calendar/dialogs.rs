@@ -652,6 +652,7 @@ pub fn show_workout_detail_dialog(
     on_toast: Rc<dyn Fn(adw::Toast)>,
     mark: EntryMark,
     rides: Vec<crate::training::matching::DayRide>,
+    ftp: u32,
 ) {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -1035,7 +1036,61 @@ pub fn show_workout_detail_dialog(
     }
     content.append(&easing_list);
 
-    toolbar_view.set_content(Some(&content));
+    // ── The shape of the session ─────────────────────────────────────────────
+    //
+    // This is the surface where the rider decides whether to ride the thing, and
+    // it was the only one of the app's seven `WorkoutGraph` surfaces without a
+    // profile. Not gated on `completed`: a finished day is exactly where someone
+    // looks to see what they did.
+    //
+    // A scheduled route has no profile to draw, and neither has a workout with
+    // no segments — `WorkoutGraph::draw` divides by `duration_secs`, so a
+    // zero-length workout renders as a bare dashed FTP line and nothing else.
+    let planned_workout = entry
+        .item
+        .workout_id()
+        .and_then(|id| workouts.iter().find(|w| w.id == id));
+    if let Some(workout) = planned_workout.filter(|w| !w.segments.is_empty()) {
+        content.append(
+            &gtk::Label::builder()
+                .label("Power Profile")
+                .halign(gtk::Align::Start)
+                .css_classes(["heading"])
+                .build(),
+        );
+        let graph = WorkoutGraph::new(workout, ftp);
+        let graph_widget = graph.widget().clone();
+        // `WorkoutGraph::new` asks for 600 px, which would shove this 420 px
+        // dialog out to roughly 650. The library's copy escapes that only by
+        // sitting in a ScrolledWindow; here the request is simply overridden.
+        graph_widget.set_content_width(1);
+        graph_widget.set_hexpand(true);
+        graph_widget.set_accessible_role(gtk::AccessibleRole::Img);
+        graph_widget.update_property(&[gtk::accessible::Property::Label("Workout power profile")]);
+        content.append(&graph_widget);
+
+        // Pure description, so it sits with the graph rather than in the
+        // action block below — where being gated on `!completed` took it away
+        // from a day the moment it was marked done.
+        content.append(
+            &gtk::Label::builder()
+                .label(format!("{} intervals", workout.segments.len()))
+                .css_classes(["caption", "dim-label"])
+                .halign(gtk::Align::Start)
+                .build(),
+        );
+    }
+
+    // Scrollable, because the content is no longer bounded: a day can be eased
+    // *and* have a suggestion waiting *and* list the rides it was trained on
+    // *and* now carry a graph, which on a short window would otherwise run off
+    // the bottom with no way to reach it.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&content)
+        .build();
+    toolbar_view.set_content(Some(&scroller));
 
     let dialog = adw::Dialog::builder()
         .title(match entry.item {
@@ -1097,18 +1152,16 @@ pub fn show_workout_detail_dialog(
             .tooltip_text("Load this workout and start riding")
             .visible(workout_id.is_some())
             .build();
-        let workouts_c = Rc::clone(&workouts);
+        let to_start = planned_workout.cloned();
         let on_start_c = Rc::clone(&on_start_workout);
         // Weak: this button is inside the dialog (CLAUDE.md §2.4).
         load_btn.connect_clicked(glib::clone!(
             #[weak]
             dialog,
             move |_| {
-                let Some(wid) = workout_id else { return };
-                if let Some(w) = workouts_c.iter().find(|w| w.id == wid).cloned() {
-                    dialog.close();
-                    on_start_c(w);
-                }
+                let Some(w) = to_start.clone() else { return };
+                dialog.close();
+                on_start_c(w);
             }
         ));
 
@@ -1203,19 +1256,6 @@ pub fn show_workout_detail_dialog(
         btn_row.append(&move_btn);
         btn_row.append(&load_btn);
         content.append(&btn_row);
-
-        // How many intervals this workout holds. Routes have no segments.
-        if let Some(w) = workout_id.and_then(|id| workouts.iter().find(|w| w.id == id)) {
-            if !w.segments.is_empty() {
-                content.append(
-                    &gtk::Label::builder()
-                        .label(format!("{} intervals", w.segments.len()))
-                        .css_classes(["caption", "dim-label"])
-                        .halign(gtk::Align::Start)
-                        .build(),
-                );
-            }
-        }
     }
 
     dialog.present(Some(parent));

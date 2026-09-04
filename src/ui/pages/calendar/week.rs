@@ -340,6 +340,7 @@ pub fn build_week_view(
                                 Rc::clone(&toast_d),
                                 mark_d.clone(),
                                 rides_d.clone(),
+                                ftp,
                             );
                         });
 
