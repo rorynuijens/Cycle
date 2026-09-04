@@ -401,4 +401,31 @@ mod tests {
             engine.trainer_grade_percent()
         );
     }
+
+    // `set_speed` could be replaced by an empty function body without a single
+    // test noticing — the speed the route advances at was only ever set through
+    // the constructor.
+
+    #[test]
+    fn should_advance_the_route_at_the_speed_it_is_given() {
+        let mut engine = RouteEngine::new(make_flat_route(), 5.0, 80.0);
+        engine.set_speed(12.0);
+        engine.tick();
+        assert!(
+            (engine.distance_m - 12.0).abs() < 0.01,
+            "expected 12 m after a second at 12 m/s, got {}",
+            engine.distance_m
+        );
+    }
+
+    #[test]
+    fn should_refuse_to_run_the_route_backwards() {
+        // A speed sensor that reports negative, or an ERG override gone wrong,
+        // must not wind the rider back down the course.
+        let mut engine = RouteEngine::new(make_flat_route(), 5.0, 80.0);
+        engine.set_speed(-5.0);
+        assert_eq!(engine.speed_ms, 0.0);
+        engine.tick();
+        assert_eq!(engine.distance_m, 0.0);
+    }
 }

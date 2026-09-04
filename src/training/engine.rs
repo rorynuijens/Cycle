@@ -572,4 +572,148 @@ mod tests {
         let age = (chrono::Utc::now() - engine.session.started_at).num_seconds();
         assert!(age < 5, "reset must clear the resume flag, got {age}s");
     }
+
+    // ── Pausing, resuming and skipping ──────────────────────────────────────
+    //
+    // Mutation testing found this corner empty: `pause`, `resume` and
+    // `skip_to_next_segment` could each be replaced by an empty function body
+    // and the whole suite still passed. The tests above all exercise the
+    // intensity dial and the resume bookkeeping; nothing drove the state
+    // machine the player actually runs on.
+
+    #[test]
+    fn should_stop_the_clock_when_a_ride_is_paused() {
+        let mut engine = make_engine();
+        engine.start();
+        engine.pause();
+        assert_eq!(engine.state, EngineState::Paused);
+        assert!(
+            engine.start_instant.is_none(),
+            "a paused ride must not leave a clock running"
+        );
+    }
+
+    #[test]
+    fn should_keep_the_time_already_ridden_when_pausing() {
+        let mut engine = make_engine();
+        // Ten minutes in, so a pause that loses time is visible in whole
+        // seconds rather than in the microseconds the test itself takes.
+        engine.pause_offset = Duration::from_secs(600);
+        engine.start();
+        engine.pause();
+        // A range, not an equality: the clock really is running between those
+        // two calls, and a test that fails when the machine stalls for a second
+        // is a test that teaches its suite to be re-run rather than believed.
+        let elapsed = engine.elapsed_secs();
+        assert!(
+            (600..=601).contains(&elapsed),
+            "expected the ten minutes already ridden, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn should_start_the_clock_again_when_a_paused_ride_resumes() {
+        let mut engine = make_engine();
+        engine.start();
+        engine.pause();
+        engine.resume();
+        assert_eq!(engine.state, EngineState::Running);
+        assert!(
+            engine.start_instant.is_some(),
+            "a running ride needs a clock to measure from"
+        );
+    }
+
+    #[test]
+    fn should_not_carry_paused_time_into_the_ride_when_resuming() {
+        let mut engine = make_engine();
+        engine.pause_offset = Duration::from_secs(600);
+        engine.start();
+        engine.pause();
+        engine.resume();
+        let elapsed = engine.elapsed_secs();
+        assert!(
+            (600..=601).contains(&elapsed),
+            "resuming must not add the time spent paused, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn should_ignore_a_pause_before_the_ride_has_started() {
+        let mut engine = make_engine();
+        engine.pause();
+        assert_eq!(engine.state, EngineState::Idle);
+    }
+
+    #[test]
+    fn should_ignore_a_resume_on_a_ride_that_is_not_paused() {
+        let mut engine = make_engine();
+        engine.resume();
+        assert_eq!(
+            engine.state,
+            EngineState::Idle,
+            "resume picks a paused ride back up; it does not start one"
+        );
+    }
+
+    #[test]
+    fn should_jump_to_the_start_of_the_next_segment() {
+        // `sample_threshold` opens with a 600 s warm-up.
+        let mut engine = make_engine();
+        engine.start();
+        engine.pause();
+        engine.skip_to_next_segment();
+        assert_eq!(engine.elapsed_secs(), 600);
+        assert_eq!(engine.segment_at(engine.elapsed_secs()), (1, 0));
+    }
+
+    #[test]
+    fn should_skip_one_segment_at_a_time() {
+        // 600 s warm-up, then a 480 s interval: two skips land at 1080 s.
+        let mut engine = make_engine();
+        engine.start();
+        engine.pause();
+        engine.skip_to_next_segment();
+        engine.skip_to_next_segment();
+        assert_eq!(engine.elapsed_secs(), 1080);
+        assert_eq!(engine.segment_at(engine.elapsed_secs()), (2, 0));
+    }
+
+    #[test]
+    fn should_not_set_a_paused_ride_running_by_skipping() {
+        let mut engine = make_engine();
+        engine.start();
+        engine.pause();
+        engine.skip_to_next_segment();
+        assert_eq!(engine.state, EngineState::Paused);
+        assert!(
+            engine.start_instant.is_none(),
+            "skipping a segment is not a reason to un-pause"
+        );
+    }
+
+    #[test]
+    fn should_ignore_a_skip_before_the_ride_has_started() {
+        let mut engine = make_engine();
+        engine.skip_to_next_segment();
+        assert_eq!(engine.elapsed_secs(), 0);
+        assert_eq!(engine.state, EngineState::Idle);
+    }
+
+    #[test]
+    fn should_return_the_segment_and_its_offset_at_an_elapsed_time() {
+        let engine = make_engine();
+        assert_eq!(engine.segment_at(0), (0, 0));
+        assert_eq!(engine.segment_at(599), (0, 599));
+        assert_eq!(engine.segment_at(600), (1, 0));
+        assert_eq!(engine.segment_at(601), (1, 1));
+    }
+
+    #[test]
+    fn should_hold_at_the_last_segment_past_the_end_of_the_workout() {
+        let engine = make_engine();
+        let last = engine.workout.segments.len() - 1;
+        // The closing cool-down, run all the way out.
+        assert_eq!(engine.segment_at(u32::MAX), (last, 600));
+    }
 }
