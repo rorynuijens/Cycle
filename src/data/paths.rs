@@ -62,6 +62,67 @@ fn resolve(
     base.join(dir_name(debug))
 }
 
+/// Scratch directories for tests that need real files on disk.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// A directory of this test's own, removed when it goes out of scope.
+    ///
+    /// Tests that write real files used to delete their directory on the last
+    /// line — which is exactly the line a failing assertion skips, so a red run
+    /// left its litter behind along with its evidence. Under mutation testing,
+    /// which runs the suite thousands of times over, that reached thousands of
+    /// directories. A `Drop` is not skipped.
+    ///
+    /// Never the rider's XDG path (CLAUDE.md §3.5).
+    pub(crate) struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        /// `prefix` names the group of tests, so a directory that somehow
+        /// outlives its guard still says where it came from.
+        pub(crate) fn new(prefix: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "cycle-{prefix}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            // Process ids are reused, so a directory under this name may be
+            // left from a previous run that died before its guard ran. Start
+            // from empty rather than inheriting it.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    /// Deref alone does not reach a generic `impl AsRef<Path>` parameter,
+    /// which several call sites use.
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // Best effort: a test that has already failed should report that,
+            // not a cleanup error stacked on top of it.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

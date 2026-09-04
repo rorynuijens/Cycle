@@ -249,17 +249,11 @@ async fn remove_sidecars(db_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::paths::testing::ScratchDir;
     use chrono::TimeZone;
 
-    fn tempdir() -> PathBuf {
-        let unique = format!(
-            "cycle-transfer-test-{}-{}",
-            std::process::id(),
-            Local::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn tempdir() -> ScratchDir {
+        ScratchDir::new("transfer-test")
     }
 
     /// A file database with the real schema and `rides` finished rides.
@@ -346,7 +340,6 @@ mod tests {
         let summary = inspect(&target).await.expect("the export is importable");
         assert_eq!(summary.rides, 3);
         assert_eq!(summary.schema_version, SCHEMA_VERSION);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -364,7 +357,6 @@ mod tests {
             b"not mine",
             "the existing file must be untouched"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── inspecting ───────────────────────────────────────────────────────────
@@ -382,7 +374,6 @@ mod tests {
             message.contains("database") || message.contains("read"),
             "{err}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -405,7 +396,6 @@ mod tests {
             err.to_string().contains("does not look like a Cycle"),
             "{err}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -423,7 +413,6 @@ mod tests {
             .expect_err("a newer schema must be refused");
 
         assert!(err.to_string().contains("newer version of Cycle"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -441,7 +430,6 @@ mod tests {
             before,
             "inspecting a candidate must leave it byte-identical"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── replacing ────────────────────────────────────────────────────────────
@@ -463,7 +451,6 @@ mod tests {
         // And what was there before is still readable.
         let old = inspect(&replaced).await.unwrap();
         assert_eq!(old.rides, 2, "the replaced history must be recoverable");
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&incoming_dir).ok();
     }
 
@@ -497,7 +484,6 @@ mod tests {
         );
         assert!(!dir.join("cycle.db-shm").exists());
         assert_eq!(inspect(&path).await.unwrap().rides, 3);
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&incoming_dir).ok();
     }
 
@@ -527,7 +513,6 @@ mod tests {
             !message.contains("closed pool"),
             "the raw sqlx wording should not reach the rider: {message}"
         );
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&incoming_dir).ok();
     }
 
@@ -550,7 +535,6 @@ mod tests {
             .filter(|n| n.contains("importing"))
             .collect();
         assert!(leftovers.is_empty(), "found {leftovers:?}");
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&incoming_dir).ok();
     }
 }

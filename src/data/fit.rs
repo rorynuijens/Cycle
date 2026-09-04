@@ -835,6 +835,7 @@ pub fn export_to_xdg_path(session: &Session, athlete: &AthleteProfile) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::paths::testing::ScratchDir;
 
     fn point(elapsed: u32, with_gps: bool) -> DataPoint {
         DataPoint {
@@ -1071,8 +1072,7 @@ mod tests {
     #[test]
     fn should_round_trip_through_the_importer() {
         let original = ride(30, true);
-        let dir = std::env::temp_dir().join(format!("cycle-fit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = ScratchDir::new("fit");
         let path = dir.join("roundtrip.fit");
         std::fs::write(&path, encode_session(&original, &profile())).expect("write");
 
@@ -1086,8 +1086,6 @@ mod tests {
         assert!((lat - 51.5).abs() < 0.0001, "got {lat}");
         let alt = first.altitude_m.expect("altitude must survive");
         assert!((alt - 100.0).abs() < 0.5, "got {alt}");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1243,14 +1241,12 @@ mod tests {
         // the buffer by it, so this crashed the process before the guard.
         let full = encode(60, false);
         let half = &full[..full.len() / 2];
-        let dir = std::env::temp_dir().join(format!("cycle-fit-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = ScratchDir::new("fit");
         let path = dir.join("truncated.fit");
         std::fs::write(&path, half).expect("write");
 
         let err = import_fit_file(&path).expect_err("a truncated file must be refused");
         assert!(err.to_string().contains("incomplete"), "got: {err}");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1290,16 +1286,13 @@ mod tests {
         };
         use proptest::prelude::*;
 
-        /// A path of this test's own.
+        /// A directory of this test's own, cleaned up when it drops.
         ///
-        /// Named for the process as well as the test: proptest runs its cases
-        /// in sequence, but two *processes* running the suite at once — which
-        /// is what a mutation-testing run is — would otherwise write the same
-        /// file underneath each other.
-        fn scratch(name: &str) -> std::path::PathBuf {
-            let dir = std::env::temp_dir().join(format!("cycle-fit-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            dir.join(name)
+        /// Two *processes* running the suite at once — which is what a
+        /// mutation-testing run is — must not write the same file underneath
+        /// each other, and neither should leave it behind afterwards.
+        fn scratch() -> ScratchDir {
+            ScratchDir::new("fit")
         }
 
         /// A valid FIT file, then damaged: truncated part-way, with some bytes
@@ -1329,7 +1322,8 @@ mod tests {
             /// goes straight into TSS, CTL and the coach's prompt.
             #[test]
             fn should_never_import_a_ride_it_cannot_stand_behind(bytes in any_damaged_fit()) {
-                let path = scratch("damaged.fit");
+                let dir = scratch();
+                let path = dir.join("damaged.fit");
                 std::fs::write(&path, &bytes).expect("write");
                 let Ok(session) = import_fit_file(&path) else { return Ok(()) };
                 for p in &session.data_points {
@@ -1356,7 +1350,8 @@ mod tests {
             /// A file this app wrote always reads back, at every ride length.
             #[test]
             fn should_round_trip_a_ride_of_any_length(points in 1u32..200, gps in any::<bool>()) {
-                let path = scratch("roundtrip.fit");
+                let dir = scratch();
+                let path = dir.join("roundtrip.fit");
                 std::fs::write(&path, encode(points, gps)).expect("write");
                 let session = import_fit_file(&path).expect("our own file must parse");
                 prop_assert_eq!(session.data_points.len(), points as usize);

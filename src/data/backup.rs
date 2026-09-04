@@ -178,6 +178,7 @@ fn quote_sql_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::paths::testing::ScratchDir;
     use chrono::TimeZone;
 
     fn at(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> DateTime<Local> {
@@ -336,7 +337,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, 0);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -365,21 +365,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, 50, "every row must survive, WAL or not");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Tests here need a database that is a real file, so they use a unique
     // directory under the system temp dir and remove it afterwards. This is
     // never the rider's XDG path (CLAUDE.md §3.5).
-    fn tempdir() -> PathBuf {
-        let unique = format!(
-            "cycle-backup-test-{}-{}",
-            std::process::id(),
-            Local::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn tempdir() -> ScratchDir {
+        ScratchDir::new("backup-test")
     }
 
     async fn file_pool(dir: &Path) -> SqlitePool {
