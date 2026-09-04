@@ -1,0 +1,131 @@
+name: Mutants
+
+# Asks the question `cargo test` cannot: not "do the tests pass" but "would
+# they fail if the code were wrong". cargo-mutants injects one bug at a time —
+# a flipped comparison, a deleted clamp, a function body replaced by its
+# default — and reports the ones no test objected to.
+#
+# Far too slow for a pull request: the crate relinks once per mutant, and there
+# are a few thousand of them. So it runs weekly and on demand, sharded across
+# runners to stay inside the job timeout.
+#
+# Survivors are this job's *output*, not its failure. It goes red only when a
+# shard could not finish.
+
+on:
+  schedule:
+    # 04:00 UTC on Mondays, before the week's riding produces anything to read.
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The generative tests run at proptest's default 256 cases in normal CI, which
+  # keeps `cargo test` at a few seconds. Here they get a real search — this is
+  # the setting that found the FIT header panic and the infinite workout TSS.
+  property:
+    name: property tests · 20k cases
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:43
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y \
+            gcc pkgconf-pkg-config git tar \
+            gtk4-devel libadwaita-devel libshumate-devel glib2-devel \
+            dbus-devel \
+            cargo rust
+
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Property tests
+        env:
+          PROPTEST_CASES: 20000
+        run: cargo test --bin cycle property_tests
+
+  mutants:
+    name: mutants ${{ matrix.shard }}/8
+    runs-on: ubuntu-latest
+    # A shard is a few hundred mutants at roughly half a minute each.
+    timeout-minutes: 350
+    container:
+      image: fedora:43
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Install system dependencies
+        run: |
+          dnf install -y \
+            gcc pkgconf-pkg-config git tar \
+            gtk4-devel libadwaita-devel libshumate-devel glib2-devel \
+            dbus-devel \
+            cargo rust
+
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Mutate
+        id: mutate
+        # `src/ui` is left out on purpose. GTK widgets are not unit-testable
+        # here (CLAUDE.md §3.1), so every mutant in them would be reported as a
+        # survivor and bury the ones that mean something.
+        #
+        # --no-shuffle keeps a mutant in the same shard from week to week, so
+        # two runs can be compared.
+        run: |
+          set +e
+          cargo mutants \
+            --no-shuffle --shard ${{ matrix.shard }}/8 \
+            -f "src/data/*.rs" -f "src/data/db/*.rs" \
+            -f "src/devices/*.rs" -f "src/training/*.rs" \
+            -f "src/ai/*.rs" -f "src/ai/brief/*.rs" \
+            --timeout 300 -j 2
+          code=$?
+          set -e
+          # A shard that got to the end wrote its outcome files, whatever it
+          # found. Missing them means it stopped early, which is a real failure.
+          if [ ! -f mutants.out/missed.txt ]; then
+            echo "cargo-mutants did not finish (exit $code)" >&2
+            exit "${code:-1}"
+          fi
+          echo "survivors=$(wc -l < mutants.out/missed.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        if: always()
+        run: |
+          echo "### Shard ${{ matrix.shard }}/8" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f mutants.out/missed.txt ]; then
+            echo "${{ steps.mutate.outputs.survivors }} mutants survived." \
+              >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The shard did not finish." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the outcome files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: |
+            mutants.out/missed.txt
+            mutants.out/caught.txt
+            mutants.out/timeout.txt
+            mutants.out/unviable.txt
+            mutants.out/outcomes.json
+          if-no-files-found: ignore

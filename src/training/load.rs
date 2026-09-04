@@ -326,4 +326,215 @@ mod tests {
                 > estimate(&now, &a).expect("has power").load
         );
     }
+
+    // ── The arithmetic itself ───────────────────────────────────────────────
+    //
+    // The tests above check direction and order of magnitude — a long hard ride
+    // outscores a short easy one, an hour at threshold lands in an 80–220 band.
+    // A band that wide tolerates almost any error inside it, and mutation
+    // testing duly found every operator in the estimator swappable without a
+    // failure. What follows pins values instead of ranges: small rides whose
+    // answer can be worked out from the formula, so a changed sign or a
+    // divide-turned-multiply has nowhere to hide. This is the number that
+    // reaches Garmin Connect as the ride's training load.
+
+    /// A ride of `secs` seconds at 1 Hz, every point identical.
+    fn flat_ride(secs: u32, watts: Option<u32>, hr: Option<u32>) -> Session {
+        let mut session = Session::new(None);
+        session.data_points = (0..secs)
+            .map(|i| DataPoint {
+                elapsed_secs: i,
+                power_watts: watts,
+                target_watts: None,
+                heart_rate_bpm: hr,
+                cadence_rpm: None,
+                speed_kmh: None,
+                lat: None,
+                lng: None,
+                altitude_m: None,
+            })
+            .collect();
+        session
+    }
+
+    #[track_caller]
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-3 * expected.abs().max(1.0),
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn should_read_the_gap_to_the_next_sample() {
+        let session = {
+            let mut s = Session::new(None);
+            for secs in [0u32, 5, 105] {
+                s.data_points.push(DataPoint {
+                    elapsed_secs: secs,
+                    power_watts: None,
+                    target_watts: None,
+                    heart_rate_bpm: None,
+                    cadence_rpm: None,
+                    speed_kmh: None,
+                    lat: None,
+                    lng: None,
+                    altitude_m: None,
+                });
+            }
+            s
+        };
+        let pts = &session.data_points;
+        assert_eq!(sample_secs(pts, 0), 5.0);
+        // A 100 s gap is a clock jump, not a hundred seconds of riding.
+        assert_eq!(sample_secs(pts, 1), 60.0);
+        // Nothing follows the last point, so it stands for the 1 Hz recorded.
+        assert_eq!(sample_secs(pts, 2), 1.0);
+    }
+
+    #[test]
+    fn should_map_a_load_onto_the_firstbeat_scale_it_was_fitted_to() {
+        // The two reference rides the curve was fitted against.
+        assert_close(aerobic_te_for_load(202.0), 1.458 * 202.0f32.ln() - 3.34);
+        assert_close(aerobic_te_for_load(48.0), 1.458 * 48.0f32.ln() - 3.34);
+        // Under a load of 1 there is no effect to report, and no logarithm to take.
+        assert_eq!(aerobic_te_for_load(1.0), 0.0);
+        assert_eq!(aerobic_te_for_load(0.0), 0.0);
+    }
+
+    #[test]
+    fn should_not_count_a_zero_reading_as_a_heart_rate() {
+        // Half the ride reads 0 bpm — the strap saying nothing, not a heart
+        // beating slowly. Counting those gives a full-coverage trace with a
+        // 100 bpm spread, which would sail through both gates.
+        let mut session = flat_ride(10, Some(200), Some(0));
+        for p in session.data_points.iter_mut().skip(5) {
+            p.heart_rate_bpm = Some(100);
+        }
+        assert!(!hr_is_usable(&session));
+    }
+
+    #[test]
+    fn should_reject_a_trace_that_covers_too_little_of_the_ride() {
+        // Four readings in ten seconds is 40 % coverage, under the half the
+        // integration needs. The spread is wide enough to pass the other gate.
+        let mut session = flat_ride(10, Some(200), None);
+        for (i, p) in session.data_points.iter_mut().take(4).enumerate() {
+            p.heart_rate_bpm = Some(120 + i as u32 * 10);
+        }
+        assert!(!hr_is_usable(&session));
+    }
+
+    #[test]
+    fn should_accept_a_trace_that_covers_half_the_ride_with_a_real_spread() {
+        let mut session = flat_ride(10, Some(200), None);
+        for (i, p) in session.data_points.iter_mut().take(5).enumerate() {
+            p.heart_rate_bpm = Some(120 + i as u32 * 10);
+        }
+        assert!(hr_is_usable(&session));
+    }
+
+    #[test]
+    fn should_integrate_the_heart_rate_reserve_second_by_second() {
+        // Span 100 bpm, so the two heart rates are 0.45 and 0.55 of reserve
+        // exactly, and 600 seconds of them is a sum that can be written down.
+        let profile = AthleteProfile {
+            max_hr: 200,
+            resting_hr: 100,
+            ..athlete()
+        };
+        let mut session = flat_ride(600, None, Some(145));
+        for p in session.data_points.iter_mut().skip(300) {
+            p.heart_rate_bpm = Some(155);
+        }
+        let est = estimate(&session, &profile).expect("a usable trace");
+        assert_eq!(est.source, LoadSource::HeartRate);
+        let expected = 300.0 * trimp_increment(0.45, 1.0) + 300.0 * trimp_increment(0.55, 1.0);
+        assert_close(est.load, expected);
+        assert_close(est.aerobic_te, aerobic_te_for_load(expected));
+    }
+
+    #[test]
+    fn should_map_power_onto_the_reserve_it_was_fitted_to() {
+        // Constant power, so the 90 s smoothing has nothing to smooth and the
+        // reserve is the fitted line read at half of FTP.
+        let est =
+            estimate(&flat_ride(600, Some(100), None), &athlete()).expect("a ride with power");
+        assert_eq!(est.source, LoadSource::Power);
+        let reserve = HR_RESERVE_AT_ZERO + HR_RESERVE_PER_FTP * 0.5;
+        assert_close(est.load, 600.0 * trimp_increment(reserve, 1.0));
+    }
+
+    #[test]
+    fn should_have_nothing_to_estimate_from_without_an_ftp() {
+        // Power with no FTP to read it against is not an effort, it is a number.
+        let profile = AthleteProfile {
+            ftp_watts: 0,
+            ..athlete()
+        };
+        let mut session = flat_ride(600, Some(200), None);
+        session.ftp_watts = Some(0);
+        assert!(estimate(&session, &profile).is_none());
+    }
+
+    #[test]
+    fn should_score_time_above_threshold_by_how_far_above_it_went() {
+        // FTP 100 and a steady 200 W: every second sits 0.95 above the 1.05
+        // threshold, so the proxy is 0.95² per second over 600 seconds.
+        let mut session = flat_ride(600, Some(200), None);
+        session.ftp_watts = Some(100);
+        let est = estimate(&session, &athlete()).expect("a ride with power");
+        let excess = 2.0 - ANAEROBIC_THRESHOLD_FRAC;
+        let proxy = excess * excess * 600.0;
+        assert_close(est.anaerobic_te, 0.506 * proxy.ln() - 0.40);
+    }
+
+    #[test]
+    fn should_score_no_anaerobic_effect_at_the_threshold_itself() {
+        // Exactly 1.05 × FTP contributes nothing: the excess over threshold is
+        // zero, whichever side of the comparison it falls.
+        let mut session = flat_ride(600, Some(105), None);
+        session.ftp_watts = Some(100);
+        let est = estimate(&session, &athlete()).expect("a ride with power");
+        assert_eq!(est.anaerobic_te, 0.0);
+    }
+
+    #[test]
+    fn should_smooth_a_step_in_power_the_way_heart_rate_lags_it() {
+        // Every test above rides at constant power, where the smoothing has
+        // nothing to do and its arithmetic cannot be wrong. Power steps here.
+        let mut session = flat_ride(4, Some(100), None);
+        for p in session.data_points.iter_mut().skip(1) {
+            p.power_watts = Some(300);
+        }
+        let est = estimate(&session, &athlete()).expect("a ride with power");
+
+        // The same walk written out: the first sample is taken as it stands,
+        // and each later one moves a 90th of the way to the new reading.
+        let ftp = 200.0;
+        let mut smoothed = 100.0f32;
+        let reserve_at = |w: f32| HR_RESERVE_AT_ZERO + HR_RESERVE_PER_FTP * (w / ftp);
+        let mut expected = trimp_increment(reserve_at(smoothed), 1.0);
+        for _ in 1..4 {
+            smoothed += (300.0 - smoothed) * (1.0 / POWER_SMOOTHING_SECS);
+            expected += trimp_increment(reserve_at(smoothed), 1.0);
+        }
+        assert_close(est.load, expected);
+    }
+
+    #[test]
+    fn should_weight_time_above_threshold_by_the_gap_between_samples() {
+        // A trace recorded every two seconds spends two seconds above
+        // threshold per sample, not one.
+        let mut session = flat_ride(300, Some(200), None);
+        for (i, p) in session.data_points.iter_mut().enumerate() {
+            p.elapsed_secs = i as u32 * 2;
+        }
+        session.ftp_watts = Some(100);
+        let est = estimate(&session, &athlete()).expect("a ride with power");
+        let excess = 2.0 - ANAEROBIC_THRESHOLD_FRAC;
+        // 299 gaps of two seconds, and a last sample standing for one.
+        let proxy = excess * excess * (299.0 * 2.0 + 1.0);
+        assert_close(est.anaerobic_te, 0.506 * proxy.ln() - 0.40);
+    }
 }

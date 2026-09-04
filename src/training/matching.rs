@@ -365,4 +365,83 @@ mod tests {
         let events = vec![activity("i1", "Maltepe Road Cycling", "Ride", 88, None)];
         assert_eq!(rides_on(day(), &events, FTP)[0].summary(), "88 min");
     }
+
+    // ── Which days count as trained ─────────────────────────────────────────
+    //
+    // `trained_days` had no tests of its own: it decides whether the program
+    // reads a day as ridden or as missed, and a missed day eases the week that
+    // follows it.
+
+    fn summary_of(secs: u64) -> crate::data::db::SessionSummary {
+        crate::data::db::SessionSummary {
+            id: 1,
+            started_at: Utc
+                .with_ymd_and_hms(2026, 8, 6, 7, 0, 0)
+                .single()
+                .expect("hardcoded valid instant"),
+            duration_secs: secs,
+            normalised_power: None,
+            average_power: None,
+            kilojoules: 0.0,
+            ftp_watts: None,
+            rpe: None,
+            workout_name: None,
+            uploaded_to_icu: false,
+            icu_id: None,
+        }
+    }
+
+    fn icu_of(sport: &str, secs: u32) -> IntervalsActivity {
+        IntervalsActivity {
+            icu_id: "icu-1".into(),
+            date: day(),
+            name: "Activity".into(),
+            tss: None,
+            duration_secs: Some(secs),
+            average_watts: None,
+            normalized_watts: None,
+            average_hr: None,
+            max_hr: None,
+            sport_type: sport.into(),
+            start_datetime_local: None,
+            distance_m: None,
+            elevation_gain_m: None,
+            average_cadence: None,
+        }
+    }
+
+    #[test]
+    fn should_count_a_ride_of_exactly_the_countable_minimum() {
+        let days = trained_days(&[summary_of(MIN_COUNTABLE_SECS as u64)], &[]);
+        assert!(
+            days.contains(&day()),
+            "ten minutes is the minimum, not past it"
+        );
+    }
+
+    #[test]
+    fn should_not_count_a_ride_a_second_under_the_minimum() {
+        let days = trained_days(&[summary_of(MIN_COUNTABLE_SECS as u64 - 1)], &[]);
+        assert!(days.is_empty());
+    }
+
+    #[test]
+    fn should_count_an_intervals_ride_of_exactly_the_minimum() {
+        let days = trained_days(&[], &[icu_of("Ride", MIN_COUNTABLE_SECS)]);
+        assert!(days.contains(&day()));
+    }
+
+    #[test]
+    fn should_not_count_a_run_however_long_it_was() {
+        // Both conditions have to hold: this is a training day for a runner,
+        // and not one for the cycling program that reads it.
+        let days = trained_days(&[], &[icu_of("Run", 7200)]);
+        assert!(days.is_empty(), "a two-hour run is not a day on the bike");
+    }
+
+    #[test]
+    fn should_not_count_a_short_ride_from_intervals() {
+        let days = trained_days(&[], &[icu_of("Ride", MIN_COUNTABLE_SECS - 1)]);
+        assert!(days.is_empty());
+    }
 }

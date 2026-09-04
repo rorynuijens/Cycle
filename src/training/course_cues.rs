@@ -397,5 +397,103 @@ mod tests {
             "the shelf should not split the climb, got {:.0} m",
             cue.length_m
         );
+        // The shelf drags the mean down from 6 % but nowhere near to zero, and
+        // certainly not below it: absorbing a segment adds its gradients to the
+        // one before, and its sample count with them.
+        assert!(
+            (4.0..=6.5).contains(&cue.mean_gradient_pct),
+            "mean gradient was {}",
+            cue.mean_gradient_pct
+        );
+    }
+
+    // ── The two lines the cockpit shows ─────────────────────────────────────
+    //
+    // Mutation testing found the distance arithmetic in `describe` and the
+    // "am I on it yet" test both unexercised: the tests here checked which
+    // terrain was picked, never what the rider was told about it.
+
+    fn a_cue(starts_at_m: f32) -> CourseCue {
+        CourseCue {
+            terrain: TerrainAhead::Climb,
+            starts_at_m,
+            length_m: 500.0,
+            mean_gradient_pct: 6.0,
+            headline: String::new(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn should_treat_only_a_climb_as_an_effort() {
+        assert!(TerrainAhead::Climb.is_effort());
+        assert!(!TerrainAhead::Descent.is_effort());
+        assert!(!TerrainAhead::Flat.is_effort());
+    }
+
+    #[test]
+    fn should_call_a_stretch_under_way_once_it_is_imminent() {
+        let cue = a_cue(200.0);
+        // A hundred metres short of the start already counts: the rider needs
+        // the cue before the gradient arrives, not as it does.
+        assert!(!cue.is_under_way(99.0));
+        assert!(cue.is_under_way(100.0));
+        assert!(cue.is_under_way(400.0));
+    }
+
+    #[test]
+    fn should_say_how_far_off_a_climb_is_before_it_starts() {
+        let route = ramp_route();
+        let at = 500.0;
+        let cue = cue_at(&route, at).expect("the climb ahead");
+        assert_eq!(cue.terrain, TerrainAhead::Climb);
+        let away = format_distance(cue.starts_at_m - at);
+        assert!(
+            cue.detail.contains(&away),
+            "expected the climb {away} off, detail was {:?}",
+            cue.detail
+        );
+    }
+
+    #[test]
+    fn should_say_how_far_is_left_to_the_top() {
+        let route = ramp_route();
+        let at = 2400.0;
+        let cue = cue_at(&route, at).expect("the climb");
+        assert_eq!(cue.terrain, TerrainAhead::Climb);
+        assert!(cue.is_under_way(at));
+        let left = format_distance(cue.length_m - (at - cue.starts_at_m));
+        assert!(
+            cue.detail.contains(&left),
+            "expected {left} to the top, detail was {:?}",
+            cue.detail
+        );
+        assert!(
+            cue.detail.contains("to the top"),
+            "detail was {:?}",
+            cue.detail
+        );
+    }
+
+    #[test]
+    fn should_have_nothing_to_say_past_the_end_of_the_route() {
+        let route = ramp_route();
+        assert_eq!(cue_at(&route, route.total_distance_m), None);
+        assert!(cue_at(&route, route.total_distance_m - 1.0).is_some());
+    }
+
+    #[test]
+    fn should_have_nothing_to_say_about_a_route_with_no_length() {
+        let route = route_from(&[(0.0, 100.0), (0.0, 100.0)]);
+        assert_eq!(cue_at(&route, 0.0), None);
+    }
+
+    #[test]
+    fn should_have_nothing_to_say_about_a_route_of_one_point() {
+        let mut route = route_from(&[(0.0, 100.0)]);
+        // A length it does not have the points to describe: the guard is on the
+        // points, not only on the total.
+        route.total_distance_m = 5000.0;
+        assert_eq!(cue_at(&route, 0.0), None);
     }
 }

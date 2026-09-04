@@ -473,4 +473,26 @@ mod tests {
         assert_eq!(tsb_status_text(30.0), TsbBand::VeryFresh.status_text());
         assert_eq!(tsb_status_text(-40.0), TsbBand::High.status_text());
     }
+
+    #[test]
+    fn should_take_an_exact_share_of_a_days_stress_into_each_average() {
+        // One 100 TSS day from nothing. Both averages step toward it by their
+        // own alpha, and the size of that step is the model — a test that only
+        // checks fatigue outran fitness cannot tell it from any other pair of
+        // numbers in the same order.
+        let day = date(2026, 8, 1);
+        let m = compute_load_metrics(&[summary_on(day, 100.0)], &[], 250, day);
+        let expect_ctl = alpha(CTL_TIME_CONSTANT_DAYS) * 100.0;
+        let expect_atl = alpha(ATL_TIME_CONSTANT_DAYS) * 100.0;
+        assert!(
+            (m.ctl - expect_ctl).abs() < 0.01,
+            "expected a fitness step of {expect_ctl}, got {}",
+            m.ctl
+        );
+        assert!(
+            (m.atl - expect_atl).abs() < 0.01,
+            "expected a fatigue step of {expect_atl}, got {}",
+            m.atl
+        );
+    }
 }

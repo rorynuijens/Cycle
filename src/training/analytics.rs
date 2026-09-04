@@ -837,4 +837,280 @@ mod tests {
         let series = build_wellness_series(&[wellness_on(today, Some(0.0))], today, |e| e.hrv);
         assert_eq!(series[13], 0.0);
     }
+
+    // ── The curves and totals themselves ────────────────────────────────────
+    //
+    // Mutation testing found this half of the file open: every comparison in
+    // `compute_pace_curve` could be flipped, and `+=` in `compute_volume_totals`
+    // turned into `-=`, without a test objecting. These pin the numbers rather
+    // than their direction, and put rides on the boundaries of the windows they
+    // are counted into.
+
+    /// An Intervals.icu activity carrying only what the volume totals read.
+    fn icu_on(day: NaiveDate, watts: u32, secs: u32) -> IntervalsActivity {
+        IntervalsActivity {
+            icu_id: format!("icu-{day}"),
+            date: day,
+            name: "Ride".into(),
+            tss: None,
+            duration_secs: Some(secs),
+            average_watts: Some(watts),
+            normalized_watts: None,
+            average_hr: None,
+            max_hr: None,
+            sport_type: "Ride".into(),
+            start_datetime_local: None,
+            distance_m: None,
+            elevation_gain_m: None,
+            average_cadence: None,
+        }
+    }
+
+    /// A run at a constant `speed_ms` for `secs`, as the cached stream JSON.
+    fn run_stream(speed_ms: f32, secs: u32) -> String {
+        let times: Vec<String> = (0..=secs).map(|t| t.to_string()).collect();
+        let dists: Vec<String> = (0..=secs)
+            .map(|t| (t as f32 * speed_ms).to_string())
+            .collect();
+        format!(
+            r#"[{{"type":"time","data":[{}]}},{{"type":"distance","data":[{}]}}]"#,
+            times.join(","),
+            dists.join(",")
+        )
+    }
+
+    fn summary_on(day: NaiveDate, np: f32, ftp: u32, secs: u64) -> SessionSummary {
+        SessionSummary {
+            id: 1,
+            started_at: Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).expect("valid time")),
+            duration_secs: secs,
+            normalised_power: Some(np),
+            average_power: Some(np),
+            kilojoules: 0.0,
+            ftp_watts: Some(ftp),
+            rpe: None,
+            workout_name: None,
+            uploaded_to_icu: false,
+            icu_id: None,
+        }
+    }
+
+    #[test]
+    fn should_pace_an_activity_that_covers_exactly_one_metre() {
+        // The guard is "under a metre", so a metre itself has a pace.
+        assert_ne!(format_average_pace(1.0, 10), "—");
+        assert_eq!(format_average_pace(0.99, 10), "—");
+    }
+
+    #[test]
+    fn should_keep_the_recent_power_best_separate_from_the_all_time_best() {
+        let cutoff = date(2026, 8, 1);
+        // Recent first, so a rule that let an old ride through would overwrite
+        // the recent best rather than merely failing to be excluded by it.
+        let records = [
+            record_on(date(2026, 8, 10), &[200; 60], &[]),
+            record_on(date(2026, 6, 1), &[300; 60], &[]),
+        ];
+        let curve = compute_power_curve(&records, cutoff);
+        assert_eq!(curve[0], (300, 200), "all-time 300 W, recent 200 W");
+    }
+
+    #[test]
+    fn should_report_a_pace_in_seconds_per_kilometre() {
+        // 5 m/s covers the 400 m in 80 s, which is 200 s/km.
+        let runs = [(date(2026, 8, 10), run_stream(5.0, 200))];
+        let curve = compute_pace_curve(&runs, date(2026, 8, 1));
+        assert_eq!(curve[0].0, 200, "400 m at 5 m/s is a 200 s/km pace");
+    }
+
+    #[test]
+    fn should_keep_the_fastest_pace_whichever_order_the_runs_arrive_in() {
+        let cutoff = date(2026, 8, 1);
+        let slow = (date(2026, 8, 10), run_stream(5.0, 200)); // 200 s/km
+        let fast = (date(2026, 8, 11), run_stream(8.0, 200)); // 125 s/km
+                                                              // Lower is better here, which is the whole reason this comparison is
+                                                              // easy to get backwards.
+        let a = compute_pace_curve(&[slow.clone(), fast.clone()], cutoff);
+        let b = compute_pace_curve(&[fast, slow], cutoff);
+        assert_eq!(a[0].0, 125);
+        assert_eq!(
+            b[0].0, 125,
+            "the order runs are read in cannot change the best"
+        );
+    }
+
+    #[test]
+    fn should_keep_the_recent_pace_best_separate_from_the_all_time_best() {
+        let cutoff = date(2026, 8, 1);
+        let runs = [
+            (date(2026, 6, 1), run_stream(8.0, 200)), // 125 s/km, too old
+            (date(2026, 8, 10), run_stream(5.0, 200)), // 200 s/km, recent
+        ];
+        let curve = compute_pace_curve(&runs, cutoff);
+        assert_eq!(curve[0], (125, 200));
+    }
+
+    #[test]
+    fn should_leave_a_distance_no_run_covered_at_zero() {
+        let runs = [(date(2026, 8, 10), run_stream(5.0, 200))]; // 1000 m
+        let curve = compute_pace_curve(&runs, date(2026, 8, 1));
+        // The marathon entry: nothing has covered it.
+        assert_eq!(curve[PACE_DISTANCES.len() - 1], (0, 0));
+    }
+
+    #[test]
+    fn should_add_up_the_work_of_the_week_from_both_sources() {
+        let today = date(2026, 8, 5);
+        // 200 W for 60 s is 12 kJ; 100 W for 600 s is 60 kJ.
+        let records = [record_on(today, &[200; 60], &[])];
+        let icu = [icu_on(today, 100, 600)];
+        let totals = compute_volume_totals(&records, &icu, today);
+        assert!(
+            (totals.week_kj - 72.0).abs() < 0.01,
+            "expected 72 kJ, got {}",
+            totals.week_kj
+        );
+        assert_eq!(totals.week_secs, 660);
+        assert_eq!(totals.activity_count, 2);
+    }
+
+    #[test]
+    fn should_leave_last_weeks_work_out_of_this_weeks_total() {
+        let today = date(2026, 8, 5);
+        let last_week = week_start_of(today) - Duration::days(1);
+        let records = [record_on(last_week, &[200; 60], &[])];
+        let icu = [icu_on(last_week, 100, 600)];
+        let totals = compute_volume_totals(&records, &icu, today);
+        assert_eq!(totals.week_kj, 0.0);
+        assert_eq!(totals.week_secs, 0);
+        // Both still happened, and both are still this month.
+        assert_eq!(totals.activity_count, 2);
+    }
+
+    #[test]
+    fn should_count_a_ride_on_either_edge_of_the_week() {
+        let today = date(2026, 8, 5);
+        let monday = week_start_of(today);
+        let sunday = monday + Duration::days(6);
+        let summaries = [
+            summary_on(monday, 200.0, 200, 3600),
+            summary_on(sunday, 200.0, 200, 3600),
+            summary_on(monday - Duration::days(1), 200.0, 200, 3600),
+            summary_on(sunday + Duration::days(1), 200.0, 200, 3600),
+        ];
+        let weekly = compute_weekly_tss_from_summaries(&summaries, &[], 200, today, 1);
+        // An hour at FTP is 100 TSS, and exactly two of the four rides are in
+        // the week — the ones on its first and last day.
+        assert!(
+            (weekly[0].1 - 200.0).abs() < 0.01,
+            "expected 200 TSS, got {}",
+            weekly[0].1
+        );
+    }
+
+    #[test]
+    fn should_call_a_reading_adverse_only_on_its_own_bad_side() {
+        let hrv = SignalReading {
+            label: "HRV",
+            latest: 50.0,
+            baseline: 50.0,
+            deviation_pct: 0.0,
+            higher_is_worse: false,
+        };
+        // On the baseline is not adverse in either direction.
+        assert!(!hrv.is_adverse(5.0));
+        // HRV below its norm is the bad side; above it is not.
+        assert!(SignalReading {
+            deviation_pct: -6.0,
+            ..hrv.clone()
+        }
+        .is_adverse(5.0));
+        assert!(!SignalReading {
+            deviation_pct: 6.0,
+            ..hrv.clone()
+        }
+        .is_adverse(5.0));
+        // Resting heart rate reads the other way round.
+        let rhr = SignalReading {
+            label: "Resting HR",
+            higher_is_worse: true,
+            ..hrv
+        };
+        assert!(SignalReading {
+            deviation_pct: 6.0,
+            ..rhr.clone()
+        }
+        .is_adverse(5.0));
+        assert!(!SignalReading {
+            deviation_pct: -6.0,
+            ..rhr
+        }
+        .is_adverse(5.0));
+    }
+
+    #[test]
+    fn should_read_each_signal_against_its_own_baseline() {
+        let today = date(2026, 8, 5);
+        // Six mornings at 50 bpm, then 55 today: 10 % above the norm.
+        let mut wellness: Vec<WellnessEntry> = (1..=6)
+            .map(|ago| WellnessEntry {
+                date: today - Duration::days(ago),
+                hrv: Some(100.0),
+                resting_hr: Some(50),
+                sleep_secs: None,
+                sleep_score: None,
+                steps: None,
+                calories: None,
+            })
+            .collect();
+        wellness.push(WellnessEntry {
+            date: today,
+            resting_hr: Some(55),
+            hrv: Some(90.0),
+            ..wellness[0].clone()
+        });
+
+        let readings = wellness_readings(&wellness, today, MIN_WELLNESS_READINGS);
+        let rhr = readings
+            .iter()
+            .find(|r| r.label == "Resting HR")
+            .expect("a resting heart rate reading");
+        assert_eq!(rhr.latest, 55.0);
+        assert_eq!(rhr.baseline, 50.0);
+        assert!(
+            (rhr.deviation_pct - 10.0).abs() < 0.01,
+            "expected 10 % above the norm, got {}",
+            rhr.deviation_pct
+        );
+        assert!(rhr.higher_is_worse);
+
+        let hrv = readings
+            .iter()
+            .find(|r| r.label == "HRV")
+            .expect("an HRV reading");
+        assert!(
+            (hrv.deviation_pct + 10.0).abs() < 0.01,
+            "expected 10 % below the norm, got {}",
+            hrv.deviation_pct
+        );
+        assert!(!hrv.higher_is_worse);
+    }
+
+    #[test]
+    fn should_read_no_signals_for_a_day_with_no_entry_of_its_own() {
+        // The staleness trap again: yesterday's numbers are not this morning's.
+        let today = date(2026, 8, 5);
+        let wellness: Vec<WellnessEntry> = (1..=6)
+            .map(|ago| WellnessEntry {
+                date: today - Duration::days(ago),
+                hrv: Some(100.0),
+                resting_hr: Some(50),
+                sleep_secs: None,
+                sleep_score: None,
+                steps: None,
+                calories: None,
+            })
+            .collect();
+        assert!(wellness_readings(&wellness, today, MIN_WELLNESS_READINGS).is_empty());
+    }
 }

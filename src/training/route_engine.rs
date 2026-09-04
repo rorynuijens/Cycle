@@ -428,4 +428,204 @@ mod tests {
         engine.tick();
         assert_eq!(engine.distance_m, 0.0);
     }
+
+    // ── What the map and the ride panel read ────────────────────────────────
+    //
+    // The tests above drive the engine — tick, gradient, smoothing — and never
+    // ask it where the rider is. Mutation testing found the whole accessor
+    // surface open: `position_at` could return `None`, or any fixed pair of
+    // coordinates, and nothing failed. That is the rider's dot on the map, the
+    // distance left, and the elevation under them.
+
+    /// A route that climbs and turns, so an accessor cannot pass by returning
+    /// the same number for every position: latitude, longitude and elevation
+    /// all differ between the three points.
+    fn make_climbing_route() -> Route {
+        Route {
+            name: "Climbing Test".into(),
+            points: vec![
+                RoutePoint {
+                    lat: 51.0,
+                    lng: -0.1,
+                    elevation_m: 100.0,
+                    distance_m: 0.0,
+                    gradient: 0.1,
+                },
+                RoutePoint {
+                    lat: 51.01,
+                    lng: -0.11,
+                    elevation_m: 150.0,
+                    distance_m: 500.0,
+                    gradient: -0.1,
+                },
+                RoutePoint {
+                    lat: 51.02,
+                    lng: -0.12,
+                    elevation_m: 100.0,
+                    distance_m: 1000.0,
+                    gradient: 0.0,
+                },
+            ],
+            total_distance_m: 1000.0,
+            total_gain_m: 50.0,
+        }
+    }
+
+    #[track_caller]
+    fn assert_at(actual: Option<(f64, f64)>, lat: f64, lng: f64) {
+        let (a_lat, a_lng) = actual.expect("a route with points has a position");
+        assert!(
+            (a_lat - lat).abs() < 1e-9 && (a_lng - lng).abs() < 1e-9,
+            "expected ({lat}, {lng}), got ({a_lat}, {a_lng})"
+        );
+    }
+
+    #[test]
+    fn should_interpolate_a_position_between_two_route_points() {
+        let engine = RouteEngine::new(make_climbing_route(), 5.0, 80.0);
+        // A quarter of the way along the first 500 m leg.
+        assert_at(engine.position_at(125.0), 51.0025, -0.1025);
+        assert_at(engine.position_at(250.0), 51.005, -0.105);
+    }
+
+    #[test]
+    fn should_sit_on_a_route_point_exactly() {
+        let engine = RouteEngine::new(make_climbing_route(), 5.0, 80.0);
+        assert_at(engine.position_at(0.0), 51.0, -0.1);
+        assert_at(engine.position_at(500.0), 51.01, -0.11);
+    }
+
+    #[test]
+    fn should_hold_at_the_ends_of_the_route() {
+        let engine = RouteEngine::new(make_climbing_route(), 5.0, 80.0);
+        // Before the start and past the end, the rider is at the nearest end
+        // rather than nowhere — the map still has to draw them.
+        assert_at(engine.position_at(-50.0), 51.0, -0.1);
+        assert_at(engine.position_at(5000.0), 51.02, -0.12);
+    }
+
+    #[test]
+    fn should_have_no_position_on_a_route_with_no_points() {
+        let empty = Route {
+            name: "Empty".into(),
+            points: Vec::new(),
+            total_distance_m: 0.0,
+            total_gain_m: 0.0,
+        };
+        let engine = RouteEngine::new(empty, 5.0, 80.0);
+        assert_eq!(engine.position_at(0.0), None);
+        assert_eq!(engine.current_position(), None);
+    }
+
+    #[test]
+    fn should_report_the_position_the_rider_has_ridden_to() {
+        let mut engine = RouteEngine::new(make_climbing_route(), 25.0, 80.0);
+        for _ in 0..10 {
+            engine.tick();
+        }
+        assert!((engine.distance_m - 250.0).abs() < 0.01);
+        assert_at(engine.current_position(), 51.005, -0.105);
+    }
+
+    #[test]
+    fn should_report_the_elevation_under_the_rider() {
+        let mut engine = RouteEngine::new(make_climbing_route(), 25.0, 80.0);
+        let at_start = engine.current_elevation();
+        for _ in 0..20 {
+            engine.tick();
+        }
+        // 500 m in, at the top of the climb.
+        assert!(
+            engine.current_elevation() > at_start,
+            "expected to have climbed, went from {at_start} to {}",
+            engine.current_elevation()
+        );
+        assert_eq!(engine.current_elevation(), engine.elevation_at(500.0));
+    }
+
+    #[test]
+    fn should_count_down_the_distance_left() {
+        let mut engine = RouteEngine::new(make_climbing_route(), 25.0, 80.0);
+        assert!((engine.remaining_m() - 1000.0).abs() < 0.01);
+        for _ in 0..10 {
+            engine.tick();
+        }
+        assert!(
+            (engine.remaining_m() - 750.0).abs() < 0.01,
+            "expected 750 m left, got {}",
+            engine.remaining_m()
+        );
+    }
+
+    #[test]
+    fn should_never_report_a_negative_distance_left() {
+        let mut engine = RouteEngine::new(make_climbing_route(), 25.0, 80.0);
+        for _ in 0..100 {
+            engine.tick();
+        }
+        assert_eq!(engine.remaining_m(), 0.0);
+    }
+
+    #[test]
+    fn should_report_progress_as_the_fraction_ridden() {
+        let mut engine = RouteEngine::new(make_climbing_route(), 25.0, 80.0);
+        assert_eq!(engine.progress(), 0.0);
+        for _ in 0..10 {
+            engine.tick();
+        }
+        assert!(
+            (engine.progress() - 0.25).abs() < 0.001,
+            "expected a quarter, got {}",
+            engine.progress()
+        );
+    }
+
+    #[test]
+    fn should_report_no_progress_along_a_route_with_no_length() {
+        let empty = Route {
+            name: "Nowhere".into(),
+            points: Vec::new(),
+            total_distance_m: 0.0,
+            total_gain_m: 0.0,
+        };
+        let engine = RouteEngine::new(empty, 5.0, 80.0);
+        // Not NaN: this is divided by the route length one line later.
+        assert_eq!(engine.progress(), 0.0);
+    }
+
+    #[test]
+    fn should_read_the_gradient_under_the_rider() {
+        let engine = RouteEngine::new(make_climbing_route(), 5.0, 80.0);
+        assert_ne!(
+            engine.current_gradient(),
+            0.0,
+            "the route climbs from its first metre"
+        );
+        assert_eq!(engine.current_gradient(), engine.gradient_at(0.0));
+    }
+
+    #[test]
+    fn should_ask_the_trainer_for_the_power_the_road_demands() {
+        let engine = RouteEngine::new(make_climbing_route(), 8.0, 80.0);
+        let expected = Route::power_at(8.0, engine.current_gradient(), 80.0) as u32;
+        assert_eq!(engine.current_target_watts(), expected);
+        assert!(
+            engine.current_target_watts() > 1,
+            "8 m/s up a climb is real work, got {} W",
+            engine.current_target_watts()
+        );
+    }
+
+    #[test]
+    fn should_count_the_seconds_it_has_simulated() {
+        let mut engine = RouteEngine::new(make_climbing_route(), 5.0, 80.0);
+        for _ in 0..7 {
+            engine.tick();
+        }
+        assert_eq!(engine.elapsed_secs, 7);
+        for _ in 0..3 {
+            engine.tick_sim(200);
+        }
+        assert_eq!(engine.elapsed_secs, 10);
+    }
 }

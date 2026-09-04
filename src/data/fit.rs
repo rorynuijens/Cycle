@@ -1071,9 +1071,9 @@ mod tests {
     #[test]
     fn should_round_trip_through_the_importer() {
         let original = ride(30, true);
-        let dir = std::env::temp_dir().join("cycle-fit-roundtrip");
+        let dir = std::env::temp_dir().join(format!("cycle-fit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("test.fit");
+        let path = dir.join("roundtrip.fit");
         std::fs::write(&path, encode_session(&original, &profile())).expect("write");
 
         let parsed = import_fit_file(&path).expect("the file we wrote must parse");
@@ -1243,7 +1243,7 @@ mod tests {
         // the buffer by it, so this crashed the process before the guard.
         let full = encode(60, false);
         let half = &full[..full.len() / 2];
-        let dir = std::env::temp_dir().join("cycle-fit-truncated");
+        let dir = std::env::temp_dir().join(format!("cycle-fit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("truncated.fit");
         std::fs::write(&path, half).expect("write");
@@ -1290,10 +1290,14 @@ mod tests {
         };
         use proptest::prelude::*;
 
-        /// A directory of this test's own: proptest runs its cases in sequence,
-        /// but two tests sharing one path would race.
+        /// A path of this test's own.
+        ///
+        /// Named for the process as well as the test: proptest runs its cases
+        /// in sequence, but two *processes* running the suite at once — which
+        /// is what a mutation-testing run is — would otherwise write the same
+        /// file underneath each other.
         fn scratch(name: &str) -> std::path::PathBuf {
-            let dir = std::env::temp_dir().join("cycle-fit-property");
+            let dir = std::env::temp_dir().join(format!("cycle-fit-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             dir.join(name)
         }

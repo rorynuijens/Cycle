@@ -1801,4 +1801,166 @@ mod tests {
         // exactly the behaviour they had before the brief existed.
         assert_eq!(CoachVerdict::default(), CoachVerdict::Proceed);
     }
+
+    // ── Where the wellness thresholds actually sit ──────────────────────────
+    //
+    // Mutation testing found every comparison and every arithmetic operator in
+    // `wellness_reason` and `is_strong_morning` swappable without a test
+    // objecting. The tests that existed drove them through `suggest_local` and
+    // asserted only that nothing came out, which cannot tell a threshold from
+    // its neighbour. These call both functions directly and sit *on* the
+    // boundary, where an off-by-one lives.
+
+    /// Wellness with a settled baseline: seven days at `base_rhr`/`base_hrv`
+    /// ending today, so `wellness_baseline` has its four readings from the days
+    /// before today. Callers adjust the last entry, which is today's.
+    fn steady_wellness(today: NaiveDate, base_rhr: u32, base_hrv: f32) -> Vec<WellnessEntry> {
+        (0..=6)
+            .rev()
+            .map(|ago| WellnessEntry {
+                date: today - chrono::Duration::days(ago),
+                hrv: Some(base_hrv),
+                resting_hr: Some(base_rhr),
+                sleep_secs: None,
+                sleep_score: Some(70),
+                steps: None,
+                calories: None,
+            })
+            .collect()
+    }
+
+    fn sleep_only(today: NaiveDate, score: u32) -> Vec<WellnessEntry> {
+        vec![WellnessEntry {
+            date: today,
+            hrv: None,
+            resting_hr: None,
+            sleep_secs: None,
+            sleep_score: Some(score),
+            steps: None,
+            calories: None,
+        }]
+    }
+
+    #[test]
+    fn should_not_ease_when_resting_heart_rate_only_reaches_the_threshold() {
+        // Four mornings at 40 make the norm, and 5 % above it is exactly 42.
+        // The rule is "above", so 42 is not yet a reason to ease.
+        let today = date(2026, 8, 5);
+        let w = wellness(&[(4, 40), (3, 40), (2, 40), (1, 40), (0, 42)], today);
+        assert_eq!(wellness_reason(&w, today), None);
+    }
+
+    /// The rise `wellness_reason` reported, or a failure naming what it did.
+    ///
+    /// The percentage is shown to the rider, so it is worth pinning and not
+    /// only the decision. Compared to a tolerance because the arithmetic is
+    /// f32: (43 − 40) / 40 × 100 comes out as 7.5000005.
+    #[track_caller]
+    fn assert_rise(reason: Option<Reason>, expected_pct: f32) {
+        match reason {
+            Some(Reason::WellnessDip {
+                resting_hr_pct: Some(pct),
+            }) => assert!(
+                (pct - expected_pct).abs() < 0.01,
+                "expected a rise of {expected_pct} %, got {pct}"
+            ),
+            other => panic!("expected a wellness dip with a percentage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_ease_when_resting_heart_rate_passes_the_threshold() {
+        let today = date(2026, 8, 5);
+        let w = wellness(&[(4, 40), (3, 40), (2, 40), (1, 40), (0, 43)], today);
+        assert_rise(wellness_reason(&w, today), 7.5);
+    }
+
+    #[test]
+    fn should_measure_the_rise_against_the_norm_without_today_in_it() {
+        // Today's reading must not dilute the baseline it is judged against.
+        // Were it included the norm would be 42.4 and the rise 2.4 %, under the
+        // threshold, and nothing would ease.
+        let today = date(2026, 8, 5);
+        let w = wellness(&[(4, 40), (3, 40), (2, 40), (1, 40), (0, 52)], today);
+        assert_rise(wellness_reason(&w, today), 30.0);
+    }
+
+    #[test]
+    fn should_not_ease_on_a_resting_heart_rate_with_no_norm_behind_it() {
+        // Three mornings is not a norm — MIN_WELLNESS_READINGS is four.
+        let today = date(2026, 8, 5);
+        let w = wellness(&[(2, 40), (1, 40), (0, 60)], today);
+        assert_eq!(wellness_reason(&w, today), None);
+    }
+
+    #[test]
+    fn should_ease_on_a_night_at_the_poor_sleep_boundary() {
+        let today = date(2026, 8, 5);
+        assert_eq!(
+            wellness_reason(&sleep_only(today, 50), today),
+            Some(Reason::WellnessDip {
+                resting_hr_pct: None
+            })
+        );
+    }
+
+    #[test]
+    fn should_not_ease_on_a_night_just_the_good_side_of_poor() {
+        let today = date(2026, 8, 5);
+        assert_eq!(wellness_reason(&sleep_only(today, 51), today), None);
+    }
+
+    #[test]
+    fn should_call_a_morning_strong_when_every_signal_clears_its_threshold() {
+        let today = date(2026, 8, 5);
+        let mut w = steady_wellness(today, 100, 100.0);
+        let entry = w.last_mut().expect("today's entry");
+        entry.resting_hr = Some(96); // norm 100, 3 % below is 97.0
+        entry.hrv = Some(106.0); // norm 100, 5 % above is 105.0
+        entry.sleep_score = Some(75); // exactly GOOD_SLEEP_SCORE, which counts
+        assert!(is_strong_morning(&w, today));
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_when_resting_heart_rate_only_reaches_its_threshold() {
+        let today = date(2026, 8, 5);
+        let mut w = steady_wellness(today, 100, 100.0);
+        let entry = w.last_mut().expect("today's entry");
+        entry.resting_hr = Some(97); // 3 % below a norm of 100 is 97.0, and the
+        entry.hrv = Some(120.0); // rule is "below", so 97 does not clear it
+        entry.sleep_score = Some(90);
+        assert!(!is_strong_morning(&w, today));
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_when_hrv_only_reaches_its_threshold() {
+        let today = date(2026, 8, 5);
+        let mut w = steady_wellness(today, 100, 100.0);
+        let entry = w.last_mut().expect("today's entry");
+        entry.resting_hr = Some(90);
+        // The boundary itself, read off the constant rather than written out:
+        // 5 % above a norm of 100 is 104.99999 in f32, not 105.
+        entry.hrv = Some(100.0 * (1.0 + HRV_ELEVATION));
+        entry.sleep_score = Some(90);
+        assert!(!is_strong_morning(&w, today));
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_on_a_sleep_score_just_under_good() {
+        let today = date(2026, 8, 5);
+        let mut w = steady_wellness(today, 100, 100.0);
+        let entry = w.last_mut().expect("today's entry");
+        entry.resting_hr = Some(90);
+        entry.hrv = Some(120.0);
+        entry.sleep_score = Some(74); // GOOD_SLEEP_SCORE is 75
+        assert!(!is_strong_morning(&w, today));
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_on_a_single_signal() {
+        // Sleep alone, with no norm behind the other two: one signal agreeing
+        // is not enough, whatever it says (SIGNALS_FOR_STRONG_MORNING is 2).
+        let today = date(2026, 8, 5);
+        assert!(!is_strong_morning(&sleep_only(today, 95), today));
+    }
 }

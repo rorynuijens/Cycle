@@ -587,4 +587,39 @@ mod tests {
         ]);
         assert!(build_cues(&w, &[])[0].closing.is_some());
     }
+
+    #[test]
+    fn should_not_repeat_the_history_on_a_second_warmup_segment() {
+        // The history goes where there is time to read it, which is the first
+        // segment and only the first.
+        let w = workout(vec![
+            Segment::steady(300, 45.0, "Spin"),
+            Segment::steady(300, 55.0, "Build"),
+            Segment::steady(480, 98.0, "Interval 1"),
+            Segment::steady(300, 50.0, "Recovery"),
+            Segment::steady(480, 98.0, "Interval 2"),
+        ]);
+        let cues = build_cues(&w, &[effort(1, Some(240))]);
+        assert_eq!(
+            cues[0].detail.as_deref(),
+            Some("You've ridden this once — best 240 W normalised.")
+        );
+        assert_eq!(
+            cues[1].detail.as_deref(),
+            Some("Ease in. First effort in 5:00."),
+            "the second warm-up segment keeps its own advice"
+        );
+    }
+
+    #[test]
+    fn should_not_call_a_lone_effort_the_last_one() {
+        // "Last one — make it count" only means something when there were
+        // others. A single block is simply the block.
+        let w = workout(vec![
+            Segment::steady(600, 50.0, "Warm-up"),
+            Segment::steady(1200, 95.0, "Threshold block"),
+            Segment::steady(300, 40.0, "Cool-down"),
+        ]);
+        assert_eq!(build_cues(&w, &[])[1].detail, None);
+    }
 }
