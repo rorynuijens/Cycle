@@ -118,13 +118,24 @@ pub struct BriefContext {
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-fn format_wellness(wellness: &[WellnessSnapshot]) -> String {
+/// The daily wellness rows, newest first.
+///
+/// Steps and calories are the only fields here that are a running total rather
+/// than a completed measurement: HRV, resting HR and sleep are all last night's
+/// and final by the time the brief is written, but today's step count is
+/// whatever the athlete has walked so far — usually a few dozen, because the
+/// brief is read before breakfast. Left unmarked, a coach reading the column
+/// takes the newest step count for a finished day and writes it up as
+/// yesterday's: a rider who walked 8308 steps yesterday was told they had done
+/// near zero. Say which day is still in progress.
+fn format_wellness(wellness: &[WellnessSnapshot], today: &str) -> String {
     if wellness.is_empty() {
         return "  No wellness data available.".to_string();
     }
     wellness
         .iter()
         .map(|w| {
+            let so_far = if w.date == today { " so far today" } else { "" };
             let mut parts = Vec::new();
             if let Some(v) = w.hrv {
                 parts.push(format!("HRV {v:.0}"));
@@ -140,10 +151,10 @@ fn format_wellness(wellness: &[WellnessSnapshot]) -> String {
                 parts.push(format!("sleep {h:.1} h{score}"));
             }
             if let Some(v) = w.steps {
-                parts.push(format!("steps {v}"));
+                parts.push(format!("steps {v}{so_far}"));
             }
             if let Some(v) = w.calories {
-                parts.push(format!("calories {v}"));
+                parts.push(format!("calories {v}{so_far}"));
             }
             if parts.is_empty() {
                 format!("  {}: no data", w.date)
@@ -580,7 +591,7 @@ PROCEED means today's plan suits the athlete as it stands. EASE means train, but
         total_sessions = ctx.total_sessions,
         week_tss = format_week_tss(&ctx.week_tss),
         wellness_header = wellness_header(&ctx.wellness, &ctx.today),
-        wellness = format_wellness(&ctx.wellness),
+        wellness = format_wellness(&ctx.wellness, &ctx.today),
         wellness_readings = format_wellness_readings(
             &ctx.wellness_readings,
             ctx.wellness.first().map(|w| w.date.as_str()),
@@ -740,6 +751,42 @@ mod tests {
         assert!(!prompt.contains("the first line is this morning"));
         assert!(prompt.contains("no reading for today (2026-08-11)"));
         assert!(prompt.contains("the newest is from 2026-08-09"));
+    }
+
+    #[test]
+    fn should_mark_todays_step_count_as_only_the_day_so_far() {
+        // The morning this fixes: 162 steps by breakfast today and 8308
+        // yesterday, and the brief opened with "yesterday's near-zero step
+        // count". A running total handed over as a day total is a wrong fact.
+        let mut c = ctx();
+        c.wellness = vec![wellness_on("2026-08-11")];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("steps 162 so far today"), "{prompt}");
+    }
+
+    #[test]
+    fn should_leave_a_finished_days_step_count_alone() {
+        let mut c = ctx();
+        c.wellness = vec![wellness_on("2026-08-10")];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("steps 162"), "{prompt}");
+        assert!(!prompt.contains("so far today"), "{prompt}");
+    }
+
+    #[test]
+    fn should_mark_only_the_running_totals_on_todays_line() {
+        // HRV, resting HR and sleep are last night's and final by breakfast;
+        // qualifying those as partial would be its own wrong fact.
+        let mut c = ctx();
+        c.wellness = vec![wellness_on("2026-08-11")];
+        let prompt = build_brief_prompt(&c);
+        assert!(
+            prompt.contains(
+                "2026-08-11: HRV 31, resting HR 55 bpm, sleep 6.9 h (score 37), \
+                 steps 162 so far today"
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]
