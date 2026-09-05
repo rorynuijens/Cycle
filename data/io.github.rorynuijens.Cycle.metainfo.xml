@@ -90,6 +90,31 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.7.3" date="2026-09-05">
+      <description>
+        <p>Your coach is now told what day it is. It had one mention of the date,
+           tucked into a heading, and no idea what day of the week it was — so it
+           read a poor night from three days ago as last night's and wrote your
+           morning around it. Every reading and every ride now says how long ago
+           it was, in plain words.</p>
+        <p>Your step count is no longer reported a day late. This morning's steps
+           are a running total of a day that has barely started, and the brief was
+           handing them over as though they were a finished day — a morning after
+           7,000 steps opened by telling you that you had barely moved.</p>
+        <p>The numbers on the ride screen stay where they are. Crossing 100 W used
+           to shove the whole cockpit sideways as the power reading grew a digit,
+           and a sprint into four digits pushed it wider still. Units have moved
+           up into the labels, so the figures themselves are bigger and steady.</p>
+        <p>The interval bar now empties as the interval runs down, instead of
+           filling up while the clock beside it counted the other way. The line
+           telling you which effort you are on is much larger — it is read from
+           the saddle, and it was sized for a desk.</p>
+        <p>A session you rode from your program appears once on the calendar, not
+           twice. The plan and the ride are both kept, as they must be, but the
+           day now shows one line: the session, ticked off, at the load you
+           actually did rather than the one that was estimated.</p>
+      </description>
+    </release>
     <release version="0.7.2" date="2026-09-04">
       <description>
         <p>The numbers on the ride screen are much bigger. Your live power, and
