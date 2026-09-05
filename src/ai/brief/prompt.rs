@@ -6,6 +6,8 @@
 //! is the failure this module is shaped to make impossible, and the test at the
 //! bottom is what actually holds it.
 
+use chrono::NaiveDate;
+
 use crate::ai::coach::{RecentSession, WellnessSnapshot, WorkoutOption};
 use crate::data::{athlete::AthleteProfile, db::AthleteGoal};
 use crate::training::analytics::SignalReading;
@@ -118,6 +120,42 @@ pub struct BriefContext {
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
+/// How a dated row relates to today: `" (today)"`, `" (yesterday)"`,
+/// `" (3 days ago)"`.
+///
+/// Every date in this prompt is absolute, which ought to be enough and is not.
+/// The brief called a wellness dip from 2026-09-02 "yesterday's" on the morning
+/// of the 5th: the only statement of the current date sat in a parenthetical on
+/// the TRAINING STATUS heading, and a model reading a column of dates will
+/// sometimes simply not do the subtraction — the same failure the norms block
+/// above exists to head off. So do it here, on every row that carries a date.
+///
+/// Returns `None` for a date that will not parse rather than guessing at one;
+/// the row then reads exactly as it did before.
+fn days_ago(date: &str, today: &str) -> Option<String> {
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+    Some(match (today - date).num_days() {
+        0 => " (today)".to_string(),
+        1 => " (yesterday)".to_string(),
+        n if n > 1 => format!(" ({n} days ago)"),
+        -1 => " (tomorrow)".to_string(),
+        n => format!(" (in {} days)", -n),
+    })
+}
+
+/// Today, spelled out: `Saturday 5 September 2026`.
+///
+/// The weekday is not decoration. "This week" is a phrase the form section uses
+/// constantly, and a coach that does not know which day of the week it is
+/// cannot tell a week that has barely started from one that is nearly over.
+fn today_in_full(today: &str) -> String {
+    match NaiveDate::parse_from_str(today, "%Y-%m-%d") {
+        Ok(d) => format!("{} ({})", d.format("%A %-d %B %Y"), today),
+        Err(_) => today.to_string(),
+    }
+}
+
 /// The daily wellness rows, newest first.
 ///
 /// Steps and calories are the only fields here that are a running total rather
@@ -156,10 +194,11 @@ fn format_wellness(wellness: &[WellnessSnapshot], today: &str) -> String {
             if let Some(v) = w.calories {
                 parts.push(format!("calories {v}{so_far}"));
             }
+            let ago = days_ago(&w.date, today).unwrap_or_default();
             if parts.is_empty() {
-                format!("  {}: no data", w.date)
+                format!("  {}{ago}: no data", w.date)
             } else {
-                format!("  {}: {}", w.date, parts.join(", "))
+                format!("  {}{ago}: {}", w.date, parts.join(", "))
             }
         })
         .collect::<Vec<_>>()
@@ -247,7 +286,7 @@ fn format_wellness_readings(readings: &[SignalReading], date: Option<&str>) -> S
     format!("\nMEASURED AGAINST THIS RIDER'S OWN NORMS{when}:\n{lines}\n{verdict}\n")
 }
 
-fn format_sessions(sessions: &[RecentSession]) -> String {
+fn format_sessions(sessions: &[RecentSession], today: &str) -> String {
     if sessions.is_empty() {
         return "  No sessions recorded in the last 4 weeks.".to_string();
     }
@@ -297,8 +336,9 @@ fn format_sessions(sessions: &[RecentSession]) -> String {
             } else {
                 String::new()
             };
+            let ago = days_ago(&s.date, today).unwrap_or_default();
             format!(
-                "  - {}{}{}: {} min{}{}{}{}",
+                "  - {}{ago}{}{}: {} min{}{}{}{}",
                 s.date, name, sport, s.duration_mins, power, tss, rpe, kj
             )
         })
@@ -530,6 +570,10 @@ pub fn build_brief_prompt(ctx: &BriefContext) -> String {
     format!(
         r#"You are an expert endurance coach and sports nutritionist writing one athlete's morning brief. Their primary sport is indoor cycling, but their training also includes runs, swims and other activities — CTL and ATL reflect all sport types.
 
+TODAY IS {today_full}. Every date below is an absolute calendar date, and each
+one says how long ago it was. Work out "today", "yesterday" and "this week" from
+those, and never from anything you believe about the current date.
+
 {background}ATHLETE: FTP {ftp} W · {weight:.1} kg · {wkg} W/kg · max HR {max_hr} bpm
 
 TRAINING STATUS (as of {today}):
@@ -583,6 +627,7 @@ PROCEED means today's plan suits the athlete as it stands. EASE means train, but
         wkg = wkg,
         max_hr = ctx.athlete.max_hr,
         today = ctx.today,
+        today_full = today_in_full(&ctx.today),
         ctl = ctx.ctl,
         atl = ctx.atl,
         tsb = ctx.tsb,
@@ -596,7 +641,7 @@ PROCEED means today's plan suits the athlete as it stands. EASE means train, but
             &ctx.wellness_readings,
             ctx.wellness.first().map(|w| w.date.as_str()),
         ),
-        sessions = format_sessions(&ctx.recent_sessions),
+        sessions = format_sessions(&ctx.recent_sessions, &ctx.today),
         cross_training = cross_training,
         time_off = time_off,
         goals = goals,
@@ -721,6 +766,19 @@ mod tests {
         );
     }
 
+    fn session_on(date: &str) -> RecentSession {
+        RecentSession {
+            date: date.into(),
+            name: Some("Endurance 60".into()),
+            sport_type: "Cycling".into(),
+            duration_mins: 60,
+            avg_power: Some(150),
+            tss: Some(48.0),
+            kj: 540.0,
+            rpe: None,
+        }
+    }
+
     fn wellness_on(date: &str) -> WellnessSnapshot {
         WellnessSnapshot {
             date: date.into(),
@@ -731,6 +789,59 @@ mod tests {
             steps: Some(162),
             calories: None,
         }
+    }
+
+    #[test]
+    fn should_say_what_day_it_is_before_anything_else() {
+        // The bug: the only statement of the date sat in a parenthetical on the
+        // TRAINING STATUS heading, and the brief called a dip from the 2nd
+        // "yesterday's" on the morning of the 5th.
+        let prompt = build_brief_prompt(&ctx());
+        assert!(
+            prompt.contains("TODAY IS Tuesday 11 August 2026 (2026-08-11)"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn should_say_how_long_ago_each_wellness_reading_was() {
+        let mut c = ctx();
+        c.wellness = vec![
+            wellness_on("2026-08-11"),
+            wellness_on("2026-08-10"),
+            wellness_on("2026-08-08"),
+        ];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("2026-08-11 (today):"), "{prompt}");
+        assert!(prompt.contains("2026-08-10 (yesterday):"), "{prompt}");
+        assert!(prompt.contains("2026-08-08 (3 days ago):"), "{prompt}");
+    }
+
+    #[test]
+    fn should_say_how_long_ago_each_ride_was() {
+        let mut c = ctx();
+        c.recent_sessions = vec![session_on("2026-08-10"), session_on("2026-07-28")];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("2026-08-10 (yesterday)"), "{prompt}");
+        assert!(prompt.contains("2026-07-28 (14 days ago)"), "{prompt}");
+    }
+
+    #[test]
+    fn should_leave_a_row_alone_when_its_date_will_not_parse() {
+        // A hand-edited or corrupted row is not a reason to invent a distance
+        // from today (CLAUDE.md §5.2).
+        let mut c = ctx();
+        c.wellness = vec![wellness_on("not a date")];
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("not a date: HRV 31"), "{prompt}");
+    }
+
+    #[test]
+    fn should_still_name_the_day_when_todays_date_will_not_parse() {
+        let mut c = ctx();
+        c.today = "whenever".into();
+        let prompt = build_brief_prompt(&c);
+        assert!(prompt.contains("TODAY IS whenever."), "{prompt}");
     }
 
     #[test]
@@ -782,7 +893,7 @@ mod tests {
         let prompt = build_brief_prompt(&c);
         assert!(
             prompt.contains(
-                "2026-08-11: HRV 31, resting HR 55 bpm, sleep 6.9 h (score 37), \
+                "2026-08-11 (today): HRV 31, resting HR 55 bpm, sleep 6.9 h (score 37), \
                  steps 162 so far today"
             ),
             "{prompt}"
