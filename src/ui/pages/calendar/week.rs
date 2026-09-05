@@ -26,6 +26,52 @@ fn program_dot() -> gtk::Label {
         .build()
 }
 
+/// Delete one recorded ride, after asking.
+///
+/// Shared by the two rows a ride can appear on — its own, and the plan it was
+/// folded into ([`crate::training::matching::plans_closed_by_a_ride`]) — so the
+/// wording and the confirmation cannot drift apart between them.
+fn delete_ride_button(
+    session_id: i64,
+    pool: SqlitePool,
+    rt_handle: tokio::runtime::Handle,
+    reload_holder: Rc<RefCell<Option<ReloadFn>>>,
+) -> gtk::Button {
+    let btn = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Delete this ride")
+        .css_classes(["flat", "circular", "destructive-action"])
+        .valign(gtk::Align::Center)
+        .build();
+    btn.connect_clicked(move |btn| {
+        let pool_c = pool.clone();
+        let rt_c = rt_handle.clone();
+        let rh_c = Rc::clone(&reload_holder);
+        crate::ui::widgets::dialog::confirm_destructive(
+            btn,
+            "Delete Ride?",
+            "This ride and all its data will be permanently deleted. \
+             Any planned session it closed stays marked done.",
+            "_Delete",
+            move || {
+                let pool_c = pool_c.clone();
+                let rh_c = Rc::clone(&rh_c);
+                crate::ui::spawn_to_main(
+                    &rt_c,
+                    async move { db::delete_session(&pool_c, session_id).await },
+                    move |res| {
+                        if let Err(e) = res {
+                            tracing::error!("delete_session: {e}");
+                        }
+                        reload_fn(&rh_c)();
+                    },
+                );
+            },
+        );
+    });
+    btn
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_week_view(
     week_start: NaiveDate,
@@ -57,6 +103,9 @@ pub fn build_week_view(
         // What the rider actually rode on this day. Same list for every entry
         // on the day.
         let day_rides = crate::training::matching::rides_on(day, day_events.iter().copied(), ftp);
+        // Plans that were ticked off by a ride recorded here: the plan and the
+        // ride are one session, and the day shows them as one row.
+        let closed = crate::training::matching::plans_closed_by_a_ride(day_events.iter().copied());
 
         let day_frame = gtk::Frame::new(None);
         if is_today {
@@ -225,6 +274,15 @@ pub fn build_week_view(
                     CalendarEvent::TimeOff(_) => unreachable!(),
 
                     CalendarEvent::Scheduled(entry) => {
+                        // The ride this plan was ticked off by, if the rider did
+                        // it here. Its row is not drawn separately; this one
+                        // stands for both, so it reports what was actually
+                        // ridden rather than what was estimated.
+                        let ridden = closed
+                            .iter()
+                            .find(|(id, _)| *id == entry.id)
+                            .map(|(_, record)| *record);
+
                         let entry_row = gtk::Box::builder()
                             .orientation(gtk::Orientation::Horizontal)
                             .spacing(6)
@@ -264,6 +322,25 @@ pub fn build_week_view(
                             entry.tss,
                             entry.category.label()
                         );
+                        // Measured beats estimated wherever the two disagree,
+                        // and the plan's own figures stay in the tooltip: a
+                        // session ridden at TSS 48 against a planned 46 is not
+                        // an error to hide, it is the day's actual load.
+                        let (load_mins, load_tss) = match ridden {
+                            Some(record) => (
+                                record.session.duration_secs() as u32 / 60,
+                                record.session.tss(ftp).unwrap_or(entry.tss),
+                            ),
+                            None => (dur_mins, entry.tss),
+                        };
+                        if ridden.is_some() {
+                            tooltip = format!(
+                                "Ridden here · {load_mins} min · TSS {load_tss:.0}\n\
+                                 Planned {dur_mins} min · TSS {:.0} · {}",
+                                entry.tss,
+                                entry.category.label()
+                            );
+                        }
                         if let Some(line) = mark.program_text() {
                             tooltip.push('\n');
                             tooltip.push_str(&line);
@@ -349,7 +426,7 @@ pub fn build_week_view(
                         // Load out of the tooltip and into view
                         entry_row.append(
                             &gtk::Label::builder()
-                                .label(format!("{} min · TSS {:.0}", dur_mins, entry.tss))
+                                .label(format!("{} min · TSS {:.0}", load_mins, load_tss))
                                 .css_classes(["caption", "dim-label", "numeric"])
                                 .halign(gtk::Align::End)
                                 .build(),
@@ -400,6 +477,19 @@ pub fn build_week_view(
                             );
                         });
                         entry_row.append(&done_btn);
+
+                        // The folded ride's own delete button. Without it the
+                        // only way to remove a bad recording would be to un-tick
+                        // the plan first to make the ride's row reappear, which
+                        // is a puzzle rather than an interface.
+                        if let Some(record) = ridden {
+                            entry_row.append(&delete_ride_button(
+                                record.session.id,
+                                pool.clone(),
+                                rt_handle.clone(),
+                                Rc::clone(&reload_holder),
+                            ));
+                        }
 
                         chip_box.append(&entry_row);
 
@@ -530,6 +620,14 @@ pub fn build_week_view(
                     }
 
                     CalendarEvent::Session(session, workout_name) => {
+                        // Drawn already, as the plan it closed.
+                        if closed
+                            .iter()
+                            .any(|(_, record)| record.session.id == session.session.id)
+                        {
+                            continue;
+                        }
+
                         let entry_row = gtk::Box::builder()
                             .orientation(gtk::Orientation::Horizontal)
                             .spacing(6)
@@ -626,45 +724,12 @@ pub fn build_week_view(
                                 .build(),
                         );
 
-                        // Delete button for local sessions
-                        let session_id_del = session.session.id;
-                        let pool_del = pool.clone();
-                        let rt_del = rt_handle.clone();
-                        let rh_del = Rc::clone(&reload_holder);
-                        let del_btn = gtk::Button::builder()
-                            .icon_name("user-trash-symbolic")
-                            .tooltip_text("Delete this session")
-                            .css_classes(["flat", "circular", "destructive-action"])
-                            .valign(gtk::Align::Center)
-                            .build();
-                        del_btn.connect_clicked(move |btn| {
-                            let pool_c = pool_del.clone();
-                            let rt_c = rt_del.clone();
-                            let rh_c = Rc::clone(&rh_del);
-                            crate::ui::widgets::dialog::confirm_destructive(
-                                btn,
-                                "Delete Session?",
-                                "This session and all its data will be permanently deleted.",
-                                "_Delete",
-                                move || {
-                                    let pool_c = pool_c.clone();
-                                    let rh_c = Rc::clone(&rh_c);
-                                    crate::ui::spawn_to_main(
-                                        &rt_c,
-                                        async move {
-                                            db::delete_session(&pool_c, session_id_del).await
-                                        },
-                                        move |res| {
-                                            if let Err(e) = res {
-                                                tracing::error!("delete_session: {e}");
-                                            }
-                                            reload_fn(&rh_c)();
-                                        },
-                                    );
-                                },
-                            );
-                        });
-                        entry_row.append(&del_btn);
+                        entry_row.append(&delete_ride_button(
+                            session.session.id,
+                            pool.clone(),
+                            rt_handle.clone(),
+                            Rc::clone(&reload_holder),
+                        ));
 
                         chip_box.append(&entry_row);
                     }

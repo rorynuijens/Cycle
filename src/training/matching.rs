@@ -152,6 +152,71 @@ pub fn trained_days(
     days
 }
 
+/// The ride that closed each planned session, for one day's events.
+///
+/// Riding a planned workout in the app saves a session *and* ticks the plan off
+/// (`db::complete_today_calendar_entry`), which is right: they are two records
+/// of two different things — what was asked for, and what was done. The calendar
+/// then drew both, and one 75-minute ride appeared on the day twice under the
+/// same name, once at the plan's estimated TSS and once at the ride's measured
+/// one. The pair is not a duplicate in the database and must not be removed from
+/// it — the load model in [`crate::data::calendar`] already relies on both being
+/// present to avoid banking the estimate on top of the ride — so it is folded
+/// here, for display, where the two are the same training.
+///
+/// Returned as `(calendar entry id, the ride that closed it)`, each entry and
+/// each ride used at most once, ordered by entry id. Only workouts pair up:
+/// nothing links a recorded ride back to a *route* entry, and guessing at one
+/// from a name would fold two rides that merely share a title.
+pub fn plans_closed_by_a_ride<'a>(
+    events: impl IntoIterator<Item = &'a CalendarEvent>,
+) -> Vec<(i64, &'a crate::data::db::SessionRecord)> {
+    let events: Vec<&CalendarEvent> = events.into_iter().collect();
+
+    let mut plans: Vec<(i64, i64, Option<NaiveDate>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            CalendarEvent::Scheduled(entry) if entry.completed => match entry.item {
+                crate::data::db::ScheduledItem::Workout { id, .. } => {
+                    Some((entry.id, id, entry.date()))
+                }
+                crate::data::db::ScheduledItem::Route { .. } => None,
+            },
+            _ => None,
+        })
+        .collect();
+    plans.sort_by_key(|(entry_id, _, _)| *entry_id);
+
+    let mut rides: Vec<(&crate::data::db::SessionRecord, i64, Option<NaiveDate>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            CalendarEvent::Session(record, _) => {
+                Some((record, record.session.workout_id?, e.date()))
+            }
+            _ => None,
+        })
+        .collect();
+    rides.sort_by_key(|(record, _, _)| record.session.started_at);
+
+    let mut taken = vec![false; rides.len()];
+    let mut out = Vec::new();
+    for (entry_id, workout_id, plan_day) in plans {
+        // The day is checked as well as the workout: handed a whole week, a
+        // Tuesday ride must not close Thursday's plan for the same session.
+        let found = rides
+            .iter()
+            .enumerate()
+            .position(|(i, (_, wid, ride_day))| {
+                !taken[i] && *wid == workout_id && *ride_day == plan_day && plan_day.is_some()
+            });
+        if let Some(i) = found {
+            taken[i] = true;
+            out.push((entry_id, rides[i].0));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +390,119 @@ mod tests {
         )];
         let other = NaiveDate::from_ymd_opt(2026, 8, 7).expect("hardcoded valid date");
         assert!(rides_on(other, &events, FTP).is_empty());
+    }
+
+    /// A ride recorded from workout `workout_id`, `mins` long.
+    fn ride_of(id: i64, workout_id: Option<i64>, mins: i64, hour: u32) -> CalendarEvent {
+        let started = Utc
+            .with_ymd_and_hms(2026, 8, 6, hour, 0, 0)
+            .single()
+            .expect("hardcoded valid instant");
+        let CalendarEvent::Session(mut record, name) = session(id, None, mins) else {
+            unreachable!("session() builds a Session event")
+        };
+        record.session.workout_id = workout_id;
+        record.session.started_at = started;
+        record.session.ended_at = Some(started + chrono::Duration::minutes(mins));
+        CalendarEvent::Session(record, name)
+    }
+
+    /// A planned workout on `day()`, ticked off or not.
+    fn plan(entry_id: i64, workout_id: i64, completed: bool) -> CalendarEvent {
+        CalendarEvent::Scheduled(crate::data::db::CalendarEntry {
+            id: entry_id,
+            item: crate::data::db::ScheduledItem::Workout {
+                id: workout_id,
+                name: "Aerobic Foundation".into(),
+            },
+            scheduled_date: day().to_string(),
+            completed,
+            category: crate::data::workout::WorkoutCategory::Endurance,
+            tss: 46.0,
+            duration_secs: 4500,
+            program_id: Some(1),
+            adjusted_from: None,
+            previous_step_name: None,
+        })
+    }
+
+    #[test]
+    fn should_pair_a_ticked_plan_with_the_ride_that_closed_it() {
+        // The reported bug: one 75-minute ride of the program's session drew two
+        // rows on the day, at TSS 46 (planned) and TSS 48 (measured).
+        let events = vec![plan(44, 22, true), ride_of(8, Some(22), 75, 9)];
+        let pairs = plans_closed_by_a_ride(&events);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, 44);
+        assert_eq!(pairs[0].1.session.id, 8);
+    }
+
+    #[test]
+    fn should_leave_an_open_plan_alone() {
+        // Nothing has closed it, so the day really does hold two things.
+        let events = vec![plan(44, 22, false), ride_of(8, Some(22), 75, 9)];
+        assert!(plans_closed_by_a_ride(&events).is_empty());
+    }
+
+    #[test]
+    fn should_not_pair_a_ride_of_a_different_workout() {
+        let events = vec![plan(44, 22, true), ride_of(8, Some(23), 75, 9)];
+        assert!(plans_closed_by_a_ride(&events).is_empty());
+    }
+
+    #[test]
+    fn should_not_pair_a_ride_that_is_not_from_a_workout_at_all() {
+        // A route ride or an imported .fit has no workout to be closed by.
+        let events = vec![plan(44, 22, true), ride_of(8, None, 75, 9)];
+        assert!(plans_closed_by_a_ride(&events).is_empty());
+    }
+
+    #[test]
+    fn should_pair_each_plan_with_a_ride_of_its_own() {
+        // Two of the same session on one day: two plans, two rides, no ride
+        // standing in for both.
+        let events = vec![
+            plan(44, 22, true),
+            plan(45, 22, true),
+            ride_of(8, Some(22), 75, 9),
+            ride_of(9, Some(22), 75, 17),
+        ];
+        let pairs = plans_closed_by_a_ride(&events);
+        let ids: Vec<(i64, i64)> = pairs.iter().map(|(e, r)| (*e, r.session.id)).collect();
+        assert_eq!(ids, vec![(44, 8), (45, 9)]);
+    }
+
+    #[test]
+    fn should_leave_the_second_plan_open_when_only_one_ride_happened() {
+        let events = vec![
+            plan(44, 22, true),
+            plan(45, 22, true),
+            ride_of(8, Some(22), 75, 9),
+        ];
+        let pairs = plans_closed_by_a_ride(&events);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, 44);
+    }
+
+    #[test]
+    fn should_not_let_one_days_ride_close_another_days_plan() {
+        // Handed a whole week, which is how the month view slices its events.
+        let mut tuesday = plan(44, 22, true);
+        if let CalendarEvent::Scheduled(e) = &mut tuesday {
+            e.scheduled_date = "2026-08-07".into();
+        }
+        let events = vec![tuesday, ride_of(8, Some(22), 75, 9)];
+        assert!(plans_closed_by_a_ride(&events).is_empty());
+    }
+
+    #[test]
+    fn should_ignore_a_plan_whose_stored_date_will_not_parse() {
+        let mut broken = plan(44, 22, true);
+        if let CalendarEvent::Scheduled(e) = &mut broken {
+            e.scheduled_date = "not a date".into();
+        }
+        let events = vec![broken, ride_of(8, Some(22), 75, 9)];
+        assert!(plans_closed_by_a_ride(&events).is_empty());
     }
 
     #[test]

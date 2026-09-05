@@ -82,8 +82,21 @@ pub fn build_month_grid(
         // planned session banks its estimate depends on what else shares the
         // date, not on the entry alone (see `CalendarEvent::load`).
         let measured = has_measured_ride(day_events.iter().copied(), ftp);
+        // A ride that ticked its own plan off is the same session as the plan,
+        // and a cell four lines tall cannot afford to say so twice. The plan
+        // chip stays — it carries the ✓ and the program dot — and the ride's is
+        // dropped. Both events stay in `day_totals`: the load model needs the
+        // pair to keep from banking the plan's estimate on top of the ride
+        // (`CalendarEvent::load`).
+        let closed = crate::training::matching::plans_closed_by_a_ride(day_events.iter().copied());
         let items: Vec<MonthCellItem> = day_events
             .iter()
+            .filter(|e| match e {
+                CalendarEvent::Session(record, _) => !closed
+                    .iter()
+                    .any(|(_, folded)| folded.session.id == record.session.id),
+                _ => true,
+            })
             .map(|e| MonthCellItem::from_event(e, ftp, &overlay, measured))
             .collect();
         let day_totals = totals(day_events.iter().copied(), ftp);
