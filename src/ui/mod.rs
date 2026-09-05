@@ -15,6 +15,12 @@ pub mod window;
 /// desk and unreadable there. `display` stops being big enough once the numbers
 /// are the point of the page rather than an accent on it.
 ///
+/// The same argument applies to the interval and course cues, which are the one
+/// part of the cockpit made of words. They were `title-4` over `caption` — a
+/// perfectly good pair of sizes for a settings page, and too small to read from
+/// the saddle, which is the only place they are ever read. `cockpit-cue` sits
+/// just under the metric numbers, and its detail line above body text.
+///
 /// Sizes are relative, never pixels, so every one of these still follows the
 /// user's system font size (CLAUDE.md §1.5); no colours are defined, so both
 /// themes work unchanged.
@@ -34,6 +40,13 @@ const APP_CSS: &str = "
 .cockpit-metric {
     font-size: 210%;
     font-weight: 700;
+}
+.cockpit-cue {
+    font-size: 180%;
+    font-weight: 700;
+}
+.cockpit-cue-detail {
+    font-size: 130%;
 }
 ";
 

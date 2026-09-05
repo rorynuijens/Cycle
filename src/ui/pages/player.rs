@@ -25,12 +25,25 @@ use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 /// mostly made of. Spare height goes to the numbers instead.
 const GRAPH_FLOOR_PX: i32 = 180;
 
+/// Character widths reserved for the cockpit numbers, so the layout stops
+/// depending on the value — see [`PlayerPage::metric_column`].
+///
+/// Power is four because a sprint reads four digits and the trainer is trusted
+/// no further (CLAUDE.md §5.1 clamps it well below 10 000 W); a clock is six
+/// because a long ride passes `120:00`; heart rate and cadence are three
+/// because both are clamped at 250.
+const POWER_DIGITS: i32 = 4;
+const CLOCK_DIGITS: i32 = 6;
+const RATE_DIGITS: i32 = 3;
+
 pub struct PlayerPage {
     root: gtk::Box,
     power_label: gtk::Label,
     hr_label: gtk::Label,
     cadence_label: gtk::Label,
     target_label: gtk::Label,
+    /// The intensity dial's reading, under the target — shown only off 100 %.
+    target_intensity: gtk::Label,
     elapsed_label: gtk::Label,
     remaining_label: gtk::Label,
     interval_label: gtk::Label,
@@ -196,12 +209,31 @@ impl PlayerPage {
             .valign(gtk::Align::Center)
             .build();
 
-        let (target_box, target_label) =
-            Self::metric_column("Target", "— W", &["cockpit-major", "numeric", "accent"]);
+        let (target_box, target_label) = Self::metric_column(
+            "Target",
+            Some("W"),
+            "—",
+            &["cockpit-major", "numeric", "accent"],
+            POWER_DIGITS,
+        );
+        // The dial only when it is off the plan: at 100 % the percentage is
+        // noise, and off it the target alone would not explain why it no longer
+        // matches the graph. On its own line so it cannot widen the number.
+        let target_intensity = gtk::Label::builder()
+            .label("")
+            .visible(false)
+            .css_classes(["caption", "dim-label", "numeric"])
+            .build();
+        target_box.append(&target_intensity);
         hero_grid.attach(&target_box, 0, 0, 1, 1);
 
-        let (power_box, power_label) =
-            Self::metric_column("Power", "— W", &["cockpit-hero", "numeric"]);
+        let (power_box, power_label) = Self::metric_column(
+            "Power",
+            Some("W"),
+            "—",
+            &["cockpit-hero", "numeric"],
+            POWER_DIGITS,
+        );
         hero_grid.attach(&power_box, 1, 0, 1, 1);
 
         let interval_box = gtk::Box::builder()
@@ -216,9 +248,13 @@ impl PlayerPage {
             .build();
         let interval_label = gtk::Label::builder()
             .label("—")
+            .width_chars(CLOCK_DIGITS)
             .css_classes(["cockpit-major", "numeric"])
             .build();
-        let segment_progress = gtk::ProgressBar::builder().fraction(0.0).build();
+        // Full at the start of an interval and empty as it runs out, so the bar
+        // and the number above it count the same way. Filling up while the
+        // clock counts down had them disagreeing at a glance.
+        let segment_progress = gtk::ProgressBar::builder().fraction(1.0).build();
         segment_progress.add_css_class("accent");
         interval_box.append(&interval_caption);
         interval_box.append(&interval_label);
@@ -242,13 +278,13 @@ impl PlayerPage {
             .build();
         let cue_headline = gtk::Label::builder()
             .label("")
-            .css_classes(["title-4"])
+            .css_classes(["cockpit-cue"])
             .justify(gtk::Justification::Center)
             .wrap(true)
             .build();
         let cue_detail = gtk::Label::builder()
             .label("")
-            .css_classes(["caption", "dim-label"])
+            .css_classes(["cockpit-cue-detail", "dim-label"])
             .justify(gtk::Justification::Center)
             .wrap(true)
             .build();
@@ -263,16 +299,33 @@ impl PlayerPage {
             .vexpand(true)
             .valign(gtk::Align::Center)
             .build();
-        let (hr_box, hr_label) =
-            Self::metric_column("Heart Rate", "— bpm", &["cockpit-metric", "numeric"]);
-        let (cadence_box, cadence_label) =
-            Self::metric_column("Cadence", "— rpm", &["cockpit-metric", "numeric"]);
-        let (elapsed_box, elapsed_label) =
-            Self::metric_column("Elapsed", "0:00", &["cockpit-metric", "numeric"]);
+        let (hr_box, hr_label) = Self::metric_column(
+            "Heart Rate",
+            Some("bpm"),
+            "—",
+            &["cockpit-metric", "numeric"],
+            RATE_DIGITS,
+        );
+        let (cadence_box, cadence_label) = Self::metric_column(
+            "Cadence",
+            Some("rpm"),
+            "—",
+            &["cockpit-metric", "numeric"],
+            RATE_DIGITS,
+        );
+        let (elapsed_box, elapsed_label) = Self::metric_column(
+            "Elapsed",
+            None,
+            "0:00",
+            &["cockpit-metric", "numeric"],
+            CLOCK_DIGITS,
+        );
         let (remaining_box, remaining_label) = Self::metric_column(
             "Remaining",
+            None,
             &WorkoutEngine::format_duration(workout.duration_secs),
             &["cockpit-metric", "numeric"],
+            CLOCK_DIGITS,
         );
         secondary_grid.attach(&hr_box, 0, 0, 1, 1);
         secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
@@ -493,6 +546,7 @@ impl PlayerPage {
             hr_label,
             cadence_label,
             target_label,
+            target_intensity,
             elapsed_label,
             remaining_label,
             interval_label,
@@ -693,11 +747,13 @@ impl PlayerPage {
         self.remaining_label
             .set_label(&WorkoutEngine::format_duration(workout.duration_secs));
         self.workout_progress.set_fraction(0.0);
-        self.segment_progress.set_fraction(0.0);
-        self.power_label.set_label("— W");
-        self.hr_label.set_label("— bpm");
-        self.cadence_label.set_label("— rpm");
-        self.target_label.set_label("— W");
+        // Full, not empty: the interval bar drains, so a fresh one is untouched.
+        self.segment_progress.set_fraction(1.0);
+        self.power_label.set_label("—");
+        self.hr_label.set_label("—");
+        self.cadence_label.set_label("—");
+        self.target_label.set_label("—");
+        self.target_intensity.set_visible(false);
         // The engine resets the dial for a new workout; the label must follow.
         self.intensity_label.set_label("100%");
         self.interval_label.set_label("—");
@@ -927,34 +983,34 @@ impl PlayerPage {
     }
 
     pub fn update_from_snapshot(&self, snap: &EngineSnapshot) {
-        self.power_label.set_label(&format!(
-            "{} W",
-            snap.readings
+        // The units live in the captions (see `metric_column`), so a reading is
+        // its digits and nothing else.
+        self.power_label.set_label(
+            &snap
+                .readings
                 .power_watts
                 .map(|w| w.to_string())
-                .unwrap_or_else(|| "—".into())
-        ));
-        self.hr_label.set_label(&format!(
-            "{} bpm",
-            snap.readings
+                .unwrap_or_else(|| "—".into()),
+        );
+        self.hr_label.set_label(
+            &snap
+                .readings
                 .heart_rate_bpm
                 .map(|h| h.to_string())
-                .unwrap_or_else(|| "—".into())
-        ));
-        self.cadence_label.set_label(&format!(
-            "{} rpm",
-            snap.readings
+                .unwrap_or_else(|| "—".into()),
+        );
+        self.cadence_label.set_label(
+            &snap
+                .readings
                 .cadence_rpm
                 .map(|c| c.to_string())
-                .unwrap_or_else(|| "—".into())
-        ));
-        // At the plan the percentage is noise; off it, the target alone would not
-        // explain why it no longer matches the graph.
-        self.target_label.set_label(&if snap.intensity_pct == 100 {
-            format!("{} W", snap.target_power_watts)
-        } else {
-            format!("{} W · {}%", snap.target_power_watts, snap.intensity_pct)
-        });
+                .unwrap_or_else(|| "—".into()),
+        );
+        self.target_label
+            .set_label(&snap.target_power_watts.to_string());
+        self.target_intensity
+            .set_label(&format!("{}% of plan", snap.intensity_pct));
+        self.target_intensity.set_visible(snap.intensity_pct != 100);
         self.intensity_label
             .set_label(&format!("{}%", snap.intensity_pct));
         self.zone_meter.set_power(snap.readings.power_watts);
@@ -971,10 +1027,11 @@ impl PlayerPage {
             self.workout_progress
                 .set_fraction(snap.elapsed_secs as f64 / total as f64);
         }
+        // Drains: the bar empties as the interval's clock above it runs down.
         let seg_total = snap.segment_elapsed_secs + snap.segment_remaining_secs;
         if seg_total > 0 {
             self.segment_progress
-                .set_fraction(snap.segment_elapsed_secs as f64 / seg_total as f64);
+                .set_fraction(snap.segment_remaining_secs as f64 / seg_total as f64);
         }
 
         // Interval caption: numbered while the workout is active.
@@ -1033,20 +1090,31 @@ impl PlayerPage {
             // whether they are working or resting; the closing seconds of one
             // get it too, on the line that is counting them down.
             self.cue_headline.set_css_classes(if cue.role.is_effort() {
-                &["title-4", "accent"]
+                &["cockpit-cue", "accent"]
             } else {
-                &["title-4"]
+                &["cockpit-cue"]
             });
             self.cue_detail.set_css_classes(if closing {
-                &["caption", "heading", "accent"]
+                &["cockpit-cue-detail", "heading", "accent"]
             } else {
-                &["caption", "dim-label"]
+                &["cockpit-cue-detail", "dim-label"]
             });
 
             self.cue_rendered.set(Some((snap.segment_index, closing)));
         }
 
         self.cue_box.set_visible(true);
+    }
+
+    /// Whether this ride's interval cues have been built yet.
+    ///
+    /// [`load_cues`] fills them from a database read, so a caller that needs
+    /// them present — the offscreen review renders, which have no ride loop to
+    /// wait in — has to be able to ask. Test-only, and gated: a `pub fn` a
+    /// shipped build never calls is a clippy `dead_code` error, not a warning.
+    #[cfg(test)]
+    pub fn has_cues(&self) -> bool {
+        !self.cues.borrow().is_empty()
     }
 
     /// Apply the Preferences → Training toggle, mid-ride if need be.
@@ -1086,7 +1154,27 @@ impl PlayerPage {
     }
 
     /// A centred caption-over-value column for the cockpit metric rows.
-    fn metric_column(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
+    ///
+    /// `unit` goes in the caption and `digits` reserves the value's width,
+    /// because on this page a label that asks for exactly the room its text
+    /// needs moves the whole window. The hero row is `column_homogeneous`, so
+    /// every column is as wide as the widest — one more digit on the power
+    /// number costs *three* columns of width, and at 620 % type that measured
+    /// as a jump in the window's minimum width from 777 px to 951 px at three
+    /// digits and 1128 px at four. The rider sees the cockpit lurch sideways
+    /// the moment they push over 100 W.
+    ///
+    /// So the width is reserved for the widest value the field can hold and
+    /// never changes again, and the unit moves to the caption: " W" is two
+    /// characters of the reservation, which at hero size is about 100 px spent
+    /// on a letter that never changes. `Power (W)` says it once instead.
+    fn metric_column(
+        title: &str,
+        unit: Option<&str>,
+        initial: &str,
+        value_css: &[&str],
+        digits: i32,
+    ) -> (gtk::Box, gtk::Label) {
         let vbox = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
@@ -1096,13 +1184,17 @@ impl PlayerPage {
 
         vbox.append(
             &gtk::Label::builder()
-                .label(title)
+                .label(match unit {
+                    Some(u) => format!("{title} ({u})"),
+                    None => title.to_string(),
+                })
                 .css_classes(["caption", "dim-label"])
                 .build(),
         );
 
         let value_label = gtk::Label::builder()
             .label(initial)
+            .width_chars(digits)
             .css_classes(value_css.to_vec())
             .build();
 

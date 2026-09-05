@@ -36,6 +36,19 @@ const LOOKAHEAD_AHEAD_M: f32 = 2000.0;
 /// Spacing of the distance ticks along the look-ahead chart, in metres.
 const TICK_SPACING_M: f32 = 500.0;
 
+/// Character widths reserved for the cockpit numbers, so the layout stops
+/// depending on the value — see [`RoutePlayerPage::metric_column`].
+///
+/// Power holds a four-digit sprint; the gradient a signed `-12.5`; speed a
+/// descent at `72.4`; the clock a long ride at `120:00`; heart rate and cadence
+/// are clamped at 250; and the climb total four digits of metres.
+const POWER_DIGITS: i32 = 4;
+const GRADIENT_DIGITS: i32 = 5;
+const SPEED_DIGITS: i32 = 4;
+const CLOCK_DIGITS: i32 = 6;
+const RATE_DIGITS: i32 = 3;
+const CLIMB_DIGITS: i32 = 4;
+
 /// Room left under the look-ahead chart for its distance labels, in pixels.
 const AXIS_HEIGHT: f64 = 14.0;
 
@@ -319,11 +332,27 @@ impl RoutePlayerPage {
             .column_spacing(12)
             .column_homogeneous(true)
             .build();
-        let (gradient_box, gradient_label) =
-            Self::metric_column("Gradient", "— %", &["title-1", "numeric"]);
-        let (power_box, power_label) = Self::metric_column("Power", "— W", &["display", "numeric"]);
-        let (speed_box, speed_label) =
-            Self::metric_column("Speed", "— km/h", &["title-1", "numeric"]);
+        let (gradient_box, gradient_label) = Self::metric_column(
+            "Gradient",
+            Some("%"),
+            "—",
+            &["title-1", "numeric"],
+            GRADIENT_DIGITS,
+        );
+        let (power_box, power_label) = Self::metric_column(
+            "Power",
+            Some("W"),
+            "—",
+            &["display", "numeric"],
+            POWER_DIGITS,
+        );
+        let (speed_box, speed_label) = Self::metric_column(
+            "Speed",
+            Some("km/h"),
+            "—",
+            &["title-1", "numeric"],
+            SPEED_DIGITS,
+        );
         hero_grid.attach(&gradient_box, 0, 0, 1, 1);
         hero_grid.attach(&power_box, 1, 0, 1, 1);
         hero_grid.attach(&speed_box, 2, 0, 1, 1);
@@ -345,12 +374,12 @@ impl RoutePlayerPage {
             .visible(false)
             .build();
         let cue_headline = gtk::Label::builder()
-            .css_classes(["title-4"])
+            .css_classes(["cockpit-cue"])
             .justify(gtk::Justification::Center)
             .wrap(true)
             .build();
         let cue_detail = gtk::Label::builder()
-            .css_classes(["caption", "dim-label"])
+            .css_classes(["cockpit-cue-detail", "dim-label"])
             .justify(gtk::Justification::Center)
             .wrap(true)
             .build();
@@ -363,14 +392,34 @@ impl RoutePlayerPage {
             .column_spacing(12)
             .column_homogeneous(true)
             .build();
-        let (hr_box, hr_label) =
-            Self::metric_column("Heart Rate", "— bpm", &["title-2", "numeric"]);
-        let (cadence_box, cadence_label) =
-            Self::metric_column("Cadence", "— rpm", &["title-2", "numeric"]);
-        let (elapsed_box, elapsed_label) =
-            Self::metric_column("Elapsed", "0:00", &["title-2", "numeric"]);
-        let (climb_box, climb_label) =
-            Self::metric_column("Climbed", "— m", &["title-2", "numeric"]);
+        let (hr_box, hr_label) = Self::metric_column(
+            "Heart Rate",
+            Some("bpm"),
+            "—",
+            &["title-2", "numeric"],
+            RATE_DIGITS,
+        );
+        let (cadence_box, cadence_label) = Self::metric_column(
+            "Cadence",
+            Some("rpm"),
+            "—",
+            &["title-2", "numeric"],
+            RATE_DIGITS,
+        );
+        let (elapsed_box, elapsed_label) = Self::metric_column(
+            "Elapsed",
+            None,
+            "0:00",
+            &["title-2", "numeric"],
+            CLOCK_DIGITS,
+        );
+        let (climb_box, climb_label) = Self::metric_column(
+            "Climbed",
+            Some("m"),
+            "—",
+            &["title-2", "numeric"],
+            CLIMB_DIGITS,
+        );
         secondary_grid.attach(&hr_box, 0, 0, 1, 1);
         secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
         secondary_grid.attach(&elapsed_box, 2, 0, 1, 1);
@@ -613,9 +662,9 @@ impl RoutePlayerPage {
         // A climb underway is the one thing here worth colouring, the same way
         // the workout player accents a work interval.
         let classes: &[&str] = if cue.terrain.is_effort() && under_way {
-            &["title-4", "accent"]
+            &["cockpit-cue", "accent"]
         } else {
-            &["title-4"]
+            &["cockpit-cue"]
         };
         self.cue_headline.set_css_classes(classes);
         self.cue_box.set_visible(true);
@@ -753,12 +802,12 @@ impl RoutePlayerPage {
             .set_label(&format!("{total_dist_km:.1} km remaining"));
         self.progress_bar.set_fraction(0.0);
         self.elapsed_label.set_label("0:00");
-        self.power_label.set_label("— W");
-        self.hr_label.set_label("— bpm");
-        self.cadence_label.set_label("— rpm");
-        self.climb_label.set_label("— m");
-        self.gradient_label.set_label("— %");
-        self.speed_label.set_label("— km/h");
+        self.power_label.set_label("—");
+        self.hr_label.set_label("—");
+        self.cadence_label.set_label("—");
+        self.climb_label.set_label("—");
+        self.gradient_label.set_label("—");
+        self.speed_label.set_label("—");
         self.playhead_dist.set(0.0);
         self.pause_btn
             .set_icon_name("media-playback-pause-symbolic");
@@ -1031,29 +1080,28 @@ impl RoutePlayerPage {
             });
 
             // ── Update UI ────────────────────────────────────────────────────
-            page.power_label.set_label(&format!(
-                "{} W",
-                readings
+            // Units are in the captions (see `metric_column`), so a reading is
+            // its digits and nothing else.
+            page.power_label.set_label(
+                &readings
                     .power_watts
                     .map(|w| w.to_string())
-                    .unwrap_or_else(|| "—".into())
-            ));
-            page.hr_label.set_label(&format!(
-                "{} bpm",
-                readings
+                    .unwrap_or_else(|| "—".into()),
+            );
+            page.hr_label.set_label(
+                &readings
                     .heart_rate_bpm
                     .map(|h| h.to_string())
-                    .unwrap_or_else(|| "—".into())
-            ));
-            page.cadence_label.set_label(&format!(
-                "{} rpm",
-                readings
+                    .unwrap_or_else(|| "—".into()),
+            );
+            page.cadence_label.set_label(
+                &readings
                     .cadence_rpm
                     .map(|c| c.to_string())
-                    .unwrap_or_else(|| "—".into())
-            ));
+                    .unwrap_or_else(|| "—".into()),
+            );
             page.climb_label.set_label(&format!(
-                "{:.0} m",
+                "{:.0}",
                 session.borrow().elevation_gain_m().unwrap_or(0.0)
             ));
             let mode_text = if sim {
@@ -1065,9 +1113,9 @@ impl RoutePlayerPage {
                 page.mode_label.set_label(mode_text);
             }
             page.gradient_label
-                .set_label(&format!("{gradient_pct:+.1}%"));
+                .set_label(&format!("{gradient_pct:+.1}"));
             page.speed_label
-                .set_label(&format!("{:.1} km/h", speed_ms * 3.6));
+                .set_label(&format!("{:.1}", speed_ms * 3.6));
 
             let mins = elapsed / 60;
             let secs = elapsed % 60;
@@ -1254,8 +1302,19 @@ impl RoutePlayerPage {
         chart
     }
 
-    /// A centred caption-over-value column, as used on the workout screen.
-    fn metric_column(title: &str, initial: &str, value_css: &[&str]) -> (gtk::Box, gtk::Label) {
+    /// A centred caption-over-value column, as used on the workout screen —
+    /// unit in the caption, width reserved for the widest value the field can
+    /// hold, and for the same reason. See [`super::player::PlayerPage`]'s own
+    /// `metric_column`: these grids are `column_homogeneous`, so a number that
+    /// asks for exactly its own text width makes every column in the row jump
+    /// the moment a digit is added.
+    fn metric_column(
+        title: &str,
+        unit: Option<&str>,
+        initial: &str,
+        value_css: &[&str],
+        digits: i32,
+    ) -> (gtk::Box, gtk::Label) {
         let vbox = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
@@ -1264,12 +1323,16 @@ impl RoutePlayerPage {
             .build();
         vbox.append(
             &gtk::Label::builder()
-                .label(title)
+                .label(match unit {
+                    Some(u) => format!("{title} ({u})"),
+                    None => title.to_string(),
+                })
                 .css_classes(["caption", "dim-label"])
                 .build(),
         );
         let value_label = gtk::Label::builder()
             .label(initial)
+            .width_chars(digits)
             .css_classes(value_css.to_vec())
             .build();
         vbox.append(&value_label);
