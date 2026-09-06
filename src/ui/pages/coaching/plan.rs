@@ -814,7 +814,13 @@ impl PlanCard {
                 move |result| {
                     card_after.set_busy(false);
                     let msg = match result {
-                        Ok(count) => format!("Remaining weeks replanned — {count} sessions"),
+                        // Said out loud: a rider who booked a holiday should see
+                        // the plan respecting it, not just a smaller number.
+                        Ok((count, off)) if off > 0 => format!(
+                            "Remaining weeks replanned — {count} sessions · \
+                             {off} skipped for time off"
+                        ),
+                        Ok((count, _)) => format!("Remaining weeks replanned — {count} sessions"),
                         Err(e) => {
                             tracing::error!("rebuilding the program: {e}");
                             "Could not replan your program — nothing was changed".to_string()
@@ -853,14 +859,25 @@ async fn rebuild_program(
     profile: AthleteProfile,
     library: Vec<Workout>,
     today: NaiveDate,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, usize)> {
     use crate::ai::coach::{
         build_program_revision_prompt, get_suggestion, parse_program_response,
         ProgramRevisionContext,
     };
-    use crate::ai::context::{day_name_to_offset, wellness_snapshots, workouts_as_options};
+    use crate::ai::context::{
+        drop_time_off_days, entry_date, wellness_snapshots, workouts_as_options,
+    };
 
-    let data = super::data::load_program_prompt_data(&pool, today).await?;
+    // Week 1 of the reply is this Monday, and the coach is told so — a
+    // (week, day) answer can only dodge a date if the dates are pinned first.
+    let start = next_monday(today);
+    let weeks_left = state.total_weeks.saturating_sub(state.week).max(1);
+    let data = super::data::load_program_prompt_data(
+        &pool,
+        today,
+        start + CDuration::days(weeks_left as i64 * 7),
+    )
+    .await?;
     let program = db::active_program(&pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("the program ended while it was being replanned"))?;
@@ -913,6 +930,9 @@ async fn rebuild_program(
         .map(|s| format!("{} — {}", s.date.format("%a %-d %b"), s.workout_name))
         .collect();
 
+    let off_days: std::collections::HashSet<NaiveDate> =
+        data.time_off.iter().map(|t| t.date).collect();
+
     let ctx = ProgramRevisionContext {
         athlete: profile,
         ctl: metrics.ctl,
@@ -922,16 +942,16 @@ async fn rebuild_program(
         workout_options: workouts_as_options(&library, &data.icu_workouts),
         training_days,
         current_week: state.week,
-        weeks_remaining: state.total_weeks.saturating_sub(state.week),
+        // The same count the time-off window above was read for: the prompt
+        // clips time off to the weeks it is planning, so a second expression
+        // here could silently load a date the prompt then throws away.
+        weeks_remaining: weeks_left,
         completed: state.completed,
         missed: state.missed_recent.len(),
         recent_missed,
         wellness: wellness_snapshots(&data.wellness),
-        time_off: data
-            .time_off
-            .iter()
-            .map(|t| t.date.format("%Y-%m-%d").to_string())
-            .collect(),
+        start_monday: start,
+        time_off: off_days.iter().copied().collect(),
     };
 
     let reply = get_suggestion(&api_key, &build_program_revision_prompt(&ctx), 2800).await?;
@@ -943,18 +963,14 @@ async fn rebuild_program(
 
     // Resolve names before touching the calendar, so an unusable reply cannot
     // leave the rider with a hole where their plan was.
-    let start = next_monday(today);
-    let mut to_schedule: Vec<(i64, String)> = Vec::new();
+    let mut to_schedule: Vec<(i64, NaiveDate)> = Vec::new();
     for entry in &entries {
-        let date = start
-            + CDuration::days(
-                (entry.week.max(1) as i64 - 1) * 7 + day_name_to_offset(&entry.day) as i64,
-            );
+        let date = entry_date(start, entry);
         match library
             .iter()
             .find(|w| crate::ai::naming::names_match(&w.name, &entry.workout_name))
         {
-            Some(w) => to_schedule.push((w.id, date.format("%Y-%m-%d").to_string())),
+            Some(w) => to_schedule.push((w.id, date)),
             None => tracing::warn!("Workout '{}' not in library — skipped", entry.workout_name),
         }
     }
@@ -963,15 +979,23 @@ async fn rebuild_program(
         "none of the coach's sessions matched a workout in your library"
     );
 
+    // The prompt asks for this; this enforces it.
+    let dropped = drop_time_off_days(&mut to_schedule, &off_days);
+    anyhow::ensure!(
+        !to_schedule.is_empty(),
+        "every session the coach returned fell on a day you are away"
+    );
+
     db::clear_future_sessions(&pool, program_id, start).await?;
     let mut written = 0usize;
     for (workout_id, date) in to_schedule {
+        let date = date.format("%Y-%m-%d").to_string();
         match db::schedule_workout(&pool, workout_id, &date, Some(program_id)).await {
             Ok(_) => written += 1,
             Err(e) => tracing::error!("scheduling {workout_id} on {date}: {e}"),
         }
     }
-    Ok(written)
+    Ok((written, dropped))
 }
 
 /// A short label for how long ago a date was, for the missed-session line.

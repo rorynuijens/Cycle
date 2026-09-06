@@ -3,20 +3,13 @@
 //! Each struct is one page concern, and each loader fetches that concern in a
 //! single pass off the GTK main thread (CLAUDE.md §2.3).
 
-use chrono::{Duration as CDuration, NaiveDate};
+use chrono::NaiveDate;
 use sqlx::SqlitePool;
 
 use crate::data::{db, settings};
 
 /// Days of wellness history sent with a coaching prompt.
 const AI_WELLNESS_DAYS: u32 = 7;
-
-/// How far ahead a program looks for planned time off.
-///
-/// Much further than a daily suggestion needs: a plan being laid out for the
-/// next several months should know about a holiday in week six, which a
-/// fortnight's view would place it straight on top of.
-const PROGRAM_TIME_OFF_LOOKAHEAD_DAYS: i64 = 180;
 
 /// The page's own state: the rider's goals and the last cached suggestion.
 pub struct CoachingData {
@@ -108,11 +101,17 @@ pub struct ProgramPromptData {
 /// Wellness and planned time off are included for the same reason the daily
 /// suggestion sends them: a plan laid over a fortnight the rider is away for
 /// is a plan they will miss.
+///
+/// `through` is the last day the plan will cover. Time off is read to exactly
+/// that day rather than to a fixed horizon: a program can run to 96 weeks, so
+/// any fixed window short enough to be sensible for a four-week plan would
+/// leave the tail of a long one unchecked.
 pub async fn load_program_prompt_data(
     pool: &SqlitePool,
     today: NaiveDate,
+    through: NaiveDate,
 ) -> anyhow::Result<ProgramPromptData> {
-    let lookahead = today + CDuration::days(PROGRAM_TIME_OFF_LOOKAHEAD_DAYS);
+    let lookahead = through.max(today);
     Ok(ProgramPromptData {
         athlete_ctx: settings::coaching_context(pool).await?,
         goals: db::load_goals(pool).await?,

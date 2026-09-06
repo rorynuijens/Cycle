@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::data::{athlete::AthleteProfile, db::AthleteGoal};
 
@@ -50,9 +52,12 @@ pub struct ProgramContext {
     pub training_days: Vec<String>,
     /// None = generate at least 8 weeks.
     pub num_weeks: Option<u32>,
+    /// The Monday week 1 of the reply lands on. Fixed before the request so the
+    /// coach is answering about real dates rather than about an unknown future.
+    pub start_monday: NaiveDate,
     /// Dates the rider has already said they will not be training. A plan laid
     /// over a fortnight they are away for is a plan they will miss.
-    pub time_off: Vec<String>,
+    pub time_off: Vec<NaiveDate>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +65,52 @@ pub struct ProgramEntry {
     pub week: u32,
     pub day: String,
     pub workout_name: String,
+}
+
+/// Planned time off, written in the coordinates the coach answers in.
+///
+/// The reply is `(week, weekday)` pairs, so a bare ISO date is a rule the coach
+/// cannot apply — nothing in the prompt tells it which week 2026-09-20 falls
+/// in, and it would have to guess. Grouping by week against the known start
+/// Monday turns the rule into one it can actually follow. Dates outside the
+/// weeks being planned are dropped rather than listed: a 180-day lookahead
+/// against an eight-week program would otherwise spend most of its lines on
+/// weeks the coach is not being asked about.
+fn time_off_section(start_monday: NaiveDate, dates: &[NaiveDate], weeks: u32) -> String {
+    let mut by_week: BTreeMap<i64, Vec<NaiveDate>> = BTreeMap::new();
+    for date in dates {
+        let offset = (*date - start_monday).num_days();
+        if offset < 0 {
+            continue;
+        }
+        let week = offset / 7 + 1;
+        if week > weeks.max(1) as i64 {
+            continue;
+        }
+        by_week.entry(week).or_default().push(*date);
+    }
+    if by_week.is_empty() {
+        return "  None planned.".to_string();
+    }
+    by_week
+        .into_iter()
+        .map(|(week, mut days)| {
+            days.sort();
+            days.dedup();
+            let names = days
+                .iter()
+                .map(|d| d.format("%A").to_string().to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let iso = days
+                .iter()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  - Week {week}: {names} ({iso})")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn build_program_prompt(ctx: &ProgramContext) -> String {
@@ -106,15 +157,7 @@ pub fn build_program_prompt(ctx: &ProgramContext) -> String {
         None => ("open-ended".to_string(), 8),
     };
 
-    let time_off_text = if ctx.time_off.is_empty() {
-        "  None planned.".to_string()
-    } else {
-        ctx.time_off
-            .iter()
-            .map(|d| format!("  - {d}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let time_off_text = time_off_section(ctx.start_monday, &ctx.time_off, week_count);
 
     format!(
         r#"You are an expert cycling coach building a structured training program.
@@ -130,14 +173,15 @@ GOALS:
 TRAINING SCHEDULE:
 - Training days: {days}
 - Program duration: {duration}
+- Week 1 of your reply is the week beginning Monday {start}.
 
-PLANNED TIME OFF:
+PLANNED TIME OFF — the rider is away or unavailable on these days:
 {time_off}
 
 AVAILABLE WORKOUTS:
 {workouts}
 
-Build a {weeks}-week training program. Apply progressive overload: weeks 1–3 build load, week 4 is a recovery week (lighter workouts), then repeat. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: mix of sweet spot, threshold, VO₂max depending on goals and current fitness). Do not schedule anything on a planned day off.
+Build a {weeks}-week training program. Apply progressive overload: weeks 1–3 build load, week 4 is a recovery week (lighter workouts), then repeat. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: mix of sweet spot, threshold, VO₂max depending on goals and current fitness).
 
 Return ONLY a JSON array — no text before or after it — in exactly this format:
 [
@@ -148,6 +192,7 @@ Return ONLY a JSON array — no text before or after it — in exactly this form
 Rules:
 - Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
 - Use only the days listed in TRAINING SCHEDULE.
+- Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
 - Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday."#,
         context_section = context_section,
         ftp = ctx.athlete.ftp_watts,
@@ -158,6 +203,7 @@ Rules:
         goals = goals_text,
         days = days_str,
         duration = duration_str,
+        start = ctx.start_monday.format("%-d %B %Y"),
         time_off = time_off_text,
         workouts = workout_list,
         weeks = week_count,
@@ -191,8 +237,10 @@ pub struct ProgramRevisionContext {
     /// The most recently missed sessions, newest first: "Wed 5 Aug — Threshold".
     pub recent_missed: Vec<String>,
     pub wellness: Vec<WellnessSnapshot>,
+    /// The Monday week 1 of the reply lands on — the week after the current one.
+    pub start_monday: NaiveDate,
     /// Dates the rider has already said they will not be training.
-    pub time_off: Vec<String>,
+    pub time_off: Vec<NaiveDate>,
 }
 
 /// Ask the coach to replan the remainder of a program.
@@ -259,15 +307,8 @@ pub fn build_program_revision_prompt(ctx: &ProgramRevisionContext) -> String {
             .join("\n")
     };
 
-    let time_off_text = if ctx.time_off.is_empty() {
-        "  None planned.".to_string()
-    } else {
-        ctx.time_off
-            .iter()
-            .map(|d| format!("  - {d}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let time_off_text =
+        time_off_section(ctx.start_monday, &ctx.time_off, ctx.weeks_remaining.max(1));
 
     format!(
         r#"You are an expert cycling coach revising a training program already under way.
@@ -291,7 +332,7 @@ RECENTLY MISSED SESSIONS:
 RECENT WELLNESS:
 {wellness}
 
-PLANNED TIME OFF:
+PLANNED TIME OFF — the rider is away or unavailable on these days:
 {time_off}
 
 TRAINING SCHEDULE:
@@ -300,13 +341,12 @@ TRAINING SCHEDULE:
 AVAILABLE WORKOUTS:
 {workouts}
 
-Replan the next {weeks} weeks, starting from next week. Week 1 of your reply is next week.
+Replan the next {weeks} weeks, starting from next week. Week 1 of your reply is the week beginning Monday {start}.
 
 Take the rider's actual training into account rather than the plan they were given:
 - Missed sessions are gone. Do NOT try to make up lost work by adding volume or intensity.
 - If form (TSB) is very negative, or wellness is trending badly, start easier and rebuild.
 - If the rider has been consistent and form is good, progress normally.
-- Do not schedule anything on a planned day off.
 - Keep applying progressive overload with a lighter recovery week every fourth week.
 
 Return ONLY a JSON array — no text before or after it — in exactly this format:
@@ -318,6 +358,7 @@ Return ONLY a JSON array — no text before or after it — in exactly this form
 Rules:
 - Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
 - Use only the days listed in TRAINING SCHEDULE.
+- Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
 - Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday."#,
         context_section = context_section,
         ftp = ctx.athlete.ftp_watts,
@@ -331,6 +372,7 @@ Rules:
         missed_list = missed_text,
         wellness = wellness_text,
         time_off = time_off_text,
+        start = ctx.start_monday.format("%-d %B %Y"),
         days = ctx.training_days.join(", "),
         workouts = workout_list,
         weeks = ctx.weeks_remaining.max(1),
@@ -568,6 +610,15 @@ mod tests {
 
     // ── build_program_prompt ─────────────────────────────────────────────────────
 
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
+    }
+
+    /// Monday 7 September 2026 — week 1 of every program built in these tests.
+    fn start() -> NaiveDate {
+        date(2026, 9, 7)
+    }
+
     fn program_ctx(num_weeks: Option<u32>) -> ProgramContext {
         ProgramContext {
             athlete: AthleteProfile::default(),
@@ -578,6 +629,7 @@ mod tests {
             workout_options: vec![workout("Sweet Spot 2x20")],
             training_days: vec!["monday".into(), "wednesday".into()],
             num_weeks,
+            start_monday: start(),
             time_off: Vec::new(),
         }
     }
@@ -602,5 +654,83 @@ mod tests {
         assert!(prompt.contains("Ride a century"));
         assert!(prompt.contains("Sweet Spot 2x20"));
         assert!(prompt.contains("monday, wednesday"));
+    }
+
+    // ── time_off_section ─────────────────────────────────────────────────────
+
+    #[test]
+    fn should_say_none_planned_when_the_rider_is_never_away() {
+        assert_eq!(time_off_section(start(), &[], 8), "  None planned.");
+    }
+
+    #[test]
+    fn should_place_a_day_off_in_the_week_the_coach_will_number_it() {
+        // Thursday 17 Sep is 10 days after Monday 7 Sep, so week 2.
+        let text = time_off_section(start(), &[date(2026, 9, 17)], 8);
+        assert_eq!(text, "  - Week 2: thursday (2026-09-17)");
+    }
+
+    #[test]
+    fn should_group_a_holiday_by_week_rather_than_listing_bare_dates() {
+        let away: Vec<NaiveDate> = (14..=20).map(|d| date(2026, 9, d)).collect();
+        let text = time_off_section(start(), &away, 8);
+        // The whole of week 2, named the way the reply names days.
+        assert!(text.contains(
+            "- Week 2: monday, tuesday, wednesday, thursday, friday, \
+                               saturday, sunday"
+        ));
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    #[test]
+    fn should_split_a_holiday_that_straddles_two_weeks() {
+        let away = vec![date(2026, 9, 12), date(2026, 9, 13), date(2026, 9, 14)];
+        let text = time_off_section(start(), &away, 8);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("  - Week 1: saturday, sunday"));
+        assert!(lines[1].starts_with("  - Week 2: monday"));
+    }
+
+    #[test]
+    fn should_drop_time_off_before_the_program_starts() {
+        // Already behind the rider — the plan is not being laid over it.
+        assert_eq!(
+            time_off_section(start(), &[date(2026, 9, 6)], 8),
+            "  None planned."
+        );
+    }
+
+    #[test]
+    fn should_drop_time_off_beyond_the_weeks_being_planned() {
+        // The lookahead runs 180 days; a 4-week program is not being asked
+        // about week 12, and listing it would bury the weeks that matter.
+        let text = time_off_section(start(), &[date(2026, 11, 26)], 4);
+        assert_eq!(text, "  None planned.");
+    }
+
+    #[test]
+    fn should_keep_time_off_in_the_final_week_of_the_program() {
+        // Boundary: week 4 of a 4-week plan is still being planned.
+        // Mon 28 Sep is 21 days after the start — the first day of week 4.
+        let text = time_off_section(start(), &[date(2026, 9, 28)], 4);
+        assert_eq!(text, "  - Week 4: monday (2026-09-28)");
+    }
+
+    #[test]
+    fn program_prompt_pins_the_week_the_coach_is_planning_from() {
+        let prompt = build_program_prompt(&program_ctx(Some(4)));
+        assert!(
+            prompt.contains("Week 1 of your reply is the week beginning Monday 7 September 2026")
+        );
+    }
+
+    #[test]
+    fn program_prompt_states_time_off_in_week_and_day_not_iso_dates() {
+        let mut ctx = program_ctx(Some(4));
+        ctx.time_off = vec![date(2026, 9, 16)];
+        let prompt = build_program_prompt(&ctx);
+        assert!(prompt.contains("Week 2: wednesday"));
+        assert!(prompt.contains("Never return a (week, day) pair listed under PLANNED TIME OFF"));
     }
 }

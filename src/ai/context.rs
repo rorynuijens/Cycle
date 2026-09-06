@@ -5,7 +5,8 @@
 //! plain data in, plain data out — no GTK (CLAUDE.md §2.6) — so the rules about
 //! what the coach is told (and what it is not) can be tested directly.
 
-use chrono::Local;
+use chrono::{Duration as CDuration, Local, NaiveDate};
+use std::collections::HashSet;
 
 use crate::ai::coach::{ProgramEntry, RecentSession, WellnessSnapshot, WorkoutOption};
 use crate::data::db::{IntervalsActivity, IntervalsWorkout, SessionSummary, WellnessEntry};
@@ -180,6 +181,36 @@ pub fn day_name_to_offset(day: &str) -> u32 {
     }
 }
 
+/// The calendar date a coach's `(week, day)` entry falls on.
+///
+/// Weeks are 1-based in the reply, so week 1 is the starting week.
+pub fn entry_date(start_monday: NaiveDate, entry: &ProgramEntry) -> NaiveDate {
+    let weeks = (entry.week.max(1) as i64 - 1) * 7;
+    start_monday + CDuration::days(weeks + day_name_to_offset(&entry.day) as i64)
+}
+
+/// Drop the planned sessions that landed on a day the rider is away, returning
+/// how many went.
+///
+/// The prompt asks the coach to avoid these days, but a prompt is a request and
+/// not a guarantee — and the rider can book time off between building a plan
+/// and putting it on the calendar. This is the check that actually holds. It
+/// works from resolved dates rather than from `(week, day)` pairs, so it stays
+/// correct even when a plan is scheduled from a different start Monday than the
+/// one it was built for.
+pub fn drop_time_off_days(
+    planned: &mut Vec<(i64, NaiveDate)>,
+    time_off: &HashSet<NaiveDate>,
+) -> usize {
+    let before = planned.len();
+    planned.retain(|(_, date)| !time_off.contains(date));
+    let dropped = before - planned.len();
+    if dropped > 0 {
+        tracing::info!("{dropped} planned session(s) fell on time off — not scheduled");
+    }
+    dropped
+}
+
 /// Split a numbered analysis reply into `(heading, body)` sections.
 ///
 /// The models reliably answer in a numbered list ("1. **Training Load**: …"),
@@ -332,6 +363,84 @@ mod tests {
         let opts = workouts_as_options(&[], &[icu_workout("Untimed", None, None)]);
         assert_eq!(opts[0].duration_mins, 60);
         assert_eq!(opts[0].tss, 0.0);
+    }
+
+    // ── entry_date / drop_time_off_days ──────────────────────────────────────
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
+    }
+
+    fn planned(week: u32, name: &str) -> ProgramEntry {
+        ProgramEntry {
+            week,
+            day: name.into(),
+            workout_name: "Sweet Spot".into(),
+        }
+    }
+
+    #[test]
+    fn should_put_week_one_monday_on_the_starting_monday() {
+        let monday = day(2026, 9, 7);
+        assert_eq!(entry_date(monday, &planned(1, "monday")), monday);
+    }
+
+    #[test]
+    fn should_count_whole_weeks_forward_from_the_start() {
+        // Week 3 thursday: two weeks on, then three days.
+        assert_eq!(
+            entry_date(day(2026, 9, 7), &planned(3, "thursday")),
+            day(2026, 9, 24)
+        );
+    }
+
+    #[test]
+    fn should_treat_week_zero_as_the_first_week() {
+        // The reply is 1-based; a model that answers 0 must not plan a session
+        // into the week before the program starts.
+        assert_eq!(
+            entry_date(day(2026, 9, 7), &planned(0, "monday")),
+            day(2026, 9, 7)
+        );
+    }
+
+    #[test]
+    fn should_drop_a_session_that_landed_on_a_day_off() {
+        let mut plan = vec![
+            (1, day(2026, 9, 7)),
+            (2, day(2026, 9, 9)),
+            (3, day(2026, 9, 11)),
+        ];
+        let off = HashSet::from([day(2026, 9, 9)]);
+        assert_eq!(drop_time_off_days(&mut plan, &off), 1);
+        assert_eq!(plan, vec![(1, day(2026, 9, 7)), (3, day(2026, 9, 11))]);
+    }
+
+    #[test]
+    fn should_keep_every_session_when_no_time_off_is_booked() {
+        let mut plan = vec![(1, day(2026, 9, 7)), (2, day(2026, 9, 9))];
+        assert_eq!(drop_time_off_days(&mut plan, &HashSet::new()), 0);
+        assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn should_drop_every_session_of_a_week_the_rider_is_away_for() {
+        // Two sessions on one day off both go — the filter is per session,
+        // not per date.
+        let mut plan = vec![(1, day(2026, 9, 9)), (2, day(2026, 9, 9))];
+        assert_eq!(
+            drop_time_off_days(&mut plan, &HashSet::from([day(2026, 9, 9)])),
+            2
+        );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn should_ignore_time_off_that_no_session_landed_on() {
+        let mut plan = vec![(1, day(2026, 9, 7))];
+        let off = HashSet::from([day(2026, 12, 25)]);
+        assert_eq!(drop_time_off_days(&mut plan, &off), 0);
+        assert_eq!(plan.len(), 1);
     }
 
     // ── day_name_to_offset ───────────────────────────────────────────────────

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::ai::coach::{
     build_program_prompt, get_suggestion, parse_program_response, ProgramContext, ProgramEntry,
 };
-use crate::ai::context::{day_name_to_offset, format_program, workouts_as_options};
+use crate::ai::context::{drop_time_off_days, entry_date, format_program, workouts_as_options};
 use crate::data::{athlete::AthleteProfile, db, keystore, workout::Workout};
 use crate::training::fitness::compute_load_metrics;
 use crate::ui::markdown::to_pango;
@@ -46,14 +46,6 @@ pub(super) fn week_start(date: NaiveDate) -> NaiveDate {
     date - CDuration::days(date.weekday().num_days_from_monday() as i64)
 }
 
-/// The calendar date an entry falls on, counting whole weeks from the start.
-///
-/// Weeks are 1-based in the coach's reply, so week 1 is the starting week.
-fn entry_date(start_monday: NaiveDate, entry: &ProgramEntry) -> NaiveDate {
-    let weeks = (entry.week.max(1) as i64 - 1) * 7;
-    start_monday + CDuration::days(weeks + day_name_to_offset(&entry.day) as i64)
-}
-
 pub struct ProgramSection {
     root: gtk::Box,
     output: gtk::Label,
@@ -63,6 +55,10 @@ pub struct ProgramSection {
     months_row: adw::SpinRow,
     open_ended_row: adw::SwitchRow,
     entries: Rc<RefCell<Vec<ProgramEntry>>>,
+    /// The Monday the coach was told week 1 would land on. The schedule dialog
+    /// offers it back rather than defaulting to today, so a plan built around a
+    /// holiday in week six is scheduled onto the weeks it was planned for.
+    plan_start: Rc<RefCell<Option<NaiveDate>>>,
     workouts: Rc<Vec<Workout>>,
 }
 
@@ -200,6 +196,7 @@ impl ProgramSection {
             months_row,
             open_ended_row,
             entries: Rc::new(RefCell::new(Vec::new())),
+            plan_start: Rc::new(RefCell::new(None)),
             workouts,
         };
 
@@ -270,6 +267,16 @@ impl ProgramSection {
             }
             let num_weeks = section.requested_weeks();
 
+            // Fixed here, before the request, rather than at scheduling time.
+            // The coach answers in (week, day) pairs, so it can only be told to
+            // avoid a date if the calendar those weeks land on is already
+            // decided — see the PLANNED TIME OFF block in the prompt.
+            let start_monday = week_start(Local::now().date_naive());
+            *section.plan_start.borrow_mut() = Some(start_monday);
+            // The last day the plan can reach, so time off is read that far.
+            let through =
+                start_monday + CDuration::days(num_weeks.unwrap_or(OPEN_ENDED_WEEKS) as i64 * 7);
+
             // Read the !Send shared state on the main thread before spawning.
             let profile = athlete.borrow().clone();
             let ftp_watts = profile.ftp_watts;
@@ -298,7 +305,7 @@ impl ProgramSection {
                     icu_workouts,
                     wellness: _,
                     time_off,
-                } = match load_program_prompt_data(&pool_task, today).await {
+                } = match load_program_prompt_data(&pool_task, today, through).await {
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Could not read training history to plan: {e}");
@@ -317,10 +324,8 @@ impl ProgramSection {
                     workout_options: workouts_as_options(&library, &icu_workouts),
                     training_days,
                     num_weeks,
-                    time_off: time_off
-                        .iter()
-                        .map(|t| t.date.format("%Y-%m-%d").to_string())
-                        .collect(),
+                    start_monday,
+                    time_off: time_off.iter().map(|t| t.date).collect(),
                 };
 
                 let result = get_suggestion(&api_key, &build_program_prompt(&ctx), 2800)
@@ -371,6 +376,7 @@ impl ProgramSection {
         on_toast: Rc<dyn Fn(adw::Toast)>,
     ) {
         let entries = Rc::clone(&self.entries);
+        let plan_start = Rc::clone(&self.plan_start);
         let workouts = Rc::clone(&self.workouts);
 
         let days = self.day_toggles.clone();
@@ -380,6 +386,11 @@ impl ProgramSection {
             if entries.is_empty() {
                 return;
             }
+            // The week the coach planned around. It is always set by the time
+            // this button is visible; today's week is only a floor to stand on.
+            let planned_start = plan_start
+                .borrow()
+                .unwrap_or_else(|| week_start(Local::now().date_naive()));
 
             // Whether a program is already being followed decides what this
             // dialog has to say, so it is read before the dialog is built —
@@ -421,19 +432,25 @@ impl ProgramSection {
                         }
                     };
 
+                    // Naming the planned week matters: the coach placed its
+                    // rest days against *these* dates, so a different start
+                    // slides every week onto a different part of the calendar.
+                    let planned = format!(
+                        "This program was built for the week beginning {}. Starting it \
+                         elsewhere shifts every week; planned time off is re-checked \
+                         against wherever it lands.",
+                        planned_start.format("%-d %B %Y")
+                    );
                     let body = match &existing {
-                        Some(_) => {
-                            "Choose a start date. The program begins on the Monday of that \
-                             week.\n\nYou are already following a program. Its remaining \
+                        Some(_) => format!(
+                            "{planned}\n\nYou are already following a program. Its remaining \
                              sessions will be replaced by this one; rides you have already \
                              done are kept."
-                        }
-                        None => {
-                            "Choose a start date. The program begins on the Monday of that week."
-                        }
+                        ),
+                        None => planned,
                     };
 
-                    let dialog = adw::AlertDialog::new(Some("Schedule Program"), Some(body));
+                    let dialog = adw::AlertDialog::new(Some("Schedule Program"), Some(&body));
                     dialog.add_response("cancel", "Cancel");
                     dialog.add_response(
                         "schedule",
@@ -449,7 +466,7 @@ impl ProgramSection {
 
                     let date_entry = adw::EntryRow::builder()
                         .title("Start date (YYYY-MM-DD)")
-                        .text(Local::now().date_naive().format("%Y-%m-%d").to_string())
+                        .text(planned_start.format("%Y-%m-%d").to_string())
                         .input_hints(gtk::InputHints::NO_EMOJI)
                         .build();
                     let date_list = gtk::ListBox::builder()
@@ -505,12 +522,10 @@ impl ProgramSection {
                 // Entries resolve to workout ids here, on the main thread, since
                 // the library is held behind a non-Send Rc. The writes then run
                 // on the tokio runtime over owned data.
-                let mut to_schedule: Vec<(i64, String)> = Vec::new();
+                let mut to_schedule: Vec<(i64, NaiveDate)> = Vec::new();
                 let mut skipped = 0u32;
                 for entry in &entries {
-                    let date = entry_date(start_monday, entry)
-                        .format("%Y-%m-%d")
-                        .to_string();
+                    let date = entry_date(start_monday, entry);
                     // Intervals.icu workouts carry no segments, so they can be
                     // planned but not scheduled; they count as skipped.
                     match workouts
@@ -528,6 +543,17 @@ impl ProgramSection {
                     }
                 }
 
+                // The span the plan actually covers, for the time-off lookup.
+                let span = to_schedule.iter().map(|(_, d)| *d).fold(
+                    None::<(NaiveDate, NaiveDate)>,
+                    |acc, d| {
+                        Some(match acc {
+                            None => (d, d),
+                            Some((lo, hi)) => (lo.min(d), hi.max(d)),
+                        })
+                    },
+                );
+
                 // The program spans as many weeks as the coach actually
                 // returned, which is what the rider will be held to — not the
                 // number that was asked for.
@@ -539,6 +565,39 @@ impl ProgramSection {
                 crate::ui::spawn_to_main(
                     &rt_handle,
                     async move {
+                        // Re-read rather than reusing what the prompt was built
+                        // from: the rider may have booked time off since, and
+                        // may have moved the start date in the dialog above.
+                        // A failure here is not worth abandoning the plan for —
+                        // the cost is a session on a day off, which the rider
+                        // can delete.
+                        let mut off_days = 0usize;
+                        if let Some((first, last)) = span {
+                            match db::load_time_off_between(
+                                &pool,
+                                &first.format("%Y-%m-%d").to_string(),
+                                &last.format("%Y-%m-%d").to_string(),
+                            )
+                            .await
+                            {
+                                Ok(entries) => {
+                                    let off = entries.into_iter().map(|t| t.date).collect();
+                                    off_days = drop_time_off_days(&mut to_schedule, &off);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("could not read planned time off: {e}")
+                                }
+                            }
+                        }
+
+                        // A rider away for the whole block would otherwise have
+                        // their current program retired and replaced by an empty
+                        // one. Nothing has been written yet, so nothing is lost
+                        // by stopping here.
+                        if to_schedule.is_empty() {
+                            return Ok((0, 0, off_days));
+                        }
+
                         // Retiring the old plan first means a failure here
                         // leaves the rider following one program, not two.
                         if let Some(old) = replacing {
@@ -572,6 +631,7 @@ impl ProgramSection {
                         let mut scheduled = 0u32;
                         let mut failed = 0u32;
                         for (id, date) in to_schedule {
+                            let date = date.format("%Y-%m-%d").to_string();
                             match db::schedule_workout(&pool, id, &date, Some(program_id)).await {
                                 Ok(_) => scheduled += 1,
                                 Err(e) => {
@@ -580,17 +640,29 @@ impl ProgramSection {
                                 }
                             }
                         }
-                        Ok((scheduled, failed))
+                        Ok((scheduled, failed, off_days))
                     },
                     move |result| {
                         let msg = match result {
-                            Ok((scheduled, failed)) => {
+                            // A whole block on time off is not a failure, and
+                            // must not read like one.
+                            Ok((0, _, off_days)) if off_days > 0 => {
+                                "Nothing scheduled — every session fell on your planned time off"
+                                    .to_string()
+                            }
+                            Ok((scheduled, failed, off_days)) => {
                                 let missed = failed + skipped;
-                                if missed == 0 {
-                                    format!("{scheduled} workouts added to calendar")
-                                } else {
-                                    format!("{scheduled} added, {missed} skipped")
+                                // Counted apart from the rest: a session left
+                                // off because the rider is away is the plan
+                                // working, not the plan failing.
+                                let mut msg = format!("{scheduled} workouts added to calendar");
+                                if missed > 0 {
+                                    msg.push_str(&format!(" · {missed} skipped"));
                                 }
+                                if off_days > 0 {
+                                    msg.push_str(&format!(" · {off_days} skipped for time off"));
+                                }
+                                msg
                             }
                             Err(()) => {
                                 "Could not save the program — nothing was scheduled".to_string()
@@ -614,6 +686,7 @@ impl ProgramSection {
             months_row: self.months_row.clone(),
             open_ended_row: self.open_ended_row.clone(),
             entries: Rc::clone(&self.entries),
+            plan_start: Rc::clone(&self.plan_start),
             workouts: Rc::clone(&self.workouts),
         }
     }
@@ -622,6 +695,7 @@ impl ProgramSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::context::day_name_to_offset;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
