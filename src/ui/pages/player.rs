@@ -1284,8 +1284,23 @@ pub fn attach_overlay(
 
                     // The app cannot pin its own window, so the first time the
                     // rider opens this, explain who can.
+                    //
+                    // Presented on the *main* window, not the overlay: the
+                    // overlay is 420 px wide, and an explanation squeezed into
+                    // that is one the rider dismisses rather than reads. The
+                    // main window is behind it and roomy. Falls back to the
+                    // overlay if the main window has gone.
                     if !saved.hint_seen {
-                        crate::ui::overlay::pin_help_dialog().present(Some(overlay.window()));
+                        let this = overlay.window().upcast_ref::<gtk::Widget>().clone();
+                        let host = app
+                            .windows()
+                            .into_iter()
+                            .find(|w| w.is_visible() && w.upcast_ref::<gtk::Widget>() != &this);
+                        match host {
+                            Some(w) => crate::ui::overlay::pin_help_dialog().present(Some(&w)),
+                            None => crate::ui::overlay::pin_help_dialog()
+                                .present(Some(overlay.window())),
+                        }
                         crate::ui::spawn_write(
                             &rt_build,
                             &pool_build,

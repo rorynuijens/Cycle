@@ -60,14 +60,14 @@ window.ride-overlay {
     background-color: transparent;
 }
 .ride-overlay-body {
-    background-color: alpha(@window_bg_color, 0.92);
+    background-color: alpha(@window_bg_color, 0.78);
     border-radius: 12px;
 }
 .ride-overlay-body.semi {
-    background-color: alpha(@window_bg_color, 0.72);
+    background-color: alpha(@window_bg_color, 0.54);
 }
 .ride-overlay-body.faint {
-    background-color: alpha(@window_bg_color, 0.48);
+    background-color: alpha(@window_bg_color, 0.28);
 }
 ";
 
