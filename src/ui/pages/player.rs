@@ -7,6 +7,7 @@ use std::time::Duration;
 type StartNowCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
+use crate::data::settings;
 use crate::data::{
     athlete::AthleteProfile,
     session::{LiveReadings, ReadingsTracker, Session},
@@ -14,6 +15,8 @@ use crate::data::{
 };
 use crate::training::cues::{SegmentCue, CLOSING_SECS};
 use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT};
+use crate::ui::overlay::RideOverlay;
+use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
 use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
@@ -24,17 +27,6 @@ use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 /// is legible at a glance, small enough that it can never be what the page is
 /// mostly made of. Spare height goes to the numbers instead.
 const GRAPH_FLOOR_PX: i32 = 180;
-
-/// Character widths reserved for the cockpit numbers, so the layout stops
-/// depending on the value — see [`PlayerPage::metric_column`].
-///
-/// Power is four because a sprint reads four digits and the trainer is trusted
-/// no further (CLAUDE.md §5.1 clamps it well below 10 000 W); a clock is six
-/// because a long ride passes `120:00`; heart rate and cadence are three
-/// because both are clamped at 250.
-const POWER_DIGITS: i32 = 4;
-const CLOCK_DIGITS: i32 = 6;
-const RATE_DIGITS: i32 = 3;
 
 pub struct PlayerPage {
     root: gtk::Box,
@@ -53,6 +45,12 @@ pub struct PlayerPage {
     interval_caption: gtk::Label,
     /// Live power-zone ribbon under the hero power number.
     zone_meter: ZoneMeter,
+    /// The compact window the rider can pin over a film, while it is open.
+    /// `None` whenever it is closed, which is the usual case.
+    overlay: Rc<RefCell<Option<RideOverlay>>>,
+    /// Fires when the overlay button is pressed; installed by `start_timer`,
+    /// which is where the ride being overlaid is known.
+    overlay_cb: ButtonCb,
     /// Shown during the pre-start countdown — hides once the engine starts.
     countdown_banner: adw::Banner,
     /// Raised mid-ride when a sensor stops reporting. A dropout used to show up
@@ -209,7 +207,7 @@ impl PlayerPage {
             .valign(gtk::Align::Center)
             .build();
 
-        let (target_box, target_label) = Self::metric_column(
+        let (target_box, target_label) = metric_column(
             "Target",
             Some("W"),
             "—",
@@ -227,7 +225,7 @@ impl PlayerPage {
         target_box.append(&target_intensity);
         hero_grid.attach(&target_box, 0, 0, 1, 1);
 
-        let (power_box, power_label) = Self::metric_column(
+        let (power_box, power_label) = metric_column(
             "Power",
             Some("W"),
             "—",
@@ -299,28 +297,28 @@ impl PlayerPage {
             .vexpand(true)
             .valign(gtk::Align::Center)
             .build();
-        let (hr_box, hr_label) = Self::metric_column(
+        let (hr_box, hr_label) = metric_column(
             "Heart Rate",
             Some("bpm"),
             "—",
             &["cockpit-metric", "numeric"],
             RATE_DIGITS,
         );
-        let (cadence_box, cadence_label) = Self::metric_column(
+        let (cadence_box, cadence_label) = metric_column(
             "Cadence",
             Some("rpm"),
             "—",
             &["cockpit-metric", "numeric"],
             RATE_DIGITS,
         );
-        let (elapsed_box, elapsed_label) = Self::metric_column(
+        let (elapsed_box, elapsed_label) = metric_column(
             "Elapsed",
             None,
             "0:00",
             &["cockpit-metric", "numeric"],
             CLOCK_DIGITS,
         );
-        let (remaining_box, remaining_label) = Self::metric_column(
+        let (remaining_box, remaining_label) = metric_column(
             "Remaining",
             None,
             &WorkoutEngine::format_duration(workout.duration_secs),
@@ -467,11 +465,22 @@ impl PlayerPage {
             .action_name("win.toggle-fullscreen")
             .build();
 
+        // Opens the compact window that can be pinned over a film. Its own
+        // header explains the pinning, which this app is not allowed to do
+        // itself — see `crate::ui::overlay`.
+        let overlay_btn = gtk::Button::builder()
+            .icon_name("view-restore-symbolic")
+            .tooltip_text("Open the compact overlay window")
+            .css_classes(["circular", "flat"])
+            .action_name("win.toggle-overlay")
+            .build();
+
         controls.append(&cancel_btn);
         controls.append(&pause_btn);
         controls.append(&skip_btn);
         controls.append(&intensity_box);
         controls.append(&controls_spacer);
+        controls.append(&overlay_btn);
         controls.append(&fullscreen_btn);
         controls.append(&end_btn);
         inner.append(&controls);
@@ -488,6 +497,7 @@ impl PlayerPage {
         let cancel_cb: ButtonCb = Rc::new(RefCell::new(None));
         let intensity_down_cb: ButtonCb = Rc::new(RefCell::new(None));
         let intensity_up_cb: ButtonCb = Rc::new(RefCell::new(None));
+        let overlay_cb: ButtonCb = Rc::new(RefCell::new(None));
 
         {
             let cb = Rc::clone(&end_cb);
@@ -570,6 +580,8 @@ impl PlayerPage {
             power_countdown: Rc::new(Cell::new(0)),
             start_now_cb,
             cancel_btn,
+            overlay: Rc::new(RefCell::new(None)),
+            overlay_cb,
             end_cb,
             pause_cb,
             skip_cb,
@@ -914,6 +926,7 @@ impl PlayerPage {
 
         glib::timeout_add_local(Duration::from_secs(1), move || {
             if !timer_alive_in_timer.get() {
+                page_clone.borrow().close_overlay();
                 return glib::ControlFlow::Break;
             }
             // Only sensors still transmitting contribute — a strap that has gone
@@ -968,11 +981,18 @@ impl PlayerPage {
             p.update_session_totals(&session, ftp);
             p.graph.set_playhead(snapshot.elapsed_secs);
             p.graph.push_power(snapshot.readings.power_watts);
+            // The overlay rides this tick rather than one of its own, so the two
+            // windows can never show different seconds of the same ride.
+            if let Some(overlay) = p.overlay.borrow().as_ref() {
+                overlay.update(&snapshot, &stale);
+            }
             drop(p);
 
             if snapshot.state == EngineState::Completed {
                 if !completed_timer.get() {
                     completed_timer.set(true);
+                    // The ride is over, so the overlay has nothing left to say.
+                    page_clone.borrow().close_overlay();
                     on_complete_timer(session);
                 }
                 return glib::ControlFlow::Break;
@@ -980,6 +1000,33 @@ impl PlayerPage {
 
             glib::ControlFlow::Continue
         });
+    }
+
+    /// Open the compact overlay, or close it if it is already open.
+    ///
+    /// The work of building it lives in the callback `attach_overlay` installs,
+    /// which is the only place that knows the database and the application.
+    pub fn toggle_overlay(&self) {
+        let is_open = self.overlay.borrow().is_some();
+        if is_open {
+            self.close_overlay();
+            return;
+        }
+        if let Some(open) = self.overlay_cb.borrow().as_ref() {
+            open();
+        }
+    }
+
+    /// Close the overlay if it is open, and forget it.
+    ///
+    /// The overlay is taken out of its cell *before* the window is closed:
+    /// closing fires the close handler, which clears the same cell, and holding
+    /// the borrow across that would panic (CLAUDE.md §2.4).
+    pub fn close_overlay(&self) {
+        let overlay = self.overlay.borrow_mut().take();
+        if let Some(overlay) = overlay {
+            overlay.close();
+        }
     }
 
     pub fn update_from_snapshot(&self, snap: &EngineSnapshot) {
@@ -1152,55 +1199,6 @@ impl PlayerPage {
         let kj = session.kilojoules();
         self.kj_total.set_label(&format!("{:.0} kJ", kj));
     }
-
-    /// A centred caption-over-value column for the cockpit metric rows.
-    ///
-    /// `unit` goes in the caption and `digits` reserves the value's width,
-    /// because on this page a label that asks for exactly the room its text
-    /// needs moves the whole window. The hero row is `column_homogeneous`, so
-    /// every column is as wide as the widest — one more digit on the power
-    /// number costs *three* columns of width, and at 620 % type that measured
-    /// as a jump in the window's minimum width from 777 px to 951 px at three
-    /// digits and 1128 px at four. The rider sees the cockpit lurch sideways
-    /// the moment they push over 100 W.
-    ///
-    /// So the width is reserved for the widest value the field can hold and
-    /// never changes again, and the unit moves to the caption: " W" is two
-    /// characters of the reservation, which at hero size is about 100 px spent
-    /// on a letter that never changes. `Power (W)` says it once instead.
-    fn metric_column(
-        title: &str,
-        unit: Option<&str>,
-        initial: &str,
-        value_css: &[&str],
-        digits: i32,
-    ) -> (gtk::Box, gtk::Label) {
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::End)
-            .build();
-
-        vbox.append(
-            &gtk::Label::builder()
-                .label(match unit {
-                    Some(u) => format!("{title} ({u})"),
-                    None => title.to_string(),
-                })
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
-
-        let value_label = gtk::Label::builder()
-            .label(initial)
-            .width_chars(digits)
-            .css_classes(value_css.to_vec())
-            .build();
-
-        vbox.append(&value_label);
-        (vbox, value_label)
-    }
 }
 
 /// Build this workout's interval cues and hand them to the player.
@@ -1213,6 +1211,97 @@ impl PlayerPage {
 ///
 /// A failed read is logged and the structural cues are built anyway. Cues are an
 /// extra, and losing the history line is not worth interrupting a ride over.
+/// Wire the player's overlay button to whatever ride the engine is holding.
+///
+/// Installed once at build time rather than per ride: the engine outlives every
+/// individual workout, so reading the workout, FTP and session out of it at
+/// click time keeps the overlay right across `reset_with_workout` without this
+/// needing to be re-installed.
+///
+/// The closure is stored *inside* the page, so it must not hold anything that
+/// owns the page (CLAUDE.md §2.4) — hence the weak application reference, and
+/// the cloned overlay cell rather than the page itself.
+pub fn attach_overlay(
+    page: &Rc<RefCell<PlayerPage>>,
+    engine: Rc<RefCell<WorkoutEngine>>,
+    app: &adw::Application,
+    pool: sqlx::SqlitePool,
+    rt: tokio::runtime::Handle,
+) {
+    let overlay_cell = Rc::clone(&page.borrow().overlay);
+    let cb: Box<dyn Fn()> = Box::new(glib::clone!(
+        #[weak]
+        app,
+        move || {
+            // Already open: bring it forward rather than opening a second one.
+            if let Some(open) = overlay_cell.borrow().as_ref() {
+                open.present();
+                return;
+            }
+
+            let (workout, ftp, session) = {
+                let eng = engine.borrow();
+                let ftp = eng.athlete.borrow().ftp_watts;
+                (eng.workout.clone(), ftp, eng.session.clone())
+            };
+
+            let cell = Rc::clone(&overlay_cell);
+            let pool_build = pool.clone();
+            let rt_build = rt.clone();
+            let pool_read = pool.clone();
+            crate::ui::spawn_to_main(
+                &rt,
+                async move { settings::load_overlay(&pool_read).await },
+                move |loaded| {
+                    // A size and an opacity are cosmetic, so an unreadable
+                    // database costs the rider their last choice rather than
+                    // the window — but it is still said out loud.
+                    let saved = loaded.unwrap_or_else(|e| {
+                        tracing::error!("Could not read the overlay settings: {e}");
+                        settings::OverlaySettings::default()
+                    });
+
+                    let overlay = RideOverlay::new(
+                        app.upcast_ref::<gtk::Application>(),
+                        &workout,
+                        ftp,
+                        saved,
+                        pool_build.clone(),
+                        rt_build.clone(),
+                    );
+                    overlay.backfill(&session, workout.duration_secs);
+
+                    // Weak, or the window's own handler would keep the cell that
+                    // holds the window alive for the life of the process.
+                    let weak_cell = Rc::downgrade(&cell);
+                    overlay.connect_closed(move || {
+                        if let Some(cell) = weak_cell.upgrade() {
+                            *cell.borrow_mut() = None;
+                        }
+                    });
+
+                    overlay.present();
+
+                    // The app cannot pin its own window, so the first time the
+                    // rider opens this, explain who can.
+                    if !saved.hint_seen {
+                        crate::ui::overlay::pin_help_dialog().present(Some(overlay.window()));
+                        crate::ui::spawn_write(
+                            &rt_build,
+                            &pool_build,
+                            "the overlay hint",
+                            |pool| async move { settings::mark_overlay_hint_seen(&pool).await },
+                        );
+                    }
+
+                    *cell.borrow_mut() = Some(overlay);
+                },
+            );
+        }
+    ));
+    *page.borrow().overlay_cb.borrow_mut() = Some(cb);
+}
+
 pub fn load_cues(
     player: Rc<RefCell<PlayerPage>>,
     workout: Workout,

@@ -39,6 +39,11 @@ pub mod keys {
     pub const WINDOW_WIDTH: &str = "window.width";
     pub const WINDOW_HEIGHT: &str = "window.height";
 
+    pub const OVERLAY_WIDTH: &str = "overlay.width";
+    pub const OVERLAY_HEIGHT: &str = "overlay.height";
+    pub const OVERLAY_OPACITY: &str = "overlay.opacity";
+    pub const OVERLAY_HINT_SEEN: &str = "overlay.hint_seen";
+
     pub const FIRST_USE_COMPLETE: &str = "first_use_complete";
     pub const COACHING_CONTEXT: &str = "coaching.athlete_context";
 }
@@ -198,6 +203,100 @@ pub async fn load_window(pool: &SqlitePool) -> Result<WindowSettings> {
 pub async fn set_window_size(pool: &SqlitePool, width: i32, height: i32) -> Result<()> {
     db::set_setting(pool, keys::WINDOW_WIDTH, &width.to_string()).await?;
     db::set_setting(pool, keys::WINDOW_HEIGHT, &height.to_string()).await
+}
+
+// ── Ride overlay ─────────────────────────────────────────────────────────────
+
+/// How much of the desktop shows through the ride overlay.
+///
+/// The overlay sits over whatever the rider is watching, so this trades the
+/// legibility of the numbers against seeing the video behind them. Stored by
+/// name rather than as a number: the three steps are a design decision about
+/// what stays readable, not a free parameter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OverlayOpacity {
+    #[default]
+    Solid,
+    Semi,
+    Faint,
+}
+
+impl OverlayOpacity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Solid => "solid",
+            Self::Semi => "semi",
+            Self::Faint => "faint",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "solid" => Some(Self::Solid),
+            "semi" => Some(Self::Semi),
+            "faint" => Some(Self::Faint),
+            _ => None,
+        }
+    }
+
+    /// The CSS class carrying this step's alpha, or `None` for the default.
+    pub fn css_class(self) -> Option<&'static str> {
+        match self {
+            Self::Solid => None,
+            Self::Semi => Some("semi"),
+            Self::Faint => Some("faint"),
+        }
+    }
+}
+
+/// The ride overlay's remembered size, opacity, and whether the rider has been
+/// shown how to pin it on top.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlaySettings {
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub opacity: OverlayOpacity,
+    pub hint_seen: bool,
+}
+
+impl OverlaySettings {
+    /// Both dimensions, or `None` if either is missing — half a remembered size
+    /// is not usable.
+    pub fn size(self) -> Option<(i32, i32)> {
+        self.width.zip(self.height)
+    }
+}
+
+pub async fn load_overlay(pool: &SqlitePool) -> Result<OverlaySettings> {
+    Ok(OverlaySettings {
+        width: db::get_setting(pool, keys::OVERLAY_WIDTH)
+            .await?
+            .and_then(|v| v.parse().ok()),
+        height: db::get_setting(pool, keys::OVERLAY_HEIGHT)
+            .await?
+            .and_then(|v| v.parse().ok()),
+        opacity: db::get_setting(pool, keys::OVERLAY_OPACITY)
+            .await?
+            .and_then(|v| OverlayOpacity::parse(&v))
+            .unwrap_or_default(),
+        hint_seen: flag(db::get_setting(pool, keys::OVERLAY_HINT_SEEN).await?, false),
+    })
+}
+
+/// Written together on close — a width without its height is not useful.
+pub async fn set_overlay_size(pool: &SqlitePool, width: i32, height: i32) -> Result<()> {
+    db::set_setting(pool, keys::OVERLAY_WIDTH, &width.to_string()).await?;
+    db::set_setting(pool, keys::OVERLAY_HEIGHT, &height.to_string()).await
+}
+
+pub async fn set_overlay_opacity(pool: &SqlitePool, opacity: OverlayOpacity) -> Result<()> {
+    db::set_setting(pool, keys::OVERLAY_OPACITY, opacity.as_str()).await
+}
+
+/// Recorded once the rider has been told how to keep the overlay on top, so the
+/// explanation appears on first use and never again.
+pub async fn mark_overlay_hint_seen(pool: &SqlitePool) -> Result<()> {
+    db::set_setting(pool, keys::OVERLAY_HINT_SEEN, flag_value(true)).await
 }
 
 // ── First run ────────────────────────────────────────────────────────────────
@@ -415,6 +514,10 @@ mod tests {
             keys::INTERVALS_SYNC,
             keys::WINDOW_WIDTH,
             keys::WINDOW_HEIGHT,
+            keys::OVERLAY_WIDTH,
+            keys::OVERLAY_HEIGHT,
+            keys::OVERLAY_OPACITY,
+            keys::OVERLAY_HINT_SEEN,
             keys::FIRST_USE_COMPLETE,
             keys::COACHING_CONTEXT,
         ];
@@ -435,5 +538,62 @@ mod tests {
         assert_eq!(load_training(&pool).await.unwrap().erg_ramp_rate, 40);
         assert!(load_intervals(&pool).await.unwrap().upload);
         assert_eq!(load_window(&pool).await.unwrap().size(), Some((1280, 800)));
+    }
+
+    // ── Ride overlay ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_default_the_overlay_when_nothing_is_stored() {
+        let pool = test_pool().await;
+        let s = load_overlay(&pool).await.unwrap();
+        assert_eq!(s.size(), None);
+        assert_eq!(s.opacity, OverlayOpacity::Solid);
+        assert!(!s.hint_seen);
+    }
+
+    #[tokio::test]
+    async fn should_round_trip_every_overlay_setting() {
+        let pool = test_pool().await;
+        set_overlay_size(&pool, 420, 300).await.unwrap();
+        set_overlay_opacity(&pool, OverlayOpacity::Faint)
+            .await
+            .unwrap();
+        mark_overlay_hint_seen(&pool).await.unwrap();
+
+        let s = load_overlay(&pool).await.unwrap();
+        assert_eq!(s.size(), Some((420, 300)));
+        assert_eq!(s.opacity, OverlayOpacity::Faint);
+        assert!(s.hint_seen);
+    }
+
+    #[tokio::test]
+    async fn should_fall_back_to_solid_when_the_stored_opacity_is_unreadable() {
+        // A hand-edited or older database must not leave the overlay invisible.
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::OVERLAY_OPACITY, "transparent")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_overlay(&pool).await.unwrap().opacity,
+            OverlayOpacity::Solid
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_remember_half_an_overlay_size() {
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::OVERLAY_WIDTH, "420")
+            .await
+            .unwrap();
+        assert_eq!(load_overlay(&pool).await.unwrap().size(), None);
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_overlay_size_apart_from_the_window_size() {
+        let pool = test_pool().await;
+        set_window_size(&pool, 1280, 800).await.unwrap();
+        set_overlay_size(&pool, 420, 300).await.unwrap();
+        assert_eq!(load_window(&pool).await.unwrap().size(), Some((1280, 800)));
+        assert_eq!(load_overlay(&pool).await.unwrap().size(), Some((420, 300)));
     }
 }

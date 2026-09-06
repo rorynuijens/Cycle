@@ -50,6 +50,19 @@ pub fn install(
     window.add_action(&fullscreen_action);
     app.set_accels_for_action("win.toggle-fullscreen", &["F11"]);
 
+    // The compact ride overlay, on the same footing as fullscreen: the on-page
+    // button and the accelerator drive one action. Weak, because the window
+    // owns the page this reaches back into (CLAUDE.md §2.4).
+    let player_for_overlay = Rc::downgrade(&player_rc);
+    let overlay_action = gio::SimpleAction::new("toggle-overlay", None);
+    overlay_action.connect_activate(move |_, _| {
+        if let Some(player) = player_for_overlay.upgrade() {
+            player.borrow().toggle_overlay();
+        }
+    });
+    window.add_action(&overlay_action);
+    app.set_accels_for_action("win.toggle-overlay", &["F10"]);
+
     // ── App actions ──────────────────────────────────────────────────────
     let window_for_about = window.clone();
     let about_action = gio::SimpleAction::new("about", None);

@@ -53,19 +53,28 @@ fn theme(dark: bool) {
 /// The window really is presented: a widget that was never allocated has no
 /// size and renders as nothing at all, and allocation is the compositor's
 /// answer rather than something that can be asserted into place.
-fn shoot(window: &adw::Window, width: i32, height: i32, name: &str) {
+fn shoot(window: &impl IsA<gtk::Window>, width: i32, height: i32, name: &str) {
+    // Generic over the window type: most shots are a bare `AdwWindow`, but the
+    // ride overlay is a real `AdwApplicationWindow` and is shot as itself.
+    let window: &gtk::Window = window.as_ref();
     window.set_default_size(width, height);
     window.present();
-    // Drain the main loop so realize, allocate and CSS have all happened.
-    for _ in 0..200 {
-        while glib::MainContext::default().iteration(false) {}
-    }
 
-    let paintable = gtk::WidgetPaintable::new(Some(window));
-    let snapshot = gtk::Snapshot::new();
-    paintable.snapshot(&snapshot, width as f64, height as f64);
-    let node = snapshot
-        .to_node()
+    // Drain the main loop so realize, allocate and CSS have all happened, and
+    // keep trying if the first pass came back empty. One drain was enough for
+    // the opaque windows here, but the ride overlay paints on a transparent
+    // ground, and on a cold first run after a rebuild it produced no node at
+    // all — a spurious failure in a tool whose whole job is to be looked at.
+    let node = (0..10)
+        .find_map(|_| {
+            for _ in 0..200 {
+                while glib::MainContext::default().iteration(false) {}
+            }
+            let paintable = gtk::WidgetPaintable::new(Some(window));
+            let snapshot = gtk::Snapshot::new();
+            paintable.snapshot(&snapshot, width as f64, height as f64);
+            snapshot.to_node()
+        })
         .expect("the window produced no render node");
 
     let renderer = gtk::gsk::CairoRenderer::new();
@@ -531,6 +540,92 @@ fn assert_the_route_cockpit_holds_still() {
     );
 }
 
+// ── The ride overlay ─────────────────────────────────────────────────────────
+
+/// What the overlay needs besides widgets: an application to belong to, and a
+/// database and runtime it only ever uses to remember its size and opacity.
+///
+/// The application is never registered or run — nothing here reaches D-Bus. It
+/// exists because `AdwApplicationWindow` must belong to one, and the overlay is
+/// an application window on purpose (CLAUDE.md §1.1).
+fn overlay_context() -> (adw::Application, sqlx::SqlitePool, tokio::runtime::Runtime) {
+    let app = adw::Application::builder()
+        .application_id("io.github.rorynuijens.Cycle.Shots")
+        .build();
+    let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
+    let pool = rt
+        .block_on(sqlx::SqlitePool::connect(":memory:"))
+        .expect("an in-memory database");
+    (app, pool, rt)
+}
+
+/// The overlay, showing one tick of a ride already under way.
+fn ride_overlay(
+    app: &adw::Application,
+    pool: &sqlx::SqlitePool,
+    rt: &tokio::runtime::Runtime,
+    power: u32,
+) -> crate::ui::overlay::RideOverlay {
+    use crate::data::session::LiveReadings;
+    use crate::training::engine::{EngineSnapshot, EngineState};
+
+    let w = workout(9, "Aerobic Foundation", WorkoutCategory::Endurance, 46.0);
+    let overlay = crate::ui::overlay::RideOverlay::new(
+        app.upcast_ref::<gtk::Application>(),
+        &w,
+        200,
+        crate::data::settings::OverlaySettings::default(),
+        pool.clone(),
+        rt.handle().clone(),
+    );
+    overlay.update(
+        &EngineSnapshot {
+            state: EngineState::Running,
+            elapsed_secs: 742,
+            remaining_secs: 1418,
+            segment_index: 2,
+            segment_elapsed_secs: 96,
+            segment_remaining_secs: 84,
+            target_power_watts: 205,
+            intensity_pct: 100,
+            readings: LiveReadings {
+                power_watts: Some(power),
+                heart_rate_bpm: Some(142),
+                cadence_rpm: Some(88),
+                ..LiveReadings::default()
+            },
+        },
+        &[],
+    );
+    overlay
+}
+
+/// The overlay must not move when a number gains a digit.
+///
+/// The same rule the cockpit is held to, and it bites harder here: this window
+/// is a few hundred pixels wide and sits over a film, so a window that resizes
+/// itself every time the rider pushes over 100 W is unusable rather than merely
+/// untidy.
+fn assert_the_overlay_holds_still() {
+    let (app, pool, rt) = overlay_context();
+    let widths: Vec<i32> = [9u32, 99, 187, 999, 1240]
+        .into_iter()
+        .map(|power| {
+            let overlay = ride_overlay(&app, &pool, &rt, power);
+            overlay.window().set_default_size(420, 312);
+            overlay.present();
+            while glib::MainContext::default().iteration(false) {}
+            let min = overlay.window().measure(gtk::Orientation::Horizontal, -1).0;
+            overlay.close();
+            min
+        })
+        .collect();
+    assert!(
+        widths.windows(2).all(|w| w[0] == w[1]),
+        "the overlay's minimum width changes with the power reading: {widths:?}"
+    );
+}
+
 // ── The shots ────────────────────────────────────────────────────────────────
 
 /// Render every shot, in one test on one thread.
@@ -550,6 +645,7 @@ fn screenshots() {
     // once per process, and a second `#[test]` is a second thread.
     assert_the_cockpit_holds_still();
     assert_the_route_cockpit_holds_still();
+    assert_the_overlay_holds_still();
 
     // The ride cockpit. Rendered at three sizes: a big window, an ordinary one,
     // and a small one — the last is the check that a taller number block plus a
@@ -561,6 +657,36 @@ fn screenshots() {
     shoot_player_cue("13-player-cue", 1100, 780);
     shoot_route_player("14-route-1100x780", 1100, 780);
     shoot_week("15-week-ridden-plan", 1000, 700);
+
+    // The ride overlay, in both themes. What a PNG cannot show is the point of
+    // it — the panel is translucent, and whether the numbers stay readable over
+    // moving video can only be judged over actual moving video.
+    {
+        let (app, pool, rt) = overlay_context();
+        // Re-assert the theme: building an `AdwApplication` resets the default
+        // style manager's colour scheme, so the light shot came out dark.
+        theme(false);
+        shoot(
+            ride_overlay(&app, &pool, &rt, 187).window(),
+            420,
+            312,
+            "18-overlay-light",
+        );
+        shoot(
+            ride_overlay(&app, &pool, &rt, 1240).window(),
+            420,
+            312,
+            "18b-overlay-sprint",
+        );
+        theme(true);
+        shoot(
+            ride_overlay(&app, &pool, &rt, 187).window(),
+            420,
+            312,
+            "19-overlay-dark",
+        );
+        theme(false);
+    }
 
     // Two eases deep: the day names its origin, the button names one rung back.
     shoot_detail_dialog(

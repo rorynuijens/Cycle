@@ -11,6 +11,7 @@ use crate::devices::manager::DeviceCommand;
 use crate::training::course_cues::{self, CourseCue};
 use crate::training::engine::{INTENSITY_STEP_PCT, MAX_INTENSITY_PCT, MIN_INTENSITY_PCT};
 use crate::training::route_engine::RouteEngine;
+use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
 use crate::ui::widgets::zone_meter::ZoneMeter;
@@ -36,17 +37,15 @@ const LOOKAHEAD_AHEAD_M: f32 = 2000.0;
 /// Spacing of the distance ticks along the look-ahead chart, in metres.
 const TICK_SPACING_M: f32 = 500.0;
 
-/// Character widths reserved for the cockpit numbers, so the layout stops
-/// depending on the value — see [`RoutePlayerPage::metric_column`].
+/// Character widths reserved for the route-only cockpit numbers, so the layout
+/// stops depending on the value — see
+/// [`crate::ui::widgets::metric_column::metric_column`], which holds the rule
+/// and the widths shared with the workout player.
 ///
-/// Power holds a four-digit sprint; the gradient a signed `-12.5`; speed a
-/// descent at `72.4`; the clock a long ride at `120:00`; heart rate and cadence
-/// are clamped at 250; and the climb total four digits of metres.
-const POWER_DIGITS: i32 = 4;
+/// The gradient holds a signed `-12.5`; speed a descent at `72.4`; the climb
+/// total four digits of metres.
 const GRADIENT_DIGITS: i32 = 5;
 const SPEED_DIGITS: i32 = 4;
-const CLOCK_DIGITS: i32 = 6;
-const RATE_DIGITS: i32 = 3;
 const CLIMB_DIGITS: i32 = 4;
 
 /// Room left under the look-ahead chart for its distance labels, in pixels.
@@ -332,21 +331,21 @@ impl RoutePlayerPage {
             .column_spacing(12)
             .column_homogeneous(true)
             .build();
-        let (gradient_box, gradient_label) = Self::metric_column(
+        let (gradient_box, gradient_label) = metric_column(
             "Gradient",
             Some("%"),
             "—",
             &["title-1", "numeric"],
             GRADIENT_DIGITS,
         );
-        let (power_box, power_label) = Self::metric_column(
+        let (power_box, power_label) = metric_column(
             "Power",
             Some("W"),
             "—",
             &["display", "numeric"],
             POWER_DIGITS,
         );
-        let (speed_box, speed_label) = Self::metric_column(
+        let (speed_box, speed_label) = metric_column(
             "Speed",
             Some("km/h"),
             "—",
@@ -392,28 +391,28 @@ impl RoutePlayerPage {
             .column_spacing(12)
             .column_homogeneous(true)
             .build();
-        let (hr_box, hr_label) = Self::metric_column(
+        let (hr_box, hr_label) = metric_column(
             "Heart Rate",
             Some("bpm"),
             "—",
             &["title-2", "numeric"],
             RATE_DIGITS,
         );
-        let (cadence_box, cadence_label) = Self::metric_column(
+        let (cadence_box, cadence_label) = metric_column(
             "Cadence",
             Some("rpm"),
             "—",
             &["title-2", "numeric"],
             RATE_DIGITS,
         );
-        let (elapsed_box, elapsed_label) = Self::metric_column(
+        let (elapsed_box, elapsed_label) = metric_column(
             "Elapsed",
             None,
             "0:00",
             &["title-2", "numeric"],
             CLOCK_DIGITS,
         );
-        let (climb_box, climb_label) = Self::metric_column(
+        let (climb_box, climb_label) = metric_column(
             "Climbed",
             Some("m"),
             "—",
@@ -1300,42 +1299,5 @@ impl RoutePlayerPage {
         });
 
         chart
-    }
-
-    /// A centred caption-over-value column, as used on the workout screen —
-    /// unit in the caption, width reserved for the widest value the field can
-    /// hold, and for the same reason. See [`super::player::PlayerPage`]'s own
-    /// `metric_column`: these grids are `column_homogeneous`, so a number that
-    /// asks for exactly its own text width makes every column in the row jump
-    /// the moment a digit is added.
-    fn metric_column(
-        title: &str,
-        unit: Option<&str>,
-        initial: &str,
-        value_css: &[&str],
-        digits: i32,
-    ) -> (gtk::Box, gtk::Label) {
-        let vbox = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::End)
-            .build();
-        vbox.append(
-            &gtk::Label::builder()
-                .label(match unit {
-                    Some(u) => format!("{title} ({u})"),
-                    None => title.to_string(),
-                })
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
-        let value_label = gtk::Label::builder()
-            .label(initial)
-            .width_chars(digits)
-            .css_classes(value_css.to_vec())
-            .build();
-        vbox.append(&value_label);
-        (vbox, value_label)
     }
 }

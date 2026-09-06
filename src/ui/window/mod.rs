@@ -159,6 +159,15 @@ impl CycleGtkWindow {
             &athlete_rc.borrow(),
         )));
         player_rc.borrow().set_cues_enabled(training.interval_cues);
+        // Installed once, not per ride: the engine outlives each workout, so the
+        // overlay reads the current one out of it when the rider opens it.
+        crate::ui::pages::player::attach_overlay(
+            &player_rc,
+            Rc::clone(&engine_rc),
+            app,
+            pool.clone(),
+            rt_handle.clone(),
+        );
 
         // ── Header resume button — created here so on_complete and do_start can ref it ──
         // Only visible while a workout is running and the user has navigated away

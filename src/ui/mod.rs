@@ -1,5 +1,6 @@
 pub mod brief_store;
 pub mod markdown;
+pub mod overlay;
 pub mod pages;
 pub mod preferences;
 pub mod resources;
@@ -22,8 +23,15 @@ pub mod window;
 /// just under the metric numbers, and its detail line above body text.
 ///
 /// Sizes are relative, never pixels, so every one of these still follows the
-/// user's system font size (CLAUDE.md §1.5); no colours are defined, so both
-/// themes work unchanged.
+/// user's system font size (CLAUDE.md §1.5).
+///
+/// The only colour in the sheet is the ride overlay's background, and it is not
+/// a colour so much as an alpha: `alpha(@window_bg_color, …)` takes libadwaita's
+/// own window background and lets the desktop through it, so the overlay still
+/// follows both themes rather than baking in a grey (CLAUDE.md §1.6). The
+/// translucency is on the panel only — never on the text, and never via
+/// `set_opacity`, which would fade the numbers along with the ground and defeat
+/// the point of reading them over moving video.
 const APP_CSS: &str = "
 .display {
     font-size: 400%;
@@ -47,6 +55,19 @@ const APP_CSS: &str = "
 }
 .cockpit-cue-detail {
     font-size: 130%;
+}
+window.ride-overlay {
+    background-color: transparent;
+}
+.ride-overlay-body {
+    background-color: alpha(@window_bg_color, 0.92);
+    border-radius: 12px;
+}
+.ride-overlay-body.semi {
+    background-color: alpha(@window_bg_color, 0.72);
+}
+.ride-overlay-body.faint {
+    background-color: alpha(@window_bg_color, 0.48);
 }
 ";
 
