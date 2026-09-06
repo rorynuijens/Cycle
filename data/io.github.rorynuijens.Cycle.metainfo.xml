@@ -90,6 +90,20 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.8.1" date="2026-09-06">
+      <description>
+        <p>Days you have marked as time off are now left alone. When the AI Coach
+           built or rebuilt a program it could put sessions straight onto a
+           holiday, because it was told the dates you were away but not which
+           week of the plan they fell in — so it had no way to avoid them.</p>
+        <p>It is now told both, and whatever it sends back is checked against
+           your calendar before anything is written, so a day off stays a day
+           off even if you book it after building the plan, or start the program
+           on a different week than it was built for. Sessions left out are
+           counted in the message that follows, rather than quietly going
+           missing.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-09-06">
       <description>
         <p>You can now watch something else while you ride. A new compact window
