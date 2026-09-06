@@ -90,6 +90,26 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.8.0" date="2026-09-06">
+      <description>
+        <p>You can now watch something else while you ride. A new compact window
+           shows the target and the power you are actually pushing, the countdown
+           to the next interval, your heart rate and cadence, and the shape of
+           the workout with your place in it — small enough to sit in a corner of
+           the screen and readable without looking straight at it. Open it from
+           the button on the ride screen, or press F10.</p>
+        <p>To keep it above your film, right-click its header bar — or hold Super
+           and right-click anywhere on it — and choose "Always on Top". The window
+           explains this the first time you open it, because an app on GNOME is
+           not allowed to do it for you. Play the film in a maximised window
+           rather than fullscreen, or it will sit above everything, pinned
+           windows included.</p>
+        <p>Its background can be made more or less see-through from its own menu,
+           and it remembers the choice along with its size. If a sensor stops
+           reporting, it says so rather than leaving a number frozen where you
+           would go on believing it.</p>
+      </description>
+    </release>
     <release version="0.7.3" date="2026-09-05">
       <description>
         <p>Your coach is now told what day it is. It had one mention of the date,
