@@ -45,6 +45,17 @@ Per session, derive a `SessionEvidence`:
   `power < 0.95 × target` → segment *failed*. A session ended before 90%
   of planned duration whose last segment was hard also counts as a
   failure.
+- **Power shortfall** (amended 2026-09-06): a run of ≥ 30 s where
+  `power < 0.90 × target` fails the segment on power alone. Deliberately
+  further from target, and held longer, than the cadence rule — with no
+  cadence to corroborate it the evidence has to be unambiguous. Without
+  this rule a ride with no cadence sensor can never fail a segment at
+  all: an absent sensor reports a flat zero, `0 < 0.8 × 0` is false for
+  every second, and `fail_rate` is pinned at 0 for the whole window. The
+  median is taken over pedalling seconds only (cadence > 0), which is
+  what makes "no sensor" distinguishable from "coasting".
+- A second with **no power reading** breaks both runs rather than
+  extending them: a dropout is missing evidence, not evidence of failure.
 - **RPE** (1–10, if recorded).
 - **HR drift** for steady hard segments ≥ 8 min:
   `mean(HR second half) / mean(HR first half)` — a proxy for aerobic
@@ -73,6 +84,17 @@ Preconditions: `n_hard ≥ 3`, cooldown satisfied (§5). Then:
    covers outdoor rides where real maximal efforts exist.
 4. Otherwise: **"FTP looks right"** — the check-in still renders, with
    evidence, so the monthly rhythm is visible.
+
+**No rise without cadence** (amended 2026-09-06): rules 2 and 3 are
+skipped entirely, falling through to rule 4, unless at least one
+hard-evidence session in the window recorded cadence. The power-shortfall
+rule above lets the detector see *a* failure without cadence, but not the
+sharpest one — in ERG the cadence goes first and power follows — so a
+window with no cadence anywhere can still miss a rider coming apart.
+A detector that is half blind may ease FTP and may hold it, never raise
+it. The check-in says so in as many words, rather than going quiet.
+Every session recorded up to 2026-09-06 is in exactly this state: no
+cadence sensor is feeding the app yet.
 
 Output: `FtpSuggestion { new_ftp, delta_pct, direction, evidence: Vec<String> }`
 where each evidence string is a human sentence
@@ -134,8 +156,13 @@ Synthetic-session builder (targets + power/cadence/HR traces + RPE), then:
 
 1. **Capture** (ship first, invisible): `target_watts` in DataPoint,
    `sessions.ftp_watts`, `ftp_history` + Preferences logging.
-2. **Detector + check-in card** — needs ≥ 3 hard sessions of new-format
-   data, i.e. usable ~2 weeks after riding resumes.
+2. **Detector** — `training/ftp_detect.rs`, built 2026-09-06 with the two
+   amendments above; 33 unit tests, no caller yet.
+   **Check-in card** — still to build. It needs ≥ 3 hard sessions of
+   new-format data before it can say anything: on 2026-09-06 the window
+   held exactly one (the 4×4, 16 min at 115 % FTP, compliance 0.99), and
+   nothing scheduled before the program expires on 2026-09-27 reaches
+   91 % FTP — the sweet-spot sessions sit at exactly 90 %.
 3. **Ramp test** workout + test mode.
 4. **Polish**: Intervals.icu eFTP cross-check, optional Claude-written
    explanation prose on the check-in card (facts stay deterministic).

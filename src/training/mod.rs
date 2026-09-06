@@ -3,6 +3,7 @@ pub mod course_cues;
 pub mod cues;
 pub mod engine;
 pub mod fitness;
+pub mod ftp_detect;
 pub mod load;
 pub mod matching;
 pub mod program;
