@@ -90,6 +90,27 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.9.0" date="2026-09-10">
+      <description>
+        <p>A training plan that has run its course now says so. Until now the
+           Coaching page went on reporting the final week for ever, and the only
+           way forward was to pay the AI Coach to build something new. It now
+           names the day the plan ended and sums up what the block delivered —
+           how many of its sessions you rode, and what your fitness did over it.</p>
+        <p>Beside that is "Start the Next Block", which builds the next four
+           weeks from your own workout library using the same rules that already
+           adjust your sessions. It costs nothing and sends nothing anywhere.
+           It asks which days you train rather than guessing, and it leaves the
+           days you are away alone. "Rebuild with AI" is still there if you would
+           rather have the coach reconsider the whole plan.</p>
+        <p>Every building week in the new block includes a session hard enough to
+           tell whether your FTP has moved — something the old plans did not
+           reliably do.</p>
+        <p>Also fixed: asking the coach to rebuild a finished program used to
+           request a single week and hid part of your time off from it, and the
+           rebuilt plan never updated the dates it claimed to cover.</p>
+      </description>
+    </release>
     <release version="0.8.1" date="2026-09-06">
       <description>
         <p>Days you have marked as time off are now left alone. When the AI Coach
