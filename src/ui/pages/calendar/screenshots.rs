@@ -25,10 +25,10 @@ use super::marks::{EntryMark, ProgramOverlay, Suggestion};
 use crate::data::db::{CalendarEntry, ScheduledItem};
 use crate::data::workout::{Segment, Workout, WorkoutCategory};
 
-const OUT_DIR: &str = "/tmp/cycle-shots";
+pub(crate) const OUT_DIR: &str = "/tmp/cycle-shots";
 
 /// Start GTK and Adwaita, and make somewhere to write to.
-fn start() {
+pub(crate) fn start() {
     adw::init().expect("Adwaita starts");
     // Without this an AdwDialog stays at zero size: it opens on an animation,
     // and an animation needs a frame clock that a headless render never ticks.
@@ -40,7 +40,7 @@ fn start() {
 }
 
 /// Force a theme, so both are shot from one process (CLAUDE.md §4.2).
-fn theme(dark: bool) {
+pub(crate) fn theme(dark: bool) {
     adw::StyleManager::default().set_color_scheme(if dark {
         adw::ColorScheme::ForceDark
     } else {
@@ -53,7 +53,7 @@ fn theme(dark: bool) {
 /// The window really is presented: a widget that was never allocated has no
 /// size and renders as nothing at all, and allocation is the compositor's
 /// answer rather than something that can be asserted into place.
-fn shoot(window: &impl IsA<gtk::Window>, width: i32, height: i32, name: &str) {
+pub(crate) fn shoot(window: &impl IsA<gtk::Window>, width: i32, height: i32, name: &str) {
     // Generic over the window type: most shots are a bare `AdwWindow`, but the
     // ride overlay is a real `AdwApplicationWindow` and is shot as itself.
     let window: &gtk::Window = window.as_ref();

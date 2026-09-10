@@ -14,7 +14,7 @@ mod week;
 // every screenshot route on this machine. Sited here rather than under `ui/` so
 // it can reach `dialogs` without making it public for a tool.
 #[cfg(test)]
-mod screenshots;
+pub(crate) mod screenshots;
 
 use adw::prelude::*;
 use chrono::{Datelike, Duration, Local, NaiveDate};

@@ -181,6 +181,26 @@ pub fn day_name_to_offset(day: &str) -> u32 {
     }
 }
 
+/// The weekday name the prompts and `programs.training_days` use.
+///
+/// The inverse of [`day_name_to_offset`], and it has to be spelled out rather
+/// than taken from `Weekday`'s `Display`, which gives the three-letter
+/// abbreviation. "tue" is not a name this mapping knows, and an unknown name
+/// becomes Monday — so borrowing `Display` here would quietly pile a week's
+/// training onto one day.
+pub fn weekday_name(day: chrono::Weekday) -> &'static str {
+    use chrono::Weekday::*;
+    match day {
+        Mon => "monday",
+        Tue => "tuesday",
+        Wed => "wednesday",
+        Thu => "thursday",
+        Fri => "friday",
+        Sat => "saturday",
+        Sun => "sunday",
+    }
+}
+
 /// The calendar date a coach's `(week, day)` entry falls on.
 ///
 /// Weeks are 1-based in the reply, so week 1 is the starting week.

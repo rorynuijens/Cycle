@@ -18,20 +18,6 @@ use crate::ui::AiFailure;
 
 use super::data::{load_program_prompt_data, ProgramPromptData};
 
-/// The days of the week, as shown and as the prompt names them.
-const DAYS: [(&str, &str); 7] = [
-    ("Mon", "monday"),
-    ("Tue", "tuesday"),
-    ("Wed", "wednesday"),
-    ("Thu", "thursday"),
-    ("Fri", "friday"),
-    ("Sat", "saturday"),
-    ("Sun", "sunday"),
-];
-
-/// Selected by default — the classic three-day week.
-const DEFAULT_DAYS: [usize; 3] = [0, 2, 4];
-
 /// Weeks generated when the rider asks for no fixed end date.
 const OPEN_ENDED_WEEKS: u32 = 8;
 
@@ -51,7 +37,7 @@ pub struct ProgramSection {
     output: gtk::Label,
     output_frame: gtk::Box,
     schedule_btn: gtk::Button,
-    day_toggles: Vec<gtk::ToggleButton>,
+    day_toggles: crate::ui::widgets::day_toggles::DayToggles,
     months_row: adw::SpinRow,
     open_ended_row: adw::SwitchRow,
     entries: Rc<RefCell<Vec<ProgramEntry>>>,
@@ -112,24 +98,12 @@ impl ProgramSection {
                 .build(),
         );
 
-        // Linked toggle group (the calendar's Week|Month pattern, multi-select)
-        // — native pressed state, no CSS hacks.
-        let days_row = gtk::Box::builder().css_classes(["linked"]).build();
-        let day_toggles: Vec<gtk::ToggleButton> = DAYS
-            .iter()
-            .map(|(label, _)| {
-                let toggle = gtk::ToggleButton::builder()
-                    .label(*label)
-                    .tooltip_text(format!("Train on {label}"))
-                    .build();
-                days_row.append(&toggle);
-                toggle
-            })
-            .collect();
-        for i in DEFAULT_DAYS {
-            day_toggles[i].set_active(true);
-        }
-        root.append(&days_row);
+        // The same strip the roll-over dialog asks with, so one weekday picker
+        // is the app's answer rather than two that drift.
+        let day_toggles = crate::ui::widgets::day_toggles::DayToggles::new(
+            &crate::ui::widgets::day_toggles::DEFAULT_DAYS,
+        );
+        root.append(day_toggles.widget());
 
         let months_adj = gtk::Adjustment::new(3.0, 1.0, 24.0, 1.0, 3.0, 0.0);
         let months_row = adw::SpinRow::new(Some(&months_adj), 1.0, 0);
@@ -218,10 +192,9 @@ impl ProgramSection {
     /// The days the rider ticked, named as the prompt expects.
     fn selected_days(&self) -> Vec<String> {
         self.day_toggles
+            .selected()
             .iter()
-            .zip(DAYS.iter())
-            .filter(|(toggle, _)| toggle.is_active())
-            .map(|(_, (_, value))| (*value).to_string())
+            .map(|d| crate::ai::context::weekday_name(*d).to_string())
             .collect()
     }
 
@@ -400,13 +373,7 @@ impl ProgramSection {
             let rt_handle = rt_handle.clone();
             let on_toast = Rc::clone(&on_toast);
             let workouts = Rc::clone(&workouts);
-            let training_days = days
-                .iter()
-                .zip(DAYS.iter())
-                .filter(|(toggle, _)| toggle.is_active())
-                .map(|(_, (_, value))| *value)
-                .collect::<Vec<_>>()
-                .join(",");
+            let training_days = days.selected_csv();
             let btn = btn.clone();
             let pool_for_check = pool.clone();
 
@@ -695,7 +662,6 @@ impl ProgramSection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::context::day_name_to_offset;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
@@ -766,21 +732,5 @@ mod tests {
     fn should_cross_a_month_boundary_correctly() {
         let monday = date(2026, 8, 31);
         assert_eq!(entry_date(monday, &entry(2, "tuesday")), date(2026, 9, 8));
-    }
-
-    #[test]
-    fn should_name_every_weekday_the_offsets_understand() {
-        // The toggle values feed straight into day_name_to_offset, so a typo
-        // here would silently schedule everything on a Monday.
-        for (i, (_, value)) in DAYS.iter().enumerate() {
-            assert_eq!(day_name_to_offset(value), i as u32, "for {value}");
-        }
-    }
-
-    #[test]
-    fn should_default_to_a_three_day_week() {
-        assert_eq!(DEFAULT_DAYS.len(), 3);
-        let names: Vec<&str> = DEFAULT_DAYS.iter().map(|&i| DAYS[i].0).collect();
-        assert_eq!(names, vec!["Mon", "Wed", "Fri"]);
     }
 }

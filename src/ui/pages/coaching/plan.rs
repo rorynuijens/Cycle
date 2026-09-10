@@ -1,10 +1,12 @@
 //! "Your Program" — the plan the rider is living with, and what should change
 //! about it.
 //!
-//! The card has three faces, and shows exactly one:
+//! The card has four faces, and shows exactly one:
 //!
 //! * a program is being followed → where it has got to, what was missed, and
 //!   any adjustment the rules propose;
+//! * a program that has run out → what the block delivered, and the offer to
+//!   start the next one locally;
 //! * no program, but the calendar holds scheduled workouts that belong to none
 //!   → an offer to adopt them, so a rider who plainly has a plan is not told
 //!   they have none;
@@ -13,6 +15,7 @@
 //! The adjustments come from [`crate::training::program`], which is pure and
 //! costs nothing to run. Only "Rebuild with AI" spends the rider's key.
 
+use adw::glib;
 use adw::prelude::*;
 use chrono::{Datelike, Duration as CDuration, Local, NaiveDate};
 use sqlx::SqlitePool;
@@ -21,7 +24,11 @@ use std::rc::Rc;
 
 use crate::data::{athlete::AthleteProfile, db, workout::Workout};
 use crate::training::fitness::TsbBand;
-use crate::training::program::{plan_view, Adjustment, CoachVerdict, Phase, ProgramStatus};
+use crate::training::program::{
+    block_summary, last_day, plan_view, Adjustment, BlockSummary, CoachVerdict, Phase,
+    ProgramStatus,
+};
+use crate::training::rollover;
 
 use super::data::{load_plan_data, PlanData};
 use super::program::week_start;
@@ -44,6 +51,7 @@ pub struct PlanCard {
     rebuild_btn: gtk::Button,
     end_btn: gtk::Button,
     adopt_btn: gtk::Button,
+    rollover_btn: gtk::Button,
     actions: gtk::Box,
     /// What "Apply Adjustments" will write, as of the last reload.
     pending: Rc<RefCell<Vec<Adjustment>>>,
@@ -52,6 +60,13 @@ pub struct PlanCard {
     /// The state the card was last drawn from, which the AI rebuild describes
     /// to the coach rather than reading the whole plan a second time.
     last_state: Rc<RefCell<Option<ProgramStatus>>>,
+    /// The program, its sessions, the days really trained and the days away, as
+    /// of the last reload — everything the roll-over needs to build the next
+    /// block without going back to the database on the main thread.
+    last_program: Rc<RefCell<Option<crate::training::program::Program>>>,
+    last_sessions: Rc<RefCell<Vec<crate::training::program::PlannedSession>>>,
+    trained: Rc<RefCell<std::collections::HashSet<NaiveDate>>>,
+    time_off: Rc<RefCell<Vec<NaiveDate>>>,
     /// What the morning brief made of today, as of the last time it changed.
     ///
     /// Held rather than passed in because the card reloads on navigation and
@@ -122,6 +137,15 @@ impl PlanCard {
                  actually ridden. This sends one request to your AI provider.",
             )
             .build();
+        let rollover_btn = gtk::Button::builder()
+            .label("Start the Next Block")
+            .css_classes(["pill", "suggested-action"])
+            .tooltip_text(
+                "Build the next four weeks from your own workout library. \
+                 Local rules only — nothing is sent to your AI provider.",
+            )
+            .visible(false)
+            .build();
         let adopt_btn = gtk::Button::builder()
             .label("Track These as a Program")
             .css_classes(["pill", "suggested-action"])
@@ -137,6 +161,7 @@ impl PlanCard {
             .build();
 
         actions.append(&apply_btn);
+        actions.append(&rollover_btn);
         actions.append(&rebuild_btn);
         actions.append(&adopt_btn);
         actions.append(&end_btn);
@@ -150,10 +175,15 @@ impl PlanCard {
             rebuild_btn,
             end_btn,
             adopt_btn,
+            rollover_btn,
             actions,
             pending: Rc::new(RefCell::new(Vec::new())),
             program_id: Rc::new(RefCell::new(None)),
             last_state: Rc::new(RefCell::new(None)),
+            last_program: Rc::new(RefCell::new(None)),
+            last_sessions: Rc::new(RefCell::new(Vec::new())),
+            trained: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            time_off: Rc::new(RefCell::new(Vec::new())),
             verdict: Rc::new(std::cell::Cell::new(CoachVerdict::Proceed)),
             athlete,
             workouts,
@@ -163,6 +193,7 @@ impl PlanCard {
         });
 
         card.connect_apply();
+        card.connect_rollover();
         card.connect_end();
         card.connect_adopt();
         card.connect_rebuild();
@@ -261,6 +292,10 @@ impl PlanCard {
         self.clear_rows();
         self.pending.borrow_mut().clear();
         *self.last_state.borrow_mut() = None;
+        *self.last_program.borrow_mut() = data.program.clone();
+        *self.last_sessions.borrow_mut() = data.sessions.clone();
+        *self.trained.borrow_mut() = data.trained.clone();
+        *self.time_off.borrow_mut() = data.time_off.clone();
         *self.program_id.borrow_mut() = data.program.as_ref().map(|p| p.id);
 
         let Some(program) = data.program else {
@@ -287,9 +322,19 @@ impl PlanCard {
             self.verdict.get(),
         );
 
-        self.group.set_description(Some(&Self::describe(&state)));
-        self.render_progress(&state, data.metrics.tsb(), today);
-        self.render_adjustments(&adjustments, &state);
+        // One suggested action at a time: once the plan is over, starting the
+        // next block is the thing to do and there is nothing left to adjust.
+        self.apply_btn.set_visible(!state.over);
+        self.rollover_btn.set_visible(state.over);
+
+        self.group
+            .set_description(Some(&Self::describe(&state, last_day(&program))));
+        if state.over {
+            self.render_finished(&block_summary(&program, &data.sessions, &data.pmc));
+        } else {
+            self.render_progress(&state, data.metrics.tsb(), today);
+            self.render_adjustments(&adjustments, &state);
+        }
 
         *self.pending.borrow_mut() = adjustments;
         self.apply_btn
@@ -298,14 +343,66 @@ impl PlanCard {
         self.root.set_visible(true);
     }
 
-    /// "Week 3 of 12 · Build"
-    fn describe(state: &ProgramStatus) -> String {
+    /// "Week 3 of 12 · Build", or the date the plan ran out.
+    ///
+    /// A finished program used to go on reporting "Week 15 of 15 · Build" for
+    /// ever, because [`crate::training::program::week_of`] clamps into the
+    /// span. The clamp is right — a past session does belong to the final week
+    /// — so the end is said here instead of unpicking it there.
+    fn describe(state: &ProgramStatus, ends: NaiveDate) -> String {
+        if state.over {
+            return format!(
+                "{} weeks · finished {}",
+                state.total_weeks,
+                ends.format("%-d %B")
+            );
+        }
         format!(
             "Week {} of {} · {}",
             state.week,
             state.total_weeks,
             state.phase.label()
         )
+    }
+
+    /// What to say about a block that is done with.
+    ///
+    /// Pure and separate from the row, like [`Self::missed_summary`]: this is
+    /// the sentence that closes off fifteen weeks of a rider's training and it
+    /// should be testable without a display.
+    fn finished_summary(s: &BlockSummary) -> (String, String) {
+        let title = format!(
+            "{} weeks done — {} of {} session{} completed",
+            s.weeks,
+            s.completed,
+            s.planned,
+            if s.planned == 1 { "" } else { "s" }
+        );
+        let ridden = format!("{:.0} TSS from the sessions you rode as written.", s.tss);
+        // Fitness needs a reading at both ends to be a change rather than a
+        // number; a program older than the recorded history has neither.
+        let subtitle = if s.ctl_start > 0.0 || s.ctl_end > 0.0 {
+            format!(
+                "{ridden} Fitness {:.0} → {:.0}.",
+                s.ctl_start.round(),
+                s.ctl_end.round()
+            )
+        } else {
+            ridden
+        };
+        (title, subtitle)
+    }
+
+    /// The face shown once the plan has run out.
+    fn render_finished(self: &Rc<Self>, summary: &BlockSummary) {
+        let (title, subtitle) = Self::finished_summary(summary);
+        self.add_row(
+            adw::ActionRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .subtitle_lines(3)
+                .build(),
+        );
     }
 
     /// What to say about sessions the rider did not ride, or `None` when there
@@ -584,7 +681,9 @@ impl PlanCard {
         self.add_row(row);
 
         self.adopt_btn.set_visible(true);
+        self.apply_btn.set_visible(true);
         self.apply_btn.set_sensitive(false);
+        self.rollover_btn.set_visible(false);
         self.rebuild_btn.set_visible(false);
         self.end_btn.set_visible(false);
         self.root.set_visible(true);
@@ -698,6 +797,233 @@ impl PlanCard {
 
             dialog.present(Some(btn));
         });
+    }
+
+    /// Start the next block from the rider's own library, billing nothing.
+    ///
+    /// The counterpart to "Rebuild with AI", and the one offered first once a
+    /// plan runs out: a rider whose program has ended should not have to pay a
+    /// provider to carry on training.
+    fn connect_rollover(self: &Rc<Self>) {
+        let card = Rc::clone(self);
+        self.rollover_btn.connect_clicked(move |btn| {
+            let (Some(program), Some(state)) = (
+                card.last_program.borrow().clone(),
+                card.last_state.borrow().clone(),
+            ) else {
+                return;
+            };
+            card.present_rollover_dialog(btn, program, state);
+        });
+    }
+
+    /// Ask which days, then write the block.
+    ///
+    /// Everything `!Send` — the toggles, the library behind the `Rc` — is read
+    /// on the main thread before the write is spawned, the same shape
+    /// [`Self::connect_rebuild`] uses.
+    fn present_rollover_dialog(
+        self: &Rc<Self>,
+        anchor: &gtk::Button,
+        program: crate::training::program::Program,
+        state: ProgramStatus,
+    ) {
+        let today = Local::now().date_naive();
+        let guess = self.likely_days(&state);
+
+        let time_off: std::collections::HashSet<NaiveDate> =
+            self.time_off.borrow().iter().copied().collect();
+        let days_for_start = if guess.is_empty() {
+            crate::ui::widgets::day_toggles::DEFAULT_DAYS.to_vec()
+        } else {
+            guess.clone()
+        };
+        let start = match rollover::next_block_monday(&program, today, &days_for_start, &time_off) {
+            Ok(d) => d,
+            Err(e) => {
+                (self.on_toast)(
+                    adw::Toast::builder()
+                        .title(e.to_string())
+                        .timeout(6)
+                        .build(),
+                );
+                return;
+            }
+        };
+
+        let easy_first = rollover::opens_easy(&program, start, &time_off);
+        let dialog = adw::AlertDialog::new(
+            Some("Start the next block"),
+            Some(&Self::rollover_body(
+                start,
+                easy_first,
+                &time_off,
+                &days_for_start,
+            )),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("start", "Start Block");
+        dialog.set_response_appearance("start", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("start"));
+        dialog.set_close_response("cancel");
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        content.append(
+            &gtk::Label::builder()
+                .label("Training days")
+                .halign(gtk::Align::Start)
+                .css_classes(["caption-heading", "dim-label"])
+                .build(),
+        );
+        let toggles = crate::ui::widgets::day_toggles::DayToggles::new(&days_for_start);
+        content.append(toggles.widget());
+        dialog.set_extra_child(Some(&content));
+
+        // Weak, so the handler on a widget inside the dialog does not own it
+        // (CLAUDE.md §2.4).
+        toggles.connect_changed(glib::clone!(
+            #[weak]
+            dialog,
+            move |n| dialog.set_response_enabled("start", n > 0)
+        ));
+
+        let card = Rc::clone(self);
+        let toggles_for_response = toggles.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "start" {
+                return;
+            }
+            let days = toggles_for_response.selected();
+            if days.is_empty() {
+                return;
+            }
+            let training_days = toggles_for_response.selected_csv();
+            card.write_next_block(program.clone(), days, training_days, start, easy_first);
+        });
+
+        dialog.present(Some(anchor));
+    }
+
+    /// What the dialog says before the rider agrees to it.
+    ///
+    /// Names the cost (none), the shape, and — because it is the one surprise
+    /// in this flow — any session the opening week will lose to time off.
+    fn rollover_body(
+        start: NaiveDate,
+        easy_first: bool,
+        time_off: &std::collections::HashSet<NaiveDate>,
+        days: &[chrono::Weekday],
+    ) -> String {
+        let shape = if easy_first {
+            "an easy week first, then three building ones"
+        } else {
+            "three building weeks, then an easy one"
+        };
+        let mut body = format!(
+            "Four weeks from {}, built from your own workout library — {shape}. \
+             Nothing is sent to your AI provider.",
+            start.format("%A %-d %B")
+        );
+        let lost: Vec<String> = days
+            .iter()
+            .map(|d| start + CDuration::days(d.num_days_from_monday() as i64))
+            .filter(|d| time_off.contains(d))
+            .map(|d| d.format("%A %-d %B").to_string())
+            .collect();
+        if !lost.is_empty() {
+            body.push_str(&format!(
+                "\n\n{} falls in your planned time off, so that session is skipped.",
+                lost.join(" and ")
+            ));
+        }
+        body
+    }
+
+    /// The days to tick before the rider is asked.
+    ///
+    /// The days they have actually *ridden* recently, not the days the plan put
+    /// sessions on: fifteen weeks of dragging sessions around leaves the plan's
+    /// own weekdays saying nothing — the live block's entries touch all seven,
+    /// and offering that back would propose training daily.
+    fn likely_days(&self, state: &ProgramStatus) -> Vec<chrono::Weekday> {
+        let today = Local::now().date_naive();
+        let since = today - CDuration::days(28);
+        let mut days: Vec<chrono::Weekday> = self
+            .trained
+            .borrow()
+            .iter()
+            .filter(|d| **d >= since && **d <= today)
+            .map(|d| d.weekday())
+            .collect();
+        days.sort_by_key(|d| d.num_days_from_monday());
+        days.dedup();
+        if days.len() < 2 {
+            // One ride, or none, is not a pattern. Offer the standard week and
+            // let the rider say otherwise.
+            return crate::ui::widgets::day_toggles::DEFAULT_DAYS.to_vec();
+        }
+        let _ = state;
+        days
+    }
+
+    /// Write the block, or write nothing at all.
+    fn write_next_block(
+        self: &Rc<Self>,
+        program: crate::training::program::Program,
+        days: Vec<chrono::Weekday>,
+        training_days: String,
+        start: NaiveDate,
+        easy_first: bool,
+    ) {
+        let pool = self.pool.clone();
+        let on_toast = Rc::clone(&self.on_toast);
+        let card = Rc::clone(self);
+        let library: Vec<Workout> = (*self.workouts).clone();
+        let ftp = self.athlete.borrow().ftp_watts;
+        let sessions = card.last_sessions.borrow().clone();
+
+        crate::ui::spawn_to_main(
+            &self.rt_handle.clone(),
+            async move {
+                roll_over(
+                    &pool,
+                    &program,
+                    &sessions,
+                    &library,
+                    days,
+                    &training_days,
+                    start,
+                    easy_first,
+                    ftp,
+                )
+                .await
+            },
+            move |result| {
+                match result {
+                    Ok(written) => {
+                        on_toast(
+                            adw::Toast::builder()
+                                .title(written.message())
+                                .timeout(6)
+                                .build(),
+                        );
+                        card.reload();
+                    }
+                    Err(e) => {
+                        tracing::error!("starting the next block: {e}");
+                        on_toast(
+                            adw::Toast::builder()
+                                .title("Could not start the next block")
+                                .timeout(5)
+                                .build(),
+                        );
+                    }
+                };
+            },
+        );
     }
 
     fn connect_adopt(self: &Rc<Self>) {
@@ -840,6 +1166,138 @@ impl PlanCard {
     }
 }
 
+/// What a roll-over managed to write.
+enum Written {
+    /// The block is on the calendar. `dropped` fell on time off; `thin` names
+    /// the weeks that got no session the FTP check-in will ever count.
+    Block {
+        sessions: usize,
+        dropped: usize,
+        thin: usize,
+    },
+    /// Nothing was written, and the old program is still the rider's.
+    Nothing,
+}
+
+impl Written {
+    fn message(&self) -> String {
+        match self {
+            Self::Nothing => {
+                "Nothing scheduled — every session fell on your planned time off".into()
+            }
+            Self::Block {
+                sessions,
+                dropped,
+                thin,
+            } => {
+                let mut m = format!("Next block started — {sessions} sessions");
+                if *dropped > 0 {
+                    m.push_str(&format!(" · {dropped} skipped for time off"));
+                }
+                if *thin > 0 {
+                    // Said out loud: a block with no session hard enough to
+                    // measure is the whole reason the FTP check-in stays dark,
+                    // and a rider would otherwise never learn why.
+                    m.push_str(" · no workout in your library is hard enough to test your FTP");
+                }
+                m
+            }
+        }
+    }
+}
+
+/// Build and write the next block, or write nothing at all.
+///
+/// Runs entirely on the tokio runtime. The order matters: the new program is
+/// written and populated *before* the old one is stood down, so a failure part
+/// way leaves the rider with a working plan rather than with none.
+#[allow(clippy::too_many_arguments)]
+async fn roll_over(
+    pool: &SqlitePool,
+    program: &crate::training::program::Program,
+    sessions: &[crate::training::program::PlannedSession],
+    library: &[Workout],
+    days: Vec<chrono::Weekday>,
+    training_days: &str,
+    start: NaiveDate,
+    easy_first: bool,
+    ftp: u32,
+) -> anyhow::Result<Written> {
+    let block = rollover::next_block(sessions, library, start, &days, ftp, easy_first)?;
+
+    // Re-read rather than trusting what the card was drawn from: the rider may
+    // have booked a trip between opening the dialog and pressing the button,
+    // and this is the check that actually holds (the dialog's warning is only
+    // a courtesy).
+    let last = start + CDuration::days(block.weeks as i64 * 7 - 1);
+    let off: std::collections::HashSet<NaiveDate> = db::load_time_off_between(
+        pool,
+        &start.format("%Y-%m-%d").to_string(),
+        &last.format("%Y-%m-%d").to_string(),
+    )
+    .await?
+    .into_iter()
+    .map(|t| t.date)
+    .collect();
+
+    let mut planned = block.sessions;
+    let dropped = crate::ai::context::drop_time_off_days(&mut planned, &off);
+    if planned.is_empty() {
+        // Nothing has been written yet, so nothing is lost — the rider keeps
+        // the program they had rather than having it retired and replaced by an
+        // empty one.
+        return Ok(Written::Nothing);
+    }
+
+    let new_id = db::save_program(pool, start, block.weeks, training_days).await?;
+    let mut written = 0usize;
+    for (workout_id, date) in &planned {
+        match db::schedule_workout(
+            pool,
+            *workout_id,
+            &date.format("%Y-%m-%d").to_string(),
+            Some(new_id),
+        )
+        .await
+        {
+            Ok(_) => written += 1,
+            Err(e) => tracing::error!("scheduling {workout_id} on {date}: {e}"),
+        }
+    }
+    if written == 0 {
+        // The only point at which an empty program can exist. Stand it back
+        // down rather than leaving the rider following nothing.
+        db::deactivate_program(pool, new_id).await?;
+        return Ok(Written::Nothing);
+    }
+
+    // The old plan may have sessions of its own past this Monday — a rebuild
+    // writes beyond the span it claims — and two plans on the same days is not
+    // a calendar anybody can read.
+    db::clear_future_sessions(pool, program.id, start).await?;
+    db::deactivate_program(pool, program.id).await?;
+
+    Ok(Written::Block {
+        sessions: written,
+        dropped,
+        thin: block.weeks_without_hard_evidence.len(),
+    })
+}
+
+/// Whole weeks from `start` through `end`, and never fewer than a block.
+///
+/// The floor is what makes a replan of a *finished* program mean something: its
+/// span has run out, so the honest answer is zero, and asking the coach for zero
+/// weeks would return nothing at all. A block is the smallest plan worth
+/// building.
+fn weeks_between(start: NaiveDate, end: NaiveDate) -> u32 {
+    let days = (end - start).num_days();
+    if days < 0 {
+        return crate::training::program::BLOCK_WEEKS;
+    }
+    ((days / 7) as u32 + 1).max(crate::training::program::BLOCK_WEEKS)
+}
+
 /// The Monday after `date` — where a replanned program picks up.
 fn next_monday(date: NaiveDate) -> NaiveDate {
     let ahead = 7 - date.weekday().num_days_from_monday() as i64;
@@ -871,16 +1329,22 @@ async fn rebuild_program(
     // Week 1 of the reply is this Monday, and the coach is told so — a
     // (week, day) answer can only dodge a date if the dates are pinned first.
     let start = next_monday(today);
-    let weeks_left = state.total_weeks.saturating_sub(state.week).max(1);
+    let program = db::active_program(&pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the program ended while it was being replanned"))?;
+
+    // Read off the program's span, not off `state.week`. `week_of` clamps into
+    // the span, so `total_weeks - week` was *always one* on a program the rider
+    // had run past — the coach was asked to replan a single week on exactly the
+    // programs most in need of replanning, and the same number clipped the
+    // time-off window below, hiding the rider's holidays from it too.
+    let weeks_left = weeks_between(start, last_day(&program));
     let data = super::data::load_program_prompt_data(
         &pool,
         today,
         start + CDuration::days(weeks_left as i64 * 7),
     )
     .await?;
-    let program = db::active_program(&pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("the program ended while it was being replanned"))?;
 
     let metrics = crate::training::fitness::compute_load_metrics(
         &data.records,
@@ -995,6 +1459,15 @@ async fn rebuild_program(
             Err(e) => tracing::error!("scheduling {workout_id} on {date}: {e}"),
         }
     }
+
+    // The plan now reaches further than the row says it does. Without this the
+    // program goes on claiming a span its own sessions sit outside, `week_of`
+    // stays pinned to the final week, and a rebuild can never move a finished
+    // program off "Week 15 of 15" however many times it is run.
+    let reaches = start + CDuration::days(weeks_left as i64 * 7 - 1);
+    let span = weeks_between(program.start_monday, reaches);
+    db::update_program_span(&pool, program_id, span).await?;
+
     Ok((written, dropped))
 }
 
@@ -1046,13 +1519,60 @@ mod tests {
     #[test]
     fn should_describe_the_week_and_phase() {
         let state = status(&program(), &[], date(2026, 8, 12));
-        assert_eq!(PlanCard::describe(&state), "Week 2 of 12 · Build");
+        let ends = last_day(&program());
+        assert_eq!(PlanCard::describe(&state, ends), "Week 2 of 12 · Build");
     }
 
     #[test]
     fn should_name_a_recovery_week_in_the_description() {
         let state = status(&program(), &[], date(2026, 8, 26));
-        assert_eq!(PlanCard::describe(&state), "Week 4 of 12 · Recovery");
+        let ends = last_day(&program());
+        assert_eq!(PlanCard::describe(&state, ends), "Week 4 of 12 · Recovery");
+    }
+
+    #[test]
+    fn should_say_the_plan_has_finished_instead_of_freezing_on_the_final_week() {
+        // The bug this release exists for: a program the rider has run past
+        // used to describe itself as "Week 12 of 12" for ever.
+        let ends = last_day(&program());
+        let state = status(&program(), &[], ends + CDuration::days(1));
+        assert!(state.over);
+        assert_eq!(
+            PlanCard::describe(&state, ends),
+            "12 weeks · finished 25 October"
+        );
+    }
+
+    #[test]
+    fn should_name_what_the_block_delivered() {
+        let summary = BlockSummary {
+            weeks: 15,
+            completed: 5,
+            planned: 26,
+            tss: 1840.0,
+            ctl_start: 42.0,
+            ctl_end: 51.0,
+        };
+        let (title, subtitle) = PlanCard::finished_summary(&summary);
+        assert_eq!(title, "15 weeks done — 5 of 26 sessions completed");
+        assert_eq!(
+            subtitle,
+            "1840 TSS from the sessions you rode as written. Fitness 42 → 51."
+        );
+    }
+
+    #[test]
+    fn should_leave_the_fitness_out_when_there_is_no_ride_history_to_read_it_from() {
+        let summary = BlockSummary {
+            weeks: 4,
+            completed: 0,
+            planned: 12,
+            tss: 0.0,
+            ctl_start: 0.0,
+            ctl_end: 0.0,
+        };
+        let (_, subtitle) = PlanCard::finished_summary(&summary);
+        assert_eq!(subtitle, "0 TSS from the sessions you rode as written.");
     }
 
     #[test]
@@ -1166,5 +1686,240 @@ mod tests {
             easing_subtitle("Endurance 60", None),
             "Adjusted from Endurance 60"
         );
+    }
+}
+
+/// Offscreen renders of the end-of-program card, for reviewing it without a
+/// screen. See [`crate::ui::pages::calendar::screenshots`] for why this exists
+/// and how to run it.
+#[cfg(test)]
+mod shots {
+    use super::*;
+    use crate::data::workout::{Segment, WorkoutCategory};
+    use crate::training::program::{PlannedSession, Program};
+
+    use crate::ui::pages::calendar::screenshots::{shoot, start, theme};
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
+    }
+
+    /// The rider's own program, as it will stand on 28 September.
+    fn program() -> Program {
+        Program {
+            id: 1,
+            start_monday: date(2026, 6, 15),
+            num_weeks: 15,
+            training_days: String::new(),
+        }
+    }
+
+    fn session(d: NaiveDate, name: &str, cat: WorkoutCategory, completed: bool) -> PlannedSession {
+        PlannedSession {
+            trained: false,
+            entry_id: 1,
+            date: d,
+            workout_id: 1,
+            workout_name: name.into(),
+            category: cat,
+            tss: 44.0,
+            duration_secs: 3600,
+            completed,
+            adjusted_from: None,
+            previous_step_name: None,
+        }
+    }
+
+    fn library() -> Vec<Workout> {
+        vec![Workout {
+            id: 1,
+            name: "Threshold 3x10".into(),
+            description: String::new(),
+            duration_secs: 3600,
+            tss: 70.0,
+            category: WorkoutCategory::Threshold,
+            segments: vec![Segment::steady(3600, 100.0, "Threshold")],
+        }]
+    }
+
+    /// The card drawn from a real database, when one is named.
+    ///
+    /// `CYCLE_SHOT_DB=/path/to/cycle.db` renders the card through the same
+    /// `load_plan_data` the app uses, against a copy of real training history.
+    /// The fixture below is the fallback; this is what proves the page.
+    fn card_window_from_db(
+        rt: &tokio::runtime::Runtime,
+        path: &str,
+        today: NaiveDate,
+    ) -> adw::Window {
+        let (pool, data) = rt
+            .block_on(async {
+                let pool = sqlx::SqlitePool::connect(&format!("sqlite://{path}")).await?;
+                let data = super::super::data::load_plan_data(&pool, today, 200).await?;
+                Ok::<_, anyhow::Error>((pool, data))
+            })
+            .expect("the named database");
+
+        let card = PlanCard::new(
+            pool,
+            rt.handle().clone(),
+            Rc::new(RefCell::new(AthleteProfile::default())),
+            Rc::new(library()),
+            Rc::new(|_| {}),
+        );
+        card.render(data, today);
+        frame(card)
+    }
+
+    /// Wrap a rendered card in a window, clamped as the page clamps it.
+    fn frame(card: Rc<PlanCard>) -> adw::Window {
+        let clamp = adw::Clamp::builder()
+            .maximum_size(900)
+            .margin_top(24)
+            .margin_bottom(24)
+            .margin_start(24)
+            .margin_end(24)
+            .child(card.widget())
+            .build();
+        let view = adw::ToolbarView::new();
+        view.add_top_bar(&adw::HeaderBar::new());
+        view.set_content(Some(&clamp));
+        let window = adw::Window::builder().title("Coaching").build();
+        window.set_content(Some(&view));
+        // The card owns callbacks the window outlives; keep it alive for the shot.
+        unsafe { window.set_data("plan-card", card) };
+        window
+    }
+
+    /// The card as a named database really renders it.
+    ///
+    /// ```text
+    /// CYCLE_SHOT_DB=~/cycle-rollover-test/cycle.db \
+    ///   cargo test -- --ignored --test-threads=1 shot_plan_card_live
+    /// ```
+    #[test]
+    #[ignore]
+    fn shot_plan_card_live() {
+        let Ok(path) = std::env::var("CYCLE_SHOT_DB") else {
+            println!("CYCLE_SHOT_DB not set — nothing to render");
+            return;
+        };
+        let name = std::env::var("CYCLE_SHOT_NAME").unwrap_or_else(|_| "plan-live".into());
+        start();
+        let rt = tokio::runtime::Runtime::new().expect("a runtime for the card's reads");
+        let today = Local::now().date_naive();
+        for (dark, suffix) in [(false, "light"), (true, "dark")] {
+            theme(dark);
+            let w = card_window_from_db(&rt, &path, today);
+            shoot(&w, 900, 420, &format!("{name}-{suffix}"));
+        }
+    }
+
+    /// The card, drawn from real-shaped data, in a window of its own.
+    fn card_window(rt: &tokio::runtime::Runtime, today: NaiveDate) -> adw::Window {
+        let pool = rt
+            .block_on(async {
+                let pool = sqlx::SqlitePool::connect(":memory:").await?;
+                crate::data::migrate::run(&pool).await?;
+                Ok::<_, anyhow::Error>(pool)
+            })
+            .expect("an empty database");
+
+        let card = PlanCard::new(
+            pool,
+            rt.handle().clone(),
+            Rc::new(RefCell::new(AthleteProfile::default())),
+            Rc::new(library()),
+            Rc::new(|_| {}),
+        );
+
+        // The live block: 26 planned, 5 ridden, over fifteen weeks.
+        let mut sessions = vec![
+            session(
+                date(2026, 6, 16),
+                "Endurance 75",
+                WorkoutCategory::Endurance,
+                true,
+            ),
+            session(date(2026, 7, 3), "2x15 Tempo", WorkoutCategory::Tempo, true),
+            session(
+                date(2026, 8, 7),
+                "Endurance 60",
+                WorkoutCategory::Endurance,
+                true,
+            ),
+            session(
+                date(2026, 8, 28),
+                "2x15 Tempo",
+                WorkoutCategory::Tempo,
+                true,
+            ),
+            session(
+                date(2026, 9, 7),
+                "Endurance 75",
+                WorkoutCategory::Endurance,
+                true,
+            ),
+        ];
+        for n in 0..21 {
+            sessions.push(session(
+                date(2026, 6, 17) + CDuration::days(n * 4),
+                "Sweet Spot Base I",
+                WorkoutCategory::SweetSpot,
+                false,
+            ));
+        }
+
+        let pmc = vec![
+            crate::training::fitness::PmcPoint {
+                date: date(2026, 6, 15),
+                ctl: 11.0,
+                atl: 9.0,
+                tsb: 2.0,
+            },
+            crate::training::fitness::PmcPoint {
+                date: date(2026, 9, 27),
+                ctl: 16.0,
+                atl: 2.0,
+                tsb: 14.0,
+            },
+        ];
+
+        card.render(
+            PlanData {
+                program: Some(program()),
+                sessions,
+                trained: std::collections::HashSet::new(),
+                metrics: crate::training::fitness::LoadMetrics::default(),
+                pmc,
+                wellness: Vec::new(),
+                orphans: None,
+                time_off: (23..=28).map(|d| date(2026, 9, d)).collect(),
+            },
+            today,
+        );
+
+        frame(card)
+    }
+
+    /// Both faces, both themes, in one test.
+    ///
+    /// One test function, not two: GTK may only be initialised from a single
+    /// thread, and the test harness gives each `#[test]` its own even at
+    /// `--test-threads=1`.
+    #[test]
+    #[ignore]
+    fn shot_plan_card() {
+        start();
+        let rt = tokio::runtime::Runtime::new().expect("a runtime for the card's reads");
+        for (dark, suffix) in [(false, "light"), (true, "dark")] {
+            theme(dark);
+            // 28 September: the day after the rider's program runs out.
+            let finished = card_window(&rt, date(2026, 9, 28));
+            shoot(&finished, 900, 360, &format!("plan-finished-{suffix}"));
+            // The ordinary face, to compare the change against.
+            let running = card_window(&rt, date(2026, 9, 8));
+            shoot(&running, 900, 360, &format!("plan-running-{suffix}"));
+        }
     }
 }

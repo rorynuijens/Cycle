@@ -47,13 +47,13 @@ const WINDOW_DAYS: i64 = 28;
 /// threshold work is what the rest of the app colours as threshold work.
 /// Compared as integer percentages throughout: `0.91_f32 * 200.0` is 182.000005,
 /// which would exclude a target of exactly 182 W from its own zone.
-const HARD_TARGET_PCT: u32 = 91;
+pub(crate) const HARD_TARGET_PCT: u32 = 91;
 
 /// Hard seconds a session needs before it counts as evidence rather than noise.
-const MIN_HARD_SECONDS: u32 = 600;
+pub(crate) const MIN_HARD_SECONDS: u32 = 600;
 
 /// Hard-evidence sessions the window needs before any suggestion is made.
-const MIN_HARD_SESSIONS: usize = 3;
+pub(crate) const MIN_HARD_SESSIONS: usize = 3;
 
 /// Cadence this far below the session's pedalling median is a collapse.
 const STRUGGLE_CADENCE_FRACTION: f32 = 0.8;
@@ -347,6 +347,41 @@ fn hard_runs(points: &[DataPoint], ftp: u32) -> Vec<(usize, usize)> {
         runs.push((s, points.len()));
     }
     runs
+}
+
+/// Seconds a *workout* prescribes at or above the hard threshold, in the whole
+/// watts the trainer will actually be sent.
+///
+/// The mirror of [`hard_runs`], read off a plan instead of a recorded ride, so
+/// the thing that writes a training block and the thing that later judges it
+/// cannot disagree about what counts as evidence.
+///
+/// It has to go through [`Segment::target_power_at`] rather than compare
+/// percentages, because that conversion truncates. At an FTP of 250 W a target
+/// of exactly 91 % is 227.5 W, sent as 227, and `227 * 100 < 250 * 91` — so a
+/// segment prescribed at the threshold is *not* hard by the test that will read
+/// it back. A plan that believed it had prescribed evidence the detector cannot
+/// see would be worse than one that prescribed none, because it looks like it
+/// is working.
+///
+/// Ramps are stepped second by second for the same reason: only the part of the
+/// ramp actually above the line counts.
+pub(crate) fn hard_evidence_seconds(workout: &crate::data::workout::Workout, ftp: u32) -> u32 {
+    workout
+        .segments
+        .iter()
+        .map(|seg| {
+            if seg.is_ramp() {
+                (0..seg.duration_secs)
+                    .filter(|t| seg.target_power_at(*t, ftp) * 100 >= ftp * HARD_TARGET_PCT)
+                    .count() as u32
+            } else if seg.target_power_at(0, ftp) * 100 >= ftp * HARD_TARGET_PCT {
+                seg.duration_secs
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 /// Judge one hard segment, preferring the cadence signal where there is one.
@@ -741,6 +776,69 @@ mod tests {
         power: Option<u32>,
         cadence: Option<u32>,
         hr: Option<u32>,
+    }
+
+    // ── Reading hard evidence off a plan ──────────────────────────────────────
+
+    fn planned(segments: Vec<crate::data::workout::Segment>) -> crate::data::workout::Workout {
+        crate::data::workout::Workout {
+            id: 1,
+            name: "Planned".into(),
+            description: String::new(),
+            duration_secs: segments.iter().map(|s| s.duration_secs).sum(),
+            tss: 0.0,
+            category: crate::data::workout::WorkoutCategory::Threshold,
+            segments,
+        }
+    }
+
+    #[test]
+    fn should_count_a_threshold_block_at_full_ftp_as_hard_evidence() {
+        let w = planned(vec![
+            crate::data::workout::Segment::steady(600, 55.0, "Warm-up"),
+            crate::data::workout::Segment::steady(900, 100.0, "Threshold"),
+        ]);
+        assert_eq!(hard_evidence_seconds(&w, FTP), 900);
+    }
+
+    #[test]
+    fn should_not_count_sweet_spot_at_ninety_percent_as_hard_evidence() {
+        // The live program's hardest work sits here — one point under the bar.
+        let w = planned(vec![crate::data::workout::Segment::steady(
+            1200,
+            90.0,
+            "Sweet spot",
+        )]);
+        assert_eq!(hard_evidence_seconds(&w, FTP), 0);
+    }
+
+    #[test]
+    fn should_not_count_a_target_that_truncates_below_the_threshold() {
+        // 91 % of 250 is 227.5, sent as 227, and 227 * 100 < 250 * 91. A plan
+        // written at exactly the threshold is not evidence the detector sees.
+        let w = planned(vec![crate::data::workout::Segment::steady(
+            900,
+            91.0,
+            "Threshold",
+        )]);
+        assert_eq!(hard_evidence_seconds(&w, 250), 0);
+    }
+
+    #[test]
+    fn should_count_only_the_part_of_a_ramp_above_the_threshold() {
+        // 60 s ramping 80 → 100 % of FTP: the target reaches the bar part way.
+        let seg = crate::data::workout::Segment {
+            duration_secs: 60,
+            power_low_pct: 80.0,
+            power_high_pct: 100.0,
+            label: Some("Ramp".into()),
+            cadence_target: None,
+        };
+        let counted = hard_evidence_seconds(&planned(vec![seg]), FTP);
+        assert!(
+            counted > 0 && counted < 60,
+            "part of the ramp, not all of it"
+        );
     }
 
     /// A stretch ridden on target, with a cadence sensor reporting.

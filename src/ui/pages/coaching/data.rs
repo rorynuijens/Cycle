@@ -11,6 +11,13 @@ use crate::data::{db, settings};
 /// Days of wellness history sent with a coaching prompt.
 const AI_WELLNESS_DAYS: u32 = 7;
 
+/// How far ahead the plan card looks for time off.
+///
+/// Comfortably past the far end of a block that may be pushed a few weeks out
+/// by a trip, and no further — this is for showing the rider what a new block
+/// would lose, not for planning against.
+const TIME_OFF_LOOKAHEAD_DAYS: i64 = 120;
+
 /// The page's own state: the rider's goals and the last cached suggestion.
 pub struct CoachingData {
     pub goals: Vec<db::AthleteGoal>,
@@ -40,7 +47,14 @@ pub struct PlanData {
     /// [`crate::training::matching::trained_days`]).
     pub trained: std::collections::HashSet<NaiveDate>,
     pub metrics: crate::training::fitness::LoadMetrics,
+    /// Fitness day by day across the program's whole span, for the summary the
+    /// card shows once the plan is over. Empty when there is no program.
+    pub pmc: Vec<crate::training::fitness::PmcPoint>,
     pub wellness: Vec<db::WellnessEntry>,
+    /// Days the rider is away, from today forward. Read here so the card can
+    /// say what a new block would lose to them before it is written; the write
+    /// path re-reads it, because a trip booked in between still counts.
+    pub time_off: Vec<NaiveDate>,
     /// Scheduled workouts belonging to no program: first, last, and how many.
     /// These predate program tracking and can be adopted.
     pub orphans: Option<(NaiveDate, NaiveDate, i64)>,
@@ -74,13 +88,41 @@ pub async fn load_plan_data(
         today,
     );
 
+    // Back to the program's first day, so the end-of-block summary can say what
+    // fitness did over the whole plan rather than over a fixed recent window.
+    let pmc = match &program {
+        Some(p) => {
+            let span = (today - p.start_monday).num_days().max(0) + 1;
+            crate::training::fitness::compute_pmc_series(
+                &records,
+                &intervals_pairs,
+                fallback_ftp,
+                today,
+                span,
+            )
+        }
+        None => Vec::new(),
+    };
+
     Ok(PlanData {
         program,
         sessions,
         trained,
         metrics,
+        pmc,
         wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS.max(14)).await?,
         orphans: db::orphan_entry_span(pool).await?,
+        time_off: db::load_time_off_between(
+            pool,
+            &today.format("%Y-%m-%d").to_string(),
+            &(today + chrono::Duration::days(TIME_OFF_LOOKAHEAD_DAYS))
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+        .await?
+        .into_iter()
+        .map(|t| t.date)
+        .collect(),
     })
 }
 

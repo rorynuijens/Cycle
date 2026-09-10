@@ -75,6 +75,27 @@ pub async fn active_program(pool: &SqlitePool) -> Result<Option<Program>> {
     }))
 }
 
+/// Move where a program ends.
+///
+/// The only writer of `num_weeks` after creation, and the reason it exists: a
+/// rebuild writes sessions past the span the row claims, and a row that
+/// disagrees with its own calendar pins [`crate::training::program::week_of`]
+/// to a final week the rider has already left behind.
+///
+/// `start_monday` is deliberately not touched. A program really did begin when
+/// it began; what a replan moves is the far end.
+///
+/// Returns whether a row changed, so a caller cannot report a moved span for a
+/// program that was ended from another surface while the request was in flight.
+pub async fn update_program_span(pool: &SqlitePool, id: i64, num_weeks: u32) -> Result<bool> {
+    let result = sqlx::query("UPDATE programs SET num_weeks = ? WHERE id = ?")
+        .bind(num_weeks as i64)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Stop tracking a program. Its calendar entries are left alone — those rides
 /// were still planned, and history should not rewrite itself.
 pub async fn deactivate_program(pool: &SqlitePool, id: i64) -> Result<()> {
@@ -386,6 +407,80 @@ mod tests {
         assert_eq!(loaded.start_monday, date(2026, 8, 3));
         assert_eq!(loaded.num_weeks, 12);
         assert_eq!(loaded.training_days, "monday,friday");
+    }
+
+    #[tokio::test]
+    async fn should_move_a_programs_span_when_it_is_replanned() {
+        let pool = test_pool().await;
+        let id = save_program(&pool, date(2026, 8, 3), 12, "monday,friday")
+            .await
+            .unwrap();
+
+        assert!(update_program_span(&pool, id, 18).await.unwrap());
+        let loaded = active_program(&pool).await.unwrap().expect("just saved");
+        assert_eq!(loaded.num_weeks, 18);
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_start_and_the_training_days_when_only_the_span_moves() {
+        // A program really did begin when it began; a replan moves the far end.
+        let pool = test_pool().await;
+        let id = save_program(&pool, date(2026, 8, 3), 12, "monday,friday")
+            .await
+            .unwrap();
+
+        update_program_span(&pool, id, 18).await.unwrap();
+        let loaded = active_program(&pool).await.unwrap().expect("just saved");
+        assert_eq!(loaded.start_monday, date(2026, 8, 3));
+        assert_eq!(loaded.training_days, "monday,friday");
+    }
+
+    #[tokio::test]
+    async fn should_report_no_change_when_the_program_does_not_exist() {
+        let pool = test_pool().await;
+        assert!(!update_program_span(&pool, 99, 4).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn should_follow_the_newest_program_when_a_block_rolls_over() {
+        // The roll-over writes the new block before standing the old one down,
+        // so both rows are briefly active. Newest must win throughout.
+        let pool = test_pool().await;
+        let old = save_program(&pool, date(2026, 6, 15), 15, "")
+            .await
+            .unwrap();
+        let new = save_program(&pool, date(2026, 9, 28), 4, "monday,wednesday,friday")
+            .await
+            .unwrap();
+
+        assert_eq!(active_program(&pool).await.unwrap().unwrap().id, new);
+        deactivate_program(&pool, old).await.unwrap();
+        let loaded = active_program(&pool).await.unwrap().expect("the new block");
+        assert_eq!(loaded.id, new);
+        assert_eq!(
+            loaded.training_days, "monday,wednesday,friday",
+            "a rolled-over block records the days it was built around"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_clear_only_the_old_programs_future_when_a_block_rolls_over() {
+        let pool = test_pool().await;
+        let (old, workout, _) = program_with_one_session(&pool).await;
+        // One session before the new block opens, one after.
+        schedule_workout(&pool, workout, "2026-10-07", Some(old))
+            .await
+            .unwrap();
+
+        let cleared = clear_future_sessions(&pool, old, date(2026, 9, 28))
+            .await
+            .unwrap();
+        assert_eq!(cleared, 1, "only the session inside the new block's span");
+        assert_eq!(
+            load_program_sessions(&pool, old).await.unwrap().len(),
+            1,
+            "the August session is history and stays"
+        );
     }
 
     #[tokio::test]

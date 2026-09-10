@@ -26,10 +26,10 @@ use chrono::NaiveDate;
 use crate::data::db::WellnessEntry;
 use crate::data::workout::{Workout, WorkoutCategory};
 use crate::training::analytics::{build_wellness_series, wellness_baseline, MIN_WELLNESS_READINGS};
-use crate::training::fitness::{LoadMetrics, TsbBand};
+use crate::training::fitness::{LoadMetrics, PmcPoint, TsbBand};
 
 /// Weeks in a block: three building, then one easier.
-const BLOCK_WEEKS: u32 = 4;
+pub(crate) const BLOCK_WEEKS: u32 = 4;
 
 /// Consecutive missed sessions before the next one is eased.
 ///
@@ -201,6 +201,14 @@ pub struct ProgramStatus {
     pub missed_recent: Vec<PlannedSession>,
     /// Sessions still to come, soonest first.
     pub upcoming: Vec<PlannedSession>,
+    /// Whether the program has run its course.
+    ///
+    /// Both halves of the test are needed. The span alone would call a program
+    /// finished while a rebuild's sessions still sat on the calendar ahead of
+    /// the rider; an empty `upcoming` alone calls a rider who is simply between
+    /// sessions "finished". Only when the weeks have run out *and* there is
+    /// nothing left to ride is the plan actually over.
+    pub over: bool,
 }
 
 impl ProgramStatus {
@@ -334,6 +342,15 @@ pub struct Adjustment {
     pub reason: Reason,
 }
 
+/// The last day the program covers — the Sunday that closes its final week.
+///
+/// A program is stored as a starting Monday and a count of weeks; nothing
+/// records an end date, so everything that needs to know when the plan runs out
+/// derives it here rather than each computing its own arithmetic.
+pub fn last_day(program: &Program) -> NaiveDate {
+    program.start_monday + chrono::Duration::days(program.num_weeks.max(1) as i64 * 7 - 1)
+}
+
 /// Which week of the program `today` falls in, 1-based and clamped to its span.
 ///
 /// A date before the program starts reads as week 1, and one past the end reads
@@ -391,7 +408,55 @@ pub fn status(program: &Program, sessions: &[PlannedSession], today: NaiveDate) 
         completed,
         missed,
         missed_recent,
+        over: today > last_day(program) && upcoming.is_empty(),
         upcoming,
+    }
+}
+
+/// What a finished block actually delivered, for the card that closes it out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockSummary {
+    pub weeks: u32,
+    pub completed: usize,
+    pub planned: usize,
+    /// Planned TSS of the sessions that were ridden as written.
+    ///
+    /// Deliberately not the TSS of everything ridden in the span: a road ride on
+    /// a planned recovery day settles that day (see [`PlannedSession::trained`])
+    /// but says nothing about what the *plan* delivered. The fitness change
+    /// below is where every ride is counted.
+    pub tss: f32,
+    /// Fitness on the program's first day, and on its last.
+    pub ctl_start: f64,
+    pub ctl_end: f64,
+}
+
+/// Total up a block once it is over.
+///
+/// Pure, and separate from the row it fills, so the sentence the rider reads at
+/// the end of fifteen weeks can be tested without a display.
+pub fn block_summary(
+    program: &Program,
+    sessions: &[PlannedSession],
+    pmc: &[PmcPoint],
+) -> BlockSummary {
+    // The last reading on or before a day: the series carries one point per
+    // day, but it is windowed, so a program older than the window has no point
+    // at its start and reads zero rather than borrowing a later day's fitness.
+    let ctl_on = |day: NaiveDate| -> f64 {
+        pmc.iter()
+            .rfind(|p| p.date <= day)
+            .map(|p| p.ctl)
+            .unwrap_or(0.0)
+    };
+
+    BlockSummary {
+        weeks: program.num_weeks.max(1),
+        completed: sessions.iter().filter(|s| s.completed).count(),
+        planned: sessions.len(),
+        tss: sessions.iter().filter(|s| s.completed).map(|s| s.tss).sum(),
+        ctl_start: ctl_on(program.start_monday),
+        ctl_end: ctl_on(last_day(program)),
     }
 }
 
@@ -917,6 +982,113 @@ mod tests {
     #[test]
     fn should_cross_a_month_boundary_correctly() {
         assert_eq!(week_of(&program(12), date(2026, 9, 1)), 5);
+    }
+
+    // ── The end of a program ──────────────────────────────────────────────────
+
+    #[test]
+    fn should_end_on_the_sunday_that_closes_the_final_week() {
+        // Monday 3 Aug + 4 weeks runs through Sunday 30 Aug.
+        assert_eq!(last_day(&program(4)), date(2026, 8, 30));
+    }
+
+    #[test]
+    fn should_report_over_when_the_span_has_passed_and_nothing_is_upcoming() {
+        let sessions = vec![session(
+            1,
+            date(2026, 8, 5),
+            WorkoutCategory::Endurance,
+            true,
+        )];
+        let state = status(&program(4), &sessions, date(2026, 8, 31));
+        assert!(state.over);
+    }
+
+    #[test]
+    fn should_not_report_over_on_the_final_day_itself() {
+        // The last Sunday is still part of the plan, even with nothing left on it.
+        let sessions = vec![session(
+            1,
+            date(2026, 8, 5),
+            WorkoutCategory::Endurance,
+            true,
+        )];
+        let state = status(&program(4), &sessions, date(2026, 8, 30));
+        assert!(!state.over);
+    }
+
+    #[test]
+    fn should_not_report_over_when_a_rebuild_left_sessions_ahead() {
+        // A rebuild writes past the nominal span; the plan is plainly not over.
+        let sessions = vec![session(
+            1,
+            date(2026, 9, 8),
+            WorkoutCategory::Endurance,
+            false,
+        )];
+        let state = status(&program(4), &sessions, date(2026, 8, 31));
+        assert!(!state.over);
+    }
+
+    #[test]
+    fn should_not_report_over_while_the_program_is_still_running() {
+        let sessions = vec![session(
+            1,
+            date(2026, 8, 20),
+            WorkoutCategory::Endurance,
+            false,
+        )];
+        let state = status(&program(12), &sessions, date(2026, 8, 10));
+        assert!(!state.over);
+    }
+
+    // ── What the block delivered ──────────────────────────────────────────────
+
+    fn pmc_point(d: NaiveDate, ctl: f64) -> crate::training::fitness::PmcPoint {
+        crate::training::fitness::PmcPoint {
+            date: d,
+            ctl,
+            atl: 0.0,
+            tsb: ctl,
+        }
+    }
+
+    #[test]
+    fn should_summarise_what_the_block_delivered() {
+        let sessions = vec![
+            session(1, date(2026, 8, 5), WorkoutCategory::Endurance, true),
+            session(2, date(2026, 8, 7), WorkoutCategory::SweetSpot, true),
+            session(3, date(2026, 8, 12), WorkoutCategory::Tempo, false),
+        ];
+        let pmc = vec![
+            pmc_point(date(2026, 8, 3), 42.0),
+            pmc_point(date(2026, 8, 30), 51.0),
+        ];
+        let summary = block_summary(&program(4), &sessions, &pmc);
+
+        assert_eq!(summary.weeks, 4);
+        assert_eq!(summary.completed, 2);
+        assert_eq!(summary.planned, 3);
+        assert_eq!(summary.tss, 120.0, "only the sessions actually ridden");
+        assert_eq!(summary.ctl_start, 42.0);
+        assert_eq!(summary.ctl_end, 51.0);
+    }
+
+    #[test]
+    fn should_read_fitness_from_the_last_day_on_or_before_each_end() {
+        // The series has no point on either boundary, so the nearest earlier
+        // day stands in rather than a later one leaking backwards.
+        let pmc = vec![
+            pmc_point(date(2026, 8, 4), 40.0),
+            pmc_point(date(2026, 8, 20), 47.0),
+            pmc_point(date(2026, 9, 5), 60.0),
+        ];
+        let summary = block_summary(&program(4), &[], &pmc);
+        assert_eq!(summary.ctl_start, 0.0, "nothing on or before the start");
+        assert_eq!(
+            summary.ctl_end, 47.0,
+            "20 Aug is the last day inside the span"
+        );
     }
 
     #[test]
