@@ -159,6 +159,34 @@ pub type ReloadFn = std::rc::Rc<dyn Fn()>;
 /// made, and the callbacks read it when they fire.
 pub type ReloadHolder = std::rc::Rc<std::cell::RefCell<Option<ReloadFn>>>;
 
+/// Call a callback a widget holds a reference to inside itself.
+///
+/// The clone is the whole point. These callbacks rebuild the widget tree that
+/// owns the holder, and the rebuild drops the old widgets — on several pages
+/// including the very `Rc` the borrow is reading through. Holding a `RefCell`
+/// borrow across that call is an `already borrowed` panic waiting for the right
+/// timing (CLAUDE.md §2.4). Cloning the inner `Rc` out first makes the call
+/// re-entrant-safe, so a reload may install a fresh callback over the one that
+/// is still running.
+///
+/// A free function rather than a wrapper that returns a closure, because two
+/// callers are `&self` methods rather than GTK handlers
+/// ([`crate::ui::pages::player::PlayerPage::trigger_pause_toggle`] and
+/// `toggle_overlay`) and need the same guarantee with no closure to hang it on.
+///
+/// Not every holder passed here is a *reload* — the player's transport
+/// callbacks are not — but the hazard is identical for any callback a widget
+/// holds inside itself, which is why they share one type and one read.
+///
+/// Does nothing when the holder has not been filled in yet: a page whose rows
+/// exist before its rebuild closure does is the ordinary case, not an error.
+pub fn call_reload(holder: &ReloadHolder) {
+    let f = holder.borrow().clone();
+    if let Some(f) = f {
+        f();
+    }
+}
+
 /// Somewhere to put "ride this route", for a page built before it exists.
 ///
 /// The calendar can hold a planned route, and opening one offers to ride it —
@@ -255,6 +283,37 @@ pub fn spawn_write<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Calling a callback a widget holds inside itself ───────────────────────
+
+    #[test]
+    fn should_do_nothing_when_no_reload_has_been_installed() {
+        let holder: ReloadHolder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        call_reload(&holder);
+    }
+
+    #[test]
+    fn should_release_the_borrow_before_calling_so_a_reload_can_replace_itself() {
+        // The regression this whole sweep exists for. A reload rebuilds the
+        // widgets that own the holder, and the rebuild installs a new callback
+        // — writing through the same RefCell the old pattern was still
+        // borrowing. That panics; this must not.
+        let holder: ReloadHolder = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let inner = std::rc::Rc::clone(&holder);
+        let counter = std::rc::Rc::clone(&calls);
+        *holder.borrow_mut() = Some(std::rc::Rc::new(move || {
+            counter.set(counter.get() + 1);
+            let again = std::rc::Rc::clone(&inner);
+            *inner.borrow_mut() = Some(std::rc::Rc::new(move || {
+                let _ = &again;
+            }));
+        }));
+
+        call_reload(&holder);
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn should_show_no_banner_when_every_sensor_is_live() {

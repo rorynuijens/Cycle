@@ -839,9 +839,7 @@ pub fn show_session_detail(
                 move |result| match result {
                     Ok(()) => {
                         row.set_subtitle("Unlinked — both rides will be shown");
-                        if let Some(cb) = reload.borrow().as_ref() {
-                            cb();
-                        }
+                        crate::ui::call_reload(&reload);
                     }
                     Err(e) => tracing::error!("unlink session failed: {e}"),
                 },
@@ -862,9 +860,7 @@ pub fn show_session_detail(
                 async move { db::set_session_title(&pool, session_id, &text).await },
                 move |result| match result {
                     Ok(()) => {
-                        if let Some(cb) = reload.borrow().as_ref() {
-                            cb();
-                        }
+                        crate::ui::call_reload(&reload);
                     }
                     Err(e) => tracing::error!("rename session failed: {e}"),
                 },
@@ -1335,9 +1331,7 @@ pub fn show_session_detail(
                                 tracing::error!("save_session_rpe failed: {e}");
                             }
                             win.close();
-                            if let Some(reload) = rh.borrow().as_ref() {
-                                reload();
-                            }
+                            crate::ui::call_reload(&rh);
                         },
                     );
                 });

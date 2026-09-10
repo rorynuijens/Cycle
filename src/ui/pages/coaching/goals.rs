@@ -129,9 +129,7 @@ impl GoalsSection {
                 async move { db::delete_goal(&pool, goal_id).await },
                 move |res| match res {
                     Ok(()) => {
-                        if let Some(reload) = reload.borrow().as_ref() {
-                            reload();
-                        }
+                        crate::ui::call_reload(&reload);
                     }
                     Err(e) => tracing::error!("delete_goal failed: {e}"),
                 },
@@ -186,9 +184,7 @@ impl GoalsSection {
                     async move { db::save_goal(&pool, &description).await },
                     move |res| match res {
                         Ok(_) => {
-                            if let Some(reload) = reload.borrow().as_ref() {
-                                reload();
-                            }
+                            crate::ui::call_reload(&reload);
                         }
                         Err(e) => tracing::error!("save_goal failed: {e}"),
                     },

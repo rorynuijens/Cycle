@@ -168,9 +168,7 @@ pub fn reload_closure(
                                                 );
                                                 return;
                                             }
-                                            if let Some(reload) = holder.borrow().as_ref() {
-                                                reload();
-                                            }
+                                            crate::ui::call_reload(&holder);
                                         },
                                     );
                                 }
@@ -278,9 +276,7 @@ pub fn reload_closure(
                                         );
                                         return;
                                     }
-                                    if let Some(reload) = holder.borrow().as_ref() {
-                                        reload();
-                                    }
+                                    crate::ui::call_reload(&holder);
                                 },
                             );
                         });

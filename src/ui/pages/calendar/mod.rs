@@ -37,17 +37,12 @@ use crate::ui::ReloadFn;
 /// The page-wide reload, resolved at click time rather than at build time.
 ///
 /// The closure a row needs does not exist while that row is being built — see
-/// [`crate::ui::ReloadHolder`]. Cloning the inner `Rc` out before calling it
-/// matters: reload rebuilds the very widget whose handler is running, and
-/// holding the `RefCell` borrow across that is a panic waiting to happen.
+/// [`crate::ui::ReloadHolder`]. The safe read itself is
+/// [`crate::ui::call_reload`]; this is the wrapper for the rows that want a
+/// plain `Rc<dyn Fn()>` to hand to a signal handler.
 fn reload_fn(holder: &Rc<RefCell<Option<ReloadFn>>>) -> Rc<dyn Fn()> {
     let holder = Rc::clone(holder);
-    Rc::new(move || {
-        let f = holder.borrow().clone();
-        if let Some(f) = f {
-            f();
-        }
-    })
+    Rc::new(move || crate::ui::call_reload(&holder))
 }
 
 /// Everything the calendar draws for one visible range.

@@ -4,8 +4,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-type StartNowCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
-type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// A transport button's action, filled in once the engine exists.
+///
+/// The same type the pages use for their reload callbacks, and read through the
+/// same [`crate::ui::call_reload`]: these are handlers on widgets the callback
+/// itself may rebuild, which is the hazard that type exists to contain
+/// (CLAUDE.md §2.4). They were `Box` only because they predate it, and a `Box`
+/// cannot be cloned out of the `RefCell` before the call.
+type ButtonCb = crate::ui::ReloadHolder;
 
 use crate::data::settings;
 use crate::data::{
@@ -78,7 +84,7 @@ pub struct PlayerPage {
     /// Consecutive seconds of power data received while the engine is Idle.
     pub power_countdown: Rc<Cell<u32>>,
     /// Callback wired by `start_timer` for the countdown banner's "Start now" button.
-    start_now_cb: StartNowCb,
+    start_now_cb: ButtonCb,
     /// Playback-control callbacks — set (and replaced) each time `start_timer` is called,
     /// so that buttons are wired exactly once in `new()` and never accumulate handlers.
     end_cb: ButtonCb,
@@ -125,12 +131,10 @@ impl PlayerPage {
             .revealed(true)
             .build();
 
-        let start_now_cb: StartNowCb = Rc::new(RefCell::new(None));
+        let start_now_cb: ButtonCb = Rc::new(RefCell::new(None));
         let start_now_ref = Rc::clone(&start_now_cb);
         countdown_banner.connect_button_clicked(move |_| {
-            if let Some(cb) = start_now_ref.borrow().as_ref() {
-                cb();
-            }
+            crate::ui::call_reload(&start_now_ref);
         });
 
         root.append(&countdown_banner);
@@ -502,49 +506,37 @@ impl PlayerPage {
         {
             let cb = Rc::clone(&end_cb);
             end_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         {
             let cb = Rc::clone(&pause_cb);
             pause_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         {
             let cb = Rc::clone(&skip_cb);
             skip_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         {
             let cb = Rc::clone(&cancel_cb);
             cancel_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         {
             let cb = Rc::clone(&intensity_down_cb);
             intensity_down_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         {
             let cb = Rc::clone(&intensity_up_cb);
             intensity_up_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
 
@@ -643,9 +635,7 @@ impl PlayerPage {
                 if !widget.is_mapped() {
                     return glib::Propagation::Proceed;
                 }
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
                 glib::Propagation::Stop
             });
             controller.add_shortcut(gtk::Shortcut::new(Some(trigger), Some(action)));
@@ -784,9 +774,7 @@ impl PlayerPage {
     /// header "Resume Workout" button calls it only when the engine is paused, so it
     /// never accidentally pauses a running workout.
     pub fn trigger_pause_toggle(&self) {
-        if let Some(cb) = self.pause_cb.borrow().as_ref() {
-            cb();
-        }
+        crate::ui::call_reload(&self.pause_cb);
     }
 
     /// Start the 1 Hz GLib timer, wire the playback controls, and call `on_complete`
@@ -809,7 +797,7 @@ impl PlayerPage {
         {
             let engine_cancel = Rc::clone(&engine);
             let timer_alive_cancel = Rc::clone(&timer_alive);
-            *page.borrow().cancel_cb.borrow_mut() = Some(Box::new(move || {
+            *page.borrow().cancel_cb.borrow_mut() = Some(Rc::new(move || {
                 if engine_cancel.borrow().state == EngineState::Idle {
                     timer_alive_cancel.set(false);
                     on_cancel();
@@ -822,7 +810,7 @@ impl PlayerPage {
             let engine_start_now = Rc::clone(&engine);
             let power_countdown_now = Rc::clone(&page.borrow().power_countdown);
             let countdown_banner_now = page.borrow().countdown_banner.clone();
-            *page.borrow().start_now_cb.borrow_mut() = Some(Box::new(move || {
+            *page.borrow().start_now_cb.borrow_mut() = Some(Rc::new(move || {
                 engine_start_now.borrow_mut().start();
                 power_countdown_now.set(0);
                 countdown_banner_now.set_revealed(false);
@@ -833,7 +821,7 @@ impl PlayerPage {
         {
             let pause_btn = page.borrow().pause_btn.clone();
             let engine_pause = Rc::clone(&engine);
-            *page.borrow().pause_cb.borrow_mut() = Some(Box::new(move || {
+            *page.borrow().pause_cb.borrow_mut() = Some(Rc::new(move || {
                 let mut eng = engine_pause.borrow_mut();
                 match eng.state {
                     EngineState::Running => {
@@ -854,7 +842,7 @@ impl PlayerPage {
         // ── Skip to next interval ────────────────────────────────────────────
         {
             let engine_skip = Rc::clone(&engine);
-            *page.borrow().skip_cb.borrow_mut() = Some(Box::new(move || {
+            *page.borrow().skip_cb.borrow_mut() = Some(Rc::new(move || {
                 engine_skip.borrow_mut().skip_to_next_segment();
             }));
         }
@@ -862,10 +850,10 @@ impl PlayerPage {
         // ── Intensity dial ───────────────────────────────────────────────────
         // The label is set here as well as from the snapshot: waiting up to a
         // second for the tick to catch up reads as a dead button.
-        let dial_cb = |delta: i32| -> Box<dyn Fn()> {
+        let dial_cb = |delta: i32| -> Rc<dyn Fn()> {
             let engine_dial = Rc::clone(&engine);
             let label = page.borrow().intensity_label.clone();
-            Box::new(move || {
+            Rc::new(move || {
                 let pct = {
                     let mut eng = engine_dial.borrow_mut();
                     eng.adjust_intensity(delta);
@@ -883,7 +871,7 @@ impl PlayerPage {
             let engine_end = Rc::clone(&engine);
             let on_complete_end = Rc::clone(&on_complete);
             let completed_end = Rc::clone(&completed);
-            *page.borrow().end_cb.borrow_mut() = Some(Box::new(move || {
+            *page.borrow().end_cb.borrow_mut() = Some(Rc::new(move || {
                 let dialog = adw::AlertDialog::builder()
                     .heading("End Workout?")
                     .body("Your progress so far will be saved.")
@@ -1012,9 +1000,7 @@ impl PlayerPage {
             self.close_overlay();
             return;
         }
-        if let Some(open) = self.overlay_cb.borrow().as_ref() {
-            open();
-        }
+        crate::ui::call_reload(&self.overlay_cb);
     }
 
     /// Close the overlay if it is open, and forget it.
@@ -1229,7 +1215,7 @@ pub fn attach_overlay(
     rt: tokio::runtime::Handle,
 ) {
     let overlay_cell = Rc::clone(&page.borrow().overlay);
-    let cb: Box<dyn Fn()> = Box::new(glib::clone!(
+    let cb: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         app,
         move || {

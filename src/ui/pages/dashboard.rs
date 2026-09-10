@@ -614,9 +614,7 @@ impl DashboardPage {
                     move |result| match result {
                         Ok(()) => {
                             btn.set_visible(false);
-                            if let Some(reload) = rh.borrow().as_ref() {
-                                reload();
-                            }
+                            crate::ui::call_reload(&rh);
                         }
                         // The rider pressed a button and something has to happen.
                         // Previously this path only logged, so a missing workout
@@ -672,9 +670,7 @@ impl DashboardPage {
                                 }
                             },
                             move |()| {
-                                if let Some(reload) = rh.borrow().as_ref() {
-                                    reload();
-                                }
+                                crate::ui::call_reload(&rh);
                             },
                         );
                     },
@@ -952,9 +948,7 @@ impl DashboardPage {
                                 }
                             },
                             move |()| {
-                                if let Some(reload) = rh.borrow().as_ref() {
-                                    reload();
-                                }
+                                crate::ui::call_reload(&rh);
                             },
                         );
                     });

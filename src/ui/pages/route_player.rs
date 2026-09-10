@@ -17,7 +17,8 @@ use crate::ui::widgets::zone_color::gradient_rgb;
 use crate::ui::widgets::zone_meter::ZoneMeter;
 use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 
-type ButtonCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// A transport button's action — see the note on the player's own alias.
+type ButtonCb = crate::ui::ReloadHolder;
 
 /// The route sampled for the profile charts, as `(distance km, elevation m,
 /// gradient %)`. Shared between the page and the two charts' draw functions,
@@ -221,9 +222,7 @@ impl RoutePlayerPage {
         {
             let cb = Rc::clone(&start_now_cb);
             countdown_banner.connect_button_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         root.append(&countdown_banner);
@@ -525,17 +524,13 @@ impl RoutePlayerPage {
         {
             let cb = Rc::clone(&end_cb);
             end_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
         {
             let cb = Rc::clone(&pause_cb);
             pause_btn.connect_clicked(move |_| {
-                if let Some(f) = cb.borrow().as_ref() {
-                    f();
-                }
+                crate::ui::call_reload(&cb);
             });
         }
 
@@ -890,7 +885,7 @@ impl RoutePlayerPage {
             let banner = page.countdown_banner.clone();
             let countdown = Rc::clone(&page.power_countdown);
             let session_btn = Rc::clone(&session);
-            *page.start_now_cb.borrow_mut() = Some(Box::new(move || {
+            *page.start_now_cb.borrow_mut() = Some(Rc::new(move || {
                 started_btn.set(true);
                 countdown.set(0);
                 banner.set_revealed(false);
@@ -902,7 +897,7 @@ impl RoutePlayerPage {
         {
             let pause_btn = page.pause_btn.clone();
             let paused_c = Rc::clone(&paused);
-            *page.pause_cb.borrow_mut() = Some(Box::new(move || {
+            *page.pause_cb.borrow_mut() = Some(Rc::new(move || {
                 let is_paused = !paused_c.get();
                 paused_c.set(is_paused);
                 if is_paused {
@@ -922,7 +917,7 @@ impl RoutePlayerPage {
             let on_complete_end = Rc::clone(&on_complete);
             let completed_end = Rc::clone(&completed);
             let timer_alive_end = Rc::clone(&timer_alive);
-            *page.end_cb.borrow_mut() = Some(Box::new(move || {
+            *page.end_cb.borrow_mut() = Some(Rc::new(move || {
                 let dialog = adw::AlertDialog::builder()
                     .heading("End Ride?")
                     .body("Your progress so far will be saved.")
