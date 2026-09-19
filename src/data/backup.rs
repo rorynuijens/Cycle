@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// How many generated snapshots to keep per database.
 ///
@@ -129,15 +130,22 @@ fn snapshot_name(db_file_name: &str, label: &str, now: DateTime<Local>) -> Strin
 
 /// Delete all but the newest `keep` generated snapshots in `dir`.
 async fn prune(dir: &Path, db_file_name: &str, keep: usize) -> Result<()> {
-    let mut names = Vec::new();
+    let mut files = Vec::new();
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if let Some(name) = entry.file_name().to_str() {
-            names.push(name.to_owned());
-        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // A file whose age cannot be read is left alone. Pruning is a tidy-up,
+        // and deleting a copy of somebody's history on a guess is not.
+        let Ok(modified) = entry.metadata().await.and_then(|m| m.modified()) else {
+            tracing::warn!("Could not read the age of {name} — leaving it alone");
+            continue;
+        };
+        files.push((name, modified));
     }
 
-    for name in snapshots_to_prune(&names, db_file_name, keep) {
+    for name in snapshots_to_prune(&files, db_file_name, keep) {
         let path = dir.join(&name);
         tokio::fs::remove_file(&path)
             .await
@@ -147,25 +155,42 @@ async fn prune(dir: &Path, db_file_name: &str, keep: usize) -> Result<()> {
     Ok(())
 }
 
-/// Which of `existing` to delete, newest `keep` retained.
+/// Which of `existing` to delete, newest `keep` retained, given each file's
+/// name and the time it was written.
 ///
 /// Only ever selects names this module generates. A file somebody named
 /// themselves — `cycle.db.bak-before-hr-repair-20260802-1401`, say — does not
 /// match the pattern and is never returned.
-fn snapshots_to_prune(existing: &[String], db_file_name: &str, keep: usize) -> Vec<String> {
+///
+/// Ordered by the file's own age rather than by its name. A generated name does
+/// end in a fixed-width timestamp, but it carries the *label* first, so sorting
+/// by name groups the labels alphabetically and only then by time. That put
+/// every `pre-import` snapshot ahead of every `pre-v2`…`pre-v6` one whatever
+/// their ages — and with a snapshot per migration already filling the quota, an
+/// import's copy of the rider's history was the first thing deleted after being
+/// made, which is the one file [`crate::data::transfer::replace_with`] promises
+/// is still there. Names break a tie, so a run of migrations landing in the same
+/// instant still prunes in a stable order.
+fn snapshots_to_prune(
+    existing: &[(String, SystemTime)],
+    db_file_name: &str,
+    keep: usize,
+) -> Vec<String> {
     let prefix = format!("{db_file_name}{SNAPSHOT_INFIX}");
-    let mut ours: Vec<&String> = existing
+    let mut ours: Vec<&(String, SystemTime)> = existing
         .iter()
-        .filter(|n| n.starts_with(&prefix) && n.ends_with(SNAPSHOT_SUFFIX))
+        .filter(|(n, _)| n.starts_with(&prefix) && n.ends_with(SNAPSHOT_SUFFIX))
         .collect();
 
-    // The timestamp is fixed-width and big-endian, so lexical order is
-    // chronological order within one label; sorting by the whole name keeps
-    // snapshots for the same version together and the newest last.
-    ours.sort();
+    ours.sort_by(|(a_name, a_time), (b_name, b_time)| {
+        a_time.cmp(b_time).then_with(|| a_name.cmp(b_name))
+    });
 
     let excess = ours.len().saturating_sub(keep);
-    ours.into_iter().take(excess).cloned().collect()
+    ours.into_iter()
+        .take(excess)
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Quote a string for use where SQLite expects a literal and takes no bind
@@ -180,6 +205,7 @@ mod tests {
     use super::*;
     use crate::data::paths::testing::ScratchDir;
     use chrono::TimeZone;
+    use std::time::Duration;
 
     fn at(y: i32, m: u32, d: u32, hh: u32, mm: u32, ss: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, m, d, hh, mm, ss).unwrap()
@@ -206,34 +232,79 @@ mod tests {
         format!("cycle.db.pre-{label}-{stamp}.bak")
     }
 
+    /// `days` after an arbitrary epoch, as a file's modification time.
+    fn written_on(days: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(days * 86_400)
+    }
+
+    /// A generated snapshot, named for the day it was written and stamped with it.
+    fn snap(label: &str, day: u64) -> (String, SystemTime) {
+        (
+            generated(label, &format!("202608{day:02}-100000")),
+            written_on(day),
+        )
+    }
+
+    /// A file this module did not write, so its age never matters.
+    fn theirs(name: &str) -> (String, SystemTime) {
+        (name.to_string(), written_on(1))
+    }
+
     #[test]
     fn should_keep_the_newest_and_prune_the_rest() {
-        let names = vec![
-            generated("v2", "20260801-100000"),
-            generated("v2", "20260802-100000"),
-            generated("v2", "20260803-100000"),
-        ];
-        let pruned = snapshots_to_prune(&names, "cycle.db", 2);
+        let files = vec![snap("v2", 1), snap("v2", 2), snap("v2", 3)];
+        let pruned = snapshots_to_prune(&files, "cycle.db", 2);
         assert_eq!(pruned, vec![generated("v2", "20260801-100000")]);
     }
 
     #[test]
+    fn should_prune_the_oldest_file_whatever_its_label_sorts_like() {
+        // The bug this guards against: a snapshot per migration fills the quota,
+        // and the copy taken before an import — the one an import promises is
+        // still recoverable — was deleted the moment it was made, because
+        // "import" sorts before "v2".
+        let files = vec![
+            snap("v2", 1),
+            snap("v3", 2),
+            snap("v4", 3),
+            snap("v5", 4),
+            snap("v6", 5),
+            snap("import", 6),
+        ];
+        let pruned = snapshots_to_prune(&files, "cycle.db", KEEP_SNAPSHOTS);
+        assert_eq!(pruned, vec![generated("v2", "20260801-100000")]);
+    }
+
+    #[test]
+    fn should_prune_in_a_stable_order_when_two_land_in_the_same_instant() {
+        // A run of migrations writes its snapshots faster than the clock the
+        // names are stamped from can tell them apart.
+        let same = written_on(9);
+        let files = vec![
+            (generated("v6", "20260809-100000"), same),
+            (generated("import", "20260809-100000"), same),
+        ];
+        let pruned = snapshots_to_prune(&files, "cycle.db", 1);
+        assert_eq!(pruned, vec![generated("import", "20260809-100000")]);
+    }
+
+    #[test]
     fn should_prune_nothing_when_under_the_limit() {
-        let names = vec![generated("v2", "20260801-100000")];
-        assert!(snapshots_to_prune(&names, "cycle.db", KEEP_SNAPSHOTS).is_empty());
+        let files = vec![snap("v2", 1)];
+        assert!(snapshots_to_prune(&files, "cycle.db", KEEP_SNAPSHOTS).is_empty());
     }
 
     #[test]
     fn should_never_prune_a_snapshot_taken_by_hand() {
         // The rider's own copies, and the shapes they actually take.
-        let names = vec![
-            "cycle.db.bak-2026-08-01".to_string(),
-            "cycle.db.bak-before-hr-repair-20260802-1401".to_string(),
-            "cycle.db-wal.bak-2026-08-01".to_string(),
-            generated("v2", "20260801-100000"),
-            generated("v2", "20260802-100000"),
+        let files = vec![
+            theirs("cycle.db.bak-2026-08-01"),
+            theirs("cycle.db.bak-before-hr-repair-20260802-1401"),
+            theirs("cycle.db-wal.bak-2026-08-01"),
+            snap("v2", 1),
+            snap("v2", 2),
         ];
-        let pruned = snapshots_to_prune(&names, "cycle.db", 1);
+        let pruned = snapshots_to_prune(&files, "cycle.db", 1);
         assert_eq!(
             pruned,
             vec![generated("v2", "20260801-100000")],
@@ -243,21 +314,27 @@ mod tests {
 
     #[test]
     fn should_never_prune_the_database_or_its_sidecars() {
-        let names = vec![
-            "cycle.db".to_string(),
-            "cycle.db-wal".to_string(),
-            "cycle.db-shm".to_string(),
+        let files = vec![
+            theirs("cycle.db"),
+            theirs("cycle.db-wal"),
+            theirs("cycle.db-shm"),
         ];
-        assert!(snapshots_to_prune(&names, "cycle.db", 0).is_empty());
+        assert!(snapshots_to_prune(&files, "cycle.db", 0).is_empty());
     }
 
     #[test]
     fn should_not_prune_snapshots_of_a_different_database() {
-        let names = vec![
-            "other.db.pre-v2-20260801-100000.bak".to_string(),
-            "other.db.pre-v2-20260802-100000.bak".to_string(),
+        let files = vec![
+            (
+                "other.db.pre-v2-20260801-100000.bak".to_string(),
+                written_on(1),
+            ),
+            (
+                "other.db.pre-v2-20260802-100000.bak".to_string(),
+                written_on(2),
+            ),
         ];
-        assert!(snapshots_to_prune(&names, "cycle.db", 0).is_empty());
+        assert!(snapshots_to_prune(&files, "cycle.db", 0).is_empty());
     }
 
     // ── quoting ──────────────────────────────────────────────────────────────
