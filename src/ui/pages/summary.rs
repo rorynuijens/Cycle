@@ -35,6 +35,8 @@ pub struct SummaryPage {
     graph_holder: gtk::Box,
     /// Holds the "Compared with Last Time" card, rebuilt per session.
     progression_holder: gtk::Box,
+    /// Holds the notice about a ride that did not record properly, if any.
+    integrity_holder: gtk::Box,
     last_session: Rc<RefCell<Option<Session>>>,
     /// The profile the last summary was drawn against — the FIT export reads
     /// FTP and heart-rate limits from it to derive training load.
@@ -111,6 +113,15 @@ impl SummaryPage {
         hero_grid.attach(&tss_box, 1, 0, 1, 1);
         hero_grid.attach(&if_box, 2, 0, 1, 1);
         inner.append(&hero_grid);
+
+        // ── What the recording looked like ───────────────────────────────────
+        // Under the hero numbers, because it is those numbers it qualifies:
+        // a TSS shown here is not a TSS being counted if the ride is flagged.
+        let integrity_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        inner.append(&integrity_holder);
 
         // ── The ride: workout profile with the actual power trace over it ────
         let graph_holder = gtk::Box::builder()
@@ -337,6 +348,7 @@ impl SummaryPage {
             cadence_label,
             graph_holder,
             progression_holder,
+            integrity_holder,
             last_session,
             last_athlete,
             export_banner,
@@ -421,6 +433,39 @@ impl SummaryPage {
         progression_card::attach(&self.progression_holder, current, pool, rt_handle);
     }
 
+    /// Say so when the ride that just finished did not record properly.
+    ///
+    /// `session_id` is the row the ride is being saved under, which the save
+    /// task fills in a few milliseconds after this page appears — the same
+    /// arrangement the RPE dialog uses, and for the same reason: reading the
+    /// flag back needs an id, and pressing the button needs a human.
+    pub fn show_integrity(
+        &self,
+        session: &Session,
+        pool: sqlx::SqlitePool,
+        rt_handle: &tokio::runtime::Handle,
+        session_id: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    ) {
+        let rt = rt_handle.clone();
+        crate::ui::widgets::integrity_notice::attach(
+            &self.integrity_holder,
+            session,
+            Rc::new(move || {
+                let Some(id) = *session_id.lock().expect("session_id cannot be poisoned") else {
+                    tracing::warn!("ride counted before it was saved — the decision is not stored");
+                    return;
+                };
+                let pool = pool.clone();
+                tracing::info!("Counting session {id} despite what was found in it");
+                rt.spawn(async move {
+                    if let Err(e) = crate::data::db::dismiss_session_integrity(&pool, id).await {
+                        tracing::error!("could not count the ride: {e}");
+                    }
+                });
+            }),
+        );
+    }
+
     /// Show the bundled RPE emoticon icon in the hero.
     pub fn show_rpe_icon(&self, rpe: u8) {
         if let Some(texture) = crate::ui::resources::rpe_texture(rpe) {
@@ -441,6 +486,12 @@ impl SummaryPage {
         *self.last_session.borrow_mut() = Some(session.clone());
         *self.last_athlete.borrow_mut() = athlete.clone();
         self.export_banner.set_revealed(false);
+        // Emptied here and refilled by `show_integrity`, which needs the row id
+        // this ride is being saved under and so cannot run until it exists.
+        while let Some(child) = self.integrity_holder.first_child() {
+            self.integrity_holder.remove(&child);
+        }
+        self.integrity_holder.set_visible(false);
         // Reset the hero icon — the RPE emoticon belongs to the previous ride.
         self.rpe_image.set_icon_name(Some("starred-symbolic"));
 

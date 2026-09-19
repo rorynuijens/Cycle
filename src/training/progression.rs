@@ -384,6 +384,8 @@ mod tests {
             workout_name: Some(name.to_string()),
             uploaded_to_icu: icu_id.is_some(),
             icu_id: icu_id.map(str::to_string),
+            integrity: Default::default(),
+            integrity_dismissed: false,
         }
     }
 

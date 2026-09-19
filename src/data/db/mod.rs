@@ -34,7 +34,7 @@ pub use intervals::*;
 mod sessions;
 pub use sessions::*;
 // Not re-exported: `migrate` is the only caller.
-use sessions::backfill_session_metrics;
+use sessions::{backfill_session_integrity, backfill_session_metrics};
 
 use anyhow::Result;
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
@@ -70,6 +70,7 @@ fn xdg_data_path() -> Result<std::path::PathBuf> {
 async fn migrate(pool: &SqlitePool) -> Result<()> {
     crate::data::migrate::run(pool).await?;
     backfill_session_metrics(pool).await?;
+    backfill_session_integrity(pool).await?;
     Ok(())
 }
 

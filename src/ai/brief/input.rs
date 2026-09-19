@@ -338,6 +338,8 @@ mod tests {
             workout_name: Some("Threshold".into()),
             uploaded_to_icu: false,
             icu_id: None,
+            integrity: Default::default(),
+            integrity_dismissed: false,
         }
     }
 

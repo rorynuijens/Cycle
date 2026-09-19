@@ -250,7 +250,8 @@ pub fn compute_volume_totals(
 ///
 /// Each entry is `(ISO week label, TSS)`. Local sessions and Intervals.icu TSS
 /// pairs are summed; as with [`compute_volume_totals`], the caller must pass
-/// only unlinked Intervals data.
+/// only unlinked Intervals data. Rides the integrity check flagged are skipped
+/// — see [`crate::training::integrity`].
 pub fn compute_weekly_tss(
     records: &[SessionRecord],
     intervals_pairs: &[(NaiveDate, f32)],
@@ -287,6 +288,11 @@ pub fn compute_weekly_tss_from_summaries(
                 let d = s.started_at.with_timezone(&Local).date_naive();
                 d >= ws && d <= we
             })
+            // Same rule as the Fitness averages: a ride whose recording came
+            // apart is left out until the rider says to count it. The morning
+            // brief reads this total beside a session list the same ride is
+            // already missing from, and the two have to agree.
+            .filter(|s| s.numbers_are_trusted())
             .filter_map(|s| s.tss(fallback_ftp))
             .sum();
         let tss_icu: f32 = intervals_pairs
@@ -892,6 +898,8 @@ mod tests {
             workout_name: None,
             uploaded_to_icu: false,
             icu_id: None,
+            integrity: Default::default(),
+            integrity_dismissed: false,
         }
     }
 
@@ -1004,6 +1012,36 @@ mod tests {
         assert!(
             (weekly[0].1 - 200.0).abs() < 0.01,
             "expected 200 TSS, got {}",
+            weekly[0].1
+        );
+    }
+
+    #[test]
+    fn should_leave_a_flagged_ride_out_of_the_weekly_total() {
+        // The brief reads this total beside a session list the same ride is
+        // already missing from, so a flagged ride counted here would be a week
+        // of training the coach can see the size of but not the shape of.
+        let today = date(2026, 8, 5);
+        let monday = week_start_of(today);
+        let mut flagged = summary_on(monday, 200.0, 200, 3600);
+        flagged.integrity = crate::training::integrity::Verdict::from_json(
+            r#"[{"kind":"StuckPower","watts":200}]"#,
+        );
+        let summaries = [summary_on(monday, 200.0, 200, 3600), flagged.clone()];
+        let weekly = compute_weekly_tss_from_summaries(&summaries, &[], 200, today, 1);
+        assert!(
+            (weekly[0].1 - 100.0).abs() < 0.01,
+            "expected only the trusted ride's 100 TSS, got {}",
+            weekly[0].1
+        );
+
+        // And back in once the rider has said to count it.
+        flagged.integrity_dismissed = true;
+        let summaries = [summary_on(monday, 200.0, 200, 3600), flagged];
+        let weekly = compute_weekly_tss_from_summaries(&summaries, &[], 200, today, 1);
+        assert!(
+            (weekly[0].1 - 200.0).abs() < 0.01,
+            "expected both rides counted, got {}",
             weekly[0].1
         );
     }

@@ -795,6 +795,40 @@ pub fn show_session_detail(
         .spacing(18)
         .build();
 
+    // ── What the recording looked like ────────────────────────────────────
+    // First, above everything derived from it: a ride that did not record
+    // properly is the most important thing to know about it, and the numbers
+    // below are the ones being held back.
+    let integrity_holder = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    inner.append(&integrity_holder);
+    {
+        let session_id = session.id;
+        let pool_dismiss = pool.clone();
+        let rt_dismiss = rt_handle.clone();
+        let reload_dismiss = Rc::clone(&reload_holder);
+        crate::ui::widgets::integrity_notice::attach(
+            &integrity_holder,
+            session,
+            Rc::new(move || {
+                let pool = pool_dismiss.clone();
+                let reload = Rc::clone(&reload_dismiss);
+                tracing::info!("Counting session {session_id} despite what was found in it");
+                crate::ui::spawn_to_main(
+                    &rt_dismiss,
+                    async move { db::dismiss_session_integrity(&pool, session_id).await },
+                    move |result| match result {
+                        // The Fitness chart and the coach both read the stored
+                        // flag, so everything showing this ride has to be rebuilt.
+                        Ok(()) => crate::ui::call_reload(&reload),
+                        Err(e) => tracing::error!("could not count the ride: {e}"),
+                    },
+                );
+            }),
+        );
+    }
+
     // ── Name ──────────────────────────────────────────────────────────────
     // Saved on focus-out and on Enter; clearing the field restores the default
     // name (the workout's, or "Unstructured Ride").

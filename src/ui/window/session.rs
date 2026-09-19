@@ -272,6 +272,17 @@ pub fn finish_session_closure(
         let session_id_for_rpe = std::sync::Arc::clone(&session_id_arc);
         let session_id_for_task = std::sync::Arc::clone(&session_id_arc);
 
+        // Said on the summary rather than only later in the ride's detail: if
+        // the trainer dropped out, now is when the rider still remembers whether
+        // it did. Placed here rather than beside the other `summary` calls above
+        // because it needs the id the save task is about to produce.
+        summary_for_complete.show_integrity(
+            &session,
+            pool_for_complete.clone(),
+            &rt_for_complete,
+            std::sync::Arc::clone(&session_id_arc),
+        );
+
         // Show the RPE questionnaire immediately after the workout ends.
         let pool_rpe = pool_for_complete.clone();
         let rt_rpe = rt_for_complete.clone();

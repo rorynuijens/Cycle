@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -165,6 +165,27 @@ const MIGRATIONS: &[Migration] = &[
           WHERE ce.original_workout_id IS NOT NULL
             AND NOT EXISTS (SELECT 1 FROM calendar_entry_adjustments a
                              WHERE a.entry_id = ce.id)",
+        ],
+    },
+    Migration {
+        version: 6,
+        name: "say when a ride cannot be trusted",
+        statements: &[
+            // What [`crate::training::integrity::check`] made of the ride, as
+            // the JSON list it serialises to; `[]` for a ride with nothing
+            // wrong. NULL means not yet assessed, which is what every existing
+            // row starts as and what the backfill in `data::db` looks for.
+            //
+            // Stored rather than derived on the fly because the judgement needs
+            // the sample blob and its readers do not: Fitness totals TSS from
+            // `SessionSummary`, which exists precisely so that drawing a chart
+            // does not deserialise half a megabyte per ride.
+            "ALTER TABLE sessions ADD COLUMN integrity TEXT",
+            // Set when the rider says to count the ride anyway. Kept apart from
+            // the concern list so that dismissing a flag does not erase what was
+            // found — the ride still says what looked wrong, it just stops being
+            // held back over it.
+            "ALTER TABLE sessions ADD COLUMN integrity_dismissed INTEGER NOT NULL DEFAULT 0",
         ],
     },
 ];

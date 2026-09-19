@@ -189,15 +189,26 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
     // The FTP the ride was actually ridden against, which is what makes TSS and
     // intensity factor mean anything to a service reading them later.
     let ftp = session.ftp_watts.unwrap_or(athlete.ftp_watts);
+
+    // Garmin Connect does not recompute any of these — it reads them out of the
+    // file and treats them as measured fact, which is exactly why a ride whose
+    // recording came apart must not carry them. Every one of these fields has an
+    // "absent" encoding, and the ride still exports: its samples, its duration
+    // and its distance are what actually happened. Only the figures derived from
+    // a power trace that has holes in it are withheld.
+    let trusted = session.numbers_are_trusted();
     let tss = session
         .tss(ftp)
+        .filter(|_| trusted)
         .map(|t| (t * 10.0).round().clamp(0.0, 65534.0) as u16)
         .unwrap_or(0xFFFF);
     let intensity_factor = match (session.normalised_power(), ftp) {
-        (Some(np), f) if f > 0 => (np / f as f32 * 1000.0).round().clamp(0.0, 65534.0) as u16,
+        (Some(np), f) if f > 0 && trusted => {
+            (np / f as f32 * 1000.0).round().clamp(0.0, 65534.0) as u16
+        }
         _ => 0xFFFF,
     };
-    let load = crate::training::load::estimate(session, athlete);
+    let load = crate::training::load::estimate(session, athlete).filter(|_| trusted);
     let training_load_peak = load
         .map(|l| (l.load * 65536.0).round().clamp(0.0, i32::MAX as f32 - 1.0) as i32)
         .unwrap_or(i32::MAX);
@@ -783,6 +794,7 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
         ftp_watts: None,
         title: None,
         icu_id: None,
+        integrity_dismissed: false,
     })
 }
 
@@ -869,6 +881,22 @@ mod tests {
 
     fn encode(points: u32, with_gps: bool) -> Vec<u8> {
         encode_session(&ride(points, with_gps), &profile())
+    }
+
+    /// The same ride with power moving the way a trainer's actually does.
+    ///
+    /// [`ride`] is flat to the watt, which is exactly what
+    /// [`crate::training::integrity`] reads as a trainer repeating a number
+    /// rather than measuring one — and a flagged ride is exported without the
+    /// figures derived from its power. Anything long enough to be assessed (two
+    /// minutes) needs this; the short fixtures above are under that floor and
+    /// stay flat, where a fixed 200 W is easier to reason about.
+    fn varied_ride(points: u32) -> Session {
+        let mut s = ride(points, false);
+        for (i, p) in s.data_points.iter_mut().enumerate() {
+            p.power_watts = Some(200 + (i as u32 % 12) * 5);
+        }
+        s
     }
 
     /// Decode the file and return the named field of the session message.
@@ -1120,7 +1148,7 @@ mod tests {
         // Garmin Connect does not derive training load for a file it did not
         // record, so an export without these three fields contributes nothing
         // to training status however complete the rest of the ride is.
-        let bytes = encode(1800, false);
+        let bytes = encode_session(&varied_ride(1800), &profile());
         for field in [
             "total_training_effect",
             "total_anaerobic_training_effect",
@@ -1135,7 +1163,7 @@ mod tests {
 
     #[test]
     fn should_scale_training_load_to_the_value_the_estimator_produced() {
-        let ride = ride(1800, false);
+        let ride = varied_ride(1800);
         let expected = crate::training::load::estimate(&ride, &profile()).expect("has data");
         let bytes = encode_session(&ride, &profile());
         let Some(fitparser::Value::Float64(load)) = session_field(&bytes, "training_load_peak")
@@ -1147,6 +1175,48 @@ mod tests {
             "wrote {load}, estimated {}",
             expected.load
         );
+    }
+
+    #[test]
+    fn should_withhold_the_figures_a_broken_recording_would_overstate() {
+        // Garmin Connect reads these out of the file and treats them as fact,
+        // so a ride whose trainer went quiet for most of it must not carry
+        // them. Half an hour on the clock, five minutes of it recorded.
+        let mut broken = varied_ride(1800);
+        for p in broken.data_points.iter_mut().skip(300) {
+            p.power_watts = None;
+        }
+        let bytes = encode_session(&broken, &profile());
+        for field in [
+            "total_training_effect",
+            "total_anaerobic_training_effect",
+            "training_load_peak",
+            "training_stress_score",
+            "intensity_factor",
+        ] {
+            assert_eq!(
+                session_field(&bytes, field),
+                None,
+                "{field} must be absent from a ride that did not record properly"
+            );
+        }
+        // The ride itself still exports: what was recorded did happen.
+        assert_eq!(
+            session_field(&bytes, "total_elapsed_time"),
+            Some(fitparser::Value::Float64(1800.0))
+        );
+    }
+
+    #[test]
+    fn should_carry_those_figures_once_the_rider_says_to_count_the_ride() {
+        let mut broken = varied_ride(1800);
+        for p in broken.data_points.iter_mut().skip(300) {
+            p.power_watts = None;
+        }
+        broken.integrity_dismissed = true;
+        let bytes = encode_session(&broken, &profile());
+        assert!(session_field(&bytes, "training_load_peak").is_some());
+        assert!(session_field(&bytes, "training_stress_score").is_some());
     }
 
     #[test]

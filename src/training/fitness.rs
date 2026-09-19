@@ -55,6 +55,9 @@ pub struct PmcPoint {
 /// Total the TSS of every ride onto the local calendar day it was ridden on.
 ///
 /// `fallback_ftp` scores only those rides that carry no stamped FTP of their own.
+///
+/// Rides the integrity check flagged are skipped until the rider dismisses the
+/// flag — see [`crate::training::integrity`].
 fn daily_tss(
     rides: &[SessionSummary],
     intervals_pairs: &[(NaiveDate, f32)],
@@ -63,6 +66,14 @@ fn daily_tss(
     let mut totals: HashMap<NaiveDate, f32> = HashMap::new();
     for ride in rides {
         if ride.counted_via_intervals() {
+            continue;
+        }
+        // A ride whose recording came apart contributes a TSS derived from the
+        // part that recorded, stretched over the part that did not. Leaving it
+        // out understates the week; counting it overstates the rider's fitness
+        // for six weeks afterwards, which is the error that goes on to make the
+        // coach ease sessions that did not need easing.
+        if !ride.numbers_are_trusted() {
             continue;
         }
         let date = ride.started_at.with_timezone(&Local).date_naive();
@@ -273,6 +284,8 @@ mod test_support {
             workout_name: None,
             uploaded_to_icu: false,
             icu_id: None,
+            integrity: Default::default(),
+            integrity_dismissed: false,
         }
     }
 }

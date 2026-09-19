@@ -83,7 +83,10 @@ fn aerobic_te_for_load(load: f32) -> f32 {
 
 /// Seconds between one data point and the next, defaulting to the 1 Hz the
 /// recorder writes when the gap cannot be read (last point, or a clock jump).
-fn sample_secs(points: &[crate::data::session::DataPoint], i: usize) -> f32 {
+///
+/// Shared with [`crate::training::integrity`], which weighs the same gaps to
+/// work out how much of a ride carries power at all.
+pub(crate) fn sample_secs(points: &[crate::data::session::DataPoint], i: usize) -> f32 {
     match points.get(i + 1) {
         Some(next) => {
             (next.elapsed_secs.saturating_sub(points[i].elapsed_secs)).clamp(1, 60) as f32

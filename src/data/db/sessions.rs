@@ -6,6 +6,7 @@ use anyhow::Result;
 // backfill records that it has run in the settings table.
 use super::{get_setting, load_intervals_activities, set_setting, IntervalsActivity};
 use crate::data::session::{DataPoint, Session};
+use crate::training::integrity::Verdict;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{Row, SqlitePool};
 
@@ -60,6 +61,14 @@ pub struct SessionSummary {
     pub workout_name: Option<String>,
     pub uploaded_to_icu: bool,
     pub icu_id: Option<String>,
+    /// What the integrity check made of the ride, as stored at save time.
+    ///
+    /// An unassessed row — every row written before the check existed, until
+    /// the backfill reaches it — reads as trusted, so a ride never disappears
+    /// from the chart merely because nothing has looked at it yet.
+    pub integrity: Verdict,
+    /// Set when the rider has said to count this ride anyway.
+    pub integrity_dismissed: bool,
 }
 
 impl SessionSummary {
@@ -87,6 +96,15 @@ impl SessionSummary {
     pub fn counted_via_intervals(&self) -> bool {
         self.uploaded_to_icu || self.icu_id.is_some()
     }
+
+    /// Whether the figures derived from this ride may be counted.
+    ///
+    /// Mirrors [`crate::data::session::Session::numbers_are_trusted`], reading
+    /// the stored judgement rather than recomputing it from the sample blob —
+    /// which is the whole reason the verdict is a column.
+    pub fn numbers_are_trusted(&self) -> bool {
+        self.integrity_dismissed || self.integrity.is_trusted()
+    }
 }
 
 impl SessionRecord {
@@ -105,6 +123,11 @@ impl SessionRecord {
             workout_name: self.workout_name.clone(),
             uploaded_to_icu: self.uploaded_to_icu,
             icu_id: self.session.icu_id.clone(),
+            // Recomputed rather than read: a record holds the samples, so the
+            // answer is available here without a second query, and a summary
+            // made this way cannot disagree with the ride it was made from.
+            integrity: crate::training::integrity::check(&self.session),
+            integrity_dismissed: self.session.integrity_dismissed,
         }
     }
 }
@@ -114,7 +137,8 @@ pub async fn load_session_summaries(pool: &SqlitePool) -> Result<Vec<SessionSumm
     let rows = sqlx::query(
         "SELECT s.id, s.started_at, s.duration_secs, s.normalised_power,
                 s.average_power, s.kilojoules, s.ftp_watts, s.rpe, s.icu_id,
-                s.uploaded_to_icu, COALESCE(s.title, w.name) AS workout_name
+                s.uploaded_to_icu, s.integrity, s.integrity_dismissed,
+                COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
          WHERE s.ended_at IS NOT NULL
@@ -139,6 +163,11 @@ pub async fn load_session_summaries(pool: &SqlitePool) -> Result<Vec<SessionSumm
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
             icu_id: r.get("icu_id"),
+            integrity: r
+                .get::<Option<&str>, _>("integrity")
+                .map(Verdict::from_json)
+                .unwrap_or_default(),
+            integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
         })
         .collect())
 }
@@ -183,16 +212,99 @@ pub(super) async fn backfill_session_metrics(pool: &SqlitePool) -> Result<()> {
 async fn write_session_metrics(pool: &SqlitePool, id: i64, session: &Session) -> Result<()> {
     sqlx::query(
         "UPDATE sessions
-            SET duration_secs = ?, normalised_power = ?, average_power = ?, kilojoules = ?
+            SET duration_secs = ?, normalised_power = ?, average_power = ?, kilojoules = ?,
+                integrity = ?
           WHERE id = ?",
     )
     .bind(session.duration_secs() as i64)
     .bind(session.normalised_power().map(|v| v as f64))
     .bind(session.average_power().map(|v| v as f64))
     .bind(session.kilojoules() as f64)
+    // Judged here for the same reason the metrics are: the answer needs the
+    // samples, and every reader of it has deliberately been kept away from them.
+    // Deliberately not touching `integrity_dismissed` — a rewritten ride keeps
+    // the rider's decision about it.
+    .bind(crate::training::integrity::check(session).to_json())
     .bind(id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Judge every finished ride that has never been judged.
+///
+/// Separate from [`backfill_session_metrics`] because the two look for different
+/// gaps: that one fills rides written before the metric columns existed, this one
+/// fills every ride written before the check did — which, the first time it runs,
+/// is all of them.
+pub(super) async fn backfill_session_integrity(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, started_at, ended_at, data_points_json
+           FROM sessions
+          WHERE integrity IS NULL AND ended_at IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!("Checking {} previously unassessed rides", rows.len());
+    let mut flagged = 0;
+    for r in rows {
+        let id: i64 = r.get("id");
+        let data_points: Vec<DataPoint> = match serde_json::from_str(r.get("data_points_json")) {
+            Ok(p) => p,
+            Err(e) => {
+                // Leaving `integrity` NULL would retry this row on every launch.
+                // A ride whose samples cannot be read has nothing to assess, and
+                // reads as trusted everywhere; record that rather than re-deciding
+                // it forever.
+                tracing::error!("session {id}: cannot assess ({e}) — recording it as trusted");
+                set_session_integrity(pool, id, "[]").await?;
+                continue;
+            }
+        };
+        let mut session = Session::new(None);
+        session.started_at = parse_started_at(r.get::<&str, _>("started_at"), id);
+        session.ended_at = r
+            .get::<Option<&str>, _>("ended_at")
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        session.data_points = data_points;
+
+        let verdict = crate::training::integrity::check(&session);
+        if !verdict.is_trusted() {
+            flagged += 1;
+            tracing::info!("session {id}: {:?}", verdict.concerns());
+        }
+        set_session_integrity(pool, id, &verdict.to_json()).await?;
+    }
+    if flagged > 0 {
+        tracing::info!("{flagged} ride(s) flagged for review");
+    }
+    Ok(())
+}
+
+/// Store one ride's verdict without touching anything else about it.
+async fn set_session_integrity(pool: &SqlitePool, id: i64, verdict_json: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET integrity = ? WHERE id = ?")
+        .bind(verdict_json)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Record that the rider has seen what was found in a ride and wants it counted.
+///
+/// The concern list is left in place: the ride goes on saying what looked wrong,
+/// it just stops being held back over it.
+pub async fn dismiss_session_integrity(pool: &SqlitePool, session_id: i64) -> Result<()> {
+    sqlx::query("UPDATE sessions SET integrity_dismissed = 1 WHERE id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -567,6 +679,7 @@ async fn load_session_records_where(
     let rows = sqlx::query(&format!(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
+                s.integrity_dismissed,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
@@ -611,6 +724,7 @@ async fn load_session_records_where(
                 ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
                 title: r.get("title"),
                 icu_id: r.get("icu_id"),
+                integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -638,6 +752,7 @@ pub async fn load_sessions_between(
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
+                s.integrity_dismissed,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
@@ -669,6 +784,7 @@ pub async fn load_sessions_between(
                 ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
                 title: r.get("title"),
                 icu_id: r.get("icu_id"),
+                integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,

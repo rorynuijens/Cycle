@@ -909,6 +909,7 @@ mod tests {
             ftp_watts: Some(FTP),
             title: None,
             icu_id: None,
+            integrity_dismissed: false,
         }
     }
 

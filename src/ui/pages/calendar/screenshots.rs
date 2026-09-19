@@ -424,6 +424,141 @@ fn shoot_week(name: &str, width: i32, height: i32) {
     shoot(&window, width, height, name);
 }
 
+/// A ride whose trainer went quiet 27 minutes in: 61 minutes on the clock, 34
+/// of them with no power. The case the integrity check exists for, and the one
+/// the notice has to explain.
+fn ride_that_lost_its_trainer() -> crate::data::session::Session {
+    use chrono::TimeZone;
+
+    let started = chrono::Utc
+        .with_ymd_and_hms(2026, 9, 12, 9, 40, 0)
+        .single()
+        .expect("hardcoded valid instant");
+    let mut ride = crate::data::session::Session::new(Some(9));
+    ride.id = 12;
+    ride.started_at = started;
+    ride.ended_at = Some(started + chrono::Duration::minutes(61));
+    ride.ftp_watts = Some(200);
+    ride.rpe = Some(6);
+    ride.data_points = (0..3660)
+        .map(|secs| crate::data::session::DataPoint {
+            elapsed_secs: secs,
+            // Power for the first 27 minutes, then the trainer stops reporting
+            // while the recorder keeps writing — which is what a dropout looks
+            // like from inside the file.
+            power_watts: (secs < 1620).then(|| 170 + (secs / 60) % 40),
+            heart_rate_bpm: Some(138 + (secs / 120) % 14),
+            cadence_rpm: Some(88),
+            speed_kmh: Some(31.0),
+            target_watts: Some(185),
+            lat: None,
+            lng: None,
+            altitude_m: None,
+        })
+        .collect();
+    ride
+}
+
+/// The real ride detail view, for a ride that did not record properly.
+///
+/// `show_session_detail` builds and presents its own `AdwWindow` rather than
+/// returning one, so the shot finds it among the toplevels afterwards. Unlike an
+/// `AdwDialog` (see the note on `shoot_detail_dialog`) an ordinary window
+/// allocates and renders offscreen without any help.
+fn shoot_session_detail(session: &crate::data::session::Session, name: &str, height: i32) {
+    use chrono::TimeZone;
+
+    let rt = tokio::runtime::Runtime::new().expect("a runtime for the dialog's writes");
+    let pool = rt
+        .block_on(async {
+            let pool = sqlx::SqlitePool::connect(":memory:").await?;
+            crate::data::migrate::run(&pool).await?;
+            Ok::<_, anyhow::Error>(pool)
+        })
+        .expect("an empty database");
+
+    // Presented against a host: the detail window is modal, and a modal window
+    // with nothing to be modal for never maps, so it is never allocated and
+    // renders as nothing at all.
+    let host = adw::Window::builder().build();
+    host.set_content(Some(&adw::ToolbarView::new()));
+    host.present();
+    while glib::MainContext::default().iteration(false) {}
+
+    let before = toplevels();
+    super::detail::show_session_detail(
+        session,
+        "Sweet Spot Base I",
+        chrono::Local
+            .with_ymd_and_hms(2026, 9, 12, 9, 40, 0)
+            .single()
+            .expect("hardcoded valid instant"),
+        200,
+        72.0,
+        None,
+        Some(host.upcast_ref()),
+        pool,
+        rt.handle().clone(),
+        Rc::new(RefCell::new(None)),
+    );
+    while glib::MainContext::default().iteration(false) {}
+
+    let presented = toplevels()
+        .into_iter()
+        .find(|w| !before.iter().any(|b| b == w))
+        .and_then(|w| w.downcast::<adw::Window>().ok())
+        .expect("the detail window was presented");
+
+    // The content is lifted onto a window of our own rather than rendered where
+    // it was presented, the same way `shoot_detail_dialog` handles a dialog:
+    // the real one is modal for the host, and a modal window is drawn as part of
+    // its host's stack rather than on its own.
+    let content = presented.content().expect("the detail window has content");
+    presented.set_content(None::<&gtk::Widget>);
+    presented.close();
+    host.close();
+    while glib::MainContext::default().iteration(false) {}
+
+    let window = adw::Window::builder().content(&content).build();
+    shoot(&window, 440, height, name);
+}
+
+/// Every window currently open, so a newly presented one can be picked out.
+fn toplevels() -> Vec<gtk::Window> {
+    let list = gtk::Window::toplevels();
+    (0..list.n_items())
+        .filter_map(|i| list.item(i).and_then(|o| o.downcast::<gtk::Window>().ok()))
+        .collect()
+}
+
+/// The summary the rider sees when they get off the bike, for the same ride.
+fn shoot_summary(session: &crate::data::session::Session, name: &str, height: i32) {
+    let rt = tokio::runtime::Runtime::new().expect("a runtime for the summary's reads");
+    let pool = rt
+        .block_on(async {
+            let pool = sqlx::SqlitePool::connect(":memory:").await?;
+            crate::data::migrate::run(&pool).await?;
+            Ok::<_, anyhow::Error>(pool)
+        })
+        .expect("an empty database");
+
+    let athlete = crate::data::athlete::AthleteProfile {
+        ftp_watts: 200,
+        ..crate::data::athlete::AthleteProfile::default()
+    };
+    let page = crate::ui::pages::summary::SummaryPage::new(|| {});
+    page.update(session, "Sweet Spot Base I", &athlete, None);
+    page.show_integrity(
+        session,
+        pool,
+        rt.handle(),
+        std::sync::Arc::new(std::sync::Mutex::new(Some(12))),
+    );
+
+    let window = adw::Window::builder().content(page.widget()).build();
+    shoot(&window, 900, height, name);
+}
+
 /// A route the shots can ride: a straight 12 km at 8 %.
 fn climb() -> crate::data::route::Route {
     crate::data::route::Route {
@@ -640,13 +775,6 @@ fn assert_the_overlay_holds_still() {
 fn screenshots() {
     start();
     theme(false);
-
-    // Checked here rather than in its own test: GTK may only be initialised
-    // once per process, and a second `#[test]` is a second thread.
-    assert_the_cockpit_holds_still();
-    assert_the_route_cockpit_holds_still();
-    assert_the_overlay_holds_still();
-
     // The ride cockpit. Rendered at three sizes: a big window, an ordinary one,
     // and a small one — the last is the check that a taller number block plus a
     // graph floor still fits without a scrollbar (the cockpit sizing rule).
@@ -655,6 +783,34 @@ fn screenshots() {
     shoot_player("12-player-900x700", 900, 700);
     shoot_player_at("12b-player-sprint-900", 900, 700, 1240);
     shoot_player_cue("13-player-cue", 1100, 780);
+
+    // Ahead of the route and week shots below, deliberately: `shoot_route_player`
+    // builds a Shumate map, and with no tile server reachable it either fails to
+    // produce a render node or sits waiting on the network for as long as it is
+    // given. Anything sequenced after it may simply never run.
+    // A ride that did not record properly, in both places it is said: the
+    // summary the rider lands on, and the detail view they open later. Shot in
+    // both themes because the notice is the one place in the app that leans on
+    // the warning colour (CLAUDE.md §4.2).
+    {
+        let broken = ride_that_lost_its_trainer();
+        shoot_summary(&broken, "20-summary-flagged-light", 900);
+        shoot_session_detail(&broken, "21-detail-flagged-light", 720);
+        let mut counted = broken.clone();
+        counted.integrity_dismissed = true;
+        shoot_session_detail(&counted, "22-detail-counted-light", 720);
+        theme(true);
+        shoot_summary(&broken, "23-summary-flagged-dark", 900);
+        shoot_session_detail(&broken, "24-detail-flagged-dark", 720);
+        theme(false);
+    }
+
+    // Checked here rather than in its own test: GTK may only be initialised
+    // once per process, and a second `#[test]` is a second thread.
+    assert_the_cockpit_holds_still();
+    assert_the_route_cockpit_holds_still();
+    assert_the_overlay_holds_still();
+
     shoot_route_player("14-route-1100x780", 1100, 780);
     shoot_week("15-week-ridden-plan", 1000, 700);
 

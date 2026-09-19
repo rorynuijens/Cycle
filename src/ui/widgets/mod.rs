@@ -3,6 +3,7 @@ pub mod api_key_row;
 pub mod day_toggles;
 pub mod dialog;
 pub mod fit_import;
+pub mod integrity_notice;
 pub mod metric_column;
 pub mod progression_card;
 pub mod route_map;

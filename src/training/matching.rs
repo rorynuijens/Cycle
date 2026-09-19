@@ -246,6 +246,7 @@ mod tests {
             ftp_watts: None,
             title: title.map(str::to_string),
             icu_id: None,
+            integrity_dismissed: false,
         };
         CalendarEvent::Session(
             SessionRecord {
@@ -566,6 +567,8 @@ mod tests {
             workout_name: None,
             uploaded_to_icu: false,
             icu_id: None,
+            integrity: Default::default(),
+            integrity_dismissed: false,
         }
     }
 

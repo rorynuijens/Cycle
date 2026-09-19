@@ -254,6 +254,11 @@ fn build_context(
     let mut recent_sessions: Vec<_> = data
         .records
         .iter()
+        // A flagged ride is left out rather than described with a caveat: the
+        // coach reads this list as the rider's recent training, and a wrong TSS
+        // in it is worse than a gap, which the wellness and form figures beside
+        // it already account for.
+        .filter(|r| r.numbers_are_trusted())
         .map(|r| build_recent_session(r, athlete.ftp_watts))
         .chain(
             data.icu_activities

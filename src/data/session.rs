@@ -29,6 +29,13 @@ pub struct Session {
     /// shown and counted once. See [`crate::data::dedupe`].
     #[serde(default)]
     pub icu_id: Option<String>,
+    /// Set when the rider has said to count this ride anyway, despite what
+    /// [`crate::training::integrity::check`] found in it.
+    ///
+    /// Defaulted on read: rides recorded before the check existed carry no such
+    /// flag, and a missing one means "never dismissed", not "unreadable".
+    #[serde(default)]
+    pub integrity_dismissed: bool,
 }
 
 impl Session {
@@ -43,7 +50,18 @@ impl Session {
             ftp_watts: None,
             title: None,
             icu_id: None,
+            integrity_dismissed: false,
         }
+    }
+
+    /// Whether the figures derived from this ride may be counted.
+    ///
+    /// False for a ride whose recording came apart in a way that makes its own
+    /// numbers describe something other than what the rider did — unless the
+    /// rider has looked at what was found and said to count it anyway. See
+    /// [`crate::training::integrity`] for what is checked and why.
+    pub fn numbers_are_trusted(&self) -> bool {
+        self.integrity_dismissed || crate::training::integrity::check(self).is_trusted()
     }
 
     pub fn duration_secs(&self) -> u64 {
