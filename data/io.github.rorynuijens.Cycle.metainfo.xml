@@ -90,6 +90,35 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.10.0" date="2026-09-19">
+      <description>
+        <p>Cycle now checks that a ride actually recorded properly before it
+           counts. If your trainer drops off the air part way through, the ride
+           still looks complete — but the training stress worked out from it is
+           the intensity of the part that recorded, stretched over the whole
+           time you were out. That number then feeds your Fitness and Fatigue
+           for weeks, and the coach eases sessions that did not need easing.</p>
+        <p>A ride that did not record properly is now held back from your
+           fitness figures, from the training load written into exported FIT
+           files, and from what the AI Coach is shown. It says what looked
+           wrong — how much of the ride lost power, a trainer reporting one
+           fixed number, a reading no rider could produce — and what to check.
+           The ride's own numbers are still there to look at.</p>
+        <p>If you know better, "Count it anyway" puts it straight back. The
+           notice appears both on the summary you see when you finish and on
+           the ride later, so you can decide while you still remember whether
+           the trainer dropped out.</p>
+        <p>Also fixed: importing a training history saves a copy of the history
+           it replaces, and that copy could be deleted moments after it was
+           made, while older backups were kept instead.</p>
+        <p>Please note: the first time you open this version, your training
+           history is upgraded to a new format automatically. A backup is saved
+           beforehand, in the same folder as your database, named
+           cycle.db.pre-v6 followed by the date. Once upgraded, your data can no
+           longer be opened by Cycle 0.9.0 or earlier — so if you ever go back to
+           an older version, restore that backup alongside it.</p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-09-10">
       <description>
         <p>A training plan that has run its course now says so. Until now the
