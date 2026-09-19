@@ -2,9 +2,8 @@
 
 use anyhow::Result;
 
-// Reconciling a ride against Intervals.icu reads the mirror, and the one-shot
-// backfill records that it has run in the settings table.
-use super::{get_setting, load_intervals_activities, set_setting, IntervalsActivity};
+// Reconciling a ride against Intervals.icu reads the mirror.
+use super::{load_intervals_activities, IntervalsActivity};
 use crate::data::session::{DataPoint, Session};
 use crate::training::integrity::Verdict;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -531,68 +530,6 @@ pub async fn reconcile_icu_links(pool: &SqlitePool) -> Result<usize> {
         }
     }
 
-    Ok(linked)
-}
-
-/// Setting key marking the one-off legacy backfill as done.
-const LEGACY_BACKFILL_KEY: &str = "dedupe.legacy_backfill_done";
-
-/// One-off pass linking rides recorded before the start-time fix.
-///
-/// Those sessions were stamped when the workout was selected rather than when the
-/// rider started pedalling, so their start times sit minutes early and the everyday
-/// matcher's three-minute window misses them — leaving historic duplicates on the
-/// calendar. This runs once over the whole history using
-/// [`dedupe::is_same_activity_legacy`], which asks the real ride to fit inside the
-/// session's inflated span instead, then records that it has run.
-///
-/// **Temporary.** Once it has run on every installation this function, its setting
-/// key and `dedupe::is_same_activity_legacy` can all be deleted; nothing else
-/// depends on them. Any link it gets wrong is reversible with Unlink in the ride's
-/// detail dialog.
-pub async fn backfill_icu_links(pool: &SqlitePool) -> Result<usize> {
-    use crate::data::dedupe;
-
-    if get_setting(pool, LEGACY_BACKFILL_KEY).await?.is_some() {
-        return Ok(0);
-    }
-
-    let rejected: std::collections::HashSet<i64> =
-        sqlx::query("SELECT id FROM sessions WHERE icu_link_rejected = 1")
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .map(|r| r.get::<i64, _>("id"))
-            .collect();
-
-    let mut taken = linked_icu_ids(pool).await?;
-    let activities = load_intervals_activities(pool).await?;
-    let mut linked = 0;
-
-    for record in load_session_records(pool).await? {
-        if record.session.icu_id.is_some() || rejected.contains(&record.session.id) {
-            continue;
-        }
-        let candidates: Vec<&IntervalsActivity> = activities
-            .iter()
-            .filter(|a| !taken.contains(&a.icu_id))
-            .collect();
-        if let Some(activity) =
-            dedupe::find_match_with(&record.session, candidates, dedupe::is_same_activity_legacy)
-        {
-            set_session_icu_id(pool, record.session.id, Some(&activity.icu_id)).await?;
-            taken.insert(activity.icu_id.clone());
-            linked += 1;
-            tracing::info!(
-                "Backfill linked session {} to Intervals.icu activity {}",
-                record.session.id,
-                activity.icu_id
-            );
-        }
-    }
-
-    set_setting(pool, LEGACY_BACKFILL_KEY, "1").await?;
-    tracing::info!("Legacy Intervals.icu backfill linked {linked} historic ride(s)");
     Ok(linked)
 }
 
@@ -1293,78 +1230,6 @@ mod tests {
         let records = load_session_records(&pool).await.unwrap();
         assert_eq!(records[0].session.icu_id, None);
         assert!(!records[0].summary().counted_via_intervals());
-    }
-
-    #[tokio::test]
-    async fn backfill_links_a_historic_ride_the_everyday_matcher_misses() {
-        let pool = test_pool().await;
-        // A ride recorded before the fix: stamped 40 minutes before the rider
-        // actually started, so its span is inflated at the front.
-        let mut session = hour_long_ride();
-        session.started_at -= chrono::Duration::minutes(40);
-        save_session(&pool, &session).await.unwrap();
-
-        // Intervals.icu has the real ride, starting 40 minutes into that span.
-        let real_start = session.ended_at.unwrap() - chrono::Duration::hours(1);
-        let local = real_start.with_timezone(&chrono::Local);
-        upsert_intervals_activity(
-            &pool,
-            "icu-old",
-            local.date_naive(),
-            "Morning Ride",
-            Some(80.0),
-            Some(3600),
-            Some(200),
-            Some(210),
-            Some(140),
-            Some(170),
-            "Ride",
-            Some(local.naive_local()),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        // The everyday pass cannot reach it — that is the whole reason for the backfill.
-        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 0);
-        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 1);
-
-        let records = load_session_records(&pool).await.unwrap();
-        assert_eq!(records[0].session.icu_id.as_deref(), Some("icu-old"));
-    }
-
-    #[tokio::test]
-    async fn backfill_runs_only_once() {
-        let pool = test_pool().await;
-        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 0);
-        assert_eq!(
-            get_setting(&pool, LEGACY_BACKFILL_KEY).await.unwrap(),
-            Some("1".into()),
-            "the backfill must record that it has run"
-        );
-
-        // A ride added afterwards must not be swept up by a second pass.
-        let session = hour_long_ride();
-        save_session(&pool, &session).await.unwrap();
-        insert_icu_mirror(&pool, "icu-1", &session).await;
-        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 0);
-        // The everyday matcher still handles it, as it should.
-        assert_eq!(reconcile_icu_links(&pool).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn backfill_respects_an_unlinked_ride() {
-        let pool = test_pool().await;
-        let session = hour_long_ride();
-        let id = save_session(&pool, &session).await.unwrap();
-        insert_icu_mirror(&pool, "icu-1", &session).await;
-        unlink_session_from_icu(&pool, id).await.unwrap();
-
-        assert_eq!(backfill_icu_links(&pool).await.unwrap(), 0);
-        let records = load_session_records(&pool).await.unwrap();
-        assert_eq!(records[0].session.icu_id, None);
     }
 
     #[tokio::test]

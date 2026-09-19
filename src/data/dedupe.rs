@@ -58,50 +58,6 @@ pub fn is_same_activity(session: &Session, activity: &IntervalsActivity) -> bool
     distances_agree(session, activity)
 }
 
-/// Slack allowed at either edge of a legacy session's recorded span.
-const LEGACY_EDGE_SLACK_SECS: i64 = 180;
-
-/// Do `session` and `activity` describe the same ride, judged the way rides
-/// recorded before the start-time fix have to be judged?
-///
-/// Those sessions were stamped when the workout was selected or the route page
-/// opened rather than at the first pedal stroke, so their start can be arbitrarily
-/// early and their duration inflated by the same amount. Both errors run in one
-/// direction only, and `ended_at` was always correct — so rather than widening the
-/// window symmetrically, the real ride is asked to *fit inside* the recorded span:
-/// it must have started within it and cannot have lasted longer than it.
-///
-/// Used only by the one-off backfill in [`crate::data::db::backfill_icu_links`].
-pub fn is_same_activity_legacy(session: &Session, activity: &IntervalsActivity) -> bool {
-    if !is_ride(&activity.sport_type) {
-        return false;
-    }
-    let Some(activity_start) = activity_start_utc(activity) else {
-        return false;
-    };
-    let Some(session_end) = session.ended_at else {
-        return false; // an unfinished session has no span to contain anything
-    };
-
-    let starts_within_span = activity_start
-        >= session.started_at - chrono::Duration::seconds(LEGACY_EDGE_SLACK_SECS)
-        && activity_start <= session_end + chrono::Duration::seconds(LEGACY_EDGE_SLACK_SECS);
-    if !starts_within_span {
-        return false;
-    }
-
-    // The real ride cannot have lasted longer than the span that supposedly
-    // contains it, give or take the same slack.
-    if let Some(activity_secs) = activity.duration_secs {
-        let span_secs = session.duration_secs() as i64;
-        if activity_secs as i64 > span_secs + LEGACY_EDGE_SLACK_SECS {
-            return false;
-        }
-    }
-
-    distances_agree(session, activity)
-}
-
 /// Find the activity that is the same ride as `session`, if any.
 ///
 /// When several match — which the thresholds make very unlikely — the one starting
@@ -110,19 +66,9 @@ pub fn find_match<'a>(
     session: &Session,
     activities: impl IntoIterator<Item = &'a IntervalsActivity>,
 ) -> Option<&'a IntervalsActivity> {
-    find_match_with(session, activities, is_same_activity)
-}
-
-/// As [`find_match`], but with the caller choosing how sameness is judged — the
-/// one-off backfill uses [`is_same_activity_legacy`].
-pub fn find_match_with<'a>(
-    session: &Session,
-    activities: impl IntoIterator<Item = &'a IntervalsActivity>,
-    same: impl Fn(&Session, &IntervalsActivity) -> bool,
-) -> Option<&'a IntervalsActivity> {
     activities
         .into_iter()
-        .filter(|a| same(session, a))
+        .filter(|a| is_same_activity(session, a))
         .min_by_key(|a| {
             activity_start_utc(a)
                 .map(|s| (session.started_at - s).num_seconds().abs())
@@ -384,66 +330,6 @@ mod tests {
         };
         let found = find_match(&session, [&far, &near, &unrelated]).expect("a match");
         assert_eq!(found.icu_id, "near");
-    }
-
-    // ── Legacy matching (rides recorded before the start-time fix) ──────────
-
-    /// A ride as it was recorded before the fix: the session was stamped 40
-    /// minutes before the rider actually started, so its span is inflated at the
-    /// front while its end is correct.
-    fn legacy_ride() -> Session {
-        let mut s = ride();
-        s.started_at -= Duration::minutes(40);
-        s
-    }
-
-    #[test]
-    fn legacy_matching_tolerates_an_inflated_start() {
-        let session = legacy_ride();
-        // Intervals.icu has the real ride: it began 40 minutes into the span.
-        let real_start = session.ended_at.expect("ride has an end") - Duration::hours(1);
-        let mut activity = activity_for(&session, "i1");
-        activity.start_datetime_local = Some(real_start.with_timezone(&Local).naive_local());
-        activity.duration_secs = Some(3600);
-
-        assert!(
-            !is_same_activity(&session, &activity),
-            "the everyday matcher is right to reject a 40-minute start difference"
-        );
-        assert!(is_same_activity_legacy(&session, &activity));
-    }
-
-    #[test]
-    fn legacy_matching_rejects_an_activity_outside_the_span() {
-        let session = legacy_ride();
-        let mut activity = activity_for(&session, "i1");
-        let after_end = session.ended_at.expect("ride has an end") + Duration::hours(2);
-        activity.start_datetime_local = Some(after_end.with_timezone(&Local).naive_local());
-        assert!(!is_same_activity_legacy(&session, &activity));
-    }
-
-    #[test]
-    fn legacy_matching_rejects_a_ride_longer_than_the_span_that_holds_it() {
-        let session = legacy_ride(); // span is 1 h 40 m
-        let mut activity = activity_for(&session, "i1");
-        activity.duration_secs = Some(3600 * 3);
-        assert!(!is_same_activity_legacy(&session, &activity));
-    }
-
-    #[test]
-    fn legacy_matching_still_rejects_a_different_sport() {
-        let session = legacy_ride();
-        let mut activity = activity_for(&session, "i1");
-        activity.sport_type = "Run".into();
-        assert!(!is_same_activity_legacy(&session, &activity));
-    }
-
-    #[test]
-    fn legacy_matching_needs_a_finished_session() {
-        let mut session = legacy_ride();
-        session.ended_at = None;
-        let activity = activity_for(&session, "i1");
-        assert!(!is_same_activity_legacy(&session, &activity));
     }
 
     #[test]
