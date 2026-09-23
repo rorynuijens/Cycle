@@ -22,7 +22,9 @@ use crate::data::{
 use crate::training::cues::{SegmentCue, CLOSING_SECS};
 use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT};
 use crate::ui::overlay::RideOverlay;
-use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
+use crate::ui::widgets::metric_column::{
+    caption_text, metric_column, metric_column_parts, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS,
+};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
 use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
@@ -44,6 +46,9 @@ pub struct PlayerPage {
     target_intensity: gtk::Label,
     elapsed_label: gtk::Label,
     remaining_label: gtk::Label,
+    /// Caption over [`Self::remaining_label`]. Kept because the ramp test
+    /// repurposes that column — see [`PlayerPage::set_test_mode`].
+    remaining_caption: gtk::Label,
     interval_label: gtk::Label,
     workout_progress: gtk::ProgressBar,
     segment_progress: gtk::ProgressBar,
@@ -112,6 +117,17 @@ pub struct PlayerPage {
     /// backs out and starts something else would otherwise land its rep numbers
     /// on the wrong workout.
     cue_generation: Cell<u64>,
+    /// Whether this ride is an FTP test rather than a workout to be completed.
+    ///
+    /// A ramp test has no end to count down to: it ends when the rider can no
+    /// longer hold the step. So the cockpit counts steps instead of time
+    /// remaining, and the end button reads as finishing the test rather than
+    /// abandoning a session. Set by [`PlayerPage::reset_workout`] from
+    /// [`Workout::is_ramp_test`], which is also what stamps the recorded ride.
+    test_mode: Cell<bool>,
+    /// Ladder steps in the test being ridden, for the "of N" in the caption.
+    /// Meaningless unless [`Self::test_mode`] is set.
+    ladder_steps: Cell<u32>,
     /// The content clamp and the box inside it, kept so fullscreen can widen
     /// the one and tighten the other — see [`PlayerPage::set_fullscreen`].
     clamp: adw::Clamp,
@@ -322,7 +338,7 @@ impl PlayerPage {
             &["cockpit-metric", "numeric"],
             CLOCK_DIGITS,
         );
-        let (remaining_box, remaining_label) = metric_column(
+        let (remaining_box, remaining_label, remaining_caption) = metric_column_parts(
             "Remaining",
             None,
             &WorkoutEngine::format_duration(workout.duration_secs),
@@ -551,6 +567,7 @@ impl PlayerPage {
             target_intensity,
             elapsed_label,
             remaining_label,
+            remaining_caption,
             interval_label,
             workout_progress,
             segment_progress,
@@ -589,6 +606,8 @@ impl PlayerPage {
             cues_enabled: Cell::new(true),
             cue_rendered: Cell::new(None),
             cue_generation: Cell::new(0),
+            test_mode: Cell::new(workout.is_ramp_test()),
+            ladder_steps: Cell::new(ladder_steps(workout)),
             clamp,
             inner,
         }
@@ -600,6 +619,48 @@ impl PlayerPage {
     /// Fullscreen there is no sidebar and no header, and holding the same
     /// 900 px would leave a ride marooned in the middle of a 27-inch screen, so
     /// the clamp opens up and the margins tighten onto the 6 px grid.
+    /// Put the cockpit into (or out of) FTP-test mode for `workout`.
+    ///
+    /// A ramp test is ridden to exhaustion rather than completed, so two things
+    /// on the page would otherwise lie about it: a countdown to an end that is
+    /// not how the test finishes, and an end button that calls finishing the
+    /// test "ending the workout". The cockpit counts ladder steps instead, and
+    /// the button says what pressing it does.
+    ///
+    /// Every class is listed in both branches: setting `css_classes` replaces
+    /// the whole set, so a partial list silently drops `pill`.
+    fn set_test_mode(&self, workout: &Workout) {
+        let testing = workout.is_ramp_test();
+        self.test_mode.set(testing);
+        self.ladder_steps.set(ladder_steps(workout));
+
+        if testing {
+            self.remaining_caption.set_label(&caption_text(
+                "Step",
+                Some(&format!("of {}", self.ladder_steps.get())),
+            ));
+            self.end_btn.set_label("I'm done");
+            self.end_btn.set_tooltip_text(Some(
+                "Finish the test and read your FTP off your best minute",
+            ));
+            self.end_btn.set_css_classes(&["suggested-action", "pill"]);
+        } else {
+            self.remaining_caption
+                .set_label(&caption_text("Remaining", None));
+            self.end_btn.set_label("End Workout");
+            self.end_btn
+                .set_tooltip_text(Some("End the current workout"));
+            self.end_btn
+                .set_css_classes(&["destructive-action", "pill"]);
+        }
+    }
+
+    /// Whether the ride in the cockpit is an FTP test. Read by `start_timer`,
+    /// which words its confirmation accordingly.
+    pub fn is_test_mode(&self) -> bool {
+        self.test_mode.get()
+    }
+
     pub fn set_fullscreen(&self, fullscreen: bool) {
         self.clamp.set_maximum_size(if fullscreen {
             FULLSCREEN_CLAMP
@@ -726,6 +787,7 @@ impl PlayerPage {
 
     /// Reset all UI for a new workout without rebuilding the widget tree.
     pub fn reset_workout(&self, workout: &Workout, ftp_watts: u32) {
+        self.set_test_mode(workout);
         self.graph.set_ftp(ftp_watts);
         self.zone_meter.set_ftp(ftp_watts);
         self.workout_name_label.set_label(&workout.name);
@@ -746,8 +808,13 @@ impl PlayerPage {
         self.graph.set_workout(workout);
         self.zone_meter.set_power(None);
         self.elapsed_label.set_label("0:00");
-        self.remaining_label
-            .set_label(&WorkoutEngine::format_duration(workout.duration_secs));
+        // No step has been reached yet in a test; the warm-up comes first.
+        let remaining = if self.test_mode.get() {
+            "—".to_string()
+        } else {
+            WorkoutEngine::format_duration(workout.duration_secs)
+        };
+        self.remaining_label.set_label(&remaining);
         self.workout_progress.set_fraction(0.0);
         // Full, not empty: the interval bar drains, so a fresh one is untouched.
         self.segment_progress.set_fraction(1.0);
@@ -871,14 +938,34 @@ impl PlayerPage {
             let engine_end = Rc::clone(&engine);
             let on_complete_end = Rc::clone(&on_complete);
             let completed_end = Rc::clone(&completed);
+            let testing = page.borrow().is_test_mode();
             *page.borrow().end_cb.borrow_mut() = Some(Rc::new(move || {
-                let dialog = adw::AlertDialog::builder()
-                    .heading("End Workout?")
-                    .body("Your progress so far will be saved.")
-                    .build();
+                // Kept in test mode too: a mis-tap part-way up the ladder would
+                // throw away a test that cannot be resumed. But it is finishing
+                // the test, not abandoning a session, so it is not destructive
+                // and it does not call itself ending a workout.
+                let dialog = if testing {
+                    adw::AlertDialog::builder()
+                        .heading("Finished the test?")
+                        .body(
+                            "Cycle will read your FTP off your best minute and \
+                             offer you the number.",
+                        )
+                        .build()
+                } else {
+                    adw::AlertDialog::builder()
+                        .heading("End Workout?")
+                        .body("Your progress so far will be saved.")
+                        .build()
+                };
                 dialog.add_response("cancel", "_Cancel");
-                dialog.add_response("end", "_End Workout");
-                dialog.set_response_appearance("end", adw::ResponseAppearance::Destructive);
+                if testing {
+                    dialog.add_response("end", "_I'm done");
+                    dialog.set_response_appearance("end", adw::ResponseAppearance::Suggested);
+                } else {
+                    dialog.add_response("end", "_End Workout");
+                    dialog.set_response_appearance("end", adw::ResponseAppearance::Destructive);
+                }
                 dialog.set_default_response(Some("cancel"));
                 dialog.set_close_response("cancel");
 
@@ -1050,8 +1137,20 @@ impl PlayerPage {
 
         self.elapsed_label
             .set_label(&WorkoutEngine::format_duration(snap.elapsed_secs));
-        self.remaining_label
-            .set_label(&WorkoutEngine::format_duration(snap.remaining_secs));
+        if self.test_mode.get() {
+            // Which step is being ridden, not how many are left: the ladder runs
+            // far past where anyone finishes, so "18 to go" tells the rider
+            // nothing. Just the number, because the total lives in the caption
+            // and the column reserves a clock's width, not a fraction's.
+            self.remaining_label.set_label(
+                &step_number(snap.segment_index, self.ladder_steps.get())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            );
+        } else {
+            self.remaining_label
+                .set_label(&WorkoutEngine::format_duration(snap.remaining_secs));
+        }
         self.interval_label
             .set_label(&WorkoutEngine::format_duration(snap.segment_remaining_secs));
 
@@ -1069,7 +1168,14 @@ impl PlayerPage {
 
         // Interval caption: numbered while the workout is active.
         let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
-        if is_active {
+        if self.test_mode.get() {
+            // The warm-up is not a step, so it is named rather than numbered.
+            self.interval_caption.set_label(
+                &step_number(snap.segment_index, self.ladder_steps.get())
+                    .filter(|_| is_active)
+                    .map_or_else(|| "Warm-up".to_string(), |n| format!("Step {n}")),
+            );
+        } else if is_active {
             self.interval_caption
                 .set_label(&format!("Interval {}", snap.segment_index + 1));
         } else {
@@ -1092,7 +1198,11 @@ impl PlayerPage {
     fn update_cue(&self, snap: &EngineSnapshot) {
         // Before the start the countdown banner is doing the talking, and after
         // the finish the summary page is; a cue in either case is noise.
-        let riding = matches!(snap.state, EngineState::Running | EngineState::Paused);
+        let riding = matches!(snap.state, EngineState::Running | EngineState::Paused)
+            // A test has one instruction — keep going until you cannot — and it
+            // is on the button. Rep-counting cues built for a plan would only
+            // talk over it.
+            && !self.test_mode.get();
         let cues = self.cues.borrow();
         let cue = cues.get(snap.segment_index);
 
@@ -1207,6 +1317,30 @@ impl PlayerPage {
 /// The closure is stored *inside* the page, so it must not hold anything that
 /// owns the page (CLAUDE.md §2.4) — hence the weak application reference, and
 /// the cloned overlay cell rather than the page itself.
+/// Ladder steps in a ramp test, or 0 for anything else.
+///
+/// The warm-up and the cool-down bracket the ladder — see
+/// [`Workout::ramp_test`].
+fn ladder_steps(workout: &Workout) -> u32 {
+    if !workout.is_ramp_test() {
+        return 0;
+    }
+    workout
+        .segments
+        .len()
+        .saturating_sub(crate::data::workout::RAMP_FIRST_STEP_INDEX + 1) as u32
+}
+
+/// Which ladder step a segment index is, counting from 1.
+///
+/// `None` during the warm-up, and past the last step for a rider who somehow
+/// rode the whole ladder out into the cool-down.
+fn step_number(segment_index: usize, ladder_steps: u32) -> Option<u32> {
+    let first = crate::data::workout::RAMP_FIRST_STEP_INDEX;
+    let step = segment_index.checked_sub(first)? as u32 + 1;
+    (step <= ladder_steps).then_some(step)
+}
+
 pub fn attach_overlay(
     page: &Rc<RefCell<PlayerPage>>,
     engine: Rc<RefCell<WorkoutEngine>>,

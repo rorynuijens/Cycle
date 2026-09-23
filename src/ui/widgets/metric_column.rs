@@ -45,6 +45,22 @@ pub fn metric_column(
     value_css: &[&str],
     digits: i32,
 ) -> (gtk::Box, gtk::Label) {
+    let (column, value_label, _) = metric_column_parts(title, unit, initial, value_css, digits);
+    (column, value_label)
+}
+
+/// As [`metric_column`], and also returns the caption label.
+///
+/// For a column whose *meaning* changes rather than only its value — the ramp
+/// test turns the cockpit's "Remaining" into "Step (of 20)", because a countdown
+/// to the end of a test that ends when the rider stops would be a lie.
+pub fn metric_column_parts(
+    title: &str,
+    unit: Option<&str>,
+    initial: &str,
+    value_css: &[&str],
+    digits: i32,
+) -> (gtk::Box, gtk::Label, gtk::Label) {
     let vbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -52,15 +68,11 @@ pub fn metric_column(
         .valign(gtk::Align::End)
         .build();
 
-    vbox.append(
-        &gtk::Label::builder()
-            .label(match unit {
-                Some(u) => format!("{title} ({u})"),
-                None => title.to_string(),
-            })
-            .css_classes(["caption", "dim-label"])
-            .build(),
-    );
+    let caption_label = gtk::Label::builder()
+        .label(caption_text(title, unit))
+        .css_classes(["caption", "dim-label"])
+        .build();
+    vbox.append(&caption_label);
 
     let value_label = gtk::Label::builder()
         .label(initial)
@@ -69,5 +81,13 @@ pub fn metric_column(
         .build();
 
     vbox.append(&value_label);
-    (vbox, value_label)
+    (vbox, value_label, caption_label)
+}
+
+/// A column's caption, with the unit in brackets where there is one.
+pub fn caption_text(title: &str, unit: Option<&str>) -> String {
+    match unit {
+        Some(u) => format!("{title} ({u})"),
+        None => title.to_string(),
+    }
 }

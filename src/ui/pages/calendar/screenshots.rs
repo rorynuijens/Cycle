@@ -256,6 +256,119 @@ fn player_page(power: u32) -> crate::ui::pages::player::PlayerPage {
     page
 }
 
+/// The cockpit riding the ramp test, part-way up the ladder.
+///
+/// The two things test mode changes are both here: "Remaining" has become
+/// "Step (of 20)" with the step number under it, and "End Workout" has become
+/// "I'm done" and stopped being red.
+fn shoot_ramp_player(name: &str, width: i32, height: i32) {
+    use crate::data::session::LiveReadings;
+
+    let athlete = crate::data::athlete::AthleteProfile {
+        ftp_watts: 200,
+        ..crate::data::athlete::AthleteProfile::default()
+    };
+    let test = Workout::ramp_test();
+    let page = crate::ui::pages::player::PlayerPage::new(&test, &athlete);
+    // `new` reads the workout, but the caption and button are switched over by
+    // `reset_workout`, which is the path a real ride takes.
+    page.reset_workout(&test, athlete.ftp_watts);
+    page.add_connected_device("AA:BB", "Elite Drivo");
+
+    // Step 9 of the ladder: 10 min warm-up plus 8 whole minutes, 24 s into the
+    // ninth. Its target is 124 % of 200 W, and the rider is just holding it.
+    let readings = LiveReadings {
+        power_watts: Some(246),
+        heart_rate_bpm: Some(171),
+        cadence_rpm: Some(94),
+        speed_kmh: Some(34.8),
+        resistance_target_watts: Some(248),
+        ..Default::default()
+    };
+    page.set_readings(readings.clone());
+    page.update_from_snapshot(&crate::training::engine::EngineSnapshot {
+        state: crate::training::engine::EngineState::Running,
+        elapsed_secs: 10 * 60 + 8 * 60 + 24,
+        remaining_secs: 12 * 60 + 36,
+        segment_index: 9,
+        segment_elapsed_secs: 24,
+        segment_remaining_secs: 36,
+        target_power_watts: 248,
+        intensity_pct: 100,
+        readings,
+    });
+
+    let window = adw::Window::builder().content(page.widget()).build();
+    shoot(&window, width, height, name);
+}
+
+/// The summary after a ramp test, with the result offered.
+fn shoot_ramp_summary(name: &str, height: i32) {
+    let test = Workout::ramp_test();
+    let session = ridden_ramp_test();
+
+    let athlete = crate::data::athlete::AthleteProfile {
+        ftp_watts: 200,
+        ..crate::data::athlete::AthleteProfile::default()
+    };
+    let page = crate::ui::pages::summary::SummaryPage::new(|| {});
+    page.update(&session, "Ramp Test", &athlete, Some(&test.segments));
+    page.show_ftp_test_result(&session, Some(&test.segments), Rc::new(|_| {}));
+
+    let window = adw::Window::builder().content(page.widget()).build();
+    shoot(&window, 900, height, name);
+}
+
+/// A ramp test ridden to step nine and then abandoned, as one is.
+///
+/// ERG holds the target, so recorded power tracks it until the rider runs out of
+/// legs half-way up the ninth step.
+fn ridden_ramp_test() -> crate::data::session::Session {
+    use crate::data::session::DataPoint;
+
+    let test = Workout::ramp_test();
+    let mut session = crate::data::session::Session::new(Some(test.id));
+    session.ftp_watts = Some(200);
+    session.is_ftp_test = true;
+    session.rpe = Some(10);
+
+    // Ten minutes of warm-up, then eight whole steps, then thirty seconds of
+    // the ninth before it comes apart.
+    let ridden = 10 * 60 + 8 * 60 + 30;
+    for sec in 0..ridden {
+        let target = test
+            .segments
+            .iter()
+            .scan(0u32, |start, seg| {
+                let this = *start;
+                *start += seg.duration_secs;
+                Some((this, seg))
+            })
+            .find(|(start, seg)| sec >= *start && sec < start + seg.duration_secs)
+            .map(|(start, seg)| seg.target_power_at(sec - start, 200))
+            .unwrap_or(0);
+        // Holding target until the last twenty seconds, then falling away.
+        let power = if sec > ridden - 20 {
+            target.saturating_sub(70)
+        } else {
+            target
+        };
+        session.data_points.push(DataPoint {
+            elapsed_secs: sec,
+            power_watts: Some(power),
+            target_watts: Some(target),
+            heart_rate_bpm: Some(120 + (sec / 40).min(60)),
+            cadence_rpm: Some(92),
+            speed_kmh: Some(32.0),
+            lat: None,
+            lng: None,
+            altitude_m: None,
+        });
+    }
+    session.ended_at = Some(session.started_at + chrono::Duration::seconds(ridden as i64));
+    session
+}
+
 /// The ride cockpit, dressed with live numbers.
 ///
 /// Sited here rather than beside `player.rs` because GTK may only be
@@ -813,6 +926,16 @@ fn screenshots() {
 
     shoot_route_player("14-route-1100x780", 1100, 780);
     shoot_week("15-week-ridden-plan", 1000, 700);
+
+    // The ramp test: the cockpit in test mode, and the result it offers after.
+    // Both themes for the summary — the card is the only place in the app that
+    // leans on the accent colour for a number (CLAUDE.md §4.2).
+    shoot_ramp_player("25-ramp-cockpit-light", 1100, 800);
+    shoot_ramp_summary("26-ramp-summary-light", 1000);
+    theme(true);
+    shoot_ramp_player("27-ramp-cockpit-dark", 1100, 800);
+    shoot_ramp_summary("28-ramp-summary-dark", 1000);
+    theme(false);
 
     // The ride overlay, in both themes. What a PNG cannot show is the point of
     // it — the panel is translucent, and whether the numbers stay readable over

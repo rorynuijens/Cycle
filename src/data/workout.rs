@@ -14,6 +14,29 @@ pub struct Workout {
     pub segments: Vec<Segment>,
 }
 
+/// Name of the built-in ramp test, and the way it is recognised — see
+/// [`Workout::is_ramp_test`].
+pub const RAMP_TEST_NAME: &str = "Ramp Test";
+/// Easy riding before the ladder starts, in seconds.
+const RAMP_WARMUP_SECS: u32 = 10 * 60;
+/// Length of one ladder step, in seconds. The result is read off the best
+/// rolling minute, so a step is a minute.
+pub const RAMP_STEP_SECS: u32 = 60;
+/// Target of the first ladder step, as a percentage of stored FTP.
+const RAMP_FIRST_PCT: f32 = 60.0;
+/// How much each step adds, in percentage points of stored FTP.
+const RAMP_STEP_PCT: f32 = 8.0;
+/// Number of one-minute steps. Twenty of them top out at 212 % of stored FTP,
+/// which stays above a rider whose stored FTP is set as much as 45 % too low —
+/// the headroom `ftp_test`'s tests assert, so the number cannot quietly shrink.
+const RAMP_STEPS: u32 = 20;
+/// Spin-down after the ladder, in seconds. See [`Workout::ramp_test`].
+const RAMP_COOLDOWN_SECS: u32 = 5 * 60;
+/// Index of the first ladder step in [`Workout::ramp_test`]'s segments. The
+/// warm-up is one segment, so the step number the rider is shown is
+/// `segment_index - RAMP_FIRST_STEP_INDEX + 1`.
+pub const RAMP_FIRST_STEP_INDEX: usize = 1;
+
 impl Workout {
     /// Build a workout from its segments, deriving duration and TSS.
     ///
@@ -38,6 +61,61 @@ impl Workout {
             category,
             segments,
         }
+    }
+
+    /// The built-in ramp test: a ladder of one-minute steps ridden to failure.
+    ///
+    /// Not a workout to be completed. It ends when the rider can no longer hold
+    /// the step, and the player runs it in test mode
+    /// ([`Workout::is_ramp_test`]) — step count in place of a countdown, and an
+    /// end button that reads as finishing the test rather than abandoning a
+    /// session. FTP comes out of what was actually ridden, not out of the plan:
+    /// see [`crate::training::ftp_test::ramp_result`].
+    ///
+    /// The ladder runs far past where anyone finishes, in percentage terms of
+    /// the *stored* FTP. That headroom is the point: the stored number
+    /// is the thing under test, so a rider whose FTP is set much too low must
+    /// still be able to ride past it. Running out of steps would cap the result
+    /// at the wrong answer.
+    pub fn ramp_test() -> Self {
+        let mut segments = vec![Segment::ramp(
+            RAMP_WARMUP_SECS,
+            40.0,
+            RAMP_FIRST_PCT,
+            "Warm-up",
+        )];
+        for step in 0..RAMP_STEPS {
+            let pct = RAMP_FIRST_PCT + RAMP_STEP_PCT * step as f32;
+            segments.push(Segment::steady(
+                RAMP_STEP_SECS,
+                pct,
+                &format!("Step {} \u{b7} {pct:.0}%", step + 1),
+            ));
+        }
+        // Reached only by a rider who rides the whole ladder out, which is not
+        // how the test ends. It is here so the workout is an ordinary finite one
+        // for everything that reads a workout — the graph, the library, TSS.
+        segments.push(Segment::steady(RAMP_COOLDOWN_SECS, 40.0, "Cool-down"));
+
+        Self::from_segments(
+            RAMP_TEST_NAME,
+            "Ridden to exhaustion, not completed. Ten minutes easy, then the \
+             target rises 8% of FTP every minute. Ride until you cannot hold the \
+             step, then press \u{201c}I\u{2019}m done\u{201d} \u{2014} Cycle reads your FTP off \
+             your best minute.",
+            WorkoutCategory::Custom,
+            segments,
+        )
+    }
+
+    /// Whether this is the built-in ramp test, and so ridden in test mode.
+    ///
+    /// Matched on the name, which is what the seeded row is identified by
+    /// everywhere else (`db::seed_workouts`) and which stays English by
+    /// decision. A copy saved under another name is an ordinary workout: it
+    /// still records, it just gets the normal cockpit and no FTP result.
+    pub fn is_ramp_test(&self) -> bool {
+        self.name.trim().eq_ignore_ascii_case(RAMP_TEST_NAME)
     }
 
     /// Returns a sample workout for UI previews and tests.
@@ -1105,31 +1183,7 @@ impl Workout {
                 ]),
             ),
             // ── FTP Tests (2) ─────────────────────────────────────────────────
-            mk(
-                "Ramp Test",
-                "Incremental ramp to exhaustion. FTP = last completed minute × 0.75. \
-                 Each minute the target rises by ~8% FTP. Go until you can no longer hold \
-                 the required power for 15 seconds.",
-                Custom,
-                chain(&[
-                    vec![wu(10)],
-                    vec![
-                        st(60, 60.0, "Ramp 60%"),
-                        st(60, 68.0, "Ramp 68%"),
-                        st(60, 76.0, "Ramp 76%"),
-                        st(60, 84.0, "Ramp 84%"),
-                        st(60, 92.0, "Ramp 92%"),
-                        st(60, 100.0, "Ramp 100%"),
-                        st(60, 108.0, "Ramp 108%"),
-                        st(60, 116.0, "Ramp 116%"),
-                        st(60, 124.0, "Ramp 124%"),
-                        st(60, 132.0, "Ramp 132%"),
-                        st(60, 140.0, "Ramp 140%"),
-                        st(60, 148.0, "Ramp 148%"),
-                    ],
-                    vec![cd(10)],
-                ]),
-            ),
+            Workout::ramp_test(),
             mk(
                 "20-Minute FTP Test",
                 "Gold-standard FTP test. Ride the 20-minute all-out section as hard as \

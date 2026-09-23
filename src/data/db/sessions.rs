@@ -328,7 +328,7 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             sqlx::query(
                 "UPDATE sessions
                     SET workout_id = ?, started_at = ?, ended_at = ?, data_points_json = ?,
-                        ftp_watts = ?, title = ?, icu_id = ?
+                        ftp_watts = ?, title = ?, icu_id = ?, is_ftp_test = ?
                   WHERE id = ?",
             )
             .bind(session.workout_id)
@@ -338,6 +338,7 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             .bind(session.ftp_watts.map(|v| v as i64))
             .bind(session.title.as_deref())
             .bind(session.icu_id.as_deref())
+            .bind(session.is_ftp_test as i64)
             .bind(existing)
             .execute(pool)
             .await?;
@@ -346,8 +347,8 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
         None => {
             let result = sqlx::query(
                 "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json,
-                                       ftp_watts, title, icu_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                       ftp_watts, title, icu_id, is_ftp_test)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(session.workout_id)
             .bind(&started_at)
@@ -356,6 +357,7 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             .bind(session.ftp_watts.map(|v| v as i64))
             .bind(session.title.as_deref())
             .bind(session.icu_id.as_deref())
+            .bind(session.is_ftp_test as i64)
             .execute(pool)
             .await?;
             result.last_insert_rowid()
@@ -389,7 +391,7 @@ pub async fn checkpoint_session(
             sqlx::query(
                 "UPDATE sessions
                     SET workout_id = ?, started_at = ?, data_points_json = ?,
-                        ftp_watts = ?, title = ?
+                        ftp_watts = ?, title = ?, is_ftp_test = ?
                   WHERE id = ? AND ended_at IS NULL",
             )
             .bind(session.workout_id)
@@ -397,6 +399,7 @@ pub async fn checkpoint_session(
             .bind(&data_points_json)
             .bind(session.ftp_watts.map(|v| v as i64))
             .bind(session.title.as_deref())
+            .bind(session.is_ftp_test as i64)
             .bind(existing)
             .execute(pool)
             .await?;
@@ -405,14 +408,15 @@ pub async fn checkpoint_session(
         None => {
             let result = sqlx::query(
                 "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json,
-                                       ftp_watts, title)
-                 VALUES (?, ?, NULL, ?, ?, ?)",
+                                       ftp_watts, title, is_ftp_test)
+                 VALUES (?, ?, NULL, ?, ?, ?, ?)",
             )
             .bind(session.workout_id)
             .bind(&started_at)
             .bind(&data_points_json)
             .bind(session.ftp_watts.map(|v| v as i64))
             .bind(session.title.as_deref())
+            .bind(session.is_ftp_test as i64)
             .execute(pool)
             .await?;
             Ok(result.last_insert_rowid())
@@ -616,7 +620,7 @@ async fn load_session_records_where(
     let rows = sqlx::query(&format!(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
-                s.integrity_dismissed,
+                s.integrity_dismissed, s.is_ftp_test,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
@@ -662,6 +666,7 @@ async fn load_session_records_where(
                 title: r.get("title"),
                 icu_id: r.get("icu_id"),
                 integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
+                is_ftp_test: r.get::<i64, _>("is_ftp_test") != 0,
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -689,7 +694,7 @@ pub async fn load_sessions_between(
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
-                s.integrity_dismissed,
+                s.integrity_dismissed, s.is_ftp_test,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
@@ -722,6 +727,7 @@ pub async fn load_sessions_between(
                 title: r.get("title"),
                 icu_id: r.get("icu_id"),
                 integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
+                is_ftp_test: r.get::<i64, _>("is_ftp_test") != 0,
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -814,6 +820,63 @@ mod tests {
         let points: Vec<DataPoint> =
             serde_json::from_str(row.get::<&str, _>("data_points_json")).unwrap();
         assert_eq!(points[0].target_watts, Some(230));
+    }
+
+    #[tokio::test]
+    async fn should_remember_that_a_ride_was_an_ftp_test() {
+        // The flag is what keeps a ramp test out of the FTP evidence
+        // (`training::ftp_detect`). If it does not survive the round trip, the
+        // exclusion is decoration.
+        let pool = test_pool().await;
+        let mut test_ride = Session::new(None);
+        test_ride.ftp_watts = Some(250);
+        test_ride.is_ftp_test = true;
+        test_ride.ended_at = Some(chrono::Utc::now());
+        save_session(&pool, &test_ride).await.unwrap();
+
+        let mut ordinary = Session::new(None);
+        ordinary.ftp_watts = Some(250);
+        ordinary.ended_at = Some(chrono::Utc::now());
+        save_session(&pool, &ordinary).await.unwrap();
+
+        let loaded = load_session_records(&pool).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded.iter().filter(|r| r.session.is_ftp_test).count(),
+            1,
+            "exactly the ride that was a test comes back flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_test_flag_through_a_mid_ride_checkpoint() {
+        // A test interrupted and recovered is still a test, and the recovery
+        // path writes through `checkpoint_session` rather than `save_session`.
+        let pool = test_pool().await;
+        let mut test_ride = Session::new(None);
+        test_ride.ftp_watts = Some(250);
+        test_ride.is_ftp_test = true;
+        let id = checkpoint_session(&pool, None, &test_ride).await.unwrap();
+        // And again on the second checkpoint, which takes the UPDATE branch.
+        checkpoint_session(&pool, Some(id), &test_ride)
+            .await
+            .unwrap();
+
+        let unfinished = load_unfinished_sessions(&pool).await.unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert!(unfinished[0].session.is_ftp_test);
+    }
+
+    #[tokio::test]
+    async fn should_not_flag_an_ordinary_ride_as_a_test() {
+        let pool = test_pool().await;
+        let mut ride = Session::new(None);
+        ride.ftp_watts = Some(250);
+        ride.ended_at = Some(chrono::Utc::now());
+        save_session(&pool, &ride).await.unwrap();
+
+        let loaded = load_session_records(&pool).await.unwrap();
+        assert!(!loaded[0].session.is_ftp_test);
     }
 
     fn riding_session(secs: u32) -> Session {

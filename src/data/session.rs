@@ -36,6 +36,19 @@ pub struct Session {
     /// flag, and a missing one means "never dismissed", not "unreadable".
     #[serde(default)]
     pub integrity_dismissed: bool,
+    /// Set when this ride was an FTP test rather than training.
+    ///
+    /// Stamped by the engine from [`crate::data::workout::Workout::is_ramp_test`]
+    /// when the ride is set up, so it records what the ride *was* even if the
+    /// workout is later renamed or deleted. FTP detection skips these rides
+    /// entirely — a test is designed to end in failure, and counting it as
+    /// evidence would read a successful test as a reason to ease FTP. See
+    /// [`crate::training::ftp_detect::session_evidence`].
+    ///
+    /// Defaulted on read: rides recorded before the flag existed carry none,
+    /// and a missing one means "ordinary ride", which is what they all were.
+    #[serde(default)]
+    pub is_ftp_test: bool,
 }
 
 impl Session {
@@ -51,6 +64,7 @@ impl Session {
             title: None,
             icu_id: None,
             integrity_dismissed: false,
+            is_ftp_test: false,
         }
     }
 

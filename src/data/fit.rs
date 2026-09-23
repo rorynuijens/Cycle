@@ -795,6 +795,7 @@ pub fn import_fit_file(path: &Path) -> Result<Session> {
         title: None,
         icu_id: None,
         integrity_dismissed: false,
+        is_ftp_test: false,
     })
 }
 

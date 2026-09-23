@@ -243,8 +243,57 @@ pub fn finish_session_closure(
         );
         stack_for_complete.set_visible_child_name("summary");
 
-        // FTP auto-suggestion based on 20-minute best power
-        if let Some(peak_20) = session.peak_power_for_duration(1200) {
+        // ── What a ramp test came out at ─────────────────────────────────────
+        // Accept-only: FTP is what every target, zone and load figure is scaled
+        // to, so it moves when the rider says so. The card does nothing until
+        // the button is pressed, and this closure is what it presses.
+        {
+            let pool_ftp = pool_for_complete.clone();
+            let rt_ftp = rt_for_complete.clone();
+            let athlete_ftp = Rc::clone(&athlete_for_complete);
+            let toast_ftp = toast_overlay_for_complete.clone();
+            summary_for_complete.show_ftp_test_result(
+                &session,
+                segments.as_deref(),
+                Rc::new(move |new_ftp| {
+                    // One cell, read by every page and by the running engine, so
+                    // writing it is the whole UI side of the change.
+                    let profile = {
+                        let mut a = athlete_ftp.borrow_mut();
+                        a.ftp_watts = new_ftp;
+                        a.clone()
+                    };
+                    toast_ftp.add_toast(
+                        adw::Toast::builder()
+                            .title(format!("FTP set to {new_ftp} W"))
+                            .timeout(5)
+                            .build(),
+                    );
+                    let pool = pool_ftp.clone();
+                    rt_ftp.spawn(async move {
+                        if let Err(e) = db::update_athlete(&pool, &profile).await {
+                            tracing::error!("update_athlete failed after a ramp test: {e}");
+                            return;
+                        }
+                        // Logged only once the profile write succeeded, so the
+                        // history never claims a change the profile did not take.
+                        if let Err(e) =
+                            db::log_ftp_change(&pool, new_ftp, "ramp_test", "ramp test").await
+                        {
+                            tracing::error!("log_ftp_change failed after a ramp test: {e}");
+                        }
+                    });
+                }),
+            );
+        }
+
+        // FTP auto-suggestion based on 20-minute best power. Not for a ramp
+        // test, which has its own card above and whose best 20 minutes are a
+        // warm-up and a ladder rather than an effort.
+        if let Some(peak_20) = session
+            .peak_power_for_duration(1200)
+            .filter(|_| !session.is_ftp_test)
+        {
             let suggested = (peak_20 as f32 * 0.95) as u32;
             if suggested > ftp + 5 {
                 toast_overlay_for_complete.add_toast(

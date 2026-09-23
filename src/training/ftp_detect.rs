@@ -225,7 +225,8 @@ pub struct FtpSuggestion {
 
 /// Reduce one recorded ride to its evidence, or `None` when it has none to give.
 ///
-/// A ride is unusable when it carries no ride-time FTP or no recorded targets:
+/// A ride is unusable when it was an FTP test ([`Session::is_ftp_test`]), or
+/// when it carries no ride-time FTP or no recorded targets:
 /// route rides and imported files never had targets, and rides recorded before
 /// target capture shipped (2026-07-24) lost theirs. `planned_duration_secs` is
 /// the workout's planned length where there is one, used only to notice a ride
@@ -237,6 +238,15 @@ pub fn session_evidence(
     session: &Session,
     planned_duration_secs: Option<u32>,
 ) -> Option<SessionEvidence> {
+    // An FTP test is not training, and reading it as training inverts its
+    // result. Its targets run far above the threshold boundary and it ends, by
+    // design, with the rider unable to hold the step — so a *successful* test
+    // reads here as a hard session that came apart, and would argue for easing
+    // the very number it was ridden to establish. Excluded at the door rather
+    // than discounted later, so no rule can see it.
+    if session.is_ftp_test {
+        return None;
+    }
     let ftp = session.ftp_watts?;
     if ftp == 0 {
         return None;
@@ -910,7 +920,81 @@ mod tests {
             title: None,
             icu_id: None,
             integrity_dismissed: false,
+            is_ftp_test: false,
         }
+    }
+
+    // ── FTP tests are not evidence ───────────────────────────────────────────
+
+    #[test]
+    fn should_give_no_evidence_for_a_ride_that_was_an_ftp_test() {
+        // A ramp test is the exact shape this module is built to react to —
+        // targets far above threshold, ridden until the rider cannot hold them.
+        // Read as training it is a hard session that came apart, and a
+        // *successful* test would argue for easing FTP for four weeks.
+        let mut test_ride = ride(
+            NaiveDate::from_ymd_opt(2026, 9, 1).expect("hardcoded valid date"),
+            Some(10),
+            &[easy(600), hard(600)],
+        );
+        assert!(
+            session_evidence(&test_ride, None).is_some(),
+            "the same ride unflagged is evidence — otherwise this test proves nothing"
+        );
+
+        test_ride.is_ftp_test = true;
+        assert_eq!(
+            session_evidence(&test_ride, None),
+            None,
+            "a flagged test contributes nothing at all"
+        );
+    }
+
+    #[test]
+    fn should_not_let_a_failed_ftp_test_drag_a_window_down() {
+        // End to end: a window of clean sessions, plus a test ridden to
+        // exhaustion on the last day. The test must not put a failure into the
+        // window that the rider's training never contained.
+        let day = |d| NaiveDate::from_ymd_opt(2026, 9, d).expect("hardcoded valid date");
+        let today = day(20);
+        let clean = vec![
+            clean_session(day(1), 5),
+            clean_session(day(3), 5),
+            clean_session(day(5), 5),
+        ];
+
+        // A test ride: ten minutes above threshold that falls well short at the
+        // end, which is what running out of legs looks like.
+        let mut test_ride = ride(
+            day(7),
+            Some(10),
+            &[easy(600), hard(300), block(300, HARD_TARGET, 150)],
+        );
+        test_ride.is_ftp_test = true;
+        assert!(
+            session_evidence(&test_ride, None).is_none(),
+            "the test is excluded before it can reach the window"
+        );
+
+        // What the window looks like with the test left out, which is the only
+        // way it can now be built.
+        let summary = summarise(&clean, today);
+        assert_eq!(summary.failed_segments, 0, "no failure came from the test");
+        assert_eq!(summary.n_hard, 3);
+
+        // And what it would have looked like had the test been counted — the
+        // failure the flag exists to keep out.
+        let mut with_test = clean.clone();
+        let mut counted = test_ride.clone();
+        counted.is_ftp_test = false;
+        with_test.push(
+            session_evidence(&counted, None).expect("unflagged, the test reads as a hard session"),
+        );
+        assert!(
+            summarise(&with_test, today).failed_segments > 0,
+            "the test really does read as a failure when counted — \
+             otherwise the flag is guarding nothing"
+        );
     }
 
     /// A clean 4×4: 16 minutes of hard work, every interval held.

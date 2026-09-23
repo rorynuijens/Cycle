@@ -7,17 +7,26 @@ use crate::data::athlete::{AthleteProfile, ZONE_COLORS};
 use crate::data::session::Session;
 use crate::data::workout::{Segment, Workout, WorkoutCategory};
 use crate::training::engine::WorkoutEngine;
+use crate::training::ftp_test;
 use crate::training::progression::Effort;
 use crate::ui::widgets::progression_card;
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_bar::ZoneBar;
 use crate::ui::widgets::zone_meter::ZONE_LABELS;
 
+/// Said under the hero icon after an ordinary ride.
+const RIDE_DONE: &str = "Workout complete";
+/// And after an FTP test, which is not completed but ridden out.
+const TEST_DONE: &str = "Test complete";
+
 #[derive(Clone)]
 pub struct SummaryPage {
     root: gtk::Box,
     /// Hero icon — a star by default, the RPE emoticon once the rider rates.
     rpe_image: gtk::Image,
+    /// Under the hero icon. A ramp test was not "completed" — it was ridden
+    /// until the rider could not hold the step, which is the test working.
+    hero_caption: gtk::Label,
     workout_name_label: gtk::Label,
     dur_label: gtk::Label,
     tss_label: gtk::Label,
@@ -37,6 +46,8 @@ pub struct SummaryPage {
     progression_holder: gtk::Box,
     /// Holds the notice about a ride that did not record properly, if any.
     integrity_holder: gtk::Box,
+    /// Holds the FTP a ramp test came out at, if this ride was one.
+    ftp_result_holder: gtk::Box,
     last_session: Rc<RefCell<Option<Session>>>,
     /// The profile the last summary was drawn against — the FIT export reads
     /// FTP and heart-rate limits from it to derive training load.
@@ -85,13 +96,12 @@ impl SummaryPage {
             .build();
         inner.append(&rpe_image);
 
-        inner.append(
-            &gtk::Label::builder()
-                .label("Workout complete")
-                .halign(gtk::Align::Center)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
+        let hero_caption = gtk::Label::builder()
+            .label(RIDE_DONE)
+            .halign(gtk::Align::Center)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        inner.append(&hero_caption);
 
         let workout_name_label = gtk::Label::builder()
             .label("")
@@ -122,6 +132,15 @@ impl SummaryPage {
             .visible(false)
             .build();
         inner.append(&integrity_holder);
+
+        // ── What the test came out at ────────────────────────────────────────
+        // Above the ride graph, because after a ramp test the number is what the
+        // rider got on the bike for; the trace is the evidence behind it.
+        let ftp_result_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .visible(false)
+            .build();
+        inner.append(&ftp_result_holder);
 
         // ── The ride: workout profile with the actual power trace over it ────
         let graph_holder = gtk::Box::builder()
@@ -333,6 +352,7 @@ impl SummaryPage {
         Self {
             root,
             rpe_image,
+            hero_caption,
             workout_name_label,
             dur_label,
             tss_label,
@@ -349,6 +369,7 @@ impl SummaryPage {
             graph_holder,
             progression_holder,
             integrity_holder,
+            ftp_result_holder,
             last_session,
             last_athlete,
             export_banner,
@@ -466,6 +487,29 @@ impl SummaryPage {
         );
     }
 
+    /// Offer the FTP a ramp test came out at, if this ride was one.
+    ///
+    /// Does nothing for an ordinary ride, or for a test that produced no usable
+    /// number — see [`ftp_test::ramp_result`]. `segments` is the ladder the ride
+    /// was ridden against, which is how the steps held are counted.
+    ///
+    /// `on_accept` is what actually changes the rider's FTP; nothing here does.
+    pub fn show_ftp_test_result(
+        &self,
+        session: &Session,
+        segments: Option<&[Segment]>,
+        on_accept: Rc<dyn Fn(u32)>,
+    ) {
+        let result = session
+            .is_ftp_test
+            .then(|| ftp_test::ramp_result(session, segments.unwrap_or_default()))
+            .flatten();
+        if session.is_ftp_test && result.is_none() {
+            tracing::info!("Ramp test recorded, but it yielded no usable FTP to offer");
+        }
+        crate::ui::widgets::ftp_result::attach(&self.ftp_result_holder, result, on_accept);
+    }
+
     /// Show the bundled RPE emoticon icon in the hero.
     pub fn show_rpe_icon(&self, rpe: u8) {
         if let Some(texture) = crate::ui::resources::rpe_texture(rpe) {
@@ -492,8 +536,18 @@ impl SummaryPage {
             self.integrity_holder.remove(&child);
         }
         self.integrity_holder.set_visible(false);
+        // Likewise refilled by `show_ftp_test_result`, and only for a test.
+        while let Some(child) = self.ftp_result_holder.first_child() {
+            self.ftp_result_holder.remove(&child);
+        }
+        self.ftp_result_holder.set_visible(false);
         // Reset the hero icon — the RPE emoticon belongs to the previous ride.
         self.rpe_image.set_icon_name(Some("starred-symbolic"));
+        self.hero_caption.set_label(if session.is_ftp_test {
+            TEST_DONE
+        } else {
+            RIDE_DONE
+        });
 
         self.workout_name_label.set_label(workout_name);
 
@@ -644,6 +698,31 @@ impl SummaryPage {
                     elapsed += seg.duration_secs;
                 }
 
+                // Stop at the last segment the ride actually reached. A ride
+                // that ended early has nothing to say about the intervals after
+                // it, and listing them as "No data" pads the page with rows
+                // about work that was never asked for — a ramp test, which ends
+                // by design part-way up, would otherwise report a dozen of them.
+                // Interior gaps are kept: a segment with no data *inside* the
+                // ride is a dropout, which is worth seeing.
+                let reached = segments_the_ride_reached(
+                    &seg_times,
+                    &named_segs.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                    session.data_points.iter().map(|dp| dp.elapsed_secs).max(),
+                );
+                let named_segs: Vec<(usize, &Segment)> = named_segs
+                    .into_iter()
+                    .filter(|(seg_idx, _)| reached.contains(seg_idx))
+                    .collect();
+
+                // Everything was trimmed: a ride with no samples at all has
+                // nothing to report against, and an empty section with a
+                // heading is worse than no section.
+                if named_segs.is_empty() {
+                    self.compliance_section.set_visible(false);
+                    return;
+                }
+
                 for (seg_idx, seg) in &named_segs {
                     let (t_start, t_end) = seg_times[*seg_idx];
                     // What the trainer was asked for, which accounts for the
@@ -697,5 +776,98 @@ impl SummaryPage {
         } else {
             self.compliance_section.set_visible(false);
         }
+    }
+}
+
+/// Which of `named` the ride actually got as far as starting.
+///
+/// `seg_times` is every segment's `(start, end)` in ride seconds, and
+/// `last_second` is the last second the ride recorded — `None` for a ride with
+/// no samples at all.
+///
+/// A ride that ended early has nothing to say about the intervals after it, and
+/// listing them pads the summary with rows about work never asked for. Segments
+/// *inside* the ride are always kept even with no data, because that is a
+/// dropout rather than an interval that never happened.
+fn segments_the_ride_reached(
+    seg_times: &[(u32, u32)],
+    named: &[usize],
+    last_second: Option<u32>,
+) -> Vec<usize> {
+    let Some(last_second) = last_second else {
+        return Vec::new();
+    };
+    named
+        .iter()
+        .copied()
+        .filter(|&i| {
+            seg_times
+                .get(i)
+                .is_some_and(|(start, _)| *start <= last_second)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Four one-minute segments back to back.
+    fn four_minutes() -> Vec<(u32, u32)> {
+        vec![(0, 60), (60, 120), (120, 180), (180, 240)]
+    }
+
+    #[test]
+    fn should_keep_every_segment_of_a_ride_that_was_finished() {
+        let reached = segments_the_ride_reached(&four_minutes(), &[0, 1, 2, 3], Some(239));
+        assert_eq!(reached, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn should_drop_the_segments_a_ride_ended_before_reaching() {
+        // Stopped 30 s into the third segment: the fourth was never asked for.
+        let reached = segments_the_ride_reached(&four_minutes(), &[0, 1, 2, 3], Some(150));
+        assert_eq!(reached, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn should_decide_on_the_second_a_segment_starts() {
+        // The boundary itself, both sides of it. A ride ending one second
+        // before segment three starts has not reached it; a ride ending on its
+        // first second has.
+        assert_eq!(
+            segments_the_ride_reached(&four_minutes(), &[0, 1, 2, 3], Some(119)),
+            vec![0, 1],
+            "119 s is still inside segment two"
+        );
+        assert_eq!(
+            segments_the_ride_reached(&four_minutes(), &[0, 1, 2, 3], Some(120)),
+            vec![0, 1, 2],
+            "120 s is segment three's first second"
+        );
+    }
+
+    #[test]
+    fn should_keep_a_gap_inside_the_ride() {
+        // Only the named segments are considered, so an unnamed recovery
+        // between them does not shift anything — and a named one the rider
+        // coasted through is still listed, because it happened.
+        let reached = segments_the_ride_reached(&four_minutes(), &[0, 2, 3], Some(239));
+        assert_eq!(reached, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn should_keep_nothing_for_a_ride_that_recorded_nothing() {
+        // Not "everything up to second zero" — a ride with no samples has no
+        // compliance to report, and one row claiming 0 % would be a lie.
+        assert!(segments_the_ride_reached(&four_minutes(), &[0, 1, 2, 3], None).is_empty());
+    }
+
+    #[test]
+    fn should_ignore_an_index_that_is_not_a_segment() {
+        // Defensive: the two lists are built from the same source, but an index
+        // past the end must not panic the summary of a finished ride.
+        let reached = segments_the_ride_reached(&four_minutes(), &[0, 9], Some(239));
+        assert_eq!(reached, vec![0]);
     }
 }

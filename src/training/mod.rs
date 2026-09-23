@@ -4,6 +4,7 @@ pub mod cues;
 pub mod engine;
 pub mod fitness;
 pub mod ftp_detect;
+pub mod ftp_test;
 pub mod integrity;
 pub mod load;
 pub mod matching;

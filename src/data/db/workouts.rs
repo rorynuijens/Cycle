@@ -133,6 +133,7 @@ pub async fn seed_workouts(pool: &SqlitePool) -> Result<()> {
                 }
             }
         }
+        refresh_ramp_test(pool).await?;
         return Ok(());
     }
 
@@ -142,6 +143,44 @@ pub async fn seed_workouts(pool: &SqlitePool) -> Result<()> {
         save_workout(pool, &workout).await?;
     }
     tracing::info!("Seeded {count} workouts");
+    Ok(())
+}
+
+/// Bring an already-seeded Ramp Test row up to the current ladder.
+///
+/// Unlike every other library workout, the ramp test is a *protocol*: its ladder
+/// is what produces the FTP number, so a row seeded from an older, shorter
+/// ladder would cap a strong rider's result at the top step it happens to have.
+/// The row is updated in place rather than replaced, because calendar entries
+/// and recorded rides refer to it by id.
+///
+/// Matched on segment count, which is what actually changes when the ladder
+/// does, and so a no-op on every launch after the first. A row the rider has
+/// edited themselves is overwritten — this is a seeded workout, and the editor
+/// offers Duplicate for keeping a variant.
+async fn refresh_ramp_test(pool: &SqlitePool) -> Result<()> {
+    let current = Workout::ramp_test();
+    let row = sqlx::query("SELECT id, segments_json FROM workouts WHERE name = ? LIMIT 1")
+        .bind(crate::data::workout::RAMP_TEST_NAME)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else { return Ok(()) };
+
+    let stored: Vec<Segment> = serde_json::from_str(row.get("segments_json"))?;
+    if stored.len() == current.segments.len() {
+        return Ok(());
+    }
+
+    let updated = Workout {
+        id: row.get("id"),
+        ..current
+    };
+    update_workout(pool, &updated).await?;
+    tracing::info!(
+        "Refreshed the Ramp Test ladder: {} segments -> {}",
+        stored.len(),
+        updated.segments.len()
+    );
     Ok(())
 }
 
@@ -248,6 +287,77 @@ pub async fn create_workout_from_icu_activity(
 mod tests {
     use super::*;
     use crate::data::db::testing::*;
+
+    /// The Ramp Test as it shipped in 0.10.0: a twelve-step ladder topping out
+    /// at 148 % of FTP.
+    fn old_ramp_test() -> Workout {
+        let mut segments = vec![Segment::ramp(600, 40.0, 60.0, "Warm-up")];
+        for step in 0..12 {
+            let pct = 60.0 + 8.0 * step as f32;
+            segments.push(Segment::steady(60, pct, "Ramp"));
+        }
+        segments.push(Segment::steady(600, 40.0, "Cool-down"));
+        Workout::from_segments(
+            crate::data::workout::RAMP_TEST_NAME,
+            "the old description",
+            WorkoutCategory::Custom,
+            segments,
+        )
+    }
+
+    #[tokio::test]
+    async fn should_bring_an_old_ramp_test_row_up_to_the_current_ladder() {
+        // The ladder is the protocol: a row seeded from the shorter one caps a
+        // strong rider's result at the top step it happens to have.
+        let pool = test_pool().await;
+        let id = save_workout(&pool, &old_ramp_test()).await.unwrap();
+
+        refresh_ramp_test(&pool).await.unwrap();
+
+        let loaded = load_workout_by_id(&pool, id)
+            .await
+            .unwrap()
+            .expect("the row is updated in place, not replaced");
+        assert_eq!(
+            loaded.segments.len(),
+            Workout::ramp_test().segments.len(),
+            "the ladder was not refreshed"
+        );
+        let top = loaded
+            .segments
+            .iter()
+            .map(|s| s.power_high_pct)
+            .fold(0.0_f32, f32::max);
+        assert!(top > 148.0, "still topping out at {top}%");
+        assert_eq!(loaded.id, id, "calendar entries refer to this row by id");
+        assert!(
+            loaded.is_ramp_test(),
+            "and it is still recognised as the test"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_leave_a_current_ramp_test_row_alone() {
+        // Runs on every launch, so it has to be a no-op once it has run.
+        let pool = test_pool().await;
+        let id = save_workout(&pool, &Workout::ramp_test()).await.unwrap();
+        let before = load_workout_by_id(&pool, id).await.unwrap().unwrap();
+
+        refresh_ramp_test(&pool).await.unwrap();
+
+        let after = load_workout_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(after.segments.len(), before.segments.len());
+        assert_eq!(after.description, before.description);
+    }
+
+    #[tokio::test]
+    async fn should_do_nothing_when_there_is_no_ramp_test_to_refresh() {
+        // A rider who deleted it has deleted it; re-seeding here would resurrect
+        // a workout they threw away.
+        let pool = test_pool().await;
+        refresh_ramp_test(&pool).await.unwrap();
+        assert!(load_workouts(&pool).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn save_and_load_workout_by_id_preserves_segments() {

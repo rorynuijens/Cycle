@@ -247,6 +247,7 @@ mod tests {
             title: title.map(str::to_string),
             icu_id: None,
             integrity_dismissed: false,
+            is_ftp_test: false,
         };
         CalendarEvent::Session(
             SessionRecord {

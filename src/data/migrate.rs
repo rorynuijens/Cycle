@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -186,6 +186,24 @@ const MIGRATIONS: &[Migration] = &[
             // found — the ride still says what looked wrong, it just stops being
             // held back over it.
             "ALTER TABLE sessions ADD COLUMN integrity_dismissed INTEGER NOT NULL DEFAULT 0",
+        ],
+    },
+    Migration {
+        version: 7,
+        name: "keep FTP tests out of the FTP evidence",
+        statements: &[
+            // Set when the ride was an FTP test rather than training. A ramp
+            // test is a structured workout whose targets run far above the
+            // threshold boundary and which ends, by design, with the rider
+            // unable to hold the step — so stored like any other ride it reads
+            // to `training::ftp_detect` as exactly the thing it is not: a hard
+            // session that came apart. A *successful* test would push the
+            // check-in toward easing FTP for the next four weeks.
+            //
+            // A column on the ride rather than a lookup through `workout_id`,
+            // which is NULL on every imported ride and can be cleared by
+            // deleting the workout. What a ride was is a fact about the ride.
+            "ALTER TABLE sessions ADD COLUMN is_ftp_test INTEGER NOT NULL DEFAULT 0",
         ],
     },
 ];
@@ -842,6 +860,43 @@ mod tests {
     }
 
     // ── a database from a newer build ────────────────────────────────────────
+
+    // ── v7: FTP tests are not evidence ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_read_a_ride_recorded_before_v7_as_an_ordinary_ride() {
+        // The column decides whether a ride reaches `training::ftp_detect`. A
+        // ride recorded before it existed was training, so it must migrate to 0
+        // — a NULL would make the read (`!= 0`) a question about nothing, and a
+        // 1 would silently drop every old ride out of the FTP evidence.
+        let pool = empty_pool().await;
+        establish_baseline(&pool).await.unwrap();
+        set_user_version(&pool, 6).await.unwrap();
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 6) {
+            for stmt in m.statements {
+                sqlx::query(stmt).execute(&pool).await.ok();
+            }
+        }
+        sqlx::query(
+            "INSERT INTO sessions (id, started_at, ended_at, data_points_json)
+             VALUES (1, '2026-09-01T09:00:00Z', '2026-09-01T10:00:00Z', '[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run(&pool).await.expect("v7 applies to a v6 database");
+
+        assert!(columns(&pool, "sessions")
+            .await
+            .iter()
+            .any(|c| c == "is_ftp_test"));
+        let flag: i64 = sqlx::query_scalar("SELECT is_ftp_test FROM sessions WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("the column is NOT NULL, so this cannot come back empty");
+        assert_eq!(flag, 0, "an existing ride was training, not a test");
+    }
 
     #[tokio::test]
     async fn should_refuse_a_database_from_a_newer_build() {

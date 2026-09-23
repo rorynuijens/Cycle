@@ -79,6 +79,11 @@ impl WorkoutEngine {
         // Stamp the FTP the ride is executed at — FTP detection needs it to
         // interpret targets after the profile FTP changes.
         session.ftp_watts = Some(athlete.borrow().ftp_watts);
+        // And stamp what kind of ride it is, for the same reader: a test is
+        // built to end in failure, so counting it as evidence would read a
+        // successful one as a reason to ease FTP. Recorded on the ride rather
+        // than looked up later — see `Session::is_ftp_test`.
+        session.is_ftp_test = workout.is_ramp_test();
         Self {
             session,
             workout,
@@ -135,8 +140,11 @@ impl WorkoutEngine {
             .last()
             .map(|p| p.elapsed_secs + 1)
             .unwrap_or(0);
-        self.workout = workout;
         self.session = session;
+        // Re-derived rather than trusted: a ride checkpointed before the flag
+        // existed carries `false` whatever it actually was.
+        self.session.is_ftp_test = workout.is_ramp_test();
+        self.workout = workout;
         self.state = EngineState::Idle;
         self.start_instant = None;
         self.pause_offset = Duration::from_secs(elapsed as u64);
@@ -221,9 +229,10 @@ impl WorkoutEngine {
     /// Used when the user picks a different workout from the library.
     pub fn reset_with_workout(&mut self, workout: Workout) {
         let workout_id = Some(workout.id);
-        self.workout = workout;
         self.session = Session::new(workout_id);
         self.session.ftp_watts = Some(self.athlete.borrow().ftp_watts);
+        self.session.is_ftp_test = workout.is_ramp_test();
+        self.workout = workout;
         self.state = EngineState::Idle;
         self.start_instant = None;
         self.pause_offset = Duration::ZERO;
