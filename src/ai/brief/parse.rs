@@ -139,7 +139,15 @@ fn non_empty(text: String) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// The verdict on the trailer line, or the best guess without one.
+/// The verdict on the trailer line. Without one, the plan stands.
+///
+/// The marker is the only authority. Reading the verdict out of the prose was
+/// tried and removed: the scan tested the uppercased reply for `EASE`, and
+/// `INCREASE` contains it, so a brief telling the rider to increase their
+/// volume eased the session on the calendar instead. `LIGHTER` had the same
+/// shape of problem, and `REST DAY` only avoided it by luck. A missing marker
+/// is a reply that could not be read, and guessing a verdict out of one either
+/// cancels training the rider was ready for or, as here, inverts the advice.
 fn parse_verdict(text: &str) -> CoachVerdict {
     if let Some(value) = extract_marker_value(text, MARKER_VERDICT) {
         // Decoration first: models write `**VERDICT:** EASE` unprompted.
@@ -158,17 +166,8 @@ fn parse_verdict(text: &str) -> CoachVerdict {
         }
     }
 
-    // No usable marker. Scan for the words, then assume the plan stands —
-    // guessing "rest" from an unreadable reply would cancel training the rider
-    // was ready for.
-    let upper = text.to_uppercase();
-    if upper.contains("REST DAY") || upper.contains("TIME OFF") {
-        CoachVerdict::Rest
-    } else if upper.contains("EASE") || upper.contains("LIGHTER") {
-        CoachVerdict::Ease
-    } else {
-        CoachVerdict::Proceed
-    }
+    // No usable marker: the plan stands.
+    CoachVerdict::Proceed
 }
 
 /// The workout the reply named, when it was entitled to name one.
@@ -394,9 +393,61 @@ mod tests {
     }
 
     #[test]
-    fn should_fall_back_to_keywords_when_the_trailer_is_missing() {
-        let reply = format!("{SECTION_SESSION}\nTake a rest day — you have earned it.");
-        assert_eq!(parse(&reply).verdict, CoachVerdict::Rest);
+    fn should_not_read_a_verdict_out_of_the_prose_when_the_trailer_is_missing() {
+        // The scan this replaces read the whole reply for the word EASE — and
+        // "INCREASE" contains it, so a brief telling the rider to ride *more*
+        // eased the session on the calendar. No marker now means no change,
+        // whatever the prose says.
+        let reply = format!("{SECTION_SESSION}\nTime to increase your volume this week.");
+        assert_eq!(parse(&reply).verdict, CoachVerdict::Proceed);
+    }
+
+    #[test]
+    fn should_not_ease_on_the_word_increase_anywhere_in_a_reply() {
+        // Every casing and position the word actually turns up in, since the
+        // old scan uppercased the whole reply before testing it.
+        for prose in [
+            "Increase the duration of your endurance ride.",
+            "INCREASE VOLUME",
+            "You could increase intensity slightly.",
+            "Your fitness will increase if you keep this up.",
+        ] {
+            let reply = format!("{SECTION_SESSION}\n{prose}");
+            assert_eq!(
+                parse(&reply).verdict,
+                CoachVerdict::Proceed,
+                "prose alone must not carry a verdict: {prose}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_read_a_verdict_out_of_prose_that_talks_about_easing() {
+        // The same rule in the direction the old scan got right by luck: even
+        // prose that plainly discusses easing is not a verdict to ease. Only
+        // the marker is.
+        for prose in [
+            "Yesterday was hard, so today should feel lighter.",
+            "Ease off if your legs still feel heavy.",
+            "Take a rest day — you have earned it.",
+            "Some riders take time off at this point in a block.",
+        ] {
+            let reply = format!("{SECTION_SESSION}\n{prose}");
+            assert_eq!(
+                parse(&reply).verdict,
+                CoachVerdict::Proceed,
+                "prose alone must not carry a verdict: {prose}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_still_ease_when_the_marker_says_so_and_the_prose_says_increase() {
+        // The marker is the only authority, so it wins over prose pulling the
+        // other way — the reverse of the bug.
+        let reply =
+            format!("{SECTION_SESSION}\nIncrease your volume next week.\n{MARKER_VERDICT} EASE");
+        assert_eq!(parse(&reply).verdict, CoachVerdict::Ease);
     }
 
     #[test]
