@@ -90,6 +90,42 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.11.0" date="2026-09-23">
+      <description>
+        <p>Cycle can now measure your FTP instead of asking you to guess it.
+           The Ramp Test in your workout library is ridden as a test: ten
+           minutes easy, then the target rises by 8% of your FTP every minute
+           until you cannot hold it. There is no finish line to reach — you
+           ride until your legs run out, press "I'm done", and Cycle reads your
+           FTP off your best minute.</p>
+        <p>While you ride it, the cockpit counts steps rather than counting
+           down to an end that is not how the test finishes. The ladder now
+           climbs far higher than before, so that if the FTP you are set to is
+           well below your real one, you do not simply run out of steps and get
+           told a number that is still too low.</p>
+        <p>Afterwards the summary offers the result: the FTP the test supports,
+           how it compares with the one you had, and the best minute it came
+           from. Nothing changes until you press the button. If you take it,
+           your FTP is updated everywhere and the change is recorded in your
+           FTP history alongside any you have made by hand.</p>
+        <p>Test rides are now marked as tests and kept out of the evidence
+           Cycle uses to judge whether your FTP looks wrong. A ramp test is
+           designed to end with you unable to hold the target, which otherwise
+           reads as a hard session falling apart — so passing a test would have
+           argued for lowering the very number you rode it to establish.</p>
+        <p>Also fixed: the AI Coach could read advice to "increase" your volume
+           as a verdict to ease off, and then ease the session on your
+           calendar, because the word increase contains the word ease. The
+           ride summary no longer lists intervals you never reached as "No
+           data", and no longer calls a test "Workout complete".</p>
+        <p>Please note: the first time you open this version, your training
+           history is upgraded to a new format automatically. A backup is saved
+           beforehand, in the same folder as your database, named
+           cycle.db.pre-v7 followed by the date. Once upgraded, your data can no
+           longer be opened by Cycle 0.10.0 or earlier — so if you ever go back
+           to an older version, restore that backup alongside it.</p>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-09-19">
       <description>
         <p>Cycle now checks that a ride actually recorded properly before it
