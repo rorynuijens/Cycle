@@ -119,14 +119,46 @@ where each evidence string is a human sentence
 - **Preferences → Athlete**: FTP row subtitle becomes
   "Last updated <date> · <source>"; manual edits log to `ftp_history`.
 
-## 7. Ramp test (phase 3)
+## 7. Ramp test (phase 3) — SHIPPED 0.11.0
 
 Built-in "Ramp Test" workout for when heuristics disagree or the user
-wants ground truth: 5 min warm-up, then +6% FTP per minute until failure
-(detected by the struggle detector or the user ending the test).
-`FTP = 0.75 × best rolling 60 s power`, presented via the same accept
-flow (`source = 'ramp_test'`). Player runs it in test mode: open-ended,
-step count instead of remaining time.
+wants ground truth. `FTP = 0.75 × best rolling 60 s power`, presented via
+the same accept flow (`source = 'ramp_test'`). The player runs it in test
+mode: step count instead of remaining time, and an end button that reads
+as finishing the test rather than abandoning a session.
+
+**As shipped, this section differs from what was specced here.** Two
+changes, both deliberate (rider's call, 2026-09-23):
+
+* **10 min warm-up, then +8% of FTP per minute, for 20 steps** — not the
+  5 min / +6% written above. The workout already existed in the library
+  on those terms, and keeping them meant riders who had seen it got the
+  test they expected. What did change is the *length*: it ran 12 steps to
+  148% of stored FTP, which a rider whose FTP is set much too low can ride
+  clean off the end of. The ladder now reaches 212%, because running out
+  of steps caps the result at the wrong answer for exactly the rider the
+  test exists to catch.
+* **The rider ends the test; the struggle detector does not.** Every
+  session recorded so far reports cadence 0 for every second, so the
+  detector is blind — the same gap that forced the two departures in §5.
+  A power-only auto-end was considered and rejected: in ERG the trainer
+  holds the power, so a sag is as likely to be a dropout as a rider
+  failing, and ending a test on a dropout throws away a test that cannot
+  be resumed.
+
+The best minute is read over **elapsed seconds, not recorded points**:
+sixty points spanning five minutes of a stuttering trainer are not a
+minute's effort. Seconds with no reading count as zero, so a gap pulls the
+window down — the safe direction for a number about to become the rider's
+FTP. A result implying an FTP outside 50–500 W is refused rather than
+clamped (§5.1): clamping would put a number in front of the rider that
+nothing in their ride supports.
+
+Test rides are flagged on the ride itself (`sessions.is_ftp_test`, schema
+v7) and skipped by `session_evidence`. A ramp test is built to end in
+failure, so counted as training it reads as a hard session that came
+apart — and passing one would argue for easing the very number it was
+ridden to establish.
 
 ## 8. Module layout & threading
 
