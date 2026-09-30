@@ -90,6 +90,15 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.12.1" date="2026-09-30">
+      <description>
+        <p>A security update. The library Cycle uses for its secure
+           connections to Intervals.icu and to the AI Coach had a flaw in how
+           it checked the start of a connection. It could not be used to read
+           or change what Cycle sends, but it is fixed here all the same.
+           Nothing else has changed.</p>
+      </description>
+    </release>
     <release version="0.12.0" date="2026-09-30">
       <description>
         <p>Your outdoor rides now count on the Fitness page. Rides synced from
