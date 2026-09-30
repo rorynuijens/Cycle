@@ -90,6 +90,28 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.12.0" date="2026-09-30">
+      <description>
+        <p>Your outdoor rides now count on the Fitness page. Rides synced from
+           Intervals.icu add their power to your best-power curve and their
+           time to the power and heart-rate zone bars, alongside the rides you
+           record in Cycle.</p>
+        <p>Cycle had been asking Intervals.icu for ride data in the wrong
+           place, so it only ever received the route map — never the power,
+           heart rate or cadence recorded with it. It now asks correctly, and
+           downloads the data for your synced rides in the background after
+           each sync, a few rides at a time, without holding up your morning
+           brief. A long history can take a few launches to fill in. Stops
+           along the way count as zero watts, so a café stop cannot join two
+           efforts into one best, and each ride's zones are judged against the
+           FTP you had on that day.</p>
+        <p>Also fixed: pressing F10 during a route ride opened the compact
+           overlay for a workout you were not riding. It now only opens during
+           a workout. And if Cycle cannot open its database when it starts,
+           the explanation now stays on screen until you close it, instead of
+           vanishing before it can be read.</p>
+      </description>
+    </release>
     <release version="0.11.0" date="2026-09-23">
       <description>
         <p>Cycle can now measure your FTP instead of asking you to guess it.
