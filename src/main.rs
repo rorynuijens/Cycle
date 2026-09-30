@@ -45,8 +45,9 @@ fn main() -> glib::ExitCode {
         Ok(p) => p,
         Err(e) => {
             tracing::error!("Failed to open database: {e}");
-            // Show a modal error dialog before giving up, so the user sees a human-readable
-            // message rather than a raw panic backtrace.
+            // Explain before giving up, so the rider sees a human-readable message
+            // rather than a raw panic backtrace — in a window of its own, which
+            // is what keeps the application alive long enough to read it.
             let app = adw::Application::builder()
                 .application_id(APP_ID)
                 .flags(gio::ApplicationFlags::empty())
@@ -61,15 +62,7 @@ fn main() -> glib::ExitCode {
                 data::paths::data_dir().display()
             );
             app.connect_activate(move |app| {
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Database Error")
-                    .body(&msg)
-                    .build();
-                dialog.add_response("quit", "_Quit");
-                dialog.set_close_response("quit");
-                let app_c = app.clone();
-                dialog.connect_response(None, move |_, _| app_c.quit());
-                dialog.present(None::<&adw::ApplicationWindow>);
+                ui::startup_error::build(app, "Cycle Could Not Start", &msg).present();
             });
             return app.run();
         }

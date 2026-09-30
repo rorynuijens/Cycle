@@ -4,6 +4,7 @@ pub mod overlay;
 pub mod pages;
 pub mod preferences;
 pub mod resources;
+pub mod startup_error;
 pub mod widgets;
 pub mod window;
 
