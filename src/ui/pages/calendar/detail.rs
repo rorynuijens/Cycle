@@ -17,7 +17,6 @@ use sqlx::SqlitePool;
 use crate::data::athlete::power_zone_index;
 use crate::data::db;
 use crate::data::keystore;
-use crate::data::settings;
 use crate::data::sport::{is_cycling, is_run};
 use crate::data::streams::ActivityStreams;
 use crate::data::workout::Workout;
@@ -498,36 +497,9 @@ pub fn show_intervals_detail(
             rt.spawn({
                 let api_key = api_key.clone();
                 let icu_id = icu_id.clone();
-                let pool = pool.clone();
                 async move {
-                    // The athlete ID is read here, not on the GTK thread: a
-                    // block_on against SQLite stalls the GLib loop whenever the
-                    // database is busy (CLAUDE.md §2.3).
-                    let athlete_id = match settings::load_intervals(&pool).await {
-                        Ok(s) if !s.athlete_id.is_empty() => s.athlete_id,
-                        Ok(_) => {
-                            tx.send(Err(anyhow::anyhow!(
-                                "Intervals.icu credentials not set — configure in Preferences"
-                            )))
-                            .await
-                            .ok();
-                            return;
-                        }
-                        Err(e) => {
-                            tx.send(Err(anyhow::anyhow!(
-                                "Could not read your Intervals.icu settings: {e}"
-                            )))
-                            .await
-                            .ok();
-                            return;
-                        }
-                    };
-                    let r = crate::ai::intervals::fetch_combined_activity_data(
-                        &athlete_id,
-                        &api_key,
-                        &icu_id,
-                    )
-                    .await;
+                    let r =
+                        crate::ai::intervals::fetch_combined_activity_data(&api_key, &icu_id).await;
                     tx.send(r).await.ok();
                 }
             });

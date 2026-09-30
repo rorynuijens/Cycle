@@ -35,6 +35,8 @@ pub mod keys {
     pub const INTERVALS_ATHLETE_ID: &str = "intervals.athlete_id";
     pub const INTERVALS_UPLOAD: &str = "intervals.upload";
     pub const INTERVALS_SYNC: &str = "intervals.sync";
+    /// Set once every stream cached by the broken pre-0.12.0 fetch is gone.
+    pub const INTERVALS_STREAMS_REFETCHED: &str = "intervals.streams_refetched";
 
     pub const WINDOW_WIDTH: &str = "window.width";
     pub const WINDOW_HEIGHT: &str = "window.height";
@@ -168,6 +170,20 @@ pub async fn set_intervals_upload(pool: &SqlitePool, on: bool) -> Result<()> {
 
 pub async fn set_intervals_sync(pool: &SqlitePool, on: bool) -> Result<()> {
     db::set_setting(pool, keys::INTERVALS_SYNC, flag_value(on)).await
+}
+
+/// Whether the stream cache has been emptied of what the pre-0.12.0 fetch
+/// stored. Before then every request went to a path Intervals.icu does not
+/// serve, so each cached row is a GPS track standing in for a ride's data.
+pub async fn streams_refetched(pool: &SqlitePool) -> Result<bool> {
+    Ok(flag(
+        db::get_setting(pool, keys::INTERVALS_STREAMS_REFETCHED).await?,
+        false,
+    ))
+}
+
+pub async fn set_streams_refetched(pool: &SqlitePool) -> Result<()> {
+    db::set_setting(pool, keys::INTERVALS_STREAMS_REFETCHED, flag_value(true)).await
 }
 
 // ── Window geometry ──────────────────────────────────────────────────────────

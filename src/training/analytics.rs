@@ -6,6 +6,7 @@
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 
+use crate::data::athlete::power_zone_index;
 use crate::data::db::{IntervalsActivity, SessionRecord, SessionSummary, WellnessEntry};
 use crate::data::streams::ActivityStreams;
 
@@ -91,8 +92,13 @@ pub fn format_average_pace(distance_m: f32, duration_secs: u32) -> String {
     format!("{}/km", format_pace_display(sec_per_km))
 }
 
-/// Seconds spent in each of the 5 heart-rate zones across local sessions.
-pub fn compute_hr_zones(records: &[SessionRecord], max_hr: u32) -> [u32; 5] {
+/// Seconds spent in each of the 5 heart-rate zones, local sessions and synced
+/// rides together.
+///
+/// Each sample counts as one second, as it does for a local session. A synced
+/// ride's 0 bpm is a strap dropout (Intervals.icu sends a gap as null), not a
+/// heart at rest, and is skipped.
+pub fn compute_hr_zones(records: &[SessionRecord], rides: &[SyncedRide], max_hr: u32) -> [u32; 5] {
     let mut zones = [0u32; 5];
     for record in records {
         for dp in &record.session.data_points {
@@ -101,15 +107,25 @@ pub fn compute_hr_zones(records: &[SessionRecord], max_hr: u32) -> [u32; 5] {
             }
         }
     }
+    for ride in rides {
+        for &bpm in ride.heartrate.iter().filter(|&&b| b > 0) {
+            zones[hr_zone_index(bpm, max_hr)] += 1;
+        }
+    }
     zones
 }
 
-/// Seconds spent in each of the 7 power zones across local sessions.
+/// Seconds spent in each of the 7 power zones, local sessions and synced rides
+/// together.
 ///
 /// Each ride is bucketed against the FTP it was ridden at, so raising FTP does
 /// not retroactively demote past efforts into lower zones — `fallback_ftp`
-/// applies only to rides recorded before FTP stamping existed.
-pub fn compute_zone_seconds(records: &[SessionRecord], fallback_ftp: u32) -> [u32; 7] {
+/// applies only to rides with no FTP on record for their day.
+pub fn compute_zone_seconds(
+    records: &[SessionRecord],
+    rides: &[SyncedRide],
+    fallback_ftp: u32,
+) -> [u32; 7] {
     let mut zone_secs = [0u32; 7];
     for record in records {
         for (zone, secs) in record
@@ -121,30 +137,126 @@ pub fn compute_zone_seconds(records: &[SessionRecord], fallback_ftp: u32) -> [u3
             zone_secs[zone] += secs;
         }
     }
+    for ride in rides {
+        let ftp = ride.ftp_watts.unwrap_or(fallback_ftp);
+        for &w in &ride.watts {
+            zone_secs[power_zone_index(w, ftp)] += 1;
+        }
+    }
     zone_secs
 }
 
-/// Best average power for each [`CURVE_DURATIONS`] window.
+/// Best average power for each [`CURVE_DURATIONS`] window, local sessions and
+/// synced rides together.
 ///
 /// Returns `(all_time, recent)` per duration, where `recent` covers rides on or
 /// after `recent_cutoff`. A zero means no ride was long enough to fill that window.
-pub fn compute_power_curve(records: &[SessionRecord], recent_cutoff: NaiveDate) -> Vec<(u32, u32)> {
+pub fn compute_power_curve(
+    records: &[SessionRecord],
+    rides: &[SyncedRide],
+    recent_cutoff: NaiveDate,
+) -> Vec<(u32, u32)> {
     let mut all_time = vec![0u32; CURVE_DURATIONS.len()];
     let mut recent = vec![0u32; CURVE_DURATIONS.len()];
+    let mut offer = |i: usize, peak: u32, is_recent: bool| {
+        all_time[i] = all_time[i].max(peak);
+        if is_recent {
+            recent[i] = recent[i].max(peak);
+        }
+    };
     for record in records {
         let is_recent = session_date(record) >= recent_cutoff;
         for (i, &dur) in CURVE_DURATIONS.iter().enumerate() {
             if let Some(peak) = record.session.peak_power_for_duration(dur) {
-                if peak > all_time[i] {
-                    all_time[i] = peak;
-                }
-                if is_recent && peak > recent[i] {
-                    recent[i] = peak;
-                }
+                offer(i, peak, is_recent);
+            }
+        }
+    }
+    for ride in rides {
+        let is_recent = ride.date >= recent_cutoff;
+        for (i, &dur) in CURVE_DURATIONS.iter().enumerate() {
+            if let Some(peak) = peak_average(&ride.watts_per_second, dur) {
+                offer(i, peak, is_recent);
             }
         }
     }
     all_time.into_iter().zip(recent).collect()
+}
+
+/// Highest mean of any `window` consecutive samples, rounded down, or `None`
+/// when there are fewer samples than that (or `window` is zero).
+///
+/// A running sum rather than re-adding every window: a five-hour ride is 18 000
+/// samples, and the 60-minute window would otherwise cost 65 million additions
+/// per ride, every time the page opens. Summed in u64 so no sample can wrap it.
+pub fn peak_average(samples: &[u32], window: usize) -> Option<u32> {
+    if window == 0 || samples.len() < window {
+        return None;
+    }
+    let mut sum: u64 = samples[..window].iter().map(|&w| w as u64).sum();
+    let mut best = sum;
+    for i in window..samples.len() {
+        sum = sum + samples[i] as u64 - samples[i - window] as u64;
+        best = best.max(sum);
+    }
+    Some((best / window as u64) as u32)
+}
+
+/// A ride synced from Intervals.icu, reduced to what the Fitness page reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncedRide {
+    pub date: NaiveDate,
+    /// FTP in effect on `date` (see [`ftp_on`]); `None` before the first
+    /// FTP on record, in which case the current profile FTP stands in.
+    pub ftp_watts: Option<u32>,
+    /// Power as recorded, one sample per moving second — for zone time.
+    pub watts: Vec<u32>,
+    /// Power per elapsed second, stops filled with 0 W — for bests.
+    pub watts_per_second: Vec<u32>,
+    pub heartrate: Vec<u32>,
+}
+
+/// The FTP in effect on `date`: the latest entry on or before it.
+///
+/// `history` is `(date, watts)` oldest first; two entries on one day resolve
+/// to the later. A change made on the morning of a ride counts for that ride.
+pub fn ftp_on(history: &[(NaiveDate, u32)], date: NaiveDate) -> Option<u32> {
+    history
+        .iter()
+        .take_while(|(day, _)| *day <= date)
+        .last()
+        .map(|&(_, watts)| watts)
+}
+
+/// Turn cached streams into [`SyncedRide`]s for the activities being shown.
+///
+/// `streams` holds `(icu_id, json)` and may include copies the Fitness page
+/// hides; only ids present in `activities` — already de-duplicated and with
+/// app-recorded rides removed — are kept, so a ride is never counted twice.
+/// Streams that will not parse, or carry neither power nor heart rate (a GPS
+/// track, or the `[]` stored for "none"), are skipped.
+pub fn synced_rides(
+    activities: &[IntervalsActivity],
+    streams: &[(String, String)],
+    ftp_history: &[(NaiveDate, u32)],
+) -> Vec<SyncedRide> {
+    streams
+        .iter()
+        .filter_map(|(id, json)| {
+            let activity = activities.iter().find(|a| &a.icu_id == id)?;
+            let parsed = ActivityStreams::from_json(json)?;
+            if !parsed.has_power() && !parsed.has_hr() {
+                return None;
+            }
+            Some(SyncedRide {
+                date: activity.date,
+                ftp_watts: ftp_on(ftp_history, activity.date),
+                watts_per_second: parsed.watts_per_second(),
+                watts: parsed.watts,
+                heartrate: parsed.heartrate,
+            })
+        })
+        .collect()
 }
 
 /// Best pace (seconds per kilometre) for each [`PACE_DISTANCES`] entry, from
@@ -516,13 +628,13 @@ mod tests {
     fn should_count_one_second_per_heart_rate_sample() {
         let records = vec![record_on(date(2026, 8, 3), &[], &[100, 100, 150, 190])];
         // 100/200 = 50 % → z1 ×2, 150/200 = 75 % → z3, 190/200 = 95 % → z5
-        assert_eq!(compute_hr_zones(&records, 200), [2, 0, 1, 0, 1]);
+        assert_eq!(compute_hr_zones(&records, &[], 200), [2, 0, 1, 0, 1]);
     }
 
     #[test]
     fn should_report_no_hr_zone_time_when_sessions_have_no_hr() {
         let records = vec![record_on(date(2026, 8, 3), &[200, 200], &[])];
-        assert_eq!(compute_hr_zones(&records, 200), [0; 5]);
+        assert_eq!(compute_hr_zones(&records, &[], 200), [0; 5]);
     }
 
     // ── format_pace_display ──────────────────────────────────────────────────
@@ -593,7 +705,7 @@ mod tests {
         // stamped with FTP 200 must stay in threshold after the rider improves.
         let mut old = record_on(date(2026, 6, 1), &[200; 10], &[]);
         old.session.ftp_watts = Some(200);
-        let zones = compute_zone_seconds(&[old], 250);
+        let zones = compute_zone_seconds(&[old], &[], 250);
         assert_eq!(zones.iter().sum::<u32>(), 10);
         assert_eq!(zones[3], 10, "expected 10 s at threshold, got {zones:?}");
     }
@@ -602,7 +714,7 @@ mod tests {
     fn should_fall_back_to_current_ftp_for_unstamped_rides() {
         let unstamped = record_on(date(2026, 6, 1), &[200; 10], &[]);
         assert!(unstamped.session.ftp_watts.is_none());
-        let zones = compute_zone_seconds(&[unstamped], 200);
+        let zones = compute_zone_seconds(&[unstamped], &[], 200);
         assert_eq!(zones[3], 10, "expected 10 s at threshold, got {zones:?}");
     }
 
@@ -615,7 +727,7 @@ mod tests {
             record_on(date(2026, 8, 5), &[300; 10], &[]),
             record_on(date(2026, 8, 6), &[250; 10], &[]),
         ];
-        let curve = compute_power_curve(&records, cutoff);
+        let curve = compute_power_curve(&records, &[], cutoff);
         assert_eq!(curve[0].0, 300); // 5 s all-time
         assert_eq!(curve[1].0, 300); // 10 s all-time
     }
@@ -627,7 +739,7 @@ mod tests {
             record_on(date(2026, 5, 1), &[400; 10], &[]), // old, stronger
             record_on(date(2026, 8, 5), &[250; 10], &[]), // recent, weaker
         ];
-        let curve = compute_power_curve(&records, cutoff);
+        let curve = compute_power_curve(&records, &[], cutoff);
         assert_eq!(curve[0].0, 400, "all-time keeps the old peak");
         assert_eq!(curve[0].1, 250, "recent must not inherit the old peak");
     }
@@ -636,13 +748,13 @@ mod tests {
     fn should_include_a_ride_on_the_cutoff_day_as_recent() {
         let cutoff = date(2026, 8, 1);
         let records = vec![record_on(cutoff, &[250; 10], &[])];
-        assert_eq!(compute_power_curve(&records, cutoff)[0].1, 250);
+        assert_eq!(compute_power_curve(&records, &[], cutoff)[0].1, 250);
     }
 
     #[test]
     fn should_report_zero_for_durations_no_ride_is_long_enough_to_fill() {
         let records = vec![record_on(date(2026, 8, 5), &[300; 10], &[])];
-        let curve = compute_power_curve(&records, date(2026, 8, 1));
+        let curve = compute_power_curve(&records, &[], date(2026, 8, 1));
         assert_eq!(curve[0].0, 300); // 5 s — filled
         assert_eq!(curve[1].0, 300); // 10 s — exactly filled
         assert_eq!(curve[2].0, 0); // 30 s — not enough data
@@ -651,9 +763,203 @@ mod tests {
 
     #[test]
     fn should_return_an_all_zero_curve_for_no_rides() {
-        let curve = compute_power_curve(&[], date(2026, 8, 1));
+        let curve = compute_power_curve(&[], &[], date(2026, 8, 1));
         assert_eq!(curve.len(), CURVE_DURATIONS.len());
         assert!(curve.iter().all(|&(a, r)| a == 0 && r == 0));
+    }
+
+    // ── synced rides ─────────────────────────────────────────────────────────
+
+    fn synced(day: NaiveDate, ftp: Option<u32>, watts: &[u32], hrs: &[u32]) -> SyncedRide {
+        SyncedRide {
+            date: day,
+            ftp_watts: ftp,
+            watts: watts.to_vec(),
+            watts_per_second: watts.to_vec(),
+            heartrate: hrs.to_vec(),
+        }
+    }
+
+    #[test]
+    fn should_put_an_outdoor_best_on_the_power_curve() {
+        // The rider's indoor 5 s best is 300 W; an outdoor sprint did 320.
+        let records = vec![record_on(date(2026, 8, 5), &[300; 10], &[])];
+        let rides = vec![synced(date(2026, 8, 6), None, &[320; 10], &[])];
+        let curve = compute_power_curve(&records, &rides, date(2026, 8, 1));
+        assert_eq!(curve[0], (320, 320));
+    }
+
+    #[test]
+    fn should_keep_an_old_outdoor_best_out_of_the_recent_series() {
+        let cutoff = date(2026, 8, 1);
+        let rides = vec![
+            synced(cutoff.pred_opt().unwrap(), None, &[400; 5], &[]),
+            synced(cutoff, None, &[250; 5], &[]),
+        ];
+        assert_eq!(compute_power_curve(&[], &rides, cutoff)[0], (400, 250));
+    }
+
+    #[test]
+    fn should_not_merge_two_efforts_across_a_stop() {
+        // 60 s at 300 W, a 30 s stop, 60 s at 300 W: the best 2 minutes spans
+        // the stop and must pay for it — (300×90) / 120 = 225, not 300.
+        let mut per_sec = vec![300; 60];
+        per_sec.extend([0; 30]);
+        per_sec.extend([300; 60]);
+        let ride = SyncedRide {
+            watts_per_second: per_sec,
+            ..synced(date(2026, 8, 6), None, &[300; 120], &[])
+        };
+        let curve = compute_power_curve(&[], &[ride], date(2026, 8, 1));
+        assert_eq!(curve[3].0, 300, "1 min fits inside one effort");
+        assert_eq!(curve[4].0, 225, "2 min must include the stop");
+    }
+
+    #[test]
+    fn should_bucket_a_synced_ride_against_its_own_ftp() {
+        // 200 W: threshold (Z4) at FTP 200, tempo (Z3) at the current 250.
+        let rides = vec![synced(date(2026, 6, 1), Some(200), &[200; 7], &[])];
+        let zones = compute_zone_seconds(&[], &rides, 250);
+        assert_eq!(zones, [0, 0, 0, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn should_bucket_a_synced_ride_with_no_ftp_on_record_against_the_fallback() {
+        let rides = vec![synced(date(2026, 6, 1), None, &[200; 7], &[])];
+        let zones = compute_zone_seconds(&[], &rides, 250);
+        assert_eq!(zones, [0, 0, 7, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn should_add_synced_zone_time_to_local_zone_time() {
+        let records = vec![record_on(date(2026, 6, 1), &[200; 3], &[])];
+        let rides = vec![synced(date(2026, 6, 2), None, &[200; 4], &[])];
+        assert_eq!(compute_zone_seconds(&records, &rides, 200)[3], 7);
+    }
+
+    #[test]
+    fn should_count_synced_heart_rate_but_not_its_dropouts() {
+        let rides = vec![synced(date(2026, 8, 3), None, &[], &[0, 100, 0, 150, 190])];
+        let records = vec![record_on(date(2026, 8, 3), &[], &[100])];
+        assert_eq!(compute_hr_zones(&records, &rides, 200), [2, 0, 1, 0, 1]);
+    }
+
+    // ── peak_average ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_have_no_peak_for_a_zero_window() {
+        assert_eq!(peak_average(&[100, 200], 0), None);
+    }
+
+    #[test]
+    fn should_have_no_peak_one_sample_short_of_the_window() {
+        assert_eq!(peak_average(&[100, 200], 3), None);
+        assert_eq!(peak_average(&[], 1), None);
+    }
+
+    #[test]
+    fn should_average_the_whole_ride_when_it_exactly_fills_the_window() {
+        assert_eq!(peak_average(&[100, 200, 301], 3), Some(200)); // 601 / 3, rounded down
+    }
+
+    #[test]
+    fn should_find_the_peak_window_at_the_very_end() {
+        assert_eq!(peak_average(&[1, 1, 1, 9, 9], 2), Some(9));
+    }
+
+    #[test]
+    fn should_find_the_peak_window_at_the_very_start() {
+        assert_eq!(peak_average(&[9, 9, 1, 1, 1], 2), Some(9));
+    }
+
+    #[test]
+    fn should_not_wrap_when_samples_sum_past_u32() {
+        assert_eq!(peak_average(&[u32::MAX, u32::MAX], 2), Some(u32::MAX));
+    }
+
+    // ── ftp_on ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_have_no_ftp_before_the_first_entry() {
+        let history = [(date(2026, 6, 16), 211)];
+        assert_eq!(ftp_on(&history, date(2026, 6, 15)), None);
+    }
+
+    #[test]
+    fn should_apply_an_ftp_change_on_the_day_it_was_made() {
+        let history = [(date(2026, 6, 16), 211), (date(2026, 8, 7), 200)];
+        assert_eq!(ftp_on(&history, date(2026, 8, 6)), Some(211));
+        assert_eq!(ftp_on(&history, date(2026, 8, 7)), Some(200));
+    }
+
+    #[test]
+    fn should_take_the_later_of_two_changes_on_one_day() {
+        // The rider's real history: 199 then 200 on 7 Aug, minutes apart.
+        let history = [(date(2026, 8, 7), 199), (date(2026, 8, 7), 200)];
+        assert_eq!(ftp_on(&history, date(2026, 8, 7)), Some(200));
+    }
+
+    // ── synced_rides ─────────────────────────────────────────────────────────
+
+    fn icu_ride(id: &str, day: NaiveDate) -> IntervalsActivity {
+        IntervalsActivity {
+            icu_id: id.into(),
+            ..icu(day, Some(150), Some(3600))
+        }
+    }
+
+    const POWER_JSON: &str = r#"[{"type":"time","data":[0,1,3]},{"type":"watts","data":[100,200,300]},
+        {"type":"heartrate","data":[120,0,140]}]"#;
+
+    #[test]
+    fn should_build_a_synced_ride_from_its_streams() {
+        let activities = vec![icu_ride("i1", date(2026, 8, 23))];
+        let streams = vec![("i1".to_string(), POWER_JSON.to_string())];
+        let history = [(date(2026, 8, 11), 200)];
+        assert_eq!(
+            synced_rides(&activities, &streams, &history),
+            vec![SyncedRide {
+                date: date(2026, 8, 23),
+                ftp_watts: Some(200),
+                watts: vec![100, 200, 300],
+                watts_per_second: vec![100, 200, 0, 300],
+                heartrate: vec![120, 0, 140],
+            }]
+        );
+    }
+
+    #[test]
+    fn should_skip_streams_for_an_activity_that_is_not_shown() {
+        // A linked copy of an app-recorded ride: counting it would count the
+        // ride twice.
+        let activities = vec![icu_ride("shown", date(2026, 8, 23))];
+        let streams = vec![("linked".to_string(), POWER_JSON.to_string())];
+        assert!(synced_rides(&activities, &streams, &[]).is_empty());
+    }
+
+    #[test]
+    fn should_skip_streams_with_neither_power_nor_heart_rate() {
+        let activities = vec![
+            icu_ride("gps", date(2026, 8, 23)),
+            icu_ride("none", date(2026, 8, 23)),
+            icu_ride("junk", date(2026, 8, 23)),
+            icu_ride("hr", date(2026, 8, 23)),
+        ];
+        let streams = vec![
+            (
+                "gps".to_string(),
+                r#"[{"type":"latlng","data":[[1.0,2.0],[1.1,2.1]]}]"#.to_string(),
+            ),
+            ("none".to_string(), "[]".to_string()),
+            ("junk".to_string(), "not json".to_string()),
+            (
+                "hr".to_string(),
+                r#"[{"type":"heartrate","data":[130]}]"#.to_string(),
+            ),
+        ];
+        let rides = synced_rides(&activities, &streams, &[]);
+        assert_eq!(rides.len(), 1);
+        assert_eq!(rides[0].heartrate, vec![130]);
     }
 
     // ── compute_pace_curve ───────────────────────────────────────────────────
@@ -919,7 +1225,7 @@ mod tests {
             record_on(date(2026, 8, 10), &[200; 60], &[]),
             record_on(date(2026, 6, 1), &[300; 60], &[]),
         ];
-        let curve = compute_power_curve(&records, cutoff);
+        let curve = compute_power_curve(&records, &[], cutoff);
         assert_eq!(curve[0], (300, 200), "all-time 300 W, recent 200 W");
     }
 

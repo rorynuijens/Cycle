@@ -62,6 +62,7 @@ impl Sections {
             icu_activities,
             wellness,
             run_streams,
+            synced_rides,
         } = data;
 
         let today = Local::now().date_naive();
@@ -97,13 +98,13 @@ impl Sections {
         ));
 
         self.zones.set_zones(
-            &compute_zone_seconds(&records, ftp_watts),
-            &compute_hr_zones(&records, athlete.max_hr),
+            &compute_zone_seconds(&records, &synced_rides, ftp_watts),
+            &compute_hr_zones(&records, &synced_rides, athlete.max_hr),
         );
 
         let recent_cutoff = today - Duration::days(RECENT_WINDOW_DAYS);
         self.bests.set_curves(
-            compute_power_curve(&records, recent_cutoff),
+            compute_power_curve(&records, &synced_rides, recent_cutoff),
             compute_pace_curve(&run_streams, recent_cutoff),
         );
     }

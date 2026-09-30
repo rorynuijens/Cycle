@@ -714,6 +714,9 @@ impl CalendarPage {
                                 tracing::error!("reconcile_icu_links: {e}");
                             }
                             let _ = tx.send(Ok(count)).await;
+                            // After the toast, not before it: the Fitness page
+                            // wants these, the sync result does not.
+                            crate::ai::intervals::backfill_streams(&pool_s, &api_key).await;
                         }
                         Err(e) => {
                             let _ = tx.send(Err(e.to_string())).await;

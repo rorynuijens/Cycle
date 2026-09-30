@@ -259,6 +259,12 @@ impl BriefStore {
                 // fingerprint taken inside `generate` covers what just arrived.
                 let (icu_id, icu_key) = intervals_credentials(&pool).await;
                 crate::ai::intervals::sync_recent(&pool, &icu_id, &icu_key, today).await;
+                // Ride streams are for the Fitness page, not the brief, and can
+                // run to megabytes — fetch them alongside, never in front.
+                tokio::spawn({
+                    let pool = pool.clone();
+                    async move { crate::ai::intervals::backfill_streams(&pool, &icu_key).await }
+                });
 
                 brief::generate(&pool, &api_key, athlete, today).await
             },

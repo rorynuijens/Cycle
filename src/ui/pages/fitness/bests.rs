@@ -196,8 +196,9 @@ impl BestsSection {
 
         let power = CurveSection::new(
             "Peak power",
-            "Best average power for each duration across all recorded sessions, \
-             coloured by the power zone it falls in at your current FTP",
+            "Best average power for each duration across rides recorded here and \
+             rides synced from Intervals.icu, coloured by the power zone it falls \
+             in at your current FTP",
             &CURVE_LABELS,
             "Dots coloured by power zone · dimmed line = last 30 days",
             |data| Self::build_power_chart(data, athlete),

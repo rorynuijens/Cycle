@@ -7,7 +7,7 @@ use chrono::NaiveDate;
 use sqlx::SqlitePool;
 
 use crate::data::{db, settings};
-use crate::training::analytics::WELLNESS_WINDOW_DAYS;
+use crate::training::analytics::{synced_rides, SyncedRide, WELLNESS_WINDOW_DAYS};
 
 /// Everything the page's charts are drawn from, loaded in one pass.
 pub struct FitnessData {
@@ -16,6 +16,10 @@ pub struct FitnessData {
     pub icu_activities: Vec<db::IntervalsActivity>,
     pub wellness: Vec<db::WellnessEntry>,
     pub run_streams: Vec<(NaiveDate, String)>,
+    /// Synced rides with per-second data, already parsed: a summer of outdoor
+    /// rides is tens of megabytes of JSON, which must not be read on the GTK
+    /// thread.
+    pub synced_rides: Vec<SyncedRide>,
 }
 
 /// Load the page's data off the GTK main thread (CLAUDE.md §2.3).
@@ -23,12 +27,19 @@ pub struct FitnessData {
 /// Every query hits the same local database, so the first failure aborts the
 /// whole load rather than leaving the page part-drawn from stale data.
 pub async fn load_fitness_data(pool: &SqlitePool) -> anyhow::Result<FitnessData> {
+    let icu_activities = db::load_unlinked_intervals_activities(pool).await?;
+    let synced_rides = synced_rides(
+        &icu_activities,
+        &db::load_ride_activity_streams(pool).await?,
+        &db::load_ftp_history(pool).await?,
+    );
     Ok(FitnessData {
         records: db::load_session_records(pool).await?,
         intervals_pairs: db::load_intervals_tss_pairs(pool).await?,
-        icu_activities: db::load_unlinked_intervals_activities(pool).await?,
+        icu_activities,
         wellness: db::load_wellness_recent(pool, WELLNESS_WINDOW_DAYS as u32).await?,
         run_streams: db::load_run_activity_streams(pool).await?,
+        synced_rides,
     })
 }
 

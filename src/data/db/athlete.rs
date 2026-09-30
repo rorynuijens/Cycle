@@ -6,6 +6,7 @@
 
 use crate::data::athlete::AthleteProfile;
 use anyhow::Result;
+use chrono::NaiveDate;
 use sqlx::{Row, SqlitePool};
 
 /// Load the athlete profile, creating a default one if the table is empty.
@@ -63,6 +64,28 @@ pub async fn log_ftp_change(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Every FTP on record as `(day, ftp_watts)`, oldest first, for scoring a
+/// synced ride against the FTP of its day.
+///
+/// Two changes on one day keep their order, so the later one wins when the
+/// list is read front to back. A row whose date will not parse is skipped
+/// rather than failing the load: one bad row should cost one data point, not
+/// the Fitness page.
+pub async fn load_ftp_history(pool: &SqlitePool) -> Result<Vec<(NaiveDate, u32)>> {
+    let rows = sqlx::query("SELECT date, ftp_watts FROM ftp_history ORDER BY date, id")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let date: String = r.get("date");
+            let day = NaiveDate::parse_from_str(date.get(..10)?, "%Y-%m-%d").ok()?;
+            let watts = u32::try_from(r.get::<i64, _>("ftp_watts")).ok()?;
+            Some((day, watts))
+        })
+        .collect())
 }
 
 /// Most recent FTP history entry as `(date, ftp_watts, source)`, if any.
@@ -223,6 +246,35 @@ mod tests {
         assert_eq!(reloaded.id, real.id);
         assert_eq!(reloaded.ftp_watts, real.ftp_watts);
         assert_ne!(reloaded.ftp_watts, 999);
+    }
+
+    #[tokio::test]
+    async fn should_load_ftp_history_in_date_order_skipping_bad_rows() {
+        // The rider's real shape: a backfilled row inserted after later ones,
+        // two changes minutes apart on one day — plus rows no writer makes.
+        let pool = test_pool().await;
+        for (date, watts) in [
+            ("2026-08-07 05:27:29", 199),
+            ("2026-08-07 09:41:55", 200),
+            ("2026-06-16 15:47:59", 211),
+            ("garbage", 300),
+            ("", 301),
+            ("2026-09-01 00:00:00", -5),
+        ] {
+            sqlx::query(
+                "INSERT INTO ftp_history (date, ftp_watts, source) VALUES (?, ?, 'manual')",
+            )
+            .bind(date)
+            .bind(watts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        assert_eq!(
+            load_ftp_history(&pool).await.unwrap(),
+            vec![(d(6, 16), 211), (d(8, 7), 199), (d(8, 7), 200)]
+        );
     }
 
     #[tokio::test]

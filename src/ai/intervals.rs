@@ -3,6 +3,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 use serde::Deserialize;
 use serde_json;
 
+use crate::data::streams::ActivityStreams;
+
 const BASE_URL: &str = "https://intervals.icu/api/v1";
 
 fn make_client() -> Result<reqwest::Client> {
@@ -261,16 +263,31 @@ pub async fn fetch_workouts(athlete_id: &str, api_key: &str) -> Result<Vec<Worko
 
 // ── Activity streams ──────────────────────────────────────────────────────────
 
-/// Fetch per-second time-series streams for a single activity, including GPS (`latlng`).
+/// The stream types the app reads — see [`ActivityStreams::from_json`].
 ///
-/// Returns the raw JSON string (array-of-objects format) so the caller can cache it verbatim.
-async fn fetch_activity_streams(
-    athlete_id: &str,
-    api_key: &str,
-    activity_id: &str,
-) -> Result<String> {
+/// Unfiltered, the endpoint also sends temperature, torque, pedal balance and
+/// respiration: a fifth of a five-hour ride's megabyte, cached for nothing.
+const STREAM_TYPES: &str = "time,watts,heartrate,cadence,distance,altitude,latlng,velocity_smooth";
+
+/// Where an activity's streams live.
+///
+/// The path has no athlete prefix. Until 0.12.0 the app asked for
+/// `/athlete/{id}/activities/{id}/streams`, which Intervals.icu does not
+/// serve: every request 404'd, the 404 was read as "this ride has no streams",
+/// and only the map endpoint's GPS track was ever cached.
+fn streams_url(activity_id: &str) -> String {
+    format!("{BASE_URL}/activity/{activity_id}/streams?types={STREAM_TYPES}")
+}
+
+/// Fetch per-second time-series streams for a single activity.
+///
+/// Returns the raw JSON (array-of-objects format) so the caller can cache it
+/// verbatim, or `None` when Intervals.icu has no streams for the activity — a
+/// manually entered ride, say. Anything else is an error, so a network failure
+/// is never mistaken for a ride without data.
+async fn fetch_activity_streams(api_key: &str, activity_id: &str) -> Result<Option<String>> {
     let client = make_client()?;
-    let url = format!("{BASE_URL}/athlete/{athlete_id}/activities/{activity_id}/streams");
+    let url = streams_url(activity_id);
 
     let response = client
         .get(&url)
@@ -282,14 +299,11 @@ async fn fetch_activity_streams(
     let status = response.status();
     tracing::debug!(url = %url, status = %status, "Streams endpoint response");
 
-    if !response.status().is_success() {
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         if status.as_u16() == 404 {
             tracing::debug!(body = %body, "Streams endpoint 404");
-            anyhow::bail!(
-                "Stream data is not available for this activity in Intervals.icu. \
-                 This is normal for activities synced without a full .fit upload."
-            );
+            return Ok(None);
         }
         anyhow::bail!("Intervals.icu streams API error {status}: {body}");
     }
@@ -297,6 +311,7 @@ async fn fetch_activity_streams(
     response
         .text()
         .await
+        .map(Some)
         .context("failed to read streams response")
 }
 
@@ -349,60 +364,55 @@ async fn fetch_activity_map(api_key: &str, activity_id: &str) -> Result<Vec<(f64
 }
 
 /// Fetch streams and GPS for an activity, returning a single combined JSON string suitable for
-/// caching in `activity_streams`.  The GPS coordinates are injected as a synthetic
-/// `{"type":"latlng","data":[[lat,lng],...]}` entry so the existing `ActivityStreams` parser
-/// handles everything in one pass.
+/// caching in `activity_streams`.
 ///
-/// Streams (404) and GPS are fetched independently — a 404 on the streams endpoint (common for
-/// activities synced from Garmin without a direct FIT upload) does not prevent GPS from being
-/// returned.  If neither succeeds, the streams error is propagated.
-pub async fn fetch_combined_activity_data(
-    athlete_id: &str,
-    api_key: &str,
-    activity_id: &str,
-) -> Result<String> {
-    // Fetch streams and GPS concurrently. Streams 404 is treated as "no streams" not a failure,
-    // because activities synced from Garmin often lack stream data but still have GPS.
-    let (streams_result, latlngs_result) = tokio::join!(
-        fetch_activity_streams(athlete_id, api_key, activity_id),
-        fetch_activity_map(api_key, activity_id),
-    );
-    let latlngs = latlngs_result.unwrap_or_default();
+/// The streams endpoint carries the GPS track itself. The map endpoint is only
+/// asked when it does not — an activity with no streams can still have a
+/// route — and its track is injected as a synthetic
+/// `{"type":"latlng","data":[[lat,lng],...]}` entry so the existing
+/// [`ActivityStreams`] parser handles everything in one pass. If neither
+/// endpoint has anything, that is an error the caller shows.
+pub async fn fetch_combined_activity_data(api_key: &str, activity_id: &str) -> Result<String> {
+    let streams = fetch_activity_streams(api_key, activity_id).await?;
+    if let Some(json) = &streams {
+        if ActivityStreams::from_json(json).is_some_and(|s| s.has_gps()) {
+            return Ok(json.clone());
+        }
+    }
 
+    let latlngs = fetch_activity_map(api_key, activity_id)
+        .await
+        .unwrap_or_default();
     tracing::debug!(
-        streams_ok = streams_result.is_ok(),
+        has_streams = streams.is_some(),
         gps_points = latlngs.len(),
         "Activity data fetch complete"
     );
+    let latlng_entry = || {
+        let data: Vec<serde_json::Value> = latlngs
+            .iter()
+            .map(|(lat, lng)| serde_json::json!([lat, lng]))
+            .collect();
+        serde_json::json!({"type": "latlng", "data": data})
+    };
 
-    match (streams_result, latlngs.is_empty()) {
-        (Ok(json), true) => Ok(json),
-        (Ok(json), false) => {
+    match (streams, latlngs.is_empty()) {
+        (Some(json), true) => Ok(json),
+        (Some(json), false) => {
             let mut arr: Vec<serde_json::Value> =
                 serde_json::from_str(&json).context("failed to parse streams JSON")?;
-            let latlng_data: Vec<serde_json::Value> = latlngs
-                .iter()
-                .map(|(lat, lng)| serde_json::json!([lat, lng]))
-                .collect();
-            arr.push(serde_json::json!({"type": "latlng", "data": latlng_data}));
+            // Replace, never duplicate: the parser keeps whichever comes last.
+            arr.retain(|s| s.get("type").and_then(|t| t.as_str()) != Some("latlng"));
+            arr.push(latlng_entry());
             serde_json::to_string(&arr).context("failed to serialise combined activity data")
         }
-        (Err(_), false) => {
-            let latlng_data: Vec<serde_json::Value> = latlngs
-                .iter()
-                .map(|(lat, lng)| serde_json::json!([lat, lng]))
-                .collect();
-            serde_json::to_string(&[serde_json::json!({"type": "latlng", "data": latlng_data})])
-                .context("failed to serialise GPS-only data")
+        (None, false) => {
+            serde_json::to_string(&[latlng_entry()]).context("failed to serialise GPS-only data")
         }
-        (Err(_), true) => {
-            anyhow::bail!(
-                "No detailed data available for this activity. \
-                 Route maps and charts require a full FIT file upload to Intervals.icu. \
-                 Activities synced as summaries only (e.g. from Garmin Connect) \
-                 do not include this data."
-            )
-        }
+        (None, true) => anyhow::bail!(
+            "Intervals.icu has no detailed data for this activity — it was probably \
+             entered by hand rather than recorded."
+        ),
     }
 }
 
@@ -503,6 +513,76 @@ pub async fn sync_recent(
     }
 }
 
+/// How many activities one backfill pass downloads.
+///
+/// A five-hour ride's streams are about a megabyte. Ten a pass clears the
+/// rider's summer of outdoor rides in a few launches without making any one
+/// of them slow, and a first-time connection with years of history does not
+/// start by pulling a gigabyte.
+const STREAM_BACKFILL_BATCH: usize = 10;
+
+/// Download streams for synced rides and runs that have none cached, so the
+/// Fitness page can count them in the power curve, the pace curve and the zone
+/// bars. Newest first, [`STREAM_BACKFILL_BATCH`] at a time.
+///
+/// Runs after the routine sync, never ahead of it: nothing waits on it. An
+/// activity Intervals.icu has no streams for is cached as `[]`, so it is not
+/// asked for again every launch. A network error ends the pass without caching
+/// anything for that activity — it is tried again next time.
+pub async fn backfill_streams(pool: &sqlx::SqlitePool, api_key: &str) {
+    use crate::data::{db, settings};
+
+    if api_key.trim().is_empty() {
+        return;
+    }
+
+    match settings::streams_refetched(pool).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(e) = db::clear_activity_streams(pool).await {
+                tracing::error!("Could not clear the old stream cache: {e}");
+                return;
+            }
+            if let Err(e) = settings::set_streams_refetched(pool).await {
+                tracing::error!("Could not record the stream cache clear-out: {e}");
+            }
+            tracing::info!("Cleared streams cached by the pre-0.12.0 fetch");
+        }
+        Err(e) => {
+            tracing::error!("Could not read the stream cache flag: {e}");
+            return;
+        }
+    }
+
+    let ids = match db::activities_missing_streams(pool, STREAM_BACKFILL_BATCH).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("Could not list activities missing streams: {e}");
+            return;
+        }
+    };
+
+    let mut fetched = 0usize;
+    for id in ids {
+        let json = match fetch_activity_streams(api_key, &id).await {
+            Ok(Some(json)) => json,
+            Ok(None) => "[]".to_string(),
+            Err(e) => {
+                tracing::warn!("Stream backfill stopped: {e}");
+                break;
+            }
+        };
+        if let Err(e) = db::save_activity_streams(pool, &id, &json).await {
+            tracing::error!("Could not cache streams for {id}: {e}");
+            break;
+        }
+        fetched += 1;
+    }
+    if fetched > 0 {
+        tracing::info!("Stream backfill cached {fetched} activities");
+    }
+}
+
 // ── Upload ────────────────────────────────────────────────────────────────────
 
 /// Upload a completed session to Intervals.icu as a FIT file.
@@ -543,4 +623,18 @@ pub async fn upload_fit_activity(
 
     tracing::debug!("Intervals.icu FIT activity uploaded");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_ask_for_streams_at_the_documented_path() {
+        assert_eq!(
+            streams_url("i178814881"),
+            "https://intervals.icu/api/v1/activity/i178814881/streams\
+             ?types=time,watts,heartrate,cadence,distance,altitude,latlng,velocity_smooth"
+        );
+    }
 }
