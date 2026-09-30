@@ -85,10 +85,15 @@ jobs:
         #
         # --no-shuffle keeps a mutant in the same shard from week to week, so
         # two runs can be compared.
+        #
+        # cargo-mutants numbers shards from 0, so the 1–8 in the job name is
+        # shifted down here. Passed as-is, `8/8` was a usage error that failed
+        # in a minute every week, and shard 0 — an eighth of every mutant —
+        # was never tested at all.
         run: |
           set +e
           cargo mutants \
-            --no-shuffle --shard ${{ matrix.shard }}/8 \
+            --no-shuffle --shard $(( ${{ matrix.shard }} - 1 ))/8 \
             -f "src/data/*.rs" -f "src/data/db/*.rs" \
             -f "src/devices/*.rs" -f "src/training/*.rs" \
             -f "src/ai/*.rs" -f "src/ai/brief/*.rs" \
