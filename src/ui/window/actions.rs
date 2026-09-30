@@ -21,6 +21,7 @@ pub fn install(
     athlete_rc: Rc<RefCell<AthleteProfile>>,
     engine_rc: Rc<RefCell<WorkoutEngine>>,
     player_rc: Rc<RefCell<crate::ui::pages::player::PlayerPage>>,
+    workout_active: Rc<Cell<bool>>,
     sim_difficulty: Rc<Cell<f32>>,
     sim_max_grade: Rc<Cell<f32>>,
 ) {
@@ -53,11 +54,21 @@ pub fn install(
     // The compact ride overlay, on the same footing as fullscreen: the on-page
     // button and the accelerator drive one action. Weak, because the window
     // owns the page this reaches back into (CLAUDE.md §2.4).
+    //
+    // Only while the workout player holds a ride. The overlay reads the
+    // workout engine, so F10 anywhere else — above all mid-way through a route
+    // ride, which runs on its own engine — opened a window showing the
+    // last-loaded workout and an empty session while the real ride carried on
+    // behind it. Closing an overlay that is already open stays allowed.
     let player_for_overlay = Rc::downgrade(&player_rc);
     let overlay_action = gio::SimpleAction::new("toggle-overlay", None);
     overlay_action.connect_activate(move |_, _| {
-        if let Some(player) = player_for_overlay.upgrade() {
-            player.borrow().toggle_overlay();
+        let Some(player) = player_for_overlay.upgrade() else {
+            return;
+        };
+        let player = player.borrow();
+        if workout_active.get() || player.overlay_is_open() {
+            player.toggle_overlay();
         }
     });
     window.add_action(&overlay_action);

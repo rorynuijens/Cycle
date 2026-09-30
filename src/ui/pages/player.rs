@@ -1082,12 +1082,17 @@ impl PlayerPage {
     /// The work of building it lives in the callback `attach_overlay` installs,
     /// which is the only place that knows the database and the application.
     pub fn toggle_overlay(&self) {
-        let is_open = self.overlay.borrow().is_some();
+        let is_open = self.overlay_is_open();
         if is_open {
             self.close_overlay();
             return;
         }
         crate::ui::call_reload(&self.overlay_cb);
+    }
+
+    /// Whether the compact overlay window is open.
+    pub fn overlay_is_open(&self) -> bool {
+        self.overlay.borrow().is_some()
     }
 
     /// Close the overlay if it is open, and forget it.

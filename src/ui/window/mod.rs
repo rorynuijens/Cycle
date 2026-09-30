@@ -661,6 +661,7 @@ impl CycleGtkWindow {
             Rc::clone(&athlete_rc),
             Rc::clone(&engine_rc),
             Rc::clone(&player_rc),
+            Rc::clone(&workout_active),
             Rc::clone(&sim_difficulty),
             Rc::clone(&sim_max_grade),
         );
