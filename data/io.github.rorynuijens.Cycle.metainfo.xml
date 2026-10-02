@@ -90,6 +90,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.12.2" date="2026-10-02">
+      <description>
+        <p>Rides uploaded to Garmin Connect now show the time you actually
+           started. Cycle saved the ride's time correctly but told Garmin you
+           were in UTC, so anywhere else a ride showed at the wrong hour —
+           three hours early, for a rider in UTC+3.
+           Exported files are now named by your own clock time too. Rides
+           exported before this update keep the wrong time in Garmin Connect;
+           you can correct it there by editing the activity's start time.</p>
+      </description>
+    </release>
     <release version="0.12.1" date="2026-09-30">
       <description>
         <p>A security update. The library Cycle uses for its secure
