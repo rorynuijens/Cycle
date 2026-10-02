@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{Local, Offset, TimeZone};
 use std::path::{Path, PathBuf};
 
 use super::athlete::AthleteProfile;
@@ -106,6 +107,27 @@ fn avg_of<F: Fn(&super::session::DataPoint) -> Option<u32>>(
 /// load for a file it did not record — it reads the finished values out of the
 /// session message — so the export carries them; see [`crate::training::load`].
 pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
+    let end = session.ended_at.unwrap_or_else(|| {
+        session.started_at + chrono::Duration::seconds(session.duration_secs() as i64)
+    });
+    // The offset in force when the ride ended, not now: a ride exported after
+    // a clock change must still carry the offset it was ridden under.
+    let utc_offset_secs = end.with_timezone(&Local).offset().fix().local_minus_utc();
+    encode_session_at_offset(session, athlete, utc_offset_secs)
+}
+
+/// [`encode_session`] with the rider's UTC offset given, rather than read from
+/// the machine's timezone.
+///
+/// Every FIT timestamp is UTC. The one local time is the activity message's
+/// `local_timestamp`, and Garmin Connect shows the ride's clock time by the
+/// difference between the two — so writing UTC into it (as this once did)
+/// shows a 06:01 ride in Istanbul as starting at 03:01.
+fn encode_session_at_offset(
+    session: &Session,
+    athlete: &AthleteProfile,
+    utc_offset_secs: i32,
+) -> Vec<u8> {
     let mut msgs: Vec<u8> = Vec::new();
 
     let start_ts = unix_to_fit(session.started_at.timestamp());
@@ -531,7 +553,8 @@ pub fn encode_session(session: &Session, athlete: &AthleteProfile) -> Vec<u8> {
     msgs.push(0x04);
     msgs.extend_from_slice(&end_ts.to_le_bytes());
     msgs.extend_from_slice(&elapsed_ms.to_le_bytes());
-    msgs.extend_from_slice(&end_ts.to_le_bytes()); // local_timestamp ≈ end_ts
+    let local_end_ts = (i64::from(end_ts) + i64::from(utc_offset_secs)).clamp(0, u32::MAX.into());
+    msgs.extend_from_slice(&(local_end_ts as u32).to_le_bytes()); // local_timestamp
     msgs.extend_from_slice(&1u16.to_le_bytes()); // num_sessions
     msgs.push(0); // type
     msgs.push(26); // event = activity
@@ -839,10 +862,22 @@ pub fn write_session_fit(path: &Path, session: &Session, athlete: &AthleteProfil
 pub fn export_to_xdg_path(session: &Session, athlete: &AthleteProfile) -> Result<PathBuf> {
     let exports_dir = crate::data::paths::data_dir().join("exports");
     std::fs::create_dir_all(&exports_dir)?;
-    let ts = session.started_at.format("%Y-%m-%d_%H%M%S").to_string();
-    let path = exports_dir.join(format!("workout_{}.fit", ts));
+    let path = exports_dir.join(export_filename(session, &Local));
     std::fs::write(&path, encode_session(session, athlete))?;
     Ok(path)
+}
+
+/// The name [`export_to_xdg_path`] saves under, stamped with the ride's start
+/// in the rider's own clock time — a UTC stamp put a 06:01 ride at 03:01.
+fn export_filename<Tz: TimeZone>(session: &Session, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let ts = session
+        .started_at
+        .with_timezone(tz)
+        .format("%Y-%m-%d_%H%M%S");
+    format!("workout_{ts}.fit")
 }
 
 #[cfg(test)]
@@ -1245,6 +1280,66 @@ mod tests {
             })
             .count();
         assert_eq!(stops, 1, "expected exactly one timer stop event");
+    }
+
+    /// `(timestamp, local_timestamp)` of the activity message, as raw FIT seconds.
+    ///
+    /// Read from the bytes, not through fitparser: it decodes a local time as
+    /// seconds since the FIT epoch *in this machine's timezone as of 1989*,
+    /// which in Istanbul was +2, not today's +3, so its reading cannot carry
+    /// the offset this checks.
+    fn activity_times(bytes: &[u8]) -> (i64, i64) {
+        // The activity message is the last one, 18 bytes, before the file CRC.
+        let msg = &bytes[bytes.len() - 2 - 18..bytes.len() - 2];
+        assert_eq!(msg[0], 0x04, "activity data header");
+        assert_eq!(msg[16], 26, "event = activity");
+        let u32_at = |i: usize| {
+            i64::from(u32::from_le_bytes([
+                msg[i],
+                msg[i + 1],
+                msg[i + 2],
+                msg[i + 3],
+            ]))
+        };
+        (u32_at(1), u32_at(9))
+    }
+
+    #[test]
+    fn should_write_the_local_time_three_hours_ahead_for_an_istanbul_ride() {
+        let bytes = encode_session_at_offset(&ride(60, false), &profile(), 3 * 3600);
+        let (utc, local) = activity_times(&bytes);
+        assert_eq!(local - utc, 10_800);
+    }
+
+    #[test]
+    fn should_write_the_local_time_behind_utc_for_a_ride_west_of_greenwich() {
+        // A negative offset: the subtraction must not wrap the unsigned field.
+        let bytes = encode_session_at_offset(&ride(60, false), &profile(), -5 * 3600);
+        let (utc, local) = activity_times(&bytes);
+        assert_eq!(local - utc, -18_000);
+    }
+
+    #[test]
+    fn should_write_the_machine_offset_at_the_end_of_the_ride() {
+        let session = ride(60, false);
+        let end = session.ended_at.expect("fixture has an end");
+        let expected = end.with_timezone(&Local).offset().fix().local_minus_utc();
+        let (utc, local) = activity_times(&encode_session(&session, &profile()));
+        assert_eq!(local - utc, i64::from(expected));
+    }
+
+    #[test]
+    fn should_stamp_the_export_filename_in_the_riders_clock_time() {
+        let mut session = ride(1, false);
+        session.started_at = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 1, 3, 1, 0)
+            .single()
+            .expect("valid instant");
+        let istanbul = chrono::FixedOffset::east_opt(3 * 3600).expect("valid offset");
+        assert_eq!(
+            export_filename(&session, &istanbul),
+            "workout_2026-10-01_060100.fit"
+        );
     }
 
     #[test]
