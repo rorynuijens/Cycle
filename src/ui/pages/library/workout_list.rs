@@ -3,7 +3,6 @@
 use adw::prelude::*;
 use sqlx::SqlitePool;
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::data::athlete::AthleteProfile;
@@ -70,24 +69,6 @@ pub fn row_subtitle(workout: &Workout) -> String {
     } else {
         format!("{meta} — {description}")
     }
-}
-
-/// Does this workout survive the current filters?
-///
-/// No categories selected means no category filter, not "none of them".
-pub fn matches(
-    workout: &Workout,
-    category: WorkoutCategory,
-    active: &HashSet<WorkoutCategory>,
-    search_lower: &str,
-) -> bool {
-    if workout.category != category {
-        return false;
-    }
-    if !active.is_empty() && !active.contains(&category) {
-        return false;
-    }
-    search_lower.is_empty() || workout.name.to_lowercase().contains(search_lower)
 }
 
 /// The shared handles a row's buttons need.
@@ -252,15 +233,32 @@ fn delete_button(workout_id: i64, ctx: &Rc<RowContext>) -> gtk::Button {
 
 /// The state page shown when the filters exclude everything, offering the way
 /// out of it.
+///
+/// `has_routes` widens the wording: with routes saved, the search and chips
+/// filter those too, and "No Workouts" would leave out half of what is missing.
 pub fn empty_state(
     filter_chips: Rc<RefCell<Vec<gtk::ToggleButton>>>,
     search_entry: gtk::SearchEntry,
+    has_routes: bool,
 ) -> adw::StatusPage {
+    let (title, description, tooltip) = if has_routes {
+        (
+            "No Matches",
+            "No workouts or routes match your search or filters.",
+            "Show all workouts and routes again",
+        )
+    } else {
+        (
+            "No Workouts",
+            "No workouts match your search or filters.",
+            "Show all workouts again",
+        )
+    };
     let clear_btn = gtk::Button::builder()
         .label("Clear Filters")
         .css_classes(["pill"])
         .halign(gtk::Align::Center)
-        .tooltip_text("Show all workouts again")
+        .tooltip_text(tooltip)
         .build();
     clear_btn.connect_clicked(move |_| {
         for chip in filter_chips.borrow().iter() {
@@ -271,8 +269,8 @@ pub fn empty_state(
 
     adw::StatusPage::builder()
         .icon_name("folder-open-symbolic")
-        .title("No Workouts")
-        .description("No workouts match your search or filters.")
+        .title(title)
+        .description(description)
         .child(&clear_btn)
         .build()
 }
@@ -360,32 +358,6 @@ mod tests {
         let mut w = workout(75.0, 95.0, 3600);
         w.description = "   ".into();
         assert!(!row_subtitle(&w).contains('—'));
-    }
-
-    #[test]
-    fn should_show_every_category_when_none_is_selected() {
-        // An empty chip set means "no filter", not "exclude everything".
-        let w = workout(50.0, 90.0, 3600);
-        let none = HashSet::new();
-        assert!(matches(&w, w.category, &none, ""));
-    }
-
-    #[test]
-    fn should_hide_categories_that_are_not_selected() {
-        let w = workout(50.0, 90.0, 3600);
-        let mut active = HashSet::new();
-        active.insert(WorkoutCategory::Recovery);
-        assert!(!matches(&w, w.category, &active, ""));
-    }
-
-    #[test]
-    fn should_match_a_search_regardless_of_case() {
-        let mut w = workout(50.0, 90.0, 3600);
-        w.name = "Sweet Spot Builder".into();
-        let none = HashSet::new();
-        assert!(matches(&w, w.category, &none, "sweet"));
-        assert!(matches(&w, w.category, &none, "builder"));
-        assert!(!matches(&w, w.category, &none, "sprint"));
     }
 
     #[test]

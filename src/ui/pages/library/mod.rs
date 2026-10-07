@@ -6,6 +6,7 @@
 
 mod detail;
 mod editor;
+mod filter;
 mod routes;
 // The calendar's scheduling picker reuses this module's row helpers rather than
 // growing a second, drifting description of what a workout looks like in a list.
@@ -21,7 +22,7 @@ use std::rc::Rc;
 use gtk::glib;
 
 use crate::data::athlete::AthleteProfile;
-use crate::data::db;
+use crate::data::db::{self, SavedRoute};
 use crate::data::import::{parse_erg, parse_zwo};
 use crate::data::route::Route;
 use crate::data::workout::{Workout, WorkoutCategory};
@@ -29,7 +30,8 @@ use crate::ui::widgets::zone_color::{category_zone_rgb, zone_swatch};
 
 use detail::show_route_detail;
 use editor::show_workout_editor;
-use routes::save_route_to_library;
+use filter::Filter;
+use routes::{save_route_to_library, RouteRows};
 use workout_list::{RowContext, CATEGORY_ORDER};
 
 /// The largest workout file worth reading — no legitimate .zwo or .erg is
@@ -137,8 +139,8 @@ impl LibraryPage {
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
             .build();
-        // Saved GPX routes sit above the workouts, in their own container so the
-        // category filters and the search leave them alone.
+        // Saved GPX routes sit above the workouts. The search and the Routes
+        // chip filter them like everything else; see `filter`.
         let routes_container = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
@@ -171,18 +173,37 @@ impl LibraryPage {
         let workouts_rc: Rc<RefCell<Vec<Workout>>> = Rc::new(RefCell::new(workouts));
         // Chip references for the empty state's "Clear Filters" action.
         let filter_chips: Rc<RefCell<Vec<gtk::ToggleButton>>> = Rc::new(RefCell::new(Vec::new()));
-
-        let reload_routes = routes::reload_closure(
-            routes_container,
-            pool.clone(),
-            rt_handle.clone(),
-            Rc::clone(&on_start_route),
-            Rc::clone(&on_toast),
-        );
-        reload_routes();
+        let saved_routes: Rc<RefCell<Vec<SavedRoute>>> = Rc::new(RefCell::new(Vec::new()));
+        // Shown only once a route is saved: a chip that can only ever empty the
+        // list is a trap, not a filter.
+        let routes_chip = gtk::ToggleButton::builder()
+            .label("Routes")
+            .css_classes(["pill"])
+            .tooltip_text("Show saved GPX routes")
+            .visible(false)
+            .build();
 
         // ── Rebuild ──────────────────────────────────────────────────────────
         let rebuild_holder: RebuildHolder = Rc::new(RefCell::new(None));
+
+        // The routes are read off the main thread, then the whole page is
+        // rebuilt — the empty state depends on routes and workouts together.
+        let reload_routes = {
+            let rebuild_holder = Rc::clone(&rebuild_holder);
+            routes::reload_closure(
+                pool.clone(),
+                rt_handle.clone(),
+                Rc::clone(&saved_routes),
+                Rc::new(move || crate::ui::call_reload(&rebuild_holder)),
+            )
+        };
+        let route_rows = Rc::new(RouteRows {
+            pool: pool.clone(),
+            rt_handle: rt_handle.clone(),
+            on_start_route: Rc::clone(&on_start_route),
+            on_toast: Rc::clone(&on_toast),
+            reload: Rc::new(RefCell::new(Some(Rc::clone(&reload_routes)))),
+        });
         let row_ctx = Rc::new(RowContext {
             pool: pool.clone(),
             rt_handle: rt_handle.clone(),
@@ -203,6 +224,10 @@ impl LibraryPage {
             let filter_chips = Rc::clone(&filter_chips);
             let search_entry = search_entry.clone();
             let row_ctx = Rc::clone(&row_ctx);
+            let routes_container = routes_container.clone();
+            let saved_routes = Rc::clone(&saved_routes);
+            let routes_chip = routes_chip.clone();
+            let route_rows = Rc::clone(&route_rows);
 
             Rc::new(move || {
                 // Every thumbnail and target wattage is scaled by FTP, so read it
@@ -211,17 +236,34 @@ impl LibraryPage {
                 let fitness = fitness_ctx.borrow();
                 let workouts = workouts_rc.borrow();
                 let active = active_cats.borrow();
-                let search_lower = search_text.borrow().to_lowercase();
+                let routes = saved_routes.borrow();
+                let filter = Filter::new(
+                    &active,
+                    routes_chip.is_active() && !routes.is_empty(),
+                    &search_text.borrow(),
+                );
 
                 while let Some(child) = list_container.first_child() {
                     list_container.remove(&child);
                 }
+                while let Some(child) = routes_container.first_child() {
+                    routes_container.remove(&child);
+                }
 
-                let mut any_visible = false;
+                routes_chip.set_visible(!routes.is_empty());
+                let shown_routes: Vec<&SavedRoute> = routes
+                    .iter()
+                    .filter(|r| filter.shows_route(&r.name))
+                    .collect();
+                let mut any_visible = !shown_routes.is_empty();
+                if any_visible {
+                    routes_container.append(&routes::build_group(&shown_routes, &route_rows));
+                }
+
                 for category in CATEGORY_ORDER {
                     let matching: Vec<&Workout> = workouts
                         .iter()
-                        .filter(|w| workout_list::matches(w, category, &active, &search_lower))
+                        .filter(|w| w.category == category && filter.shows_workout(w))
                         .collect();
                     if matching.is_empty() {
                         continue;
@@ -256,11 +298,13 @@ impl LibraryPage {
                     list_container.append(&workout_list::empty_state(
                         Rc::clone(&filter_chips),
                         search_entry.clone(),
+                        !routes.is_empty(),
                     ));
                 }
             })
         };
         *rebuild_holder.borrow_mut() = Some(Rc::clone(&rebuild));
+        reload_routes();
 
         // ── GPX Route button handler ─────────────────────────────────────────
         connect_gpx(
@@ -305,6 +349,14 @@ impl LibraryPage {
         }
 
         // ── Filter chips ─────────────────────────────────────────────────────
+        // Routes first: they are listed first.
+        {
+            let rebuild = Rc::clone(&rebuild);
+            routes_chip.connect_toggled(move |_| rebuild());
+        }
+        filter_chips.borrow_mut().push(routes_chip.clone());
+        filter_box.append(&routes_chip);
+
         for category in CATEGORY_ORDER {
             let chip = gtk::ToggleButton::builder()
                 .label(category.label())
@@ -404,7 +456,7 @@ struct Toolbar {
 fn build_toolbar(root: &gtk::Box) -> Toolbar {
     // ── Search bar (revealed by Ctrl+F, dismissed by Escape) ─────────────
     let search_entry = gtk::SearchEntry::builder()
-        .placeholder_text("Search workouts…")
+        .placeholder_text("Search workouts and routes…")
         .hexpand(true)
         .build();
 
