@@ -90,6 +90,23 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.13.0" date="2026-10-07">
+      <description>
+        <p>Your rides, out of Cycle.</p>
+        <ul>
+          <li>Export every ride at once: Preferences → Data → Export Every Ride
+              saves each ride as its own FIT file in a folder you choose, ready
+              for Garmin Connect, Strava or an archive.</li>
+          <li>Search and filter your routes: the Library search now finds routes
+              as well as workouts, and a Routes chip shows just your saved
+              GPX routes. Searching for "i" also finds the Turkish ı and İ.</li>
+          <li>Ride and route maps now draw the route the same way the route
+              player does.</li>
+          <li>Fixed: a ride with a very long name could not be exported, because
+              its file name was longer than the system allows.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.2" date="2026-10-02">
       <description>
         <p>Rides uploaded to Garmin Connect now show the time you actually
