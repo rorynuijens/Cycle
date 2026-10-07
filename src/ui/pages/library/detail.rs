@@ -2,7 +2,6 @@
 //! and the ways to act on it.
 
 use adw::prelude::*;
-use libshumate::prelude::LocationExt;
 use sqlx::SqlitePool;
 use std::rc::Rc;
 
@@ -10,6 +9,7 @@ use crate::data::db;
 use crate::data::route::Route;
 use crate::data::workout::Workout;
 use crate::training::recommend::workout_fit;
+use crate::ui::widgets::route_map::RouteMap;
 
 #[allow(clippy::too_many_arguments)] // detail dialog wiring; grouping deferred
 pub fn show_workout_detail(
@@ -373,40 +373,10 @@ pub fn show_route_detail(
     // ── Map ───────────────────────────────────────────────────────────────
     let gps: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lng)).collect();
     if gps.len() >= 2 {
-        let lat_min = gps.iter().map(|&(la, _)| la).fold(f64::INFINITY, f64::min);
-        let lat_max = gps
-            .iter()
-            .map(|&(la, _)| la)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let lng_min = gps.iter().map(|&(_, lo)| lo).fold(f64::INFINITY, f64::min);
-        let lng_max = gps
-            .iter()
-            .map(|&(_, lo)| lo)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let center_lat = (lat_min + lat_max) / 2.0;
-        let center_lng = (lng_min + lng_max) / 2.0;
-        let max_span = (lat_max - lat_min).max(lng_max - lng_min).max(1e-9);
-        let zoom = ((360.0_f64 / max_span).log2() - 1.0).clamp(2.0, 16.0);
-
-        let route_map = libshumate::SimpleMap::new();
-        route_map.set_hexpand(true);
-        route_map.set_size_request(-1, 220);
-        route_map.set_map_source(Some(&libshumate::RasterRenderer::from_url(
-            "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        )));
-
-        if let Some(viewport) = route_map.viewport() {
-            viewport.set_location(center_lat, center_lng);
-            viewport.set_zoom_level(zoom);
-            let path_layer = libshumate::PathLayer::new(&viewport);
-            let downsampled = crate::data::streams::ActivityStreams::downsample(&gps, 500);
-            for &(lat, lng) in &downsampled {
-                path_layer.add_node(&libshumate::Coordinate::new_full(lat, lng));
-            }
-            path_layer.set_stroke_color(Some(&gtk::gdk::RGBA::new(0.35, 0.60, 1.0, 0.9)));
-            path_layer.set_stroke_width(3.0);
-            route_map.add_overlay_layer(&path_layer);
-        }
+        let route_map = RouteMap::for_dialog();
+        route_map.set_route(&crate::data::streams::ActivityStreams::downsample(
+            &gps, 500,
+        ));
 
         inner.append(
             &gtk::Label::builder()
@@ -415,7 +385,7 @@ pub fn show_route_detail(
                 .css_classes(["heading"])
                 .build(),
         );
-        inner.append(&route_map);
+        inner.append(route_map.widget());
     }
 
     // ── Ride this Route button ────────────────────────────────────────────

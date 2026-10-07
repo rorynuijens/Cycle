@@ -432,6 +432,9 @@ impl RoutePlayerPage {
         let route_map = RouteMap::new();
         route_map.widget().set_vexpand(true);
         route_map.widget().set_size_request(-1, MAP_MIN_HEIGHT);
+        route_map.widget().set_tooltip_text(Some(
+            "Route map — drag to look around; following resumes automatically",
+        ));
 
         let graph_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)

@@ -1,7 +1,8 @@
 //! Slippy map showing a route and, during a ride, where the rider is on it.
 //!
-//! Shared by the live route player and the post-ride detail dialog so the tile
-//! source, styling and attribution are configured in one place.
+//! Shared by the live route player and both of the calendar's ride-detail
+//! dialogs, so the tile source, styling and attribution are configured in one
+//! place.
 //!
 //! Tiles come from the network. Offline, the base map is blank but the route
 //! line and rider marker still draw, so the map degrades rather than breaks.
@@ -48,6 +49,9 @@ const ROUTE_CASING_COLOR: gtk::gdk::RGBA = gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 0.
 /// The next kilometre, in a warm colour no OSM road uses.
 const LOOKAHEAD_COLOR: gtk::gdk::RGBA = gtk::gdk::RGBA::new(1.0, 0.42, 0.05, 0.95);
 
+/// Height of the map in a ride or route dialog.
+const DIALOG_MAP_HEIGHT: i32 = 222;
+
 /// Overall size of the rider marker, in pixels — the dot plus its halo.
 const MARKER_SIZE: i32 = 34;
 
@@ -73,9 +77,7 @@ impl RouteMap {
         map.set_map_source(Some(&libshumate::RasterRenderer::from_url(
             "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
         )));
-        map.set_tooltip_text(Some(
-            "Route map — drag to look around; following resumes automatically",
-        ));
+        map.set_tooltip_text(Some("Route map — drag to look around"));
 
         let last_interaction: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         watch_for_interaction(&map, &last_interaction);
@@ -88,6 +90,16 @@ impl RouteMap {
             marker: RefCell::new(None),
             last_interaction,
         }
+    }
+
+    /// A map for a dialog showing a finished ride or a saved route: a fixed
+    /// height that sits in a scrolling column, rather than filling the page the
+    /// way the route player's does.
+    pub fn for_dialog() -> Self {
+        let map = Self::new();
+        map.map.set_vexpand(false);
+        map.map.set_size_request(-1, DIALOG_MAP_HEIGHT);
+        map
     }
 
     pub fn widget(&self) -> &libshumate::SimpleMap {

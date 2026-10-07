@@ -5,7 +5,6 @@
 
 use adw::prelude::*;
 use chrono::Local;
-use libshumate::prelude::LocationExt;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,6 +23,7 @@ use crate::training::analytics::{format_average_pace, format_distance};
 use crate::training::engine::WorkoutEngine;
 use crate::training::progression::Effort;
 use crate::ui::widgets::progression_card;
+use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_bar::ZoneBar;
 
 use crate::ui::ReloadHolder;
@@ -253,14 +253,7 @@ pub fn show_intervals_detail(
     }
 
     // ── Route map (Shumate tile map) ──────────────────────────────────────────
-    let route_map = libshumate::SimpleMap::new();
-    route_map.set_hexpand(true);
-    route_map.set_size_request(-1, 220);
-    route_map.set_map_source(Some(&libshumate::RasterRenderer::from_url(
-        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    )));
-    let current_path_layer: Rc<RefCell<Option<libshumate::PathLayer>>> =
-        Rc::new(RefCell::new(None));
+    let route_map = Rc::new(RouteMap::for_dialog());
     let route_section = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -273,7 +266,7 @@ pub fn show_intervals_detail(
             .css_classes(["heading"])
             .build(),
     );
-    route_section.append(&route_map);
+    route_section.append(route_map.widget());
     inner.append(&route_section);
 
     // ── Elevation profile ─────────────────────────────────────────────────────
@@ -398,8 +391,7 @@ pub fn show_intervals_detail(
     let populate_streams: Rc<dyn Fn(ActivityStreams)> = {
         let streams_data = Rc::clone(&streams_data);
         let route_section = route_section.clone();
-        let route_map = route_map.clone();
-        let current_path_layer = Rc::clone(&current_path_layer);
+        let route_map = Rc::clone(&route_map);
         let elev_section = elev_section.clone();
         let elev_area = elev_area.clone();
         let perf_section = perf_section.clone();
@@ -412,45 +404,7 @@ pub fn show_intervals_detail(
             let has_perf = s.has_hr() || s.has_power() || s.has_velocity();
 
             if has_gps {
-                let latlng = &s.latlng;
-                let lat_min = latlng
-                    .iter()
-                    .map(|&(lat, _)| lat)
-                    .fold(f64::INFINITY, f64::min);
-                let lat_max = latlng
-                    .iter()
-                    .map(|&(lat, _)| lat)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let lng_min = latlng
-                    .iter()
-                    .map(|&(_, lng)| lng)
-                    .fold(f64::INFINITY, f64::min);
-                let lng_max = latlng
-                    .iter()
-                    .map(|&(_, lng)| lng)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let center_lat = (lat_min + lat_max) / 2.0;
-                let center_lng = (lng_min + lng_max) / 2.0;
-                let max_span = (lat_max - lat_min).max(lng_max - lng_min).max(1e-9);
-                let zoom = ((360.0_f64 / max_span).log2() - 1.0).clamp(2.0, 16.0);
-
-                if let Some(viewport) = route_map.viewport() {
-                    viewport.set_location(center_lat, center_lng);
-                    viewport.set_zoom_level(zoom);
-                    if let Some(old) = current_path_layer.borrow().as_ref() {
-                        route_map.remove_overlay_layer(old);
-                    }
-                    let path_layer = libshumate::PathLayer::new(&viewport);
-                    let pts = ActivityStreams::downsample(latlng, 500);
-                    for &(lat, lng) in &pts {
-                        path_layer.add_node(&libshumate::Coordinate::new_full(lat, lng));
-                    }
-                    let stroke = gtk::gdk::RGBA::new(0.35, 0.60, 1.0, 0.9);
-                    path_layer.set_stroke_color(Some(&stroke));
-                    path_layer.set_stroke_width(3.0);
-                    route_map.add_overlay_layer(&path_layer);
-                    *current_path_layer.borrow_mut() = Some(path_layer);
-                }
+                route_map.set_route(&ActivityStreams::downsample(&s.latlng, 500));
             }
 
             *streams_data.borrow_mut() = Some(s);
@@ -1223,49 +1177,9 @@ pub fn show_session_detail(
                 .css_classes(["heading"])
                 .build(),
         );
-        let route_map = libshumate::SimpleMap::new();
-        route_map.set_hexpand(true);
-        route_map.set_size_request(-1, 220);
-        route_map.set_map_source(Some(&libshumate::RasterRenderer::from_url(
-            "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        )));
-
-        let lat_min = gps_pts
-            .iter()
-            .map(|&(lat, _)| lat)
-            .fold(f64::INFINITY, f64::min);
-        let lat_max = gps_pts
-            .iter()
-            .map(|&(lat, _)| lat)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let lng_min = gps_pts
-            .iter()
-            .map(|&(_, lng)| lng)
-            .fold(f64::INFINITY, f64::min);
-        let lng_max = gps_pts
-            .iter()
-            .map(|&(_, lng)| lng)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let center_lat = (lat_min + lat_max) / 2.0;
-        let center_lng = (lng_min + lng_max) / 2.0;
-        let max_span = (lat_max - lat_min).max(lng_max - lng_min).max(1e-9);
-        let zoom = ((360.0_f64 / max_span).log2() - 1.0).clamp(2.0, 16.0);
-
-        if let Some(viewport) = route_map.viewport() {
-            viewport.set_location(center_lat, center_lng);
-            viewport.set_zoom_level(zoom);
-            let path_layer = libshumate::PathLayer::new(&viewport);
-            let pts = ActivityStreams::downsample(&gps_pts, 500);
-            for &(lat, lng) in &pts {
-                path_layer.add_node(&libshumate::Coordinate::new_full(lat, lng));
-            }
-            let stroke = gtk::gdk::RGBA::new(0.35, 0.60, 1.0, 0.9);
-            path_layer.set_stroke_color(Some(&stroke));
-            path_layer.set_stroke_width(3.0);
-            route_map.add_overlay_layer(&path_layer);
-        }
-
-        route_section.append(&route_map);
+        let route_map = RouteMap::for_dialog();
+        route_map.set_route(&ActivityStreams::downsample(&gps_pts, 500));
+        route_section.append(route_map.widget());
         inner.append(&route_section);
     }
 
