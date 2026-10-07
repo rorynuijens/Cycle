@@ -31,6 +31,7 @@ pub fn build(
         .build();
 
     group.add(&export_row(win, pool.clone(), rt_handle.clone()));
+    group.add(&export_rides_row(win, pool.clone(), rt_handle.clone()));
     group.add(&import_row(win, parent, pool, rt_handle));
     page.add(&group);
 
@@ -114,6 +115,103 @@ fn export_row(
     ));
 
     row
+}
+
+// ── every ride as FIT ────────────────────────────────────────────────────────
+
+fn export_rides_row(
+    win: &adw::PreferencesWindow,
+    pool: SqlitePool,
+    rt_handle: tokio::runtime::Handle,
+) -> adw::ActionRow {
+    let button = gtk::Button::builder()
+        .label("Export…")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Save every ride as its own FIT file in a folder")
+        .build();
+
+    let row = adw::ActionRow::builder()
+        .title("Export Every Ride")
+        .subtitle("One FIT file per ride, for Garmin Connect, Strava or an archive")
+        .activatable_widget(&button)
+        .build();
+    row.add_suffix(&button);
+
+    // Weak: this button lives inside the preferences window (CLAUDE.md §2.4).
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        win,
+        move |button| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Export Every Ride")
+                .accept_label("Export Here")
+                .build();
+
+            let win_cb = win.clone();
+            let button = button.clone();
+            let pool = pool.clone();
+            let rt_handle = rt_handle.clone();
+            dialog.select_folder(Some(&win), gtk::gio::Cancellable::NONE, move |result| {
+                // A cancelled chooser is not a failure worth reporting.
+                let Ok(folder) = result else { return };
+                let Some(dir) = folder.path() else {
+                    toast(&win_cb, "That folder cannot be written to.");
+                    return;
+                };
+                let folder_name = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| dir.to_string_lossy().to_string());
+
+                // A second click while the first export runs would write every
+                // file twice, racing itself.
+                button.set_sensitive(false);
+                let win_done = win_cb.clone();
+                crate::ui::spawn_to_main(
+                    &rt_handle,
+                    async move { transfer::export_rides(&pool, &dir).await },
+                    move |result| {
+                        button.set_sensitive(true);
+                        match result {
+                            Ok(report) => {
+                                toast(&win_done, &ride_export_message(&report, &folder_name))
+                            }
+                            Err(e) => {
+                                tracing::error!("Ride export failed: {e:#}");
+                                toast(&win_done, "Your rides could not be exported.");
+                            }
+                        }
+                    },
+                );
+            });
+        }
+    ));
+
+    row
+}
+
+/// What a finished ride export tells the rider, counting only what is on disk.
+fn ride_export_message(report: &transfer::RideExport, folder: &str) -> String {
+    let rides = |n: usize| match n {
+        1 => "1 ride".to_string(),
+        n => format!("{n} rides"),
+    };
+    let mut message = match (report.written, report.failed) {
+        (0, 0) if report.empty == 0 => return "There are no recorded rides to export.".into(),
+        (0, 0) => return "None of your rides have recorded data to export.".into(),
+        (0, _) => return format!("No rides could be written to {folder}."),
+        (written, 0) => format!("Exported {} to {folder}", rides(written)),
+        (written, failed) => format!(
+            "Exported {written} of {} to {folder} — {failed} could not be written",
+            rides(written + failed)
+        ),
+    };
+    // Said out loud, so a rider counting files is not left a ride short with
+    // no idea why.
+    if report.empty > 0 {
+        message.push_str(&format!("; {} had no recorded data", rides(report.empty)));
+    }
+    message
 }
 
 // ── import ───────────────────────────────────────────────────────────────────
@@ -367,4 +465,66 @@ fn db_filters() -> gtk::gio::ListStore {
 
 fn toast(win: &adw::PreferencesWindow, message: &str) {
     win.add_toast(adw::Toast::builder().title(message).build());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use transfer::RideExport;
+
+    fn report(written: usize, empty: usize, failed: usize) -> RideExport {
+        RideExport {
+            written,
+            empty,
+            failed,
+        }
+    }
+
+    #[test]
+    fn should_count_rides_in_the_singular_and_plural() {
+        assert_eq!(
+            ride_export_message(&report(1, 0, 0), "FIT"),
+            "Exported 1 ride to FIT"
+        );
+        assert_eq!(
+            ride_export_message(&report(2, 0, 0), "FIT"),
+            "Exported 2 rides to FIT"
+        );
+    }
+
+    #[test]
+    fn should_say_how_many_could_not_be_written() {
+        assert_eq!(
+            ride_export_message(&report(27, 0, 1), "FIT"),
+            "Exported 27 of 28 rides to FIT — 1 could not be written"
+        );
+    }
+
+    #[test]
+    fn should_not_claim_an_export_when_nothing_was_written() {
+        assert_eq!(
+            ride_export_message(&report(0, 0, 5), "FIT"),
+            "No rides could be written to FIT."
+        );
+        assert_eq!(
+            ride_export_message(&report(0, 0, 0), "FIT"),
+            "There are no recorded rides to export."
+        );
+        assert_eq!(
+            ride_export_message(&report(0, 2, 0), "FIT"),
+            "None of your rides have recorded data to export."
+        );
+    }
+
+    #[test]
+    fn should_name_rides_left_out_for_having_no_data() {
+        assert_eq!(
+            ride_export_message(&report(3, 1, 0), "FIT"),
+            "Exported 3 rides to FIT; 1 ride had no recorded data"
+        );
+        assert_eq!(
+            ride_export_message(&report(3, 2, 1), "FIT"),
+            "Exported 3 of 4 rides to FIT — 1 could not be written; 2 rides had no recorded data"
+        );
+    }
 }

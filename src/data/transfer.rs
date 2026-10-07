@@ -77,6 +77,113 @@ pub async fn export(pool: &SqlitePool, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What exporting every ride as a FIT file came to.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RideExport {
+    /// Files written.
+    pub written: usize,
+    /// Rides with no recorded samples, which make no FIT file worth having.
+    pub empty: usize,
+    /// Rides whose file could not be written.
+    pub failed: usize,
+}
+
+/// Write every finished ride into `dir` as its own FIT file.
+///
+/// Files are named the way a single-ride export names them, so a ride saved
+/// from the calendar and the same ride in an archive carry one name, and
+/// exporting into the same folder again refreshes the archive rather than
+/// doubling it. Two rides that would share a name in one export — the same
+/// title started in the same minute — are told apart with a `-2` suffix.
+///
+/// Fails without writing anything if the profile or the rides cannot be read,
+/// or if `dir` is not a folder. A file that cannot be written is counted in
+/// [`RideExport::failed`] and the rest carry on.
+pub async fn export_rides(pool: &SqlitePool, dir: &Path) -> Result<RideExport> {
+    if !dir.is_dir() {
+        bail!("{} is not a folder", dir.display());
+    }
+    // The training-load figure in each file is scaled to this profile, and
+    // Garmin reads it rather than recomputing it — see the single-ride export.
+    let athlete = super::db::load_or_create_athlete(pool)
+        .await
+        .context("could not read your profile")?;
+    let mut records = super::db::load_session_records(pool)
+        .await
+        .context("could not read your rides")?;
+    // Oldest first, so the earlier of two clashing rides keeps the plain name
+    // and the archive's names do not shift when a newer ride is added.
+    records.reverse();
+
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut report = RideExport::default();
+        let rides: Vec<_> = records
+            .into_iter()
+            .filter(|r| {
+                let empty = r.session.data_points.is_empty();
+                report.empty += empty as usize;
+                !empty
+            })
+            .collect();
+        let names = unique_file_names(
+            rides
+                .iter()
+                .map(|r| {
+                    super::fit::suggested_filename(
+                        &r.session,
+                        r.workout_name.as_deref().unwrap_or(""),
+                    )
+                })
+                .collect(),
+        );
+        for (record, name) in rides.iter().zip(names) {
+            match super::fit::write_session_fit(&dir.join(&name), &record.session, &athlete) {
+                Ok(()) => report.written += 1,
+                Err(e) => {
+                    tracing::error!("session {}: FIT export failed: {e:#}", record.session.id);
+                    report.failed += 1;
+                }
+            }
+        }
+        tracing::info!(
+            "Exported {} rides as FIT ({} empty, {} failed)",
+            report.written,
+            report.empty,
+            report.failed
+        );
+        report
+    })
+    .await
+    .context("the export stopped unexpectedly")
+}
+
+/// Make every name in `names` distinct, keeping the first of each as it is and
+/// numbering the rest `-2`, `-3`… before the extension.
+///
+/// Compared without case: an archive copied to a USB stick lands on FAT or
+/// exFAT, where `Ride.fit` and `ride.fit` are the same file and the second
+/// write would replace the first.
+fn unique_file_names(names: Vec<String>) -> Vec<String> {
+    let mut taken = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let (stem, ext) = match name.rfind('.') {
+                Some(dot) => name.split_at(dot),
+                None => (name.as_str(), ""),
+            };
+            let mut candidate = name.clone();
+            let mut n = 2;
+            while !taken.insert(candidate.to_lowercase()) {
+                candidate = format!("{stem}-{n}{ext}");
+                n += 1;
+            }
+            candidate
+        })
+        .collect()
+}
+
 /// Open `path` read-only and decide whether it can be imported, without
 /// changing it in any way.
 pub async fn inspect(path: &Path) -> Result<ImportSummary> {
@@ -536,5 +643,260 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "found {leftovers:?}");
         std::fs::remove_dir_all(&incoming_dir).ok();
+    }
+
+    // ── every ride as FIT ────────────────────────────────────────────────────
+
+    /// Save a finished ride of `secs` one-second samples, titled `title`.
+    async fn ride(pool: &SqlitePool, start: &str, title: Option<&str>, secs: u32) -> i64 {
+        let mut s = crate::data::session::Session::new(None);
+        s.started_at = DateTime::parse_from_rfc3339(start)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        s.ended_at = Some(s.started_at + chrono::Duration::seconds(secs as i64));
+        s.title = title.map(str::to_string);
+        s.data_points = (0..secs).map(sample).collect();
+        crate::data::db::save_session(pool, &s).await.unwrap()
+    }
+
+    fn sample(elapsed_secs: u32) -> crate::data::session::DataPoint {
+        crate::data::session::DataPoint {
+            elapsed_secs,
+            power_watts: Some(200),
+            target_watts: None,
+            heart_rate_bpm: None,
+            cadence_rpm: None,
+            speed_kmh: None,
+            lat: None,
+            lng: None,
+            altitude_m: None,
+        }
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn should_number_a_second_ride_that_would_share_a_name() {
+        let names = vec!["a.fit".to_string(), "a.fit".into(), "a.fit".into()];
+        assert_eq!(unique_file_names(names), ["a.fit", "a-2.fit", "a-3.fit"]);
+    }
+
+    #[test]
+    fn should_treat_names_differing_only_in_case_as_a_clash() {
+        // On FAT or exFAT these are one file, and the second write replaces the first.
+        let names = vec!["Ride.fit".to_string(), "ride.fit".into()];
+        assert_eq!(unique_file_names(names), ["Ride.fit", "ride-2.fit"]);
+    }
+
+    #[test]
+    fn should_not_hand_out_a_numbered_name_a_later_ride_already_has() {
+        // The numbered name for the first clash is a real name further down.
+        let names = vec!["a.fit".to_string(), "a.fit".into(), "a-2.fit".into()];
+        assert_eq!(unique_file_names(names), ["a.fit", "a-2.fit", "a-2-2.fit"]);
+    }
+
+    #[test]
+    fn should_number_a_name_with_no_extension() {
+        let names = vec!["ride".to_string(), "ride".into()];
+        assert_eq!(unique_file_names(names), ["ride", "ride-2"]);
+    }
+
+    #[test]
+    fn should_leave_distinct_names_alone() {
+        assert!(unique_file_names(Vec::new()).is_empty());
+        let names = vec!["a.fit".to_string(), "b.fit".into()];
+        assert_eq!(unique_file_names(names), ["a.fit", "b.fit"]);
+    }
+
+    #[tokio::test]
+    async fn should_write_one_readable_fit_file_per_ride() {
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        ride(&pool, "2026-05-01T10:00:00+00:00", Some("Threshold"), 60).await;
+        ride(&pool, "2026-05-02T10:00:00+00:00", Some("Sweet Spot"), 90).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let report = export_rides(&pool, &out).await.unwrap();
+
+        assert_eq!(
+            report,
+            RideExport {
+                written: 2,
+                empty: 0,
+                failed: 0
+            }
+        );
+        let names = files_in(&out);
+        assert_eq!(names.len(), 2);
+        assert!(names[0].starts_with("Sweet_Spot-2026-05-02-"), "{names:?}");
+        assert!(names[1].starts_with("Threshold-2026-05-01-"), "{names:?}");
+        // Read back with the importer: the file must be a real activity, and
+        // the right ride must be in the right file.
+        let back = crate::data::fit::import_fit_file(&out.join(&names[0])).unwrap();
+        assert_eq!(back.data_points.len(), 90);
+    }
+
+    #[tokio::test]
+    async fn should_keep_both_rides_when_two_would_share_a_name() {
+        // Same title, same minute: the second write would replace the first.
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        ride(&pool, "2026-05-01T10:00:05+00:00", Some("Ride"), 60).await;
+        ride(&pool, "2026-05-01T10:00:40+00:00", Some("ride"), 120).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let report = export_rides(&pool, &out).await.unwrap();
+
+        assert_eq!(report.written, 2);
+        let names = files_in(&out);
+        assert_eq!(names.len(), 2, "{names:?}");
+        // The earlier ride keeps the plain name.
+        let plain = names.iter().find(|n| !n.ends_with("-2.fit")).unwrap();
+        let first = crate::data::fit::import_fit_file(&out.join(plain)).unwrap();
+        assert_eq!(first.data_points.len(), 60);
+    }
+
+    #[tokio::test]
+    async fn should_skip_and_count_rides_with_no_samples() {
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 3).await; // three empty rides
+        ride(&pool, "2026-06-01T10:00:00+00:00", Some("Real"), 30).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let report = export_rides(&pool, &out).await.unwrap();
+
+        assert_eq!(
+            report,
+            RideExport {
+                written: 1,
+                empty: 3,
+                failed: 0
+            }
+        );
+        assert_eq!(files_in(&out).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_write_nothing_for_an_empty_history() {
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        assert_eq!(
+            export_rides(&pool, &out).await.unwrap(),
+            RideExport::default()
+        );
+        assert!(files_in(&out).is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_leave_out_a_ride_still_in_progress() {
+        // A checkpointed ride has no end: it is not history yet.
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        let mut live = crate::data::session::Session::new(None);
+        live.data_points = (0..10).map(sample).collect();
+        crate::data::db::checkpoint_session(&pool, None, &live)
+            .await
+            .unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        assert_eq!(export_rides(&pool, &out).await.unwrap().written, 0);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_a_target_that_is_not_a_folder() {
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        ride(&pool, "2026-05-01T10:00:00+00:00", Some("Threshold"), 60).await;
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert!(export_rides(&pool, &file).await.is_err());
+        assert!(export_rides(&pool, &dir.join("missing")).await.is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn should_refresh_an_archive_rather_than_double_it() {
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        ride(&pool, "2026-05-01T10:00:00+00:00", Some("Threshold"), 60).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        export_rides(&pool, &out).await.unwrap();
+        export_rides(&pool, &out).await.unwrap();
+
+        assert_eq!(files_in(&out).len(), 1, "{:?}", files_in(&out));
+    }
+
+    #[tokio::test]
+    async fn should_name_a_ride_with_a_turkish_title_and_no_title_at_all() {
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        ride(
+            &pool,
+            "2026-05-01T10:00:00+00:00",
+            Some("İzmir – Çeşme"),
+            30,
+        )
+        .await;
+        ride(&pool, "2026-05-02T10:00:00+00:00", None, 30).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        assert_eq!(export_rides(&pool, &out).await.unwrap().written, 2);
+        let names = files_in(&out);
+        assert!(
+            names.iter().any(|n| n.starts_with("İzmir___Çeşme-")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("Ride-2026-05-02-")),
+            "{names:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_count_a_ride_it_could_not_write() {
+        // A read-only folder: every write fails, and the report must say so
+        // rather than claim an export that is not on disk.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let pool = history(&dir, "cycle.db", 0).await;
+        ride(&pool, "2026-05-01T10:00:00+00:00", Some("A"), 30).await;
+        ride(&pool, "2026-05-02T10:00:00+00:00", Some("B"), 30).await;
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(out.join("probe"), b"").is_ok() {
+            return; // running as root: permissions do not bind, nothing to test
+        }
+
+        let report = export_rides(&pool, &out).await.unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            report,
+            RideExport {
+                written: 0,
+                empty: 0,
+                failed: 2
+            }
+        );
     }
 }
