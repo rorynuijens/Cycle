@@ -1,5 +1,6 @@
 /target
 /_build
+/_build51
 /build-dir
 /cargo-home
 /.flatpak-builder
