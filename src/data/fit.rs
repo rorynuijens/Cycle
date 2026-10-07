@@ -71,11 +71,18 @@ fn semicircles(degrees: Option<f64>) -> i32 {
     }
 }
 
+/// The most characters of the ride's title a filename keeps.
+const MAX_STEM_CHARS: usize = 80;
+
 /// A filename-safe name for an exported activity, e.g. `Alpe_d_Huez-2026-08-01-1930.fit`.
 pub fn suggested_filename(session: &Session, title: &str) -> String {
     let safe: String = title
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        // Every Linux filesystem refuses a name over 255 bytes. Cut by
+        // characters, not bytes, so a multi-byte letter is never split; 80
+        // characters of at most 4 bytes each still leaves room for the stamp.
+        .take(MAX_STEM_CHARS)
         .collect();
     let safe = safe.trim_matches('_');
     let stem = if safe.is_empty() { "Ride" } else { safe };
@@ -1400,6 +1407,46 @@ mod tests {
     #[test]
     fn should_fall_back_to_ride_for_an_empty_name() {
         assert!(suggested_filename(&ride(1, false), "  ").starts_with("Ride-"));
+    }
+
+    #[test]
+    fn should_keep_a_long_multibyte_name_inside_the_filename_limit() {
+        // Every Linux filesystem refuses a name over 255 bytes, and `ğ` is two.
+        // 200 of them is a 400-byte stem: the write fails with "File name too
+        // long" and, in a bulk export, the ride is silently missing.
+        let name = suggested_filename(&ride(1, false), &"ğ".repeat(200));
+        assert!(name.len() <= 255, "{} bytes", name.len());
+        assert!(name.ends_with(".fit"));
+        // The stamp is what tells two rides apart, so it must survive the cut.
+        let stamp = ride(1, false)
+            .started_at
+            .with_timezone(&chrono::Local)
+            .format("-%Y-%m-%d-%H%M.fit")
+            .to_string();
+        assert!(name.ends_with(&stamp), "got {name}");
+        assert_eq!(
+            name.chars().take_while(|&c| c == 'ğ').count(),
+            MAX_STEM_CHARS
+        );
+    }
+
+    #[test]
+    fn should_leave_a_name_at_exactly_the_stem_limit_whole() {
+        let title = "a".repeat(MAX_STEM_CHARS);
+        let name = suggested_filename(&ride(1, false), &title);
+        assert!(name.starts_with(&format!("{title}-")), "got {name}");
+    }
+
+    #[test]
+    fn should_not_end_a_cut_stem_on_an_underscore() {
+        // 79 letters then a space: the cut lands just after the space, which
+        // would leave "…a_-2026…" — the trim must run after the cut, not before.
+        let title = format!("{} bcd", "a".repeat(MAX_STEM_CHARS - 1));
+        let name = suggested_filename(&ride(1, false), &title);
+        assert!(
+            name.starts_with(&format!("{}-", "a".repeat(MAX_STEM_CHARS - 1))),
+            "got {name}"
+        );
     }
     #[test]
     fn should_refuse_a_truncated_fit_file_instead_of_panicking() {
