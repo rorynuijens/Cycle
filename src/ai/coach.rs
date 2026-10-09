@@ -3,6 +3,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::data::training_profile::{BlockPattern, TrainingProfile};
 use crate::data::{athlete::AthleteProfile, db::AthleteGoal};
 
 // ── Workout options (library → prompt) ───────────────────────────────────────
@@ -58,6 +59,9 @@ pub struct ProgramContext {
     /// Dates the rider has already said they will not be training. A plan laid
     /// over a fortnight they are away for is a plan they will miss.
     pub time_off: Vec<NaiveDate>,
+    /// What the rider told the guided builder. `None` builds exactly the prompt
+    /// used before the profile existed.
+    pub profile: Option<TrainingProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +117,20 @@ fn time_off_section(start_monday: NaiveDate, dates: &[NaiveDate], weeks: u32) ->
         .join("\n")
 }
 
+/// The profile block and the block pattern a prompt plans with.
+///
+/// With no profile the section is empty and the pattern is the three-and-one
+/// every program used before, so the prompt is unchanged.
+fn profile_parts(
+    profile: Option<&TrainingProfile>,
+    start_monday: NaiveDate,
+) -> (String, BlockPattern) {
+    match profile {
+        Some(p) => (p.prompt_section(start_monday), p.block_pattern()),
+        None => (String::new(), BlockPattern::ThreeOne),
+    }
+}
+
 pub fn build_program_prompt(ctx: &ProgramContext) -> String {
     let wkg = if ctx.athlete.weight_kg > 0.0 {
         format!(
@@ -158,6 +176,14 @@ pub fn build_program_prompt(ctx: &ProgramContext) -> String {
     };
 
     let time_off_text = time_off_section(ctx.start_monday, &ctx.time_off, week_count);
+    let (profile_section, pattern) = profile_parts(ctx.profile.as_ref(), ctx.start_monday);
+    // The default mix names sweet spot; a polarised rider has ruled it out, so
+    // with a profile the mix defers to it instead of contradicting it.
+    let build_mix = if ctx.profile.is_some() {
+        "the TRAINING PROFILE above"
+    } else {
+        "mix of sweet spot, threshold, VO₂max depending on goals and current fitness"
+    };
 
     format!(
         r#"You are an expert cycling coach building a structured training program.
@@ -170,7 +196,7 @@ pub fn build_program_prompt(ctx: &ProgramContext) -> String {
 GOALS:
 {goals}
 
-TRAINING SCHEDULE:
+{profile_section}TRAINING SCHEDULE:
 - Training days: {days}
 - Program duration: {duration}
 - Week 1 of your reply is the week beginning Monday {start}.
@@ -181,7 +207,7 @@ PLANNED TIME OFF — the rider is away or unavailable on these days:
 AVAILABLE WORKOUTS:
 {workouts}
 
-Build a {weeks}-week training program. Apply progressive overload: weeks 1–3 build load, week 4 is a recovery week (lighter workouts), then repeat. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: mix of sweet spot, threshold, VO₂max depending on goals and current fitness).
+Build a {weeks}-week training program. Apply progressive overload: {pattern}. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: {build_mix}).
 
 Return ONLY a JSON array — no text before or after it — in exactly this format:
 [
@@ -207,6 +233,9 @@ Rules:
         time_off = time_off_text,
         workouts = workout_list,
         weeks = week_count,
+        profile_section = profile_section,
+        pattern = pattern.build_sentence(),
+        build_mix = build_mix,
     )
 }
 
@@ -241,6 +270,9 @@ pub struct ProgramRevisionContext {
     pub start_monday: NaiveDate,
     /// Dates the rider has already said they will not be training.
     pub time_off: Vec<NaiveDate>,
+    /// The rider's guided-builder answers. A replan that forgot them would undo
+    /// the approach the program was built on.
+    pub profile: Option<TrainingProfile>,
 }
 
 /// Ask the coach to replan the remainder of a program.
@@ -309,6 +341,7 @@ pub fn build_program_revision_prompt(ctx: &ProgramRevisionContext) -> String {
 
     let time_off_text =
         time_off_section(ctx.start_monday, &ctx.time_off, ctx.weeks_remaining.max(1));
+    let (profile_section, pattern) = profile_parts(ctx.profile.as_ref(), ctx.start_monday);
 
     format!(
         r#"You are an expert cycling coach revising a training program already under way.
@@ -321,7 +354,7 @@ pub fn build_program_revision_prompt(ctx: &ProgramRevisionContext) -> String {
 GOALS:
 {goals}
 
-THE PROGRAM SO FAR:
+{profile_section}THE PROGRAM SO FAR:
 - The rider is in week {current_week}.
 - Sessions completed: {completed}
 - Sessions missed in the last fortnight: {missed}
@@ -347,7 +380,7 @@ Take the rider's actual training into account rather than the plan they were giv
 - Missed sessions are gone. Do NOT try to make up lost work by adding volume or intensity.
 - If form (TSB) is very negative, or wellness is trending badly, start easier and rebuild.
 - If the rider has been consistent and form is good, progress normally.
-- Keep applying progressive overload with a lighter recovery week every fourth week.
+- Keep applying progressive overload with a lighter recovery week {cadence}.
 
 Return ONLY a JSON array — no text before or after it — in exactly this format:
 [
@@ -376,6 +409,8 @@ Rules:
         days = ctx.training_days.join(", "),
         workouts = workout_list,
         weeks = ctx.weeks_remaining.max(1),
+        profile_section = profile_section,
+        cadence = pattern.revision_cadence(),
     )
 }
 
@@ -631,7 +666,98 @@ mod tests {
             num_weeks,
             start_monday: start(),
             time_off: Vec::new(),
+            profile: None,
         }
+    }
+
+    fn revision_ctx() -> ProgramRevisionContext {
+        ProgramRevisionContext {
+            athlete: AthleteProfile::default(),
+            ctl: 50.0,
+            tsb: -5.0,
+            goals: vec![goal("Ride a century")],
+            athlete_context: String::new(),
+            workout_options: vec![workout("Sweet Spot 2x20")],
+            training_days: vec!["monday".into(), "wednesday".into()],
+            current_week: 3,
+            weeks_remaining: 5,
+            completed: 6,
+            missed: 1,
+            recent_missed: vec!["Wed 2 Sep — Sweet Spot 2x20".into()],
+            wellness: Vec::new(),
+            start_monday: start(),
+            time_off: Vec::new(),
+            profile: None,
+        }
+    }
+
+    fn polarised_new_rider() -> TrainingProfile {
+        use crate::data::training_profile::{Approach, Experience};
+        TrainingProfile {
+            approach: Approach::Polarised,
+            experience: Experience::New,
+            ..TrainingProfile::default()
+        }
+    }
+
+    #[test]
+    fn should_build_todays_program_prompt_exactly_when_there_is_no_profile() {
+        // Frozen before the profile existed: a rider who never opens the guided
+        // builder must get the prompt the coach was tuned on, byte for byte.
+        assert_eq!(
+            build_program_prompt(&program_ctx(Some(8))),
+            include_str!("testdata/program_prompt_no_profile.txt")
+        );
+    }
+
+    #[test]
+    fn should_build_todays_replan_prompt_exactly_when_there_is_no_profile() {
+        assert_eq!(
+            build_program_revision_prompt(&revision_ctx()),
+            include_str!("testdata/revision_prompt_no_profile.txt")
+        );
+    }
+
+    #[test]
+    fn should_put_the_profile_between_goals_and_schedule() {
+        let mut ctx = program_ctx(Some(8));
+        ctx.profile = Some(polarised_new_rider());
+        let prompt = build_program_prompt(&ctx);
+        let goals = prompt.find("GOALS:").unwrap();
+        let profile = prompt.find("TRAINING PROFILE").unwrap();
+        let schedule = prompt.find("TRAINING SCHEDULE:").unwrap();
+        assert!(goals < profile && profile < schedule, "{prompt}");
+    }
+
+    #[test]
+    fn should_drop_the_three_and_one_cycle_for_a_two_and_one_rider() {
+        let mut ctx = program_ctx(Some(8));
+        ctx.profile = Some(polarised_new_rider());
+        let prompt = build_program_prompt(&ctx);
+        assert!(!prompt.contains("weeks 1–3 build load"), "{prompt}");
+        assert!(prompt.contains(
+            "Apply progressive overload: weeks 1–2 build load, week 3 is a recovery week"
+        ));
+    }
+
+    #[test]
+    fn should_not_suggest_sweet_spot_to_a_polarised_rider() {
+        // The default build-week mix names sweet spot, which the polarised line
+        // forbids; the prompt must not say both.
+        let mut ctx = program_ctx(Some(8));
+        ctx.profile = Some(polarised_new_rider());
+        let prompt = build_program_prompt(&ctx);
+        assert!(!prompt.contains("mix of sweet spot"), "{prompt}");
+        assert!(prompt.contains("build weeks: the TRAINING PROFILE above"));
+    }
+
+    #[test]
+    fn should_keep_the_rider_s_cycle_when_replanning() {
+        let mut ctx = revision_ctx();
+        ctx.profile = Some(polarised_new_rider());
+        let prompt = build_program_revision_prompt(&ctx);
+        assert!(prompt.contains("a lighter recovery week every third week."));
+        assert!(prompt.contains("- Approach: polarised."));
     }
 
     #[test]

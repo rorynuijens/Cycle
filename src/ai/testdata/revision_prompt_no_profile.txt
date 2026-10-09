@@ -1,0 +1,49 @@
+You are an expert cycling coach revising a training program already under way.
+
+ATHLETE:
+- FTP: 200 W · 70.0 kg
+- Current CTL (fitness): 50
+- Current TSB (form): -5
+
+GOALS:
+  - Ride a century
+
+THE PROGRAM SO FAR:
+- The rider is in week 3.
+- Sessions completed: 6
+- Sessions missed in the last fortnight: 1
+
+RECENTLY MISSED SESSIONS:
+  - Wed 2 Sep — Sweet Spot 2x20
+
+RECENT WELLNESS:
+  No recent readings.
+
+PLANNED TIME OFF — the rider is away or unavailable on these days:
+  None planned.
+
+TRAINING SCHEDULE:
+- Training days: monday, wednesday
+
+AVAILABLE WORKOUTS:
+  - Sweet Spot 2x20 (Threshold, 60 min, TSS 60)
+
+Replan the next 5 weeks, starting from next week. Week 1 of your reply is the week beginning Monday 7 September 2026.
+
+Take the rider's actual training into account rather than the plan they were given:
+- Missed sessions are gone. Do NOT try to make up lost work by adding volume or intensity.
+- If form (TSB) is very negative, or wellness is trending badly, start easier and rebuild.
+- If the rider has been consistent and form is good, progress normally.
+- Keep applying progressive overload with a lighter recovery week every fourth week.
+
+Return ONLY a JSON array — no text before or after it — in exactly this format:
+[
+  {"week": 1, "day": "monday", "workout": "Exact Workout Name"},
+  {"week": 1, "day": "wednesday", "workout": "Exact Workout Name"}
+]
+
+Rules:
+- Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
+- Use only the days listed in TRAINING SCHEDULE.
+- Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
+- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday.

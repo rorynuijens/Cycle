@@ -6,6 +6,7 @@
 use chrono::NaiveDate;
 use sqlx::SqlitePool;
 
+use crate::data::training_profile::TrainingProfile;
 use crate::data::{db, settings};
 
 /// Days of wellness history sent with a coaching prompt.
@@ -135,6 +136,9 @@ pub struct ProgramPromptData {
     pub icu_workouts: Vec<db::IntervalsWorkout>,
     pub wellness: Vec<db::WellnessEntry>,
     pub time_off: Vec<db::TimeOffEntry>,
+    /// The guided builder's saved answers, read here so the build and the
+    /// replan cannot disagree about them.
+    pub training_profile: Option<TrainingProfile>,
 }
 
 /// Load the history a training program is built from. Aborts on the first
@@ -167,5 +171,6 @@ pub async fn load_program_prompt_data(
             &lookahead.format("%Y-%m-%d").to_string(),
         )
         .await?,
+        training_profile: settings::training_profile(pool).await?,
     })
 }

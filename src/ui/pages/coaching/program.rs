@@ -11,15 +11,15 @@ use crate::ai::coach::{
     build_program_prompt, get_suggestion, parse_program_response, ProgramContext, ProgramEntry,
 };
 use crate::ai::context::{drop_time_off_days, entry_date, format_program, workouts_as_options};
-use crate::data::{athlete::AthleteProfile, db, keystore, workout::Workout};
+use crate::data::training_profile::{TrainingProfile, ROLLING_WEEKS};
+use crate::data::{athlete::AthleteProfile, db, keystore, settings, workout::Workout};
 use crate::training::fitness::compute_load_metrics;
 use crate::ui::markdown::to_pango;
 use crate::ui::AiFailure;
 
 use super::data::{load_program_prompt_data, ProgramPromptData};
 
-/// Weeks generated when the rider asks for no fixed end date.
-const OPEN_ENDED_WEEKS: u32 = 8;
+const NO_PROFILE: &str = "Not set up yet — Build Program walks you through it";
 
 const NO_API_KEY: &str = "No AI provider key configured. Enter your API key in \
                           Preferences → Integrations.";
@@ -37,9 +37,11 @@ pub struct ProgramSection {
     output: gtk::Label,
     output_frame: gtk::Box,
     schedule_btn: gtk::Button,
-    day_toggles: crate::ui::widgets::day_toggles::DayToggles,
-    months_row: adw::SpinRow,
-    open_ended_row: adw::SwitchRow,
+    /// Shows the guided builder's saved answers in one line.
+    profile_row: adw::ActionRow,
+    /// The answers the last program was built from — and so the training days
+    /// scheduling records. `None` until the rider has been through the wizard.
+    profile: Rc<RefCell<Option<TrainingProfile>>>,
     entries: Rc<RefCell<Vec<ProgramEntry>>>,
     /// The Monday the coach was told week 1 would land on. The schedule dialog
     /// offers it back rather than defaulting to today, so a plan built around a
@@ -90,47 +92,18 @@ impl ProgramSection {
         header.append(&build_btn);
         root.append(&header);
 
-        root.append(
-            &gtk::Label::builder()
-                .label("Training days")
-                .halign(gtk::Align::Start)
-                .css_classes(["caption-heading", "dim-label"])
-                .build(),
-        );
-
-        // The same strip the roll-over dialog asks with, so one weekday picker
-        // is the app's answer rather than two that drift.
-        let day_toggles = crate::ui::widgets::day_toggles::DayToggles::new(
-            &crate::ui::widgets::day_toggles::DEFAULT_DAYS,
-        );
-        root.append(day_toggles.widget());
-
-        let months_adj = gtk::Adjustment::new(3.0, 1.0, 24.0, 1.0, 3.0, 0.0);
-        let months_row = adw::SpinRow::new(Some(&months_adj), 1.0, 0);
-        months_row.set_title("Duration (months)");
-        months_row.set_tooltip_text(Some("Number of months for the training program"));
-
-        let open_ended_row = adw::SwitchRow::builder()
-            .title("Open-ended")
-            .subtitle(format!(
-                "Generate {OPEN_ENDED_WEEKS} weeks without a fixed end date"
-            ))
-            .tooltip_text("Build a program without a fixed end date")
+        // Everything the build asks is answered in the guided builder; this row
+        // only says what was answered last.
+        let profile_row = adw::ActionRow::builder()
+            .title("Training Profile")
+            .subtitle(NO_PROFILE)
             .build();
-
-        let duration_list = gtk::ListBox::builder()
+        let profile_list = gtk::ListBox::builder()
             .css_classes(["boxed-list"])
             .selection_mode(gtk::SelectionMode::None)
             .build();
-        duration_list.append(&months_row);
-        duration_list.append(&open_ended_row);
-        root.append(&duration_list);
-
-        // A duration means nothing once there is no end date to count towards.
-        let months_for_toggle = months_row.clone();
-        open_ended_row.connect_active_notify(move |row| {
-            months_for_toggle.set_sensitive(!row.is_active());
-        });
+        profile_list.append(&profile_row);
+        root.append(&profile_list);
 
         let output = gtk::Label::builder()
             .label("")
@@ -166,9 +139,8 @@ impl ProgramSection {
             output,
             output_frame,
             schedule_btn,
-            day_toggles,
-            months_row,
-            open_ended_row,
+            profile_row,
+            profile: Rc::new(RefCell::new(None)),
             entries: Rc::new(RefCell::new(Vec::new())),
             plan_start: Rc::new(RefCell::new(None)),
             workouts,
@@ -189,21 +161,13 @@ impl ProgramSection {
         &self.root
     }
 
-    /// The days the rider ticked, named as the prompt expects.
-    fn selected_days(&self) -> Vec<String> {
-        self.day_toggles
-            .selected()
-            .iter()
-            .map(|d| crate::ai::context::weekday_name(*d).to_string())
-            .collect()
-    }
-
-    /// How many weeks to plan, or `None` when the rider wants no end date.
-    fn requested_weeks(&self) -> Option<u32> {
-        if self.open_ended_row.is_active() {
-            None
-        } else {
-            Some((self.months_row.value() as u32) * 4)
+    /// Show the saved answers on the summary row.
+    fn show_profile(&self, profile: Option<&TrainingProfile>) {
+        match profile {
+            Some(p) => self
+                .profile_row
+                .set_subtitle(&super::profile_wizard::summary_line(p)),
+            None => self.profile_row.set_subtitle(NO_PROFILE),
         }
     }
 
@@ -221,34 +185,54 @@ impl ProgramSection {
         rt_handle: tokio::runtime::Handle,
         athlete: Rc<RefCell<AthleteProfile>>,
     ) {
+        // The saved answers, so the wizard opens on them and the row says what
+        // the next build will use. Read off the main thread (CLAUDE.md §2.3).
+        {
+            let section = self.clone_handles();
+            let pool = pool.clone();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move { settings::training_profile(&pool).await },
+                move |result| match result {
+                    Ok(saved) => {
+                        section.show_profile(saved.as_ref());
+                        *section.profile.borrow_mut() = saved;
+                    }
+                    Err(e) => tracing::error!("Could not read the training profile: {e}"),
+                },
+            );
+        }
+
         let section = self.clone_handles();
         let spinner = spinner.clone();
+        let (build_pool, build_rt) = (pool.clone(), rt_handle.clone());
 
-        button.connect_clicked(move |btn| {
-            let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
-                Ok(Some(k)) if !k.trim().is_empty() => k,
-                _ => {
-                    section.set_status(NO_API_KEY);
-                    return;
-                }
-            };
-
-            let training_days = section.selected_days();
-            if training_days.is_empty() {
-                section.set_status("Please select at least one training day.");
-                return;
-            }
-            let num_weeks = section.requested_weeks();
-
+        let run_build = move |btn: gtk::Button,
+                              api_key: String,
+                              training_profile: TrainingProfile| {
             // Fixed here, before the request, rather than at scheduling time.
             // The coach answers in (week, day) pairs, so it can only be told to
             // avoid a date if the calendar those weeks land on is already
             // decided — see the PLANNED TIME OFF block in the prompt.
             let start_monday = week_start(Local::now().date_naive());
+            let num_weeks = match training_profile.weeks(start_monday) {
+                Ok(weeks) => weeks,
+                // The wizard checked the date against this same Monday, so this
+                // is only reachable if the build straddles midnight on a Sunday.
+                Err(e) => {
+                    section.set_status(&e.to_string());
+                    return;
+                }
+            };
+            let training_days: Vec<String> = training_profile
+                .training_days
+                .iter()
+                .map(|d| crate::ai::context::weekday_name(*d).to_string())
+                .collect();
             *section.plan_start.borrow_mut() = Some(start_monday);
             // The last day the plan can reach, so time off is read that far.
             let through =
-                start_monday + CDuration::days(num_weeks.unwrap_or(OPEN_ENDED_WEEKS) as i64 * 7);
+                start_monday + CDuration::days(num_weeks.unwrap_or(ROLLING_WEEKS) as i64 * 7);
 
             // Read the !Send shared state on the main thread before spawning.
             let profile = athlete.borrow().clone();
@@ -264,11 +248,11 @@ impl ProgramSection {
 
             let (tx, rx) =
                 async_channel::bounded::<Result<(String, Vec<db::IntervalsWorkout>), AiFailure>>(1);
-            let pool_task = pool.clone();
+            let pool_task = build_pool.clone();
             // All DB reads + prompt assembly + the network call run off the main
             // thread (CLAUDE.md §2.3). icu_workouts comes back with the reply so
             // the handler can format a program naming Intervals.icu workouts.
-            rt_handle.spawn(async move {
+            build_rt.spawn(async move {
                 let today = Local::now().date_naive();
                 let ProgramPromptData {
                     athlete_ctx,
@@ -278,6 +262,9 @@ impl ProgramSection {
                     icu_workouts,
                     wellness: _,
                     time_off,
+                    // The answers just given, below, rather than the stored
+                    // copy: the save may not have landed yet.
+                    training_profile: _,
                 } = match load_program_prompt_data(&pool_task, today, through).await {
                     Ok(data) => data,
                     Err(e) => {
@@ -299,6 +286,7 @@ impl ProgramSection {
                     num_weeks,
                     start_monday,
                     time_off: time_off.iter().map(|t| t.date).collect(),
+                    profile: Some(training_profile),
                 };
 
                 let result = get_suggestion(&api_key, &build_program_prompt(&ctx), 2800)
@@ -339,6 +327,38 @@ impl ProgramSection {
                 spinner.set_visible(false);
                 btn.set_sensitive(true);
             });
+        };
+        let run_build = Rc::new(run_build);
+
+        let section = self.clone_handles();
+        button.connect_clicked(move |btn| {
+            // Checked before the questions, not after: a rider who answers every
+            // step only to be told there is no key has been wasted.
+            let api_key = match keystore::get_secret(keystore::KEY_ANTHROPIC) {
+                Ok(Some(k)) if !k.trim().is_empty() => k,
+                _ => {
+                    section.set_status(NO_API_KEY);
+                    return;
+                }
+            };
+            let initial = section.profile.borrow().clone().unwrap_or_default();
+            let section = section.clone_handles();
+            let run_build = Rc::clone(&run_build);
+            let pool = pool.clone();
+            let rt_handle = rt_handle.clone();
+            let btn = btn.clone();
+            super::profile_wizard::show(&btn.clone(), initial, move |answers| {
+                section.show_profile(Some(&answers));
+                *section.profile.borrow_mut() = Some(answers.clone());
+                let to_save = answers.clone();
+                crate::ui::spawn_write(
+                    &rt_handle,
+                    &pool,
+                    "the training profile",
+                    |pool| async move { settings::set_training_profile(&pool, &to_save).await },
+                );
+                run_build(btn.clone(), api_key.clone(), answers);
+            });
         });
     }
 
@@ -352,7 +372,7 @@ impl ProgramSection {
         let plan_start = Rc::clone(&self.plan_start);
         let workouts = Rc::clone(&self.workouts);
 
-        let days = self.day_toggles.clone();
+        let profile = Rc::clone(&self.profile);
 
         self.schedule_btn.connect_clicked(move |btn| {
             let entries = entries.borrow().clone();
@@ -373,7 +393,20 @@ impl ProgramSection {
             let rt_handle = rt_handle.clone();
             let on_toast = Rc::clone(&on_toast);
             let workouts = Rc::clone(&workouts);
-            let training_days = days.selected_csv();
+            // The days the program was built for, as `programs.training_days`
+            // stores them. Empty only if no profile exists, which cannot be the
+            // case once there are entries to schedule.
+            let training_days = profile
+                .borrow()
+                .as_ref()
+                .map(|p| {
+                    p.training_days
+                        .iter()
+                        .map(|d| crate::ai::context::weekday_name(*d))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
             let btn = btn.clone();
             let pool_for_check = pool.clone();
 
@@ -649,9 +682,8 @@ impl ProgramSection {
             output: self.output.clone(),
             output_frame: self.output_frame.clone(),
             schedule_btn: self.schedule_btn.clone(),
-            day_toggles: self.day_toggles.clone(),
-            months_row: self.months_row.clone(),
-            open_ended_row: self.open_ended_row.clone(),
+            profile_row: self.profile_row.clone(),
+            profile: Rc::clone(&self.profile),
             entries: Rc::clone(&self.entries),
             plan_start: Rc::clone(&self.plan_start),
             workouts: Rc::clone(&self.workouts),

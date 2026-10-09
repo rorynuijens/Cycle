@@ -7,6 +7,7 @@
 pub(crate) mod data;
 mod goals;
 mod plan;
+mod profile_wizard;
 mod program;
 mod suggestion;
 

@@ -1,0 +1,34 @@
+You are an expert cycling coach building a structured training program.
+
+ATHLETE:
+- FTP: 200 W · 70.0 kg · 2.86 W/kg
+- Current CTL (fitness): 50
+- Current TSB (form): +5
+
+GOALS:
+  - Ride a century
+
+TRAINING SCHEDULE:
+- Training days: monday, wednesday
+- Program duration: 8 weeks
+- Week 1 of your reply is the week beginning Monday 7 September 2026.
+
+PLANNED TIME OFF — the rider is away or unavailable on these days:
+  None planned.
+
+AVAILABLE WORKOUTS:
+  - Sweet Spot 2x20 (Threshold, 60 min, TSS 60)
+
+Build a 8-week training program. Apply progressive overload: weeks 1–3 build load, week 4 is a recovery week (lighter workouts), then repeat. Match intensity to phase (recovery weeks: recovery/endurance only; build weeks: mix of sweet spot, threshold, VO₂max depending on goals and current fitness).
+
+Return ONLY a JSON array — no text before or after it — in exactly this format:
+[
+  {"week": 1, "day": "monday", "workout": "Exact Workout Name"},
+  {"week": 1, "day": "wednesday", "workout": "Exact Workout Name"}
+]
+
+Rules:
+- Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
+- Use only the days listed in TRAINING SCHEDULE.
+- Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
+- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday.

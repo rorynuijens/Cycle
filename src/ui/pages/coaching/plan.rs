@@ -1298,6 +1298,18 @@ fn weeks_between(start: NaiveDate, end: NaiveDate) -> u32 {
     ((days / 7) as u32 + 1).max(crate::training::program::BLOCK_WEEKS)
 }
 
+/// Weeks a replan covers: the program's remaining span, cut at the event.
+///
+/// Never past the event — a program stretched beyond it by an old span, or an
+/// event the rider has since moved earlier, would plan through race day and put
+/// the taper in the wrong place.
+fn replan_weeks(span_left: u32, event_week: Option<u32>) -> u32 {
+    match event_week {
+        Some(event_week) => span_left.min(event_week),
+        None => span_left,
+    }
+}
+
 /// The Monday after `date` — where a replanned program picks up.
 fn next_monday(date: NaiveDate) -> NaiveDate {
     let ahead = 7 - date.weekday().num_days_from_monday() as i64;
@@ -1338,13 +1350,20 @@ async fn rebuild_program(
     // had run past — the coach was asked to replan a single week on exactly the
     // programs most in need of replanning, and the same number clipped the
     // time-off window below, hiding the rider's holidays from it too.
-    let weeks_left = weeks_between(start, last_day(&program));
+    let span_left = weeks_between(start, last_day(&program));
     let data = super::data::load_program_prompt_data(
         &pool,
         today,
-        start + CDuration::days(weeks_left as i64 * 7),
+        start + CDuration::days(span_left as i64 * 7),
     )
     .await?;
+    // Reading time off over the longer span above is harmless — the prompt
+    // clips it to the weeks it plans.
+    let event_week = data
+        .training_profile
+        .as_ref()
+        .and_then(|p| p.week_holding_event(start));
+    let weeks_left = replan_weeks(span_left, event_week);
 
     let metrics = crate::training::fitness::compute_load_metrics(
         &data.records,
@@ -1416,10 +1435,15 @@ async fn rebuild_program(
         wellness: wellness_snapshots(&data.wellness),
         start_monday: start,
         time_off: off_days.iter().copied().collect(),
+        profile: data.training_profile,
     };
 
     let reply = get_suggestion(&api_key, &build_program_revision_prompt(&ctx), 2800).await?;
-    let entries = parse_program_response(&reply);
+    let mut entries = parse_program_response(&reply);
+    // The prompt says to plan nothing after the event; this enforces it.
+    if event_week.is_some() {
+        entries.retain(|e| e.week <= weeks_left);
+    }
     anyhow::ensure!(
         !entries.is_empty(),
         "the coach's reply held no sessions we could read"
@@ -1485,6 +1509,21 @@ fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
 mod tests {
     use super::*;
     use crate::data::workout::WorkoutCategory;
+
+    #[test]
+    fn should_never_replan_past_an_event_five_weeks_out() {
+        assert_eq!(replan_weeks(12, Some(5)), 5);
+    }
+
+    #[test]
+    fn should_replan_the_whole_span_when_it_ends_before_the_event() {
+        assert_eq!(replan_weeks(4, Some(5)), 4);
+    }
+
+    #[test]
+    fn should_replan_the_whole_span_with_no_event() {
+        assert_eq!(replan_weeks(12, None), 12);
+    }
     use crate::training::program::{status, PlannedSession, Program};
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {

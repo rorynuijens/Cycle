@@ -19,6 +19,7 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use super::db;
+use super::training_profile::TrainingProfile;
 
 /// The settings keys this app reads and writes.
 ///
@@ -48,6 +49,7 @@ pub mod keys {
 
     pub const FIRST_USE_COMPLETE: &str = "first_use_complete";
     pub const COACHING_CONTEXT: &str = "coaching.athlete_context";
+    pub const TRAINING_PROFILE: &str = "coaching.training_profile";
 }
 
 /// Booleans are stored as `"1"` / `"0"`; anything else reads as unset.
@@ -343,6 +345,21 @@ pub async fn set_coaching_context(pool: &SqlitePool, context: &str) -> Result<()
     db::set_setting(pool, keys::COACHING_CONTEXT, context).await
 }
 
+// ── Training profile ─────────────────────────────────────────────────────────
+
+/// The answers the program builder last saved, or `None` when the rider has
+/// never answered or the stored value cannot be trusted (see
+/// [`TrainingProfile::from_json`]). Errors only when the database read fails.
+pub async fn training_profile(pool: &SqlitePool) -> Result<Option<TrainingProfile>> {
+    Ok(db::get_setting(pool, keys::TRAINING_PROFILE)
+        .await?
+        .and_then(|raw| TrainingProfile::from_json(&raw)))
+}
+
+pub async fn set_training_profile(pool: &SqlitePool, profile: &TrainingProfile) -> Result<()> {
+    db::set_setting(pool, keys::TRAINING_PROFILE, &profile.to_json()?).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,11 +553,40 @@ mod tests {
             keys::OVERLAY_HINT_SEEN,
             keys::FIRST_USE_COMPLETE,
             keys::COACHING_CONTEXT,
+            keys::TRAINING_PROFILE,
         ];
         let mut seen = std::collections::HashSet::new();
         for key in all {
             assert!(seen.insert(key), "duplicate settings key: {key}");
         }
+    }
+
+    #[tokio::test]
+    async fn should_read_no_training_profile_before_one_is_saved() {
+        let pool = test_pool().await;
+        assert_eq!(training_profile(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn should_read_back_the_training_profile_that_was_saved() {
+        let pool = test_pool().await;
+        let profile = TrainingProfile {
+            approach: crate::data::training_profile::Approach::Polarised,
+            ..TrainingProfile::default()
+        };
+        set_training_profile(&pool, &profile).await.unwrap();
+        assert_eq!(training_profile(&pool).await.unwrap(), Some(profile));
+    }
+
+    #[tokio::test]
+    async fn should_read_a_damaged_training_profile_as_none_not_an_error() {
+        // A bad row must open the wizard on defaults, not lock the rider out of
+        // building a program.
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::TRAINING_PROFILE, "{\"goal\":")
+            .await
+            .unwrap();
+        assert_eq!(training_profile(&pool).await.unwrap(), None);
     }
 
     #[tokio::test]
