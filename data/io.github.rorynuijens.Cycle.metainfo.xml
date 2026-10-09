@@ -90,6 +90,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.13.1" date="2026-10-09">
+      <description>
+        <p>Build Program now walks you through a few questions before the
+           AI Coach plans anything.</p>
+        <ul>
+          <li>Choose what you are training for — a climbing event, a long
+              ride, racing, a time trial, or no event — and, for an event,
+              its date. The program builds up to it and tapers in the last
+              two weeks.</li>
+          <li>Choose how you want to train (polarised, pyramidal, sweet spot,
+              or let the coach decide), how you recover from hard days, and
+              how long you have trained with structure.</li>
+          <li>Every question has a recommended answer already picked, and
+              your answers are remembered for the next build and used when
+              a program is replanned.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.0" date="2026-10-07">
       <description>
         <p>Your rides, out of Cycle.</p>
