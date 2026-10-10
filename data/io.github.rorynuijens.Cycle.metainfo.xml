@@ -90,6 +90,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.13.5" date="2026-10-10">
+      <description>
+        <p>More variety in your training program:</p>
+        <ul>
+          <li>The program builder now knows what each workout is, and avoids
+              repeating the same workout within three weeks.</li>
+          <li>When a session is eased or stepped up on the day, Cycle picks a
+              workout you have not ridden or planned recently.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.4" date="2026-10-10">
       <description>
         <p>Nine new workouts in the library, added to yours automatically:</p>
