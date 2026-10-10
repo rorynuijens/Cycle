@@ -257,7 +257,7 @@ impl WorkoutCategory {
 }
 
 impl Workout {
-    /// Returns the full structured training library of 100 workouts.
+    /// Returns the full structured training library.
     pub fn workout_library() -> Vec<Workout> {
         use WorkoutCategory::*;
         vec![
@@ -310,7 +310,7 @@ impl Workout {
                 Recovery,
                 vec![wu(5), Segment::ramp(20 * 60, 40.0, 50.0, "Flush"), cd(5)],
             ),
-            // ── Endurance (22) ─────────────────────────────────────────────────
+            // ── Endurance (24) ─────────────────────────────────────────────────
             mk(
                 "Endurance 60",
                 "Bread-and-butter Zone 2 aerobic ride.",
@@ -454,6 +454,30 @@ impl Workout {
                 "Extended aerobic base — 105 minutes of steady Zone 2.",
                 Endurance,
                 vec![wu(10), st(85 * 60, 65.0, "Aerobic Cap"), cd(10)],
+            ),
+            mk(
+                "Endurance 150",
+                "Two and a half hours of steady aerobic riding — the long day a \
+                 long event asks for.",
+                Endurance,
+                vec![wu(10), st(130 * 60, 65.0, "Endurance"), cd(10)],
+            ),
+            mk(
+                "Long Ride with Tempo",
+                "Three hours with three 20-minute tempo blocks, so the tempo comes \
+                 on tired legs the way it does late in a gran fondo.",
+                Endurance,
+                vec![
+                    wu(10),
+                    st(30 * 60, 65.0, "Endurance"),
+                    st(20 * 60, 80.0, "Tempo 1"),
+                    st(20 * 60, 65.0, "Endurance"),
+                    st(20 * 60, 80.0, "Tempo 2"),
+                    st(20 * 60, 65.0, "Endurance"),
+                    st(20 * 60, 80.0, "Tempo 3"),
+                    st(30 * 60, 65.0, "Endurance"),
+                    cd(10),
+                ],
             ),
             // ── Tempo (15) ─────────────────────────────────────────────────────
             mk(
@@ -605,7 +629,7 @@ impl Workout {
                     vec![cd(10)],
                 ]),
             ),
-            // ── Sweet Spot (12) ────────────────────────────────────────────────
+            // ── Sweet Spot (14) ────────────────────────────────────────────────
             mk(
                 "Sweet Spot 2x15",
                 "Two 15-minute efforts just below threshold.",
@@ -718,7 +742,28 @@ impl Workout {
                     vec![cd(10)],
                 ]),
             ),
-            // ── Threshold (18) ─────────────────────────────────────────────────
+            mk(
+                "Sweet Spot 2x30",
+                "Two 30-minute sweet spot blocks — the sustained climbing effort a \
+                 hilly event is decided on.",
+                SweetSpot,
+                chain(&[
+                    vec![wu(15)],
+                    ivls(2, 30 * 60, 90.0, 8 * 60, "Sweet Spot"),
+                    vec![cd(10)],
+                ]),
+            ),
+            mk(
+                "Sweet Spot Express",
+                "Two 12-minute sweet spot efforts in 45 minutes, for a short day.",
+                SweetSpot,
+                chain(&[
+                    vec![wu(10)],
+                    ivls(2, 12 * 60, 90.0, 4 * 60, "Sweet Spot"),
+                    vec![cd(7)],
+                ]),
+            ),
+            // ── Threshold (23) ─────────────────────────────────────────────────
             mk(
                 "Threshold 2x10",
                 "Two 10-minute efforts at 100% FTP.",
@@ -906,6 +951,58 @@ impl Workout {
                     vec![wu(10)],
                     ivls(2, 25 * 60, 96.0, 5 * 60, "Threshold"),
                     vec![cd(15)],
+                ]),
+            ),
+            mk(
+                "Classic Over-Unders 3x9",
+                "Three 9-minute intervals alternating 2 minutes just under FTP with 1 \
+                 minute just over — clearing lactate while staying on the limit.",
+                Threshold,
+                chain(&[
+                    vec![wu(15)],
+                    over_unders(3, 3, 2 * 60, 95.0, 60, 105.0, 5),
+                    vec![cd(10)],
+                ]),
+            ),
+            mk(
+                "Classic Over-Unders 3x12",
+                "Three 12-minute intervals of 2 minutes at 95 % and 1 minute at 105 %.",
+                Threshold,
+                chain(&[
+                    vec![wu(15)],
+                    over_unders(3, 4, 2 * 60, 95.0, 60, 105.0, 5),
+                    vec![cd(10)],
+                ]),
+            ),
+            mk(
+                "Threshold Surges 2x15",
+                "Two 15 minutes at 95 % with a 30-second surge to 115 % every three \
+                 minutes, like answering attacks on a climb.",
+                Threshold,
+                chain(&[
+                    vec![wu(15)],
+                    over_unders(2, 5, 150, 95.0, 30, 115.0, 6),
+                    vec![cd(10)],
+                ]),
+            ),
+            mk(
+                "Threshold 3x20",
+                "Three 20-minute efforts at 95 % FTP for long climbs.",
+                Threshold,
+                chain(&[
+                    vec![wu(15)],
+                    ivls(3, 20 * 60, 95.0, 6 * 60, "Threshold"),
+                    vec![cd(10)],
+                ]),
+            ),
+            mk(
+                "Threshold Express",
+                "Three 8-minute efforts at FTP in 45 minutes, for a short day.",
+                Threshold,
+                chain(&[
+                    vec![wu(10)],
+                    ivls(3, 8 * 60, 100.0, 3 * 60, "Threshold"),
+                    vec![cd(5)],
                 ]),
             ),
             // ── VO₂Max (15) ────────────────────────────────────────────────────
@@ -1230,6 +1327,35 @@ fn ivls(n: u32, on_secs: u32, on_pct: f32, off_secs: u32, label: &str) -> Vec<Se
     v
 }
 
+/// `sets` intervals, each `cycles` repeats of `under` then `over`, with
+/// `rest_mins` easy between sets — the classic over-under, where the switch
+/// happens inside the interval rather than once per repeat.
+fn over_unders(
+    sets: u32,
+    cycles: u32,
+    under_secs: u32,
+    under_pct: f32,
+    over_secs: u32,
+    over_pct: f32,
+    rest_mins: u32,
+) -> Vec<Segment> {
+    let mut v = Vec::new();
+    for set in 1..=sets {
+        for _ in 0..cycles {
+            v.push(Segment::steady(
+                under_secs,
+                under_pct,
+                &format!("Under {set}"),
+            ));
+            v.push(Segment::steady(over_secs, over_pct, &format!("Over {set}")));
+        }
+        if set < sets {
+            v.push(rv(rest_mins));
+        }
+    }
+    v
+}
+
 fn chain(parts: &[Vec<Segment>]) -> Vec<Segment> {
     parts.iter().flatten().cloned().collect()
 }
@@ -1241,6 +1367,70 @@ fn mk(name: &str, desc: &str, cat: WorkoutCategory, segs: Vec<Segment>) -> Worko
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn library_workout(name: &str) -> Workout {
+        Workout::workout_library()
+            .into_iter()
+            .find(|w| w.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the library"))
+    }
+
+    #[test]
+    fn should_alternate_inside_each_classic_over_under_interval() {
+        // The point of these, and what the older Over-Under 1 and 2 are not:
+        // under and over swap every minute or two within one interval, with
+        // no rest between them.
+        let w = library_workout("Classic Over-Unders 3x9");
+        let work: Vec<&Segment> = w
+            .segments
+            .iter()
+            .filter(|s| s.power_low_pct >= 90.0)
+            .collect();
+        assert_eq!(work.len(), 18, "3 sets × 3 cycles × under+over");
+        for pair in work.chunks(2) {
+            assert_eq!((pair[0].duration_secs, pair[0].power_low_pct), (120, 95.0));
+            assert_eq!((pair[1].duration_secs, pair[1].power_low_pct), (60, 105.0));
+        }
+        assert_eq!(w.duration_secs, 62 * 60);
+    }
+
+    #[test]
+    fn should_put_rest_only_between_sets_of_over_unders() {
+        let segs = over_unders(3, 4, 120, 95.0, 60, 105.0, 5);
+        let rests = segs.iter().filter(|s| s.power_low_pct == 50.0).count();
+        assert_eq!(rests, 2, "two rests for three sets, none after the last");
+        assert_eq!(segs.len(), 3 * 4 * 2 + 2);
+        assert_eq!(segs.last().map(|s| s.power_low_pct), Some(105.0));
+    }
+
+    #[test]
+    fn should_give_each_new_workout_the_length_it_promises() {
+        for (name, mins, category) in [
+            ("Classic Over-Unders 3x12", 71, WorkoutCategory::Threshold),
+            ("Threshold Surges 2x15", 61, WorkoutCategory::Threshold),
+            ("Sweet Spot 2x30", 93, WorkoutCategory::SweetSpot),
+            ("Threshold 3x20", 97, WorkoutCategory::Threshold),
+            ("Endurance 150", 150, WorkoutCategory::Endurance),
+            ("Long Ride with Tempo", 180, WorkoutCategory::Endurance),
+            ("Sweet Spot Express", 45, WorkoutCategory::SweetSpot),
+            ("Threshold Express", 45, WorkoutCategory::Threshold),
+        ] {
+            let w = library_workout(name);
+            assert_eq!(w.duration_secs, mins * 60, "{name}");
+            assert_eq!(w.category, category, "{name}");
+        }
+    }
+
+    #[test]
+    fn should_surge_to_115_percent_every_three_minutes() {
+        let w = library_workout("Threshold Surges 2x15");
+        let surges = w
+            .segments
+            .iter()
+            .filter(|s| s.power_low_pct == 115.0 && s.duration_secs == 30)
+            .count();
+        assert_eq!(surges, 10, "five per 15-minute block, two blocks");
+    }
 
     #[test]
     fn should_score_an_hour_at_ftp_as_one_hundred_tss() {

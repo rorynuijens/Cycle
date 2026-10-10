@@ -105,6 +105,28 @@ pub async fn delete_workout(pool: &SqlitePool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Library workouts added after the first release, matched by exact name.
+///
+/// An already-seeded library gets only these, and only the ones it lacks — a
+/// rider's edits and imports are never touched. A name here that is not in
+/// [`Workout::workout_library`] would be skipped without a word, which is why
+/// a test checks every one.
+const ADDED_AFTER_FIRST_SEED: &[&str] = &[
+    "Ramp Test",
+    "20-Minute FTP Test",
+    // 0.13.4: classic over-unders, long climbing blocks, long-event rides,
+    // and short days.
+    "Classic Over-Unders 3x9",
+    "Classic Over-Unders 3x12",
+    "Threshold Surges 2x15",
+    "Sweet Spot 2x30",
+    "Threshold 3x20",
+    "Endurance 150",
+    "Long Ride with Tempo",
+    "Sweet Spot Express",
+    "Threshold Express",
+];
+
 /// Seed the workouts table with the full training library if not already seeded.
 pub async fn seed_workouts(pool: &SqlitePool) -> Result<()> {
     let already_seeded: bool =
@@ -116,8 +138,7 @@ pub async fn seed_workouts(pool: &SqlitePool) -> Result<()> {
     if already_seeded {
         // Additive migration: insert any library workouts that were added after the
         // initial seed but are not yet present (matched by exact name).
-        let new_workouts: &[&str] = &["Ramp Test", "20-Minute FTP Test"];
-        for &name in new_workouts {
+        for &name in ADDED_AFTER_FIRST_SEED {
             let exists = sqlx::query("SELECT 1 FROM workouts WHERE name = ? LIMIT 1")
                 .bind(name)
                 .fetch_optional(pool)
@@ -287,6 +308,73 @@ pub async fn create_workout_from_icu_activity(
 mod tests {
     use super::*;
     use crate::data::db::testing::*;
+
+    #[test]
+    fn should_find_every_late_addition_in_the_library() {
+        // A misspelt name here is skipped silently, and the rider never gets
+        // the workout — so the list is checked against the library itself.
+        let names: Vec<String> = Workout::workout_library()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        for name in ADDED_AFTER_FIRST_SEED {
+            assert!(
+                names.iter().any(|n| n == name),
+                "not in the library: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_give_every_library_workout_its_own_name() {
+        // Seeding matches by name: two with one name and the second never lands.
+        let mut seen = std::collections::HashSet::new();
+        for w in Workout::workout_library() {
+            assert!(seen.insert(w.name.clone()), "duplicate name: {}", w.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_add_the_new_workouts_to_an_older_library_once() {
+        let pool = test_pool().await;
+        seed_workouts(&pool).await.unwrap();
+        let full = load_workouts(&pool).await.unwrap().len();
+        // Back to a 0.13.3 library: everything but this release's additions.
+        for w in load_workouts(&pool).await.unwrap() {
+            if ADDED_AFTER_FIRST_SEED[2..].contains(&w.name.as_str()) {
+                delete_workout(&pool, w.id).await.unwrap();
+            }
+        }
+        assert_eq!(load_workouts(&pool).await.unwrap().len(), full - 9);
+
+        seed_workouts(&pool).await.unwrap();
+        seed_workouts(&pool).await.unwrap();
+
+        assert_eq!(
+            load_workouts(&pool).await.unwrap().len(),
+            full,
+            "added once, not twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_leave_a_riders_edited_workout_alone_when_adding_new_ones() {
+        let pool = test_pool().await;
+        seed_workouts(&pool).await.unwrap();
+        let mut edited = load_workouts(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|w| w.name == "Endurance 60")
+            .expect("seeded");
+        edited.description = "My own notes".into();
+        update_workout(&pool, &edited).await.unwrap();
+
+        seed_workouts(&pool).await.unwrap();
+
+        let after = load_workout_by_id(&pool, edited.id).await.unwrap().unwrap();
+        assert_eq!(after.description, "My own notes");
+    }
 
     /// The Ramp Test as it shipped in 0.10.0: a twelve-step ladder topping out
     /// at 148 % of FTP.
