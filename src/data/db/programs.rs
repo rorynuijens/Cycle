@@ -106,6 +106,32 @@ pub async fn deactivate_program(pool: &SqlitePool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// End a program the rider no longer wants: stand it down and take its
+/// upcoming, unridden workouts off the calendar. Returns how many were removed.
+///
+/// `today` is included — an unridden session today is as unwanted as one next
+/// week. Ridden sessions and earlier days stay: they are what happened. Both
+/// writes share one transaction, so a failure cannot leave an active program
+/// with an empty calendar or an ended one still filling it.
+pub async fn end_program(pool: &SqlitePool, id: i64, today: NaiveDate) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query(
+        "DELETE FROM calendar_entries
+          WHERE program_id = ? AND completed = 0 AND scheduled_date >= ?",
+    )
+    .bind(id)
+    .bind(today.format("%Y-%m-%d").to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query("UPDATE programs SET active = 0 WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(removed)
+}
+
 /// Every session a program has on the calendar, oldest first.
 pub async fn load_program_sessions(
     pool: &SqlitePool,
@@ -480,6 +506,81 @@ mod tests {
             load_program_sessions(&pool, old).await.unwrap().len(),
             1,
             "the August session is history and stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_take_an_ended_programs_upcoming_workouts_off_the_calendar() {
+        let pool = test_pool().await;
+        // One session on 5 Aug (history), then today and later ones.
+        let (program, workout, _) = program_with_one_session(&pool).await;
+        for day in ["2026-10-10", "2026-10-12", "2026-11-02"] {
+            schedule_workout(&pool, workout, day, Some(program))
+                .await
+                .unwrap();
+        }
+
+        let removed = end_program(&pool, program, date(2026, 10, 10))
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 3, "today and both later sessions");
+        let left = load_program_sessions(&pool, program).await.unwrap();
+        assert_eq!(left.len(), 1, "the August session is history and stays");
+        assert_eq!(left[0].date, date(2026, 8, 5));
+        assert!(active_program(&pool).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_keep_a_session_already_ridden_today_when_a_program_ends() {
+        let pool = test_pool().await;
+        let (program, workout, _) = program_with_one_session(&pool).await;
+        let ridden = schedule_workout(&pool, workout, "2026-10-10", Some(program))
+            .await
+            .unwrap();
+        set_entry_completed(&pool, ridden, true).await.unwrap();
+
+        assert_eq!(
+            end_program(&pool, program, date(2026, 10, 10))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            load_program_sessions(&pool, program).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn should_leave_other_workouts_alone_when_a_program_ends() {
+        // Only this program's sessions go: a workout the rider scheduled by hand,
+        // and another program's, are not the rider's to lose by ending this one.
+        let pool = test_pool().await;
+        let (program, workout, _) = program_with_one_session(&pool).await;
+        let other = save_program(&pool, date(2026, 10, 5), 4, "monday")
+            .await
+            .unwrap();
+        schedule_workout(&pool, workout, "2026-10-12", Some(program))
+            .await
+            .unwrap();
+        schedule_workout(&pool, workout, "2026-10-12", Some(other))
+            .await
+            .unwrap();
+        schedule_workout(&pool, workout, "2026-10-12", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            end_program(&pool, program, date(2026, 10, 10))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(load_program_sessions(&pool, other).await.unwrap().len(), 1);
+        assert_eq!(
+            orphan_entry_span(&pool).await.unwrap().map(|o| o.2),
+            Some(1)
         );
     }
 

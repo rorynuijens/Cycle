@@ -753,8 +753,8 @@ impl PlanCard {
             let dialog = adw::AlertDialog::new(
                 Some("End this program?"),
                 Some(
-                    "The workouts already on your calendar stay where they are. \
-                     This page will stop tracking them.",
+                    "This program's upcoming workouts are removed from your calendar. \
+                     Rides you have done, and earlier days, stay.",
                 ),
             );
             dialog.add_response("cancel", "Cancel");
@@ -777,10 +777,23 @@ impl PlanCard {
 
                 crate::ui::spawn_to_main(
                     &rt_handle,
-                    async move { db::deactivate_program(&pool_write, id).await },
+                    async move {
+                        db::end_program(&pool_write, id, Local::now().date_naive()).await
+                    },
                     move |result| {
                         match result {
-                            Ok(()) => card.reload(),
+                            Ok(removed) => {
+                                card.reload();
+                                on_toast(
+                                    adw::Toast::builder()
+                                        .title(match removed {
+                                            0 => "Program ended".to_string(),
+                                            1 => "Program ended — 1 workout removed".to_string(),
+                                            n => format!("Program ended — {n} workouts removed"),
+                                        })
+                                        .build(),
+                                );
+                            }
                             Err(e) => {
                                 tracing::error!("ending the program: {e}");
                                 on_toast(
