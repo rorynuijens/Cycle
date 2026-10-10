@@ -90,6 +90,16 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.13.2" date="2026-10-10">
+      <description>
+        <p>Ending a program now takes its upcoming workouts off your calendar.
+           Before, they stayed behind with nothing tracking them. Rides you
+           have done, earlier days, and workouts you scheduled yourself are
+           kept. Workouts left behind by a program ended before this update
+           stay on the calendar; delete them there if you no longer want
+           them.</p>
+      </description>
+    </release>
     <release version="0.13.1" date="2026-10-09">
       <description>
         <p>Build Program now walks you through a few questions before the
