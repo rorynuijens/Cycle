@@ -90,6 +90,22 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.13.4" date="2026-10-10">
+      <description>
+        <p>Nine new workouts in the library, added to yours automatically:</p>
+        <ul>
+          <li>Classic over-unders (3×9 and 3×12) that alternate two minutes
+              just under FTP with one minute just over, and Threshold Surges
+              2×15 with a short surge every three minutes.</li>
+          <li>Long climbing efforts: Sweet Spot 2×30 and Threshold 3×20.</li>
+          <li>Long-event rides: Endurance 150 and a three-hour Long Ride with
+              Tempo.</li>
+          <li>Short days: 45-minute Sweet Spot Express and Threshold
+              Express.</li>
+        </ul>
+        <p>Workouts you have edited or imported are not changed.</p>
+      </description>
+    </release>
     <release version="0.13.3" date="2026-10-10">
       <description>
         <ul>
