@@ -76,7 +76,7 @@ const GOOD_SLEEP_SCORE: f32 = 75.0;
 /// How far above its baseline an HRV reading reads as recovered.
 const HRV_ELEVATION: f32 = 0.05;
 
-/// Wellness signals that must be present, and agree, for a morning to count.
+/// Wellness signals that must be strong for a morning to count.
 ///
 /// One signal is not a morning. A good sleep score on its own says the watch
 /// was worn, not that the rider is ready.
@@ -557,13 +557,18 @@ fn wellness_reason(wellness: &[WellnessEntry], today: NaiveDate) -> Option<Reaso
     None
 }
 
-/// Whether every wellness signal recorded for `day` says the rider is recovered,
-/// and enough of them exist to mean it.
+/// Whether `day`'s wellness says the rider is recovered: at least
+/// [`SIGNALS_FOR_STRONG_MORNING`] signals strong, and none warning.
 ///
 /// Stricter than the inverse of [`wellness_reason`], which fires on any single
 /// warning. A warning is allowed to be lonely because the cost of believing one
-/// wrongly is a light day. This is not allowed to be lonely, because the cost of
-/// believing it wrongly is a hard session on a body that did not want one.
+/// wrongly is a light day. This is not, because the cost of believing it wrongly
+/// is a hard session on a body that did not want one.
+///
+/// It used to need *every* signal strong. A steady resting HR then vetoed
+/// nearly every morning — on the rider's real data, 2 of 83 qualified in pairs —
+/// so an ordinary reading may now sit beside two strong ones. A warning still
+/// may not: that is [`wellness_reason`] firing, the same line easing uses.
 fn is_strong_morning(wellness: &[WellnessEntry], day: NaiveDate) -> bool {
     // The reading must be for this day. Falling back to the most recent one is
     // how a two-day-old HRV comes to be read as this morning's.
@@ -591,7 +596,8 @@ fn is_strong_morning(wellness: &[WellnessEntry], day: NaiveDate) -> bool {
         signals.push(score as f32 >= GOOD_SLEEP_SCORE);
     }
 
-    signals.len() >= SIGNALS_FOR_STRONG_MORNING && signals.iter().all(|&s| s)
+    signals.iter().filter(|&&strong| strong).count() >= SIGNALS_FOR_STRONG_MORNING
+        && wellness_reason(wellness, day).is_none()
 }
 
 /// The one path that proposes more work than the program wrote.
@@ -1580,8 +1586,90 @@ mod tests {
         assert_eq!(push(Custom), None);
     }
 
+    /// Sets one signal on both strong mornings — today and yesterday.
+    fn on_both_strong_mornings(
+        mut w: Vec<WellnessEntry>,
+        set: impl Fn(&mut WellnessEntry),
+    ) -> Vec<WellnessEntry> {
+        let yesterday = today_of(&w) - chrono::Duration::days(1);
+        for e in w.iter_mut().filter(|e| e.date >= yesterday) {
+            set(e);
+        }
+        w
+    }
+
+    /// The newest date in a fixture — its "today".
+    fn today_of(w: &[WellnessEntry]) -> NaiveDate {
+        w.iter().map(|e| e.date).max().expect("fixture has entries")
+    }
+
     #[test]
-    fn should_not_call_a_morning_strong_when_one_signal_disagrees() {
+    fn should_step_up_when_two_signals_are_strong_and_the_third_is_ordinary() {
+        // A sleep score of 70 is neither good (75) nor poor (50). Requiring every
+        // signal to be strong let a steady resting HR veto every morning: on the
+        // rider's real data only 2 of 83 mornings qualified in pairs.
+        let today = date(2026, 8, 5);
+        let w = on_both_strong_mornings(strong_wellness(today, 2), |e| e.sleep_score = Some(70));
+        let s = today_status(WorkoutCategory::Endurance, today);
+        let out = suggest_local(&s, &[], &metrics(12.0), &w, &library(), today);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].to_name, "Tempo 60");
+    }
+
+    #[test]
+    fn should_step_up_when_resting_hr_sits_on_its_baseline() {
+        // The case that blocked the rider: resting HR exactly at its average,
+        // with HRV and sleep both strong.
+        let today = date(2026, 8, 5);
+        let w = on_both_strong_mornings(strong_wellness(today, 2), |e| e.resting_hr = Some(50));
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert_eq!(
+            suggest_local(&s, &[], &metrics(12.0), &w, &library(), today).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn should_not_step_up_on_one_strong_signal_and_two_ordinary() {
+        let today = date(2026, 8, 5);
+        let w = on_both_strong_mornings(strong_wellness(today, 2), |e| {
+            e.resting_hr = Some(50);
+            e.sleep_score = Some(70);
+        });
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(&s, &[], &metrics(12.0), &w, &library(), today).is_empty());
+    }
+
+    #[test]
+    fn should_not_count_yesterday_as_strong_when_its_resting_hr_warned() {
+        // Today's warnings already ease; yesterday's must still break the run.
+        // 53 is 6 % over a baseline of 50, past the 5 % easing line.
+        let today = date(2026, 8, 5);
+        let mut w = strong_wellness(today, 2);
+        let yesterday = today - chrono::Duration::days(1);
+        w.iter_mut()
+            .find(|e| e.date == yesterday)
+            .expect("yesterday's entry")
+            .resting_hr = Some(53);
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(&s, &[], &metrics(12.0), &w, &library(), today).is_empty());
+    }
+
+    #[test]
+    fn should_not_count_yesterday_as_strong_after_a_poor_night() {
+        let today = date(2026, 8, 5);
+        let mut w = strong_wellness(today, 2);
+        let yesterday = today - chrono::Duration::days(1);
+        w.iter_mut()
+            .find(|e| e.date == yesterday)
+            .expect("yesterday's entry")
+            .sleep_score = Some(50);
+        let s = today_status(WorkoutCategory::Endurance, today);
+        assert!(suggest_local(&s, &[], &metrics(12.0), &w, &library(), today).is_empty());
+    }
+
+    #[test]
+    fn should_not_call_a_morning_strong_when_one_signal_warns() {
         let today = date(2026, 8, 5);
         let mut w = strong_wellness(today, 2);
         // Slept badly last night; everything else still looks recovered.
@@ -2100,8 +2188,12 @@ mod tests {
         let entry = w.last_mut().expect("today's entry");
         entry.resting_hr = Some(97); // 3 % below a norm of 100 is 97.0, and the
         entry.hrv = Some(120.0); // rule is "below", so 97 does not clear it
-        entry.sleep_score = Some(90);
+                                 // Ordinary, so resting HR is the signal that decides: two strong
+                                 // signals are a strong morning on their own.
+        entry.sleep_score = Some(70);
         assert!(!is_strong_morning(&w, today));
+        w.last_mut().expect("today's entry").resting_hr = Some(96);
+        assert!(is_strong_morning(&w, today), "one beat lower clears it");
     }
 
     #[test]
@@ -2113,8 +2205,10 @@ mod tests {
         // The boundary itself, read off the constant rather than written out:
         // 5 % above a norm of 100 is 104.99999 in f32, not 105.
         entry.hrv = Some(100.0 * (1.0 + HRV_ELEVATION));
-        entry.sleep_score = Some(90);
+        entry.sleep_score = Some(70); // ordinary, so HRV decides
         assert!(!is_strong_morning(&w, today));
+        w.last_mut().expect("today's entry").hrv = Some(106.0);
+        assert!(is_strong_morning(&w, today), "clearly above clears it");
     }
 
     #[test]
@@ -2123,9 +2217,11 @@ mod tests {
         let mut w = steady_wellness(today, 100, 100.0);
         let entry = w.last_mut().expect("today's entry");
         entry.resting_hr = Some(90);
-        entry.hrv = Some(120.0);
+        entry.hrv = Some(100.0); // on its norm: ordinary, so sleep decides
         entry.sleep_score = Some(74); // GOOD_SLEEP_SCORE is 75
         assert!(!is_strong_morning(&w, today));
+        w.last_mut().expect("today's entry").sleep_score = Some(75);
+        assert!(is_strong_morning(&w, today), "exactly good counts");
     }
 
     #[test]
