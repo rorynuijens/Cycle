@@ -43,6 +43,8 @@ const MISSED_ROWS_SHOWN: usize = 5;
 
 pub struct PlanCard {
     root: gtk::Box,
+    /// Offers to clear workouts that ended programs left on the calendar.
+    leftover_banner: adw::Banner,
     group: adw::PreferencesGroup,
     /// Rows added per reload, tracked so they can be removed cleanly —
     /// AdwPreferencesGroup's first_child() returns internal layout widgets.
@@ -112,6 +114,12 @@ impl PlanCard {
             .visible(false)
             .build();
 
+        let leftover_banner = adw::Banner::builder()
+            .button_label("_Remove…")
+            .revealed(false)
+            .build();
+        root.append(&leftover_banner);
+
         let group = adw::PreferencesGroup::builder()
             .title("Your Program")
             .build();
@@ -155,7 +163,10 @@ impl PlanCard {
         let end_btn = gtk::Button::builder()
             .label("End Program")
             .css_classes(["pill", "destructive-action"])
-            .tooltip_text("Stop following this program. Your calendar is left as it is.")
+            .tooltip_text(
+                "Stop following this program and remove its upcoming workouts from \
+                 your calendar",
+            )
             .hexpand(true)
             .halign(gtk::Align::End)
             .build();
@@ -169,6 +180,7 @@ impl PlanCard {
 
         let card = Rc::new(Self {
             root,
+            leftover_banner,
             group,
             rows: Rc::new(RefCell::new(Vec::new())),
             apply_btn,
@@ -196,6 +208,7 @@ impl PlanCard {
         card.connect_rollover();
         card.connect_end();
         card.connect_adopt();
+        card.connect_leftovers();
         card.connect_rebuild();
         card
     }
@@ -298,8 +311,9 @@ impl PlanCard {
         *self.time_off.borrow_mut() = data.time_off.clone();
         *self.program_id.borrow_mut() = data.program.as_ref().map(|p| p.id);
 
+        self.render_leftovers(data.leftovers);
         let Some(program) = data.program else {
-            self.render_orphans(data.orphans);
+            self.render_orphans(data.orphans, data.leftovers.is_some());
             return;
         };
 
@@ -659,9 +673,22 @@ impl PlanCard {
     }
 
     /// The face shown when the calendar holds a plan the app is not tracking.
-    fn render_orphans(&self, orphans: Option<(NaiveDate, NaiveDate, i64)>) {
+    fn render_orphans(&self, orphans: Option<(NaiveDate, NaiveDate, i64)>, has_leftovers: bool) {
         let Some((first, last, count)) = orphans else {
-            self.root.set_visible(false);
+            // Leftovers are the one thing worth showing with no program at
+            // all: the card then holds the banner and nothing else.
+            for btn in [
+                &self.adopt_btn,
+                &self.apply_btn,
+                &self.rollover_btn,
+                &self.rebuild_btn,
+                &self.end_btn,
+            ] {
+                btn.set_visible(false);
+            }
+            self.group
+                .set_description(Some("You are not following a program."));
+            self.root.set_visible(has_leftovers);
             return;
         };
 
@@ -1037,6 +1064,104 @@ impl PlanCard {
                 };
             },
         );
+    }
+
+    /// Show or hide the leftover banner for what the last reload found.
+    fn render_leftovers(&self, leftovers: Option<(NaiveDate, NaiveDate, i64)>) {
+        match leftovers {
+            Some((_, _, count)) => {
+                self.leftover_banner.set_title(&leftover_title(count));
+                self.leftover_banner.set_revealed(true);
+            }
+            None => self.leftover_banner.set_revealed(false),
+        }
+    }
+
+    /// Ask, then clear the leftovers. Counted again at the moment of asking so
+    /// the dialog states what will actually go.
+    fn connect_leftovers(self: &Rc<Self>) {
+        let pool = self.pool.clone();
+        let rt_handle = self.rt_handle.clone();
+        let on_toast = Rc::clone(&self.on_toast);
+        let card = Rc::clone(self);
+        self.leftover_banner.connect_button_clicked(move |banner| {
+            let today = Local::now().date_naive();
+            let pool_read = pool.clone();
+            let pool = pool.clone();
+            let rt = rt_handle.clone();
+            let on_toast = Rc::clone(&on_toast);
+            let card = Rc::clone(&card);
+            let banner = banner.clone();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move { db::leftover_entry_span(&pool_read, today).await },
+                move |result| {
+                    let (first, last, count) = match result {
+                        Ok(Some(span)) => span,
+                        Ok(None) => {
+                            card.reload();
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::error!("counting leftover workouts: {e}");
+                            on_toast(
+                                adw::Toast::builder()
+                                    .title("Could not read your calendar")
+                                    .timeout(5)
+                                    .build(),
+                            );
+                            return;
+                        }
+                    };
+                    let dialog = adw::AlertDialog::new(
+                        Some(&leftover_heading(count)),
+                        Some(&format!(
+                            "They run from {} to {} and belong to programs you have ended. \
+                             Rides you have done, earlier days, and workouts you scheduled \
+                             yourself stay.",
+                            first.format("%-d %B"),
+                            last.format("%-d %B %Y")
+                        )),
+                    );
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("remove", "_Remove");
+                    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                    dialog.set_close_response("cancel");
+                    dialog.connect_response(None, move |_, response| {
+                        if response != "remove" {
+                            return;
+                        }
+                        let pool = pool.clone();
+                        let card = Rc::clone(&card);
+                        let on_toast = Rc::clone(&on_toast);
+                        crate::ui::spawn_to_main(
+                            &rt,
+                            async move { db::remove_leftover_entries(&pool, today).await },
+                            move |result| {
+                                match result {
+                                    Ok(removed) => on_toast(
+                                        adw::Toast::builder()
+                                            .title(removed_message(removed))
+                                            .build(),
+                                    ),
+                                    Err(e) => {
+                                        tracing::error!("removing leftover workouts: {e}");
+                                        on_toast(
+                                            adw::Toast::builder()
+                                                .title("Could not remove the workouts")
+                                                .timeout(5)
+                                                .build(),
+                                        );
+                                    }
+                                }
+                                card.reload();
+                            },
+                        );
+                    });
+                    dialog.present(Some(&banner));
+                },
+            );
+        });
     }
 
     fn connect_adopt(self: &Rc<Self>) {
@@ -1508,6 +1633,31 @@ async fn rebuild_program(
     Ok((written, dropped))
 }
 
+/// The banner line for `count` leftover workouts.
+fn leftover_title(count: i64) -> String {
+    match count {
+        1 => "1 workout from an ended program is still on your calendar".to_string(),
+        n => format!("{n} workouts from ended programs are still on your calendar"),
+    }
+}
+
+fn leftover_heading(count: i64) -> String {
+    match count {
+        1 => "Remove 1 Workout?".to_string(),
+        n => format!("Remove {n} Workouts?"),
+    }
+}
+
+/// The toast after a cleanup. Zero is possible: everything may have been ridden
+/// or removed between the dialog opening and the button being pressed.
+fn removed_message(removed: u64) -> String {
+    match removed {
+        0 => "Nothing left to remove".to_string(),
+        1 => "Removed 1 workout".to_string(),
+        n => format!("Removed {n} workouts"),
+    }
+}
+
 /// A short label for how long ago a date was, for the missed-session line.
 fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
     match (today - date).num_days() {
@@ -1522,6 +1672,22 @@ fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
 mod tests {
     use super::*;
     use crate::data::workout::WorkoutCategory;
+
+    #[test]
+    fn should_word_the_leftover_banner_for_one_and_for_many() {
+        assert_eq!(
+            leftover_title(1),
+            "1 workout from an ended program is still on your calendar"
+        );
+        assert_eq!(
+            leftover_title(14),
+            "14 workouts from ended programs are still on your calendar"
+        );
+        assert_eq!(leftover_heading(1), "Remove 1 Workout?");
+        assert_eq!(removed_message(0), "Nothing left to remove");
+        assert_eq!(removed_message(1), "Removed 1 workout");
+        assert_eq!(removed_message(3), "Removed 3 workouts");
+    }
 
     #[test]
     fn should_never_replan_past_an_event_five_weeks_out() {
@@ -1946,6 +2112,7 @@ mod shots {
                 pmc,
                 wellness: Vec::new(),
                 orphans: None,
+                leftovers: None,
                 time_off: (23..=28).map(|d| date(2026, 9, d)).collect(),
             },
             today,

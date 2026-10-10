@@ -59,6 +59,9 @@ pub struct PlanData {
     /// Scheduled workouts belonging to no program: first, last, and how many.
     /// These predate program tracking and can be adopted.
     pub orphans: Option<(NaiveDate, NaiveDate, i64)>,
+    /// Unridden workouts left on the calendar by programs that have ended:
+    /// first, last, and how many. See [`db::leftover_entry_span`].
+    pub leftovers: Option<(NaiveDate, NaiveDate, i64)>,
 }
 
 /// Load the program's state. `fallback_ftp` scores only rides that carry no
@@ -113,6 +116,7 @@ pub async fn load_plan_data(
         pmc,
         wellness: db::load_wellness_recent(pool, AI_WELLNESS_DAYS.max(14)).await?,
         orphans: db::orphan_entry_span(pool).await?,
+        leftovers: db::leftover_entry_span(pool, today).await?,
         time_off: db::load_time_off_between(
             pool,
             &today.format("%Y-%m-%d").to_string(),

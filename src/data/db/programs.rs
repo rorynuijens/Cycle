@@ -347,6 +347,59 @@ pub async fn clear_future_sessions(
     Ok(result.rows_affected())
 }
 
+/// Which calendar entries were left behind by programs that have ended.
+///
+/// Before 0.13.2, ending a program left its whole future on the calendar. A
+/// leftover is an unridden entry, today or later, of an inactive program — but
+/// only where no running program owns those days. Scheduling a new program to
+/// start later keeps the old one's sessions until then on purpose: the rider
+/// is still riding that plan. From the new program's start they would double
+/// up with it, so from there they count as leftovers too. `?1` is today.
+const LEFTOVER_FILTER: &str = "
+      completed = 0
+  AND scheduled_date >= ?1
+  AND program_id IN (SELECT id FROM programs WHERE active = 0)
+  AND scheduled_date >= COALESCE(
+        (SELECT start_monday FROM programs WHERE active = 1 ORDER BY id DESC LIMIT 1),
+        ?1)";
+
+/// Leftover entries from ended programs: first date, last date and how many.
+/// `None` when there are none. See [`LEFTOVER_FILTER`] for what counts.
+pub async fn leftover_entry_span(
+    pool: &SqlitePool,
+    today: NaiveDate,
+) -> Result<Option<(NaiveDate, NaiveDate, i64)>> {
+    let row = sqlx::query(&format!(
+        "SELECT MIN(scheduled_date) AS first, MAX(scheduled_date) AS last, COUNT(*) AS n
+           FROM calendar_entries
+          WHERE {LEFTOVER_FILTER}"
+    ))
+    .bind(today.format("%Y-%m-%d").to_string())
+    .fetch_one(pool)
+    .await?;
+    let n: i64 = row.get("n");
+    if n == 0 {
+        return Ok(None);
+    }
+    let first: Option<String> = row.get("first");
+    let last: Option<String> = row.get("last");
+    let parse = |s: Option<String>| s.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
+    Ok(parse(first).zip(parse(last)).map(|(f, l)| (f, l, n)))
+}
+
+/// Delete the leftover entries [`leftover_entry_span`] reports, returning how
+/// many went. Re-evaluated at delete time, so a session ridden since the count
+/// was shown is kept.
+pub async fn remove_leftover_entries(pool: &SqlitePool, today: NaiveDate) -> Result<u64> {
+    let result = sqlx::query(&format!(
+        "DELETE FROM calendar_entries WHERE {LEFTOVER_FILTER}"
+    ))
+    .bind(today.format("%Y-%m-%d").to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Calendar entries that belong to no program, within a date range.
 ///
 /// These are what the rider scheduled before programs were tracked. Reported so
@@ -581,6 +634,129 @@ mod tests {
         assert_eq!(
             orphan_entry_span(&pool).await.unwrap().map(|o| o.2),
             Some(1)
+        );
+    }
+
+    // ── Leftovers from ended programs ────────────────────────────────────────
+
+    /// A program ended the pre-0.13.2 way: stood down with its calendar intact.
+    async fn ended_the_old_way(pool: &SqlitePool, days: &[&str]) -> (i64, i64) {
+        let (program, workout, _) = program_with_one_session(pool).await;
+        for day in days {
+            schedule_workout(pool, workout, day, Some(program))
+                .await
+                .unwrap();
+        }
+        deactivate_program(pool, program).await.unwrap();
+        (program, workout)
+    }
+
+    #[tokio::test]
+    async fn should_count_an_ended_programs_future_from_today_on() {
+        let pool = test_pool().await;
+        // 5 Aug (history), yesterday, today, and two later sessions.
+        ended_the_old_way(
+            &pool,
+            &["2026-10-09", "2026-10-10", "2026-10-14", "2026-11-02"],
+        )
+        .await;
+
+        assert_eq!(
+            leftover_entry_span(&pool, date(2026, 10, 10))
+                .await
+                .unwrap(),
+            Some((date(2026, 10, 10), date(2026, 11, 2), 3))
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_count_a_leftover_already_ridden() {
+        let pool = test_pool().await;
+        let (program, workout) = ended_the_old_way(&pool, &[]).await;
+        let ridden = schedule_workout(&pool, workout, "2026-10-12", Some(program))
+            .await
+            .unwrap();
+        set_entry_completed(&pool, ridden, true).await.unwrap();
+
+        assert_eq!(
+            leftover_entry_span(&pool, date(2026, 10, 10))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_old_plan_until_a_later_new_program_starts() {
+        // A new program scheduled to start on Monday 19 Oct: the old plan's
+        // sessions before then are still the rider's plan, not leftovers. From
+        // the new start, on and after, they would double up with it.
+        let pool = test_pool().await;
+        let (_, workout) = ended_the_old_way(
+            &pool,
+            &["2026-10-12", "2026-10-18", "2026-10-19", "2026-10-21"],
+        )
+        .await;
+        let current = save_program(&pool, date(2026, 10, 19), 4, "monday")
+            .await
+            .unwrap();
+        schedule_workout(&pool, workout, "2026-10-19", Some(current))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            leftover_entry_span(&pool, date(2026, 10, 10))
+                .await
+                .unwrap(),
+            Some((date(2026, 10, 19), date(2026, 10, 21), 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn should_never_count_unassigned_workouts_or_the_running_programs_own() {
+        let pool = test_pool().await;
+        let workout = workout_named(&pool, "Endurance", WorkoutCategory::Endurance).await;
+        let current = save_program(&pool, date(2026, 10, 5), 4, "monday")
+            .await
+            .unwrap();
+        schedule_workout(&pool, workout, "2026-10-12", Some(current))
+            .await
+            .unwrap();
+        schedule_workout(&pool, workout, "2026-10-12", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            leftover_entry_span(&pool, date(2026, 10, 10))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn should_remove_exactly_the_leftovers_it_counted() {
+        let pool = test_pool().await;
+        let (program, _) =
+            ended_the_old_way(&pool, &["2026-10-09", "2026-10-10", "2026-11-02"]).await;
+        let today = date(2026, 10, 10);
+        let (_, _, counted) = leftover_entry_span(&pool, today).await.unwrap().unwrap();
+
+        assert_eq!(
+            remove_leftover_entries(&pool, today).await.unwrap(),
+            counted as u64
+        );
+        assert_eq!(leftover_entry_span(&pool, today).await.unwrap(), None);
+        let kept: Vec<_> = load_program_sessions(&pool, program)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.date)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![date(2026, 8, 5), date(2026, 10, 9)],
+            "history stays"
         );
     }
 
