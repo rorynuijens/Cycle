@@ -90,6 +90,22 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.13.3" date="2026-10-10">
+      <description>
+        <ul>
+          <li>Workouts left on your calendar by programs you ended before 0.13.2
+              can now be cleared in one go: the Coaching page shows how many
+              there are and removes them after you confirm. Rides you have
+              done, earlier days, and workouts you scheduled yourself stay.</li>
+          <li>Your program now suggests a harder session more often when you
+              are well recovered. A morning used to count only if every
+              wellness reading was strong, so a steady resting heart rate
+              ruled out almost every day. Two strong readings and no warning
+              signs are now enough; form must still be fresh, two mornings in
+              a row.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.2" date="2026-10-10">
       <description>
         <p>Ending a program now takes its upcoming workouts off your calendar.
