@@ -686,6 +686,7 @@ mod tests {
             duration_mins: 60,
             tss: 60.0,
             category: "Endurance".into(),
+            description: String::new(),
         }
     }
 

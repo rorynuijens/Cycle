@@ -1582,6 +1582,11 @@ async fn rebuild_program(
     if event_week.is_some() {
         entries.retain(|e| e.week <= weeks_left);
     }
+    // The prompt asks for variety; this guarantees it.
+    let swapped = crate::ai::context::diversify(&mut entries, &library);
+    if swapped > 0 {
+        tracing::info!("Swapped {swapped} repeated workouts for variety");
+    }
     anyhow::ensure!(
         !entries.is_empty(),
         "the coach's reply held no sessions we could read"

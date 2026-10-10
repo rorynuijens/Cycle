@@ -95,6 +95,7 @@ pub fn workouts_as_options(
             duration_mins: w.duration_secs / 60,
             tss: w.tss,
             category: w.category.label().to_string(),
+            description: crate::ai::coach::short_description(&w.description),
         })
         .collect();
 
@@ -106,6 +107,7 @@ pub fn workouts_as_options(
             duration_mins: w.duration_secs.map(|s| s / 60).unwrap_or(60),
             tss: w.tss.unwrap_or(0.0),
             category: "Intervals.icu".to_string(),
+            description: crate::ai::coach::short_description(&w.description),
         });
     }
     opts
@@ -209,6 +211,64 @@ pub fn entry_date(start_monday: NaiveDate, entry: &ProgramEntry) -> NaiveDate {
     start_monday + CDuration::days(weeks + day_name_to_offset(&entry.day) as i64)
 }
 
+/// The variety rule's window: a workout may not come back within this many
+/// consecutive weeks. Matches the wording of `VARIETY_RULE` in the prompts.
+pub const VARIETY_WEEKS: u32 = 3;
+
+/// Swap out workouts the coach repeated too soon, returning how many changed.
+///
+/// The prompt asks for variety; this guarantees it, as [`drop_time_off_days`]
+/// guarantees time off. Walking the plan in date order, a library workout seen
+/// again within [`VARIETY_WEEKS`] is replaced by one of the same category not
+/// used in that window, of about the same length (see
+/// [`crate::training::program::pick_fresh`]). Left alone: Intervals.icu
+/// templates and names not in the library (nothing to swap them for), the
+/// Custom category (the FTP tests are never interchangeable), and any repeat the
+/// library cannot replace without changing the session's length.
+pub fn diversify(entries: &mut [ProgramEntry], library: &[Workout]) -> usize {
+    use crate::data::workout::WorkoutCategory;
+
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (entries[i].week, day_name_to_offset(&entries[i].day)));
+
+    // (week, workout id) for every entry already settled, in date order.
+    let mut placed: Vec<(u32, i64)> = Vec::new();
+    let mut swapped = 0;
+    for i in order {
+        let week = entries[i].week;
+        let Some(current) = library
+            .iter()
+            .find(|w| crate::ai::naming::names_match(&w.name, &entries[i].workout_name))
+        else {
+            continue;
+        };
+        let recent: HashSet<i64> = placed
+            .iter()
+            .filter(|(w, _)| *w + VARIETY_WEEKS > week)
+            .map(|(_, id)| *id)
+            .collect();
+        let mut chosen = current;
+        if current.category != WorkoutCategory::Custom && recent.contains(&current.id) {
+            if let Some(fresh) = crate::training::program::pick_fresh(
+                library,
+                current.category,
+                current.duration_secs,
+                &recent,
+            ) {
+                if !recent.contains(&fresh.id) {
+                    chosen = fresh;
+                }
+            }
+        }
+        if chosen.id != current.id {
+            entries[i].workout_name = chosen.name.clone();
+            swapped += 1;
+        }
+        placed.push((week, chosen.id));
+    }
+    swapped
+}
+
 /// Drop the planned sessions that landed on a day the rider is away, returning
 /// how many went.
 ///
@@ -290,6 +350,133 @@ mod tests {
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("valid test date")
+    }
+
+    // ── diversify ────────────────────────────────────────────────────────────
+
+    fn lib(id: i64, name: &str, cat: crate::data::workout::WorkoutCategory, mins: u32) -> Workout {
+        Workout {
+            id,
+            name: name.into(),
+            description: String::new(),
+            duration_secs: mins * 60,
+            tss: 50.0,
+            category: cat,
+            segments: Vec::new(),
+        }
+    }
+
+    fn two_endurance() -> Vec<Workout> {
+        use crate::data::workout::WorkoutCategory::Endurance;
+        vec![
+            lib(1, "Endurance 60", Endurance, 60),
+            lib(2, "Steady Miles", Endurance, 60),
+        ]
+    }
+
+    fn plan(rows: &[(u32, &str, &str)]) -> Vec<ProgramEntry> {
+        rows.iter()
+            .map(|(week, day, name)| ProgramEntry {
+                week: *week,
+                day: day.to_string(),
+                workout_name: name.to_string(),
+            })
+            .collect()
+    }
+
+    fn names(entries: &[ProgramEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.workout_name.as_str()).collect()
+    }
+
+    #[test]
+    fn should_swap_a_workout_repeated_the_next_week() {
+        let mut p = plan(&[(1, "monday", "Endurance 60"), (2, "monday", "Endurance 60")]);
+        assert_eq!(diversify(&mut p, &two_endurance()), 1);
+        assert_eq!(names(&p), ["Endurance 60", "Steady Miles"]);
+    }
+
+    #[test]
+    fn should_still_swap_a_repeat_two_weeks_later_but_not_three() {
+        // "Within any three consecutive weeks": weeks 1 and 3 share a window,
+        // weeks 1 and 4 do not.
+        let mut close = plan(&[(1, "monday", "Endurance 60"), (3, "monday", "Endurance 60")]);
+        assert_eq!(diversify(&mut close, &two_endurance()), 1);
+        let mut apart = plan(&[(1, "monday", "Endurance 60"), (4, "monday", "Endurance 60")]);
+        assert_eq!(diversify(&mut apart, &two_endurance()), 0);
+    }
+
+    #[test]
+    fn should_swap_the_later_session_whatever_order_the_reply_lists_them_in() {
+        let mut p = plan(&[(2, "monday", "Endurance 60"), (1, "friday", "Endurance 60")]);
+        diversify(&mut p, &two_endurance());
+        assert_eq!(
+            names(&p),
+            ["Steady Miles", "Endurance 60"],
+            "week 2 is the repeat"
+        );
+    }
+
+    #[test]
+    fn should_treat_two_in_one_week_as_a_repeat() {
+        let mut p = plan(&[(1, "friday", "Endurance 60"), (1, "monday", "Endurance 60")]);
+        diversify(&mut p, &two_endurance());
+        assert_eq!(
+            names(&p),
+            ["Steady Miles", "Endurance 60"],
+            "Friday follows Monday"
+        );
+    }
+
+    #[test]
+    fn should_repeat_rather_than_reuse_a_swap_when_the_library_runs_out() {
+        // Two endurance rides, three weeks running: the third has nothing fresh
+        // and keeps the original rather than doubling the swap.
+        let mut p = plan(&[
+            (1, "monday", "Endurance 60"),
+            (2, "monday", "Endurance 60"),
+            (3, "monday", "Endurance 60"),
+        ]);
+        assert_eq!(diversify(&mut p, &two_endurance()), 1);
+        assert_eq!(names(&p), ["Endurance 60", "Steady Miles", "Endurance 60"]);
+    }
+
+    #[test]
+    fn should_keep_a_repeat_when_the_only_alternative_is_a_different_length() {
+        use crate::data::workout::WorkoutCategory::Endurance;
+        let library = vec![
+            lib(1, "Endurance 60", Endurance, 60),
+            lib(2, "Endurance 120", Endurance, 120),
+        ];
+        let mut p = plan(&[(1, "monday", "Endurance 60"), (2, "monday", "Endurance 60")]);
+        assert_eq!(diversify(&mut p, &library), 0);
+    }
+
+    #[test]
+    fn should_never_swap_an_ftp_test() {
+        use crate::data::workout::WorkoutCategory::Custom;
+        let library = vec![
+            lib(1, "Ramp Test", Custom, 35),
+            lib(2, "20-Minute FTP Test", Custom, 50),
+        ];
+        let mut p = plan(&[(1, "monday", "Ramp Test"), (2, "monday", "Ramp Test")]);
+        assert_eq!(diversify(&mut p, &library), 0);
+    }
+
+    #[test]
+    fn should_leave_names_outside_the_library_alone() {
+        let mut p = plan(&[
+            (1, "monday", "[Intervals.icu] My Template"),
+            (2, "monday", "[Intervals.icu] My Template"),
+        ]);
+        assert_eq!(diversify(&mut p, &two_endurance()), 0);
+    }
+
+    #[test]
+    fn should_match_the_coachs_spelling_loosely_when_finding_repeats() {
+        // The reply is matched by names_match everywhere else, so a repeat in a
+        // different case is still a repeat.
+        let mut p = plan(&[(1, "monday", "Endurance 60"), (2, "monday", "endurance 60")]);
+        assert_eq!(diversify(&mut p, &two_endurance()), 1);
     }
 
     fn icu(sport: &str, watts: Option<u32>, secs: Option<u32>) -> IntervalsActivity {

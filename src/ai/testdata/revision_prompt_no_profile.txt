@@ -47,3 +47,4 @@ Rules:
 - Use only the days listed in TRAINING SCHEDULE.
 - Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
 - Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday.
+- Vary the sessions. Never use the same workout twice within any three consecutive weeks unless AVAILABLE WORKOUTS has no other workout of that category and a similar length, and within a category mix formats — steady rides, progressions, intervals, openers, cadence work — rather than repeating the plainest name.

@@ -10,7 +10,9 @@ use std::rc::Rc;
 use crate::ai::coach::{
     build_program_prompt, get_suggestion, parse_program_response, ProgramContext, ProgramEntry,
 };
-use crate::ai::context::{drop_time_off_days, entry_date, format_program, workouts_as_options};
+use crate::ai::context::{
+    diversify, drop_time_off_days, entry_date, format_program, workouts_as_options,
+};
 use crate::data::training_profile::{TrainingProfile, ROLLING_WEEKS};
 use crate::data::{athlete::AthleteProfile, db, keystore, settings, workout::Workout};
 use crate::training::fitness::compute_load_metrics;
@@ -306,7 +308,12 @@ impl ProgramSection {
                 if let Ok(result) = rx.recv().await {
                     match result {
                         Ok((text, icu_workouts)) => {
-                            let entries = parse_program_response(&text);
+                            let mut entries = parse_program_response(&text);
+                            // The prompt asks for variety; this guarantees it.
+                            let swapped = diversify(&mut entries, &section.workouts);
+                            if swapped > 0 {
+                                tracing::info!("Swapped {swapped} repeated workouts for variety");
+                            }
                             if entries.is_empty() {
                                 section.set_status(
                                     "Could not parse the program response. Please try again.",

@@ -13,7 +13,57 @@ pub struct WorkoutOption {
     pub duration_mins: u32,
     pub tss: f32,
     pub category: String,
+    /// One line on what the session is, from the workout's own description.
+    /// Only the program prompts show it: "Aerobic Power" or "Fasted Simulation"
+    /// mean nothing beside "Endurance 75" without it, so the coach kept picking
+    /// the names that explain themselves.
+    pub description: String,
 }
+
+/// Longest description line a program prompt carries for one workout.
+const MAX_DESCRIPTION_CHARS: usize = 100;
+
+/// A workout's description cut to its first sentence and at most
+/// [`MAX_DESCRIPTION_CHARS`] characters, whitespace collapsed. Empty in, empty out.
+pub fn short_description(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = match flat.find(". ") {
+        Some(i) => &flat[..=i],
+        None => flat.as_str(),
+    };
+    if sentence.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return sentence.to_string();
+    }
+    let cut: String = sentence.chars().take(MAX_DESCRIPTION_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The AVAILABLE WORKOUTS list both program prompts use.
+fn program_workout_list(options: &[WorkoutOption]) -> String {
+    options
+        .iter()
+        .map(|w| {
+            let line = format!(
+                "  - {} ({}, {} min, TSS {:.0})",
+                w.name, w.category, w.duration_mins, w.tss
+            );
+            if w.description.is_empty() {
+                line
+            } else {
+                format!("{line} — {}", w.description)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The variety rule both program prompts end their rules with. The write path
+/// enforces it too (see `ai::context::diversify`); this is the request.
+const VARIETY_RULE: &str =
+    "- Vary the sessions. Never use the same workout twice within any three \
+consecutive weeks unless AVAILABLE WORKOUTS has no other workout of that category and a similar \
+length, and within a category mix formats — steady rides, progressions, intervals, openers, \
+cadence work — rather than repeating the plainest name.";
 
 // ── Wellness snapshot (shared by both Fitness and Coaching contexts) ──────────
 
@@ -157,17 +207,7 @@ pub fn build_program_prompt(ctx: &ProgramContext) -> String {
         format!("ATHLETE BACKGROUND:\n{}\n\n", ctx.athlete_context.trim())
     };
 
-    let workout_list = ctx
-        .workout_options
-        .iter()
-        .map(|w| {
-            format!(
-                "  - {} ({}, {} min, TSS {:.0})",
-                w.name, w.category, w.duration_mins, w.tss
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let workout_list = program_workout_list(&ctx.workout_options);
 
     let days_str = ctx.training_days.join(", ");
     let (duration_str, week_count) = match ctx.num_weeks {
@@ -219,7 +259,8 @@ Rules:
 - Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
 - Use only the days listed in TRAINING SCHEDULE.
 - Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
-- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday."#,
+- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday.
+{variety}"#,
         context_section = context_section,
         ftp = ctx.athlete.ftp_watts,
         weight = ctx.athlete.weight_kg,
@@ -236,6 +277,7 @@ Rules:
         profile_section = profile_section,
         pattern = pattern.build_sentence(),
         build_mix = build_mix,
+        variety = VARIETY_RULE,
     )
 }
 
@@ -297,17 +339,7 @@ pub fn build_program_revision_prompt(ctx: &ProgramRevisionContext) -> String {
         format!("ATHLETE BACKGROUND:\n{}\n\n", ctx.athlete_context.trim())
     };
 
-    let workout_list = ctx
-        .workout_options
-        .iter()
-        .map(|w| {
-            format!(
-                "  - {} ({}, {} min, TSS {:.0})",
-                w.name, w.category, w.duration_mins, w.tss
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let workout_list = program_workout_list(&ctx.workout_options);
 
     let missed_text = if ctx.recent_missed.is_empty() {
         "  None.".to_string()
@@ -392,7 +424,8 @@ Rules:
 - Use only workout names that appear exactly in the AVAILABLE WORKOUTS list above.
 - Use only the days listed in TRAINING SCHEDULE.
 - Never return a (week, day) pair listed under PLANNED TIME OFF. Move that session to another training day in the same week, or leave the week a session short — never push it into a different week.
-- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday."#,
+- Day values must be lowercase full day names: monday, tuesday, wednesday, thursday, friday, saturday, sunday.
+{variety}"#,
         context_section = context_section,
         ftp = ctx.athlete.ftp_watts,
         weight = ctx.athlete.weight_kg,
@@ -411,6 +444,7 @@ Rules:
         weeks = ctx.weeks_remaining.max(1),
         profile_section = profile_section,
         cadence = pattern.revision_cadence(),
+        variety = VARIETY_RULE,
     )
 }
 
@@ -603,6 +637,7 @@ mod tests {
             duration_mins: 60,
             tss: 60.0,
             category: "Threshold".to_string(),
+            description: String::new(),
         }
     }
 
@@ -689,6 +724,46 @@ mod tests {
             time_off: Vec::new(),
             profile: None,
         }
+    }
+
+    #[test]
+    fn should_cut_a_description_to_its_first_sentence() {
+        assert_eq!(
+            short_description("Two 30-minute blocks.  Then a long\n cool-down."),
+            "Two 30-minute blocks."
+        );
+        assert_eq!(short_description(""), "");
+        assert_eq!(short_description("No full stop"), "No full stop");
+    }
+
+    #[test]
+    fn should_cap_a_long_description_at_exactly_the_limit() {
+        let at = "é".repeat(MAX_DESCRIPTION_CHARS);
+        assert_eq!(
+            short_description(&at),
+            at,
+            "exactly the limit is kept whole"
+        );
+        let over = "é".repeat(MAX_DESCRIPTION_CHARS + 1);
+        let cut = short_description(&over);
+        assert_eq!(cut.chars().count(), MAX_DESCRIPTION_CHARS);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn should_show_a_workouts_description_after_its_numbers() {
+        let mut w = workout("Aerobic Power");
+        w.description = "Long Z2 with short high-cadence lifts.".into();
+        assert_eq!(
+            program_workout_list(&[w]),
+            "  - Aerobic Power (Threshold, 60 min, TSS 60) — Long Z2 with short high-cadence lifts."
+        );
+    }
+
+    #[test]
+    fn should_ask_for_variety_in_both_program_prompts() {
+        assert!(build_program_prompt(&program_ctx(Some(8))).ends_with(VARIETY_RULE));
+        assert!(build_program_revision_prompt(&revision_ctx()).ends_with(VARIETY_RULE));
     }
 
     fn polarised_new_rider() -> TrainingProfile {

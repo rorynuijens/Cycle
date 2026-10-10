@@ -529,6 +529,58 @@ pub fn pick_replacement(
         .min_by_key(|w| w.duration_secs.abs_diff(duration_secs))
 }
 
+/// How much further from the target length a fresh workout may be than the
+/// closest one, and still be preferred for variety's sake.
+///
+/// Variety must not quietly change a session's load: swapping a 60-minute ride
+/// for a 150-minute one because it had not been ridden lately would be a
+/// different session, not a different version of the same one.
+pub const VARIETY_SLACK_SECS: u32 = 15 * 60;
+
+/// [`pick_replacement`], but preferring a workout not in `avoid`.
+///
+/// `avoid` is what the rider has ridden or is about to ride nearby. A fresh
+/// workout wins only when its length is within [`VARIETY_SLACK_SECS`] of the
+/// closest match; otherwise the closest match stands, repeated or not, so a thin
+/// library gives a repeated session rather than a mis-sized one.
+pub fn pick_fresh<'a>(
+    library: &'a [Workout],
+    category: WorkoutCategory,
+    duration_secs: u32,
+    avoid: &std::collections::HashSet<i64>,
+) -> Option<&'a Workout> {
+    let closest = pick_replacement(library, category, duration_secs)?;
+    let limit = closest.duration_secs.abs_diff(duration_secs) + VARIETY_SLACK_SECS;
+    library
+        .iter()
+        .filter(|w| {
+            w.category == category
+                && !avoid.contains(&w.id)
+                && w.duration_secs.abs_diff(duration_secs) <= limit
+        })
+        .min_by_key(|w| w.duration_secs.abs_diff(duration_secs))
+        .or(Some(closest))
+}
+
+/// How far either side of a session the daily swap looks for workouts to avoid.
+const RECENT_DAYS: i64 = 14;
+
+/// The workouts on the program within [`RECENT_DAYS`] of `target`, ridden or
+/// planned, including its own — what a swap should not hand straight back.
+fn nearby_workouts(
+    status: &ProgramStatus,
+    decided: &[PlannedSession],
+    target: &PlannedSession,
+) -> std::collections::HashSet<i64> {
+    decided
+        .iter()
+        .chain(status.upcoming.iter())
+        .filter(|s| (s.date - target.date).num_days().abs() <= RECENT_DAYS)
+        .map(|s| s.workout_id)
+        .chain(std::iter::once(target.workout_id))
+        .collect()
+}
+
 /// Is resting heart rate up, or sleep poor, enough to ease a session over?
 fn wellness_reason(wellness: &[WellnessEntry], today: NaiveDate) -> Option<Reason> {
     let rhr = build_wellness_series(wellness, today, |e| e.resting_hr.map(|v| v as f32));
@@ -654,7 +706,8 @@ fn push_suggestion(
     let Some(harder) = push(target.category) else {
         return Vec::new();
     };
-    let Some(replacement) = pick_replacement(library, harder, target.duration_secs) else {
+    let avoid = nearby_workouts(status, decided, target);
+    let Some(replacement) = pick_fresh(library, harder, target.duration_secs, &avoid) else {
         return Vec::new();
     };
     if replacement.id == target.workout_id {
@@ -754,7 +807,8 @@ pub fn suggest(
     let Some(eased) = eased else {
         return Vec::new();
     };
-    let Some(replacement) = pick_replacement(library, eased, target.duration_secs) else {
+    let avoid = nearby_workouts(status, decided, target);
+    let Some(replacement) = pick_fresh(library, eased, target.duration_secs, &avoid) else {
         return Vec::new();
     };
     // The library can hold only one workout of a category, and it may be the
@@ -1933,6 +1987,138 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].reason, Reason::CoachAdvised);
         assert_eq!(out[0].to_name, "Sweet Spot 60", "one rung down");
+    }
+
+    // ── Variety ──────────────────────────────────────────────────────────────
+
+    fn endurance(id: i64, mins: u32) -> Workout {
+        Workout {
+            name: format!("Endurance #{id}"),
+            ..workout(id, WorkoutCategory::Endurance, mins * 60)
+        }
+    }
+
+    fn avoiding(ids: &[i64]) -> HashSet<i64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn should_prefer_a_fresh_workout_of_about_the_same_length() {
+        let lib = vec![endurance(1, 60), endurance(2, 70)];
+        let picked = pick_fresh(&lib, WorkoutCategory::Endurance, 3600, &avoiding(&[1]));
+        assert_eq!(picked.map(|w| w.id), Some(2));
+    }
+
+    #[test]
+    fn should_accept_a_fresh_workout_exactly_at_the_slack_and_not_a_second_past() {
+        let at = vec![endurance(1, 60), endurance(2, 75)];
+        assert_eq!(
+            pick_fresh(&at, WorkoutCategory::Endurance, 3600, &avoiding(&[1])).map(|w| w.id),
+            Some(2),
+            "15 minutes longer is still the same session"
+        );
+        let mut past = vec![endurance(1, 60), endurance(2, 75)];
+        past[1].duration_secs += 1;
+        assert_eq!(
+            pick_fresh(&past, WorkoutCategory::Endurance, 3600, &avoiding(&[1])).map(|w| w.id),
+            Some(1),
+            "a second further is a different load: repeat instead"
+        );
+    }
+
+    #[test]
+    fn should_measure_the_slack_from_the_closest_match_not_the_target() {
+        // Nothing is near 60 minutes; the closest is 90. A fresh 100-minute ride
+        // is within 15 of that, so it still wins.
+        let lib = vec![endurance(1, 90), endurance(2, 100)];
+        let picked = pick_fresh(&lib, WorkoutCategory::Endurance, 3600, &avoiding(&[1]));
+        assert_eq!(picked.map(|w| w.id), Some(2));
+    }
+
+    #[test]
+    fn should_repeat_when_every_workout_was_ridden_recently() {
+        let lib = vec![endurance(1, 60), endurance(2, 70)];
+        let picked = pick_fresh(&lib, WorkoutCategory::Endurance, 3600, &avoiding(&[1, 2]));
+        assert_eq!(picked.map(|w| w.id), Some(1));
+    }
+
+    #[test]
+    fn should_never_pick_another_category_for_freshness() {
+        let lib = vec![endurance(1, 60), workout(2, WorkoutCategory::Tempo, 3600)];
+        let picked = pick_fresh(&lib, WorkoutCategory::Endurance, 3600, &avoiding(&[1]));
+        assert_eq!(picked.map(|w| w.id), Some(1));
+    }
+
+    #[test]
+    fn should_ease_to_a_sweet_spot_not_ridden_in_the_last_fortnight() {
+        // Two sweet spot workouts of one length. Last week's ride used the first,
+        // which is the one the old length-only picker would always return.
+        let today = date(2026, 8, 5);
+        let mut lib = library();
+        lib.push(Workout {
+            name: "Sweet Spot Other".into(),
+            ..workout(99, WorkoutCategory::SweetSpot, 3600)
+        });
+        let first_ss = lib
+            .iter()
+            .find(|w| w.category == WorkoutCategory::SweetSpot)
+            .expect("fixture")
+            .id;
+        let mut ridden = session(
+            7,
+            today - chrono::Duration::days(6),
+            WorkoutCategory::SweetSpot,
+            true,
+        );
+        ridden.workout_id = first_ss;
+        let s = due_today(WorkoutCategory::Threshold, today);
+        let out = suggest(
+            &s,
+            &[ridden],
+            &metrics(0.0),
+            &[],
+            &lib,
+            today,
+            CoachVerdict::Ease,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_name, "Sweet Spot Other");
+    }
+
+    #[test]
+    fn should_not_avoid_a_workout_ridden_more_than_a_fortnight_ago() {
+        let today = date(2026, 8, 5);
+        let mut lib = library();
+        lib.push(Workout {
+            name: "Sweet Spot Other".into(),
+            ..workout(99, WorkoutCategory::SweetSpot, 3600)
+        });
+        let first_ss = lib
+            .iter()
+            .find(|w| w.category == WorkoutCategory::SweetSpot)
+            .expect("fixture")
+            .id;
+        let mut ridden = session(
+            7,
+            today - chrono::Duration::days(15),
+            WorkoutCategory::SweetSpot,
+            true,
+        );
+        ridden.workout_id = first_ss;
+        let s = due_today(WorkoutCategory::Threshold, today);
+        let out = suggest(
+            &s,
+            &[ridden],
+            &metrics(0.0),
+            &[],
+            &lib,
+            today,
+            CoachVerdict::Ease,
+        );
+        assert_eq!(
+            out[0].to_name, "Sweet Spot 60",
+            "15 days back is outside the window"
+        );
     }
 
     #[test]
