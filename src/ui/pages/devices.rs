@@ -40,6 +40,10 @@ struct DeviceEntry {
     /// Discovered at least once this session, so the manager can connect to it.
     seen: bool,
     erg_enabled: bool,
+    /// The rider disconnected it from this page. Auto-reconnect leaves it
+    /// alone until they press Connect: a disconnect that a dropout rescan
+    /// quietly undoes a few seconds later is not a disconnect.
+    held_off: bool,
     row: adw::ActionRow,
     /// Status label on saved rows ("Connected" / "Searching…" / "Not connected").
     status_label: Option<gtk::Label>,
@@ -198,6 +202,7 @@ impl DevicesPage {
                     connecting: false,
                     seen: false,
                     erg_enabled: saved.erg_enabled,
+                    held_off: false,
                     row,
                     status_label: Some(status_label),
                 },
@@ -238,7 +243,13 @@ impl DevicesPage {
                     entry.kind = kind;
                 }
                 if entry.saved {
-                    if !entry.connected && !entry.connecting && self.ctx.auto_reconnect.get() {
+                    if should_auto_connect(
+                        entry.saved,
+                        entry.connected,
+                        entry.connecting,
+                        entry.held_off,
+                        self.ctx.auto_reconnect.get(),
+                    ) {
                         entry.connecting = true;
                         auto_connect = true;
                     }
@@ -262,6 +273,7 @@ impl DevicesPage {
                         connecting: false,
                         seen: true,
                         erg_enabled: true,
+                        held_off: false,
                         row,
                         status_label: None,
                     },
@@ -360,13 +372,14 @@ impl DevicesPage {
             // matters most and nothing was watching for it: auto-reconnect only
             // fires from `on_discovered`, which needs a scan running, and no
             // scan runs during a ride. Start one so the existing path can work.
-            let was_saved = self
+            // Not for a device the rider disconnected on purpose.
+            let went_missing = self
                 .ctx
                 .entries
                 .borrow()
                 .get(&address)
-                .is_some_and(|e| e.saved);
-            if was_saved {
+                .is_some_and(|e| is_missing(e.saved, e.connected, e.held_off));
+            if went_missing {
                 schedule_reconnect_scan(&self.ctx);
             }
         }
@@ -500,11 +513,12 @@ fn refresh_strip(ctx: &PageCtx) {
         match (connected, saved) {
             (Some(e), _) => set_slot(slot, &e.display_name, "Connected", true),
             (None, Some(e)) => {
-                let status = if scanning {
-                    "Searching…"
-                } else {
-                    "Not connected"
-                };
+                let status =
+                    if saved_status(false, false, e.held_off, scanning) == RowStatus::Searching {
+                        "Searching…"
+                    } else {
+                        "Not connected"
+                    };
                 set_slot(slot, &e.display_name, status, false);
             }
             (None, None) => set_slot(slot, empty_name, "Scan to add one", false),
@@ -525,6 +539,37 @@ fn set_slot(slot: &SetupSlot, name: &str, status: &str, connected: bool) {
 }
 
 // ── Scanning ─────────────────────────────────────────────────────────────────
+
+/// Whether hearing from a saved device should connect it without the rider
+/// asking.
+fn should_auto_connect(
+    saved: bool,
+    connected: bool,
+    connecting: bool,
+    held_off: bool,
+    auto_reconnect: bool,
+) -> bool {
+    saved && !connected && !connecting && !held_off && auto_reconnect
+}
+
+/// Whether a saved device counts as missing — what the reconnect scans are
+/// looking for, and what keeps them going.
+fn is_missing(saved: bool, connected: bool, held_off: bool) -> bool {
+    saved && !connected && !held_off
+}
+
+/// What a saved device's row says.
+fn saved_status(connected: bool, connecting: bool, held_off: bool, scanning: bool) -> RowStatus {
+    if connected {
+        RowStatus::Connected
+    } else if connecting {
+        RowStatus::Connecting
+    } else if scanning && !held_off {
+        RowStatus::Searching
+    } else {
+        RowStatus::Idle
+    }
+}
 
 /// How long to wait before the `attempt`-th consecutive auto-reconnect scan.
 ///
@@ -617,7 +662,7 @@ fn has_missing_saved(ctx: &PageCtx) -> bool {
     ctx.entries
         .borrow()
         .values()
-        .any(|e| e.saved && !e.connected)
+        .any(|e| is_missing(e.saved, e.connected, e.held_off))
 }
 
 /// Refresh status text on every saved-but-not-connected row.
@@ -628,13 +673,7 @@ fn update_saved_statuses(ctx: &PageCtx) {
         if !entry.saved || entry.connected {
             continue;
         }
-        let status = if entry.connecting {
-            RowStatus::Connecting
-        } else if scanning {
-            RowStatus::Searching
-        } else {
-            RowStatus::Idle
-        };
+        let status = saved_status(entry.connected, entry.connecting, entry.held_off, scanning);
         if let Some(label) = &entry.status_label {
             apply_status(label, status);
         }
@@ -710,15 +749,7 @@ fn rebuild_saved_row(ctx: &PageCtx, address: &str) {
     let Some((old_row, display_name, kind, transport, status)) = ({
         let entries = ctx.entries.borrow();
         entries.get(address).map(|e| {
-            let status = if e.connected {
-                RowStatus::Connected
-            } else if e.connecting {
-                RowStatus::Connecting
-            } else if ctx.scanning.get() {
-                RowStatus::Searching
-            } else {
-                RowStatus::Idle
-            };
+            let status = saved_status(e.connected, e.connecting, e.held_off, ctx.scanning.get());
             (
                 e.row.clone(),
                 e.display_name.clone(),
@@ -784,6 +815,7 @@ fn make_add_row(
         btn.set_label("Connecting…");
         if let Some(e) = ctx_add.entries.borrow_mut().get_mut(&addr) {
             e.connecting = true;
+            e.held_off = false;
         }
         let _ = ctx_add.cmd_tx.try_send(DeviceCommand::Connect {
             address: addr.clone(),
@@ -915,6 +947,9 @@ fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widge
             #[weak]
             dialog,
             move |_| {
+                if let Some(e) = ctx_disc.entries.borrow_mut().get_mut(&addr_disc) {
+                    e.held_off = true;
+                }
                 let _ = ctx_disc.cmd_tx.try_send(DeviceCommand::Disconnect {
                     address: addr_disc.clone(),
                 });
@@ -937,6 +972,7 @@ fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widge
             move |_| {
                 if let Some(e) = ctx_conn.entries.borrow_mut().get_mut(&addr_conn) {
                     e.connecting = true;
+                    e.held_off = false;
                 }
                 set_saved_status(&ctx_conn, &addr_conn, RowStatus::Connecting);
                 let _ = ctx_conn.cmd_tx.try_send(DeviceCommand::Connect {
@@ -1060,6 +1096,66 @@ fn signal_text(rssi: Option<i16>) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── A disconnect the rider asked for ────────────────────────────────────
+    // Pressing Disconnect on a saved device used to be undone within seconds:
+    // the disconnect looked like a dropout, a reconnect scan started, the
+    // device was heard again and auto-connect took it straight back.
+
+    #[test]
+    fn should_auto_connect_a_saved_device_that_dropped_out() {
+        assert!(should_auto_connect(true, false, false, false, true));
+    }
+
+    #[test]
+    fn should_not_auto_connect_a_device_the_rider_disconnected() {
+        assert!(!should_auto_connect(true, false, false, true, true));
+    }
+
+    #[test]
+    fn should_not_auto_connect_with_auto_reconnect_off() {
+        assert!(!should_auto_connect(true, false, false, false, false));
+    }
+
+    #[test]
+    fn should_not_auto_connect_twice_while_a_connect_is_in_flight() {
+        assert!(!should_auto_connect(true, false, true, false, true));
+    }
+
+    #[test]
+    fn should_not_auto_connect_a_device_that_was_never_saved() {
+        assert!(!should_auto_connect(false, false, false, false, true));
+    }
+
+    #[test]
+    fn should_count_a_saved_device_that_dropped_out_as_missing() {
+        assert!(is_missing(true, false, false));
+    }
+
+    #[test]
+    fn should_not_hunt_for_a_device_the_rider_disconnected() {
+        assert!(!is_missing(true, false, true));
+    }
+
+    #[test]
+    fn should_not_count_a_connected_device_as_missing() {
+        assert!(!is_missing(true, true, false));
+    }
+
+    #[test]
+    fn should_not_say_searching_for_a_device_the_rider_disconnected() {
+        assert!(saved_status(false, false, true, true) == RowStatus::Idle);
+    }
+
+    #[test]
+    fn should_say_searching_for_a_missing_device_during_a_scan() {
+        assert!(saved_status(false, false, false, true) == RowStatus::Searching);
+    }
+
+    #[test]
+    fn should_say_connecting_once_the_rider_presses_connect() {
+        assert!(saved_status(false, true, false, true) == RowStatus::Connecting);
+    }
 
     #[test]
     fn should_retry_immediately_on_the_first_dropout() {

@@ -140,13 +140,15 @@ const PAGE_TARGET_POWER: u8 = 0x31; // 49
 const PAGE_TRACK_RESISTANCE: u8 = 0x33; // 51
 
 /// Commands sent from the device manager to the ANT thread.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum AntCommand {
     Scan,
     /// Go live with the FE-C trainer. Named for the trainer specifically: the
     /// stick can carry several devices, and only this one is controllable.
     ConnectTrainer,
     DisconnectTrainer,
+    /// Bring back a heart rate strap the rider disconnected.
+    ConnectHr,
     /// Drop the heart rate strap alone, leaving the trainer running.
     DisconnectHr,
     SetTargetPower(u16),
@@ -522,29 +524,308 @@ fn dead_channel_event(data: &[u8]) -> Option<u8> {
     matches!(data[2], EVENT_RX_SEARCH_TIMEOUT | EVENT_CHANNEL_CLOSED).then_some(data[0])
 }
 
+/// Something the connection state asks of the stick or the app.
+#[derive(Debug)]
+enum Effect {
+    /// Bring a channel up (or back up) exactly as it is configured at startup.
+    Open(u8),
+    /// Shut one channel, leaving the others searching.
+    Close(u8),
+    /// Tell the rest of the app.
+    Emit(DeviceEvent),
+}
+
+/// Which ANT+ devices are announced, live, or shut off by the rider — the part
+/// of the ANT thread that decides what the app is told, kept apart from the USB
+/// I/O so it can be tested without a stick.
+///
+/// Every method returns what has to happen as a result; [`run`] carries it out.
+/// Time is passed in rather than read, so the silence rules can be tested on
+/// their boundaries.
+#[derive(Debug, Default)]
+struct AntLink {
+    /// Announced to the Devices page as *present*. A scan clears these so a
+    /// rescan re-lists what is out there. The `*_connected` flags below are
+    /// deliberately kept separate and survive a rescan: re-announcing a live
+    /// sensor as freshly connected toasts the rider once per broadcast.
+    discovered: bool,
+    /// The ANT+ HR strap is announced separately from the trainer — it is a
+    /// different device on its own channel.
+    hr_discovered: bool,
+    /// Reported to the rest of the app as connected.
+    connected: bool,
+    hr_connected: bool,
+    /// The rider has asked for the trainer, but no FE-C page has arrived yet.
+    connect_requested: bool,
+    /// Channels closed by a per-device disconnect. They stay shut — through
+    /// scans, and through the stick being unplugged and replugged — until the
+    /// rider connects that device again. A scan cannot be read as asking for
+    /// them back: the Devices page starts one on its own after every
+    /// disconnect, which used to undo the disconnect within seconds.
+    fec_muted: bool,
+    hr_muted: bool,
+    /// When the FE-C channel last spoke — see `FEC_SILENCE_TIMEOUT`.
+    last_fec_seen: Option<Instant>,
+}
+
+fn trainer_changed(connected: bool) -> Effect {
+    Effect::Emit(DeviceEvent::ConnectionChanged {
+        address: ANT_FEC_ADDRESS.to_string(),
+        connected,
+        device_type: connected.then_some(DeviceType::FtmsTrainer),
+    })
+}
+
+fn strap_changed(connected: bool) -> Effect {
+    Effect::Emit(DeviceEvent::ConnectionChanged {
+        address: ANT_HR_ADDRESS.to_string(),
+        connected,
+        device_type: connected.then_some(DeviceType::HeartRateMonitor),
+    })
+}
+
+impl AntLink {
+    /// The rider pressed Scan, with the stick present. `channels_up` says
+    /// whether the channels are already searching; if not, the caller opens
+    /// them all itself.
+    fn scan(&mut self, channels_up: bool) -> Vec<Effect> {
+        let mut out = Vec::new();
+        // Re-list whatever is found, but leave the channels alone if they are
+        // already up: reopening restarts the ANT search and throws away sensors
+        // already paired.
+        self.discovered = false;
+        self.hr_discovered = false;
+        if channels_up && !self.connected && !self.fec_muted {
+            // Pressing Scan with no trainer found is the rider saying "look
+            // again", so re-arm the FE-C search on its own. The other channels
+            // keep whatever they have already paired: restarting those would
+            // throw away a live strap.
+            out.push(Effect::Open(FEC_CHANNEL));
+        }
+        out
+    }
+
+    /// The rider asked to connect the trainer.
+    fn connect_trainer(&mut self, now: Instant) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if self.fec_muted {
+            self.fec_muted = false;
+            out.push(Effect::Open(FEC_CHANNEL));
+        }
+        // A USB stick is not a trainer. Going live waits for an actual FE-C
+        // page, so a trainer that is switched off is never reported as
+        // connected — otherwise the app shows a dead trainer as ready and
+        // accepts ERG targets for it.
+        self.connect_requested = true;
+        // Listed is not the same as there: a trainer found and then switched
+        // off before the rider pressed Connect is still listed. Only a recent
+        // page counts — otherwise the silence check takes it straight back down.
+        let heard_recently = self
+            .last_fec_seen
+            .is_some_and(|t| now.saturating_duration_since(t) < FEC_SILENCE_TIMEOUT);
+        if self.discovered && heard_recently && !self.connected {
+            self.connected = true;
+            out.push(trainer_changed(true));
+            tracing::info!("ANT FE-C trainer connected");
+        } else if !self.connected {
+            tracing::info!("ANT FE-C connect requested — waiting for the trainer to broadcast");
+        }
+        out
+    }
+
+    /// The rider disconnected the trainer from the Devices page.
+    fn disconnect_trainer(&mut self) -> Vec<Effect> {
+        self.fec_muted = true;
+        self.connected = false;
+        self.connect_requested = false;
+        self.discovered = false;
+        self.last_fec_seen = None;
+        vec![Effect::Close(FEC_CHANNEL), trainer_changed(false)]
+    }
+
+    /// The rider asked to connect the heart rate strap. Only a strap they
+    /// disconnected needs anything doing: a live one is already connected, and
+    /// one not yet heard announces itself when it is.
+    fn connect_hr(&mut self) -> Vec<Effect> {
+        if !self.hr_muted {
+            return Vec::new();
+        }
+        self.hr_muted = false;
+        vec![Effect::Open(HR_CHANNEL)]
+    }
+
+    /// The rider disconnected the strap alone, leaving the trainer running.
+    fn disconnect_hr(&mut self) -> Vec<Effect> {
+        let mut out = vec![Effect::Close(HR_CHANNEL)];
+        self.hr_muted = true;
+        self.hr_discovered = false;
+        if self.hr_connected {
+            self.hr_connected = false;
+            out.push(strap_changed(false));
+        }
+        out
+    }
+
+    /// The stick has gone — unplugged, or taken by another process. Every
+    /// sensor on it went with it, not just the trainer. What the rider
+    /// disconnected stays disconnected when it comes back.
+    fn stick_lost(&mut self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        self.connect_requested = false;
+        self.discovered = false;
+        self.hr_discovered = false;
+        self.last_fec_seen = None;
+        if self.connected {
+            self.connected = false;
+            out.push(trainer_changed(false));
+        }
+        if self.hr_connected {
+            self.hr_connected = false;
+            out.push(strap_changed(false));
+        }
+        out
+    }
+
+    /// A trainer that is switched off mid-ride stops broadcasting and says
+    /// nothing else, so silence is the only disconnect there is to observe.
+    fn check_silence(&mut self, now: Instant) -> Vec<Effect> {
+        let silent = self
+            .last_fec_seen
+            .is_some_and(|t| now.saturating_duration_since(t) >= FEC_SILENCE_TIMEOUT);
+        if !(self.connected && silent) {
+            return Vec::new();
+        }
+        tracing::info!("ANT FE-C trainer went silent — reporting it disconnected");
+        self.connected = false;
+        self.connect_requested = false;
+        self.discovered = false;
+        self.last_fec_seen = None;
+        vec![trainer_changed(false)]
+    }
+
+    /// The stick says `channel` has stopped listening. It is dead until it is
+    /// opened again and nothing else will mention it, so reopen it — unless the
+    /// rider shut it by disconnecting that device.
+    fn channel_dead(&self, channel: u8) -> Vec<Effect> {
+        let muted = match channel {
+            FEC_CHANNEL => self.fec_muted,
+            HR_CHANNEL => self.hr_muted,
+            _ => false,
+        };
+        if muted || channel_config(channel).is_none() {
+            return Vec::new();
+        }
+        vec![Effect::Open(channel)]
+    }
+
+    /// The channels the rider has shut, which must stay shut when every
+    /// channel is opened together.
+    fn muted_channels(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.fec_muted {
+            out.push(FEC_CHANNEL);
+        }
+        if self.hr_muted {
+            out.push(HR_CHANNEL);
+        }
+        out
+    }
+
+    /// A heart rate reading arrived on the HR channel.
+    fn hr_heard(&mut self, bpm: u32) -> Vec<Effect> {
+        if self.hr_muted {
+            return Vec::new(); // rider disconnected the strap; its channel should be shut
+        }
+        let mut out = Vec::new();
+        // Announce the strap the first time it reports, so it shows up in the
+        // Devices page. A scan clears this to re-list it.
+        if !self.hr_discovered {
+            self.hr_discovered = true;
+            out.push(Effect::Emit(DeviceEvent::PeripheralDiscovered {
+                address: ANT_HR_ADDRESS.to_string(),
+                name: "ANT+ Heart Rate".to_string(),
+                rssi: None,
+                transport: Transport::AntPlus,
+                kind: DeviceType::HeartRateMonitor,
+            }));
+        }
+        // A broadcast sensor has nothing to connect to, so it counts as
+        // connected the moment it is heard — but only say so once. A strap that
+        // never went away must not be re-announced by every rescan: each
+        // announcement is a toast, and a scan restarted by one of those toasts
+        // announces it again, 4× a second.
+        if !self.hr_connected {
+            self.hr_connected = true;
+            out.push(strap_changed(true));
+            tracing::info!("ANT+ heart rate monitor found");
+        }
+        out.push(Effect::Emit(DeviceEvent::Readings(LiveReadings {
+            heart_rate_bpm: Some(bpm),
+            source: ReadingSource::Ant,
+            ..Default::default()
+        })));
+        out
+    }
+
+    /// A page arrived on the FE-C channel. Afterwards, `connected` says whether
+    /// its readings should be passed on.
+    fn fec_heard(&mut self, now: Instant) -> Vec<Effect> {
+        if self.fec_muted {
+            // The rider disconnected it; a page already in flight when the
+            // channel closed must not list it again.
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.last_fec_seen = Some(now);
+        if !self.discovered {
+            self.discovered = true;
+            out.push(Effect::Emit(DeviceEvent::PeripheralDiscovered {
+                address: ANT_FEC_ADDRESS.to_string(),
+                name: "ANT+ Trainer (FE-C)".to_string(),
+                rssi: None,
+                transport: Transport::AntPlus,
+                // FE-C is by definition a controllable trainer.
+                kind: DeviceType::FtmsTrainer,
+            }));
+        }
+        // The connect the rider asked for completes here, not when the command
+        // arrived: this page is the first evidence there is a trainer on the
+        // other end of the stick.
+        if self.connect_requested && !self.connected {
+            self.connected = true;
+            out.push(trainer_changed(true));
+            tracing::info!("ANT FE-C trainer connected");
+        }
+        out
+    }
+}
+
+/// Carry out what [`AntLink`] asked for. Stick operations are skipped when
+/// there is no stick; there is nothing to open or close.
+fn apply(stick: Option<&AntStick>, event_tx: &Sender<DeviceEvent>, effects: Vec<Effect>) {
+    for effect in effects {
+        match effect {
+            Effect::Open(channel) => {
+                if let (Some(s), Some((device_type, period))) = (stick, channel_config(channel)) {
+                    s.open_channel(channel, device_type, period);
+                }
+            }
+            Effect::Close(channel) => {
+                if let Some(s) = stick {
+                    s.close_channel(channel);
+                }
+            }
+            Effect::Emit(event) => {
+                let _ = event_tx.send_blocking(event);
+            }
+        }
+    }
+}
+
 /// ANT thread entry point. Runs until a `Shutdown` command or the channel closes.
 pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut stick: Option<AntStick> = None;
-    // Announced to the Devices page as *present*. A scan clears these so a
-    // rescan re-lists what is out there. The `*_connected` flags below are
-    // deliberately kept separate and survive a rescan: re-announcing a live
-    // sensor as freshly connected toasts the rider once per broadcast.
-    let mut discovered = false;
-    // The ANT+ HR strap is announced separately from the trainer — it is a
-    // different device on its own channel.
-    let mut hr_discovered = false;
-    // Reported to the rest of the app as connected.
-    let mut connected = false;
-    let mut hr_connected = false;
-    // The rider has asked for the trainer, but no FE-C page has arrived yet.
-    let mut connect_requested = false;
-    // Channels closed by a per-device disconnect. They stay shut until the
-    // rider scans (or reconnects the trainer) rather than being reopened by
-    // `open_channels`, which resets the search for everything else too.
-    let mut fec_muted = false;
-    let mut hr_muted = false;
-    // When the FE-C channel last spoke — see `FEC_SILENCE_TIMEOUT`.
-    let mut last_fec_seen: Option<Instant> = None;
+    let mut link = AntLink::default();
     let mut channel_open = false;
     let mut erg_enabled = true;
     // Set once the Speed & Cadence channel supplies cadence; thereafter FE-C cadence
@@ -556,6 +837,17 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     // Paced retries of a failed channel open — see the loop below.
     let mut last_open_attempt = Instant::now();
 
+    // Open every channel, then shut again whichever the rider has disconnected:
+    // opening all of them together is the only way the stick is set up, and it
+    // would otherwise bring a muted device straight back.
+    let open_all = |s: &AntStick, link: &AntLink| -> bool {
+        let ok = s.open_channels();
+        for channel in link.muted_channels() {
+            s.close_channel(channel);
+        }
+        ok
+    };
+
     loop {
         // Drain pending commands first.
         loop {
@@ -566,31 +858,10 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     }
                     match &stick {
                         Some(s) => {
-                            // Re-list whatever is found, but leave the channels
-                            // alone if they are already up: reopening restarts the
-                            // ANT search and throws away sensors already paired.
-                            discovered = false;
-                            hr_discovered = false;
-                            // A scan is the rider asking for a muted device back.
-                            let mut fec_reopened = false;
-                            if fec_muted {
-                                fec_muted = false;
-                                s.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
-                                fec_reopened = true;
-                            }
-                            if hr_muted {
-                                hr_muted = false;
-                                s.open_channel(HR_CHANNEL, HR_DEVICE_TYPE, HR_CHANNEL_PERIOD);
-                            }
+                            let effects = link.scan(channel_open);
+                            apply(Some(s), &event_tx, effects);
                             if !channel_open {
-                                channel_open = s.open_channels();
-                            } else if !connected && !fec_reopened {
-                                // Pressing Scan with no trainer found is the
-                                // rider saying "look again", so re-arm the FE-C
-                                // search on its own. The other channels keep
-                                // whatever they have already paired: restarting
-                                // those would throw away a live strap.
-                                s.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
+                                channel_open = open_all(s, &link);
                             }
                         }
                         None => tracing::warn!("ANT scan requested but no stick available"),
@@ -604,66 +875,28 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                         // The user may connect a saved ANT device without scanning first,
                         // so make sure the FE-C channel is up before going live.
                         if !channel_open {
-                            channel_open = s.open_channels();
+                            channel_open = open_all(s, &link);
                         }
-                        if fec_muted {
-                            fec_muted = false;
-                            s.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
-                        }
-                        // A USB stick is not a trainer. Going live waits for an
-                        // actual FE-C page, so a trainer that is switched off is
-                        // never reported as connected — otherwise the app shows a
-                        // dead trainer as ready and accepts ERG targets for it.
-                        connect_requested = true;
-                        if discovered && !connected {
-                            connected = true;
-                            let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                                address: ANT_FEC_ADDRESS.to_string(),
-                                connected: true,
-                                device_type: Some(DeviceType::FtmsTrainer),
-                            });
-                            tracing::info!("ANT FE-C trainer connected");
-                        } else if !connected {
-                            tracing::info!(
-                                "ANT FE-C connect requested — waiting for the trainer to broadcast"
-                            );
-                        }
+                        let effects = link.connect_trainer(Instant::now());
+                        apply(Some(s), &event_tx, effects);
                     } else {
                         tracing::warn!("ANT connect requested but no stick available");
                     }
                 }
                 Ok(AntCommand::DisconnectTrainer) => {
-                    if let Some(s) = &stick {
-                        s.close_channel(FEC_CHANNEL);
-                    }
-                    fec_muted = true;
-                    connected = false;
-                    connect_requested = false;
-                    discovered = false;
-                    last_fec_seen = None;
-                    let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                        address: ANT_FEC_ADDRESS.to_string(),
-                        connected: false,
-                        device_type: None,
-                    });
+                    let effects = link.disconnect_trainer();
+                    apply(stick.as_ref(), &event_tx, effects);
+                }
+                Ok(AntCommand::ConnectHr) => {
+                    let effects = link.connect_hr();
+                    apply(stick.as_ref(), &event_tx, effects);
                 }
                 Ok(AntCommand::DisconnectHr) => {
-                    if let Some(s) = &stick {
-                        s.close_channel(HR_CHANNEL);
-                    }
-                    hr_muted = true;
-                    hr_discovered = false;
-                    if hr_connected {
-                        hr_connected = false;
-                        let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                            address: ANT_HR_ADDRESS.to_string(),
-                            connected: false,
-                            device_type: None,
-                        });
-                    }
+                    let effects = link.disconnect_hr();
+                    apply(stick.as_ref(), &event_tx, effects);
                 }
                 Ok(AntCommand::SetTargetPower(watts)) => {
-                    if connected && erg_enabled {
+                    if link.connected && erg_enabled {
                         if let Some(s) = &stick {
                             s.send_target_power(watts);
                         }
@@ -672,7 +905,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                 Ok(AntCommand::SetTrackResistance(grade_percent)) => {
                     // Gated on the same "automatic resistance" switch as ERG —
                     // it is the user's kill switch for trainer control.
-                    if connected && erg_enabled {
+                    if link.connected && erg_enabled {
                         if let Some(s) = &stick {
                             s.send_track_resistance(grade_percent);
                         }
@@ -718,59 +951,26 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
         // leaving the trainer permanently undiscoverable.
         if !channel_open && last_open_attempt.elapsed() >= CHANNEL_RETRY_INTERVAL {
             last_open_attempt = Instant::now();
-            channel_open = s.open_channels();
+            channel_open = open_all(s, &link);
         }
         let n = match s.read(&mut buf) {
             Ok(n) => n,
             Err(e) => {
-                // The stick has gone — unplugged, or taken by another process.
-                // Drop it so the loop idles instead of spinning on a read that
-                // fails instantly, and let the retry above pick it up again.
+                // Drop the stick so the loop idles instead of spinning on a read
+                // that fails instantly, and let the retry above pick it up again.
                 tracing::warn!("ANT stick lost ({e}) — waiting for it to return");
                 stick = None;
                 channel_open = false;
-                fec_muted = false;
-                hr_muted = false;
-                connect_requested = false;
-                discovered = false;
-                hr_discovered = false;
-                last_fec_seen = None;
-                if connected {
-                    connected = false;
-                    let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                        address: ANT_FEC_ADDRESS.to_string(),
-                        connected: false,
-                        device_type: None,
-                    });
-                }
-                // Every sensor on this stick went with it, not just the trainer.
-                if hr_connected {
-                    hr_connected = false;
-                    let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                        address: ANT_HR_ADDRESS.to_string(),
-                        connected: false,
-                        device_type: None,
-                    });
-                }
+                let effects = link.stick_lost();
+                apply(None, &event_tx, effects);
                 continue;
             }
         };
 
-        // A trainer that is switched off mid-ride stops broadcasting and says
-        // nothing else. Checked before the `n == 0` idle path below, because
-        // silence is exactly the case this has to catch.
-        if connected && last_fec_seen.is_some_and(|t| t.elapsed() >= FEC_SILENCE_TIMEOUT) {
-            tracing::info!("ANT FE-C trainer went silent — reporting it disconnected");
-            connected = false;
-            connect_requested = false;
-            discovered = false;
-            last_fec_seen = None;
-            let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                address: ANT_FEC_ADDRESS.to_string(),
-                connected: false,
-                device_type: None,
-            });
-        }
+        // Checked before the `n == 0` idle path below, because silence is
+        // exactly the case this has to catch.
+        let effects = link.check_silence(Instant::now());
+        apply(Some(s), &event_tx, effects);
 
         if n == 0 {
             continue;
@@ -781,22 +981,14 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             // here or the device on that channel is lost for the whole run.
             if msg_id == MSG_CHANNEL_RESPONSE {
                 if let Some(channel) = dead_channel_event(data) {
-                    let muted = match channel {
-                        FEC_CHANNEL => fec_muted,
-                        HR_CHANNEL => hr_muted,
-                        _ => false,
-                    };
-                    // A channel the rider muted by disconnecting that device
-                    // is meant to be shut. Leave it that way.
-                    if !muted {
-                        if let Some((device_type, period)) = channel_config(channel) {
-                            tracing::info!(
-                                "ANT ch{channel} stopped listening (event 0x{:02x}) — reopening",
-                                data[2]
-                            );
-                            s.open_channel(channel, device_type, period);
-                        }
+                    let effects = link.channel_dead(channel);
+                    if !effects.is_empty() {
+                        tracing::info!(
+                            "ANT ch{channel} stopped listening (event 0x{:02x}) — reopening",
+                            data[2]
+                        );
                     }
+                    apply(Some(s), &event_tx, effects);
                 }
                 return;
             }
@@ -815,41 +1007,9 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             // Heart rate channel — independent of the trainer, so it reports
             // whether or not an FE-C trainer has been found.
             if channel == HR_CHANNEL {
-                if hr_muted {
-                    return; // rider disconnected the strap; its channel should be shut
-                }
                 if let Some(bpm) = parse_ant_heart_rate(payload) {
-                    // Announce the strap the first time it reports, so it shows up
-                    // in the Devices page. A scan clears this to re-list it.
-                    if !hr_discovered {
-                        hr_discovered = true;
-                        let _ = event_tx.send_blocking(DeviceEvent::PeripheralDiscovered {
-                            address: ANT_HR_ADDRESS.to_string(),
-                            name: "ANT+ Heart Rate".to_string(),
-                            rssi: None,
-                            transport: Transport::AntPlus,
-                            kind: DeviceType::HeartRateMonitor,
-                        });
-                    }
-                    // A broadcast sensor has nothing to connect to, so it counts as
-                    // connected the moment it is heard — but only say so once. A
-                    // strap that never went away must not be re-announced by every
-                    // rescan: each announcement is a toast, and a scan restarted by
-                    // one of those toasts announces it again, 4× a second.
-                    if !hr_connected {
-                        hr_connected = true;
-                        let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                            address: ANT_HR_ADDRESS.to_string(),
-                            connected: true,
-                            device_type: Some(DeviceType::HeartRateMonitor),
-                        });
-                        tracing::info!("ANT+ heart rate monitor found");
-                    }
-                    let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
-                        heart_rate_bpm: Some(bpm),
-                        source: ReadingSource::Ant,
-                        ..Default::default()
-                    }));
+                    let effects = link.hr_heard(bpm);
+                    apply(Some(s), &event_tx, effects);
                 }
                 return;
             }
@@ -858,7 +1018,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             // omit it from the FE-C trainer page. Cadence is derived from the change
             // in crank revolutions between samples.
             if channel == CADENCE_CHANNEL {
-                if connected {
+                if link.connected {
                     if let Some((revs, time)) = parse_speed_cadence(payload) {
                         if let Some((prev_revs, prev_time)) = last_cadence_sample {
                             if let Some(rpm) = compute_cadence_rpm(prev_revs, prev_time, revs, time)
@@ -879,33 +1039,9 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             }
 
             // FE-C channel: discovery + power / speed / HR.
-            last_fec_seen = Some(Instant::now());
-            if !discovered {
-                discovered = true;
-                let _ = event_tx.send_blocking(DeviceEvent::PeripheralDiscovered {
-                    address: ANT_FEC_ADDRESS.to_string(),
-                    name: "ANT+ Trainer (FE-C)".to_string(),
-                    rssi: None,
-                    transport: Transport::AntPlus,
-                    // FE-C is by definition a controllable trainer.
-                    kind: DeviceType::FtmsTrainer,
-                });
-            }
-
-            // The connect the rider asked for completes here, not when the
-            // command arrived: this page is the first evidence there is a
-            // trainer on the other end of the stick.
-            if connect_requested && !connected {
-                connected = true;
-                let _ = event_tx.send_blocking(DeviceEvent::ConnectionChanged {
-                    address: ANT_FEC_ADDRESS.to_string(),
-                    connected: true,
-                    device_type: Some(DeviceType::FtmsTrainer),
-                });
-                tracing::info!("ANT FE-C trainer connected");
-            }
-
-            if !connected {
+            let effects = link.fec_heard(Instant::now());
+            apply(Some(s), &event_tx, effects);
+            if !link.connected {
                 return;
             }
             if let Some(mut readings) =
@@ -924,6 +1060,340 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Connection state (AntLink) ──────────────────────────────────────────
+    // The two `run()` loops had no tests at all. These pin what the link tells
+    // the app before 0.14.0 changed any of it, then the changes, each written
+    // first and watched failing.
+
+    fn connection_changes(effects: &[Effect]) -> Vec<(&str, bool)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Emit(DeviceEvent::ConnectionChanged {
+                    address, connected, ..
+                }) => Some((address.as_str(), *connected)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn discoveries(effects: &[Effect]) -> Vec<&str> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Emit(DeviceEvent::PeripheralDiscovered { address, .. }) => {
+                    Some(address.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn opened(effects: &[Effect]) -> Vec<u8> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Open(ch) => Some(*ch),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn closed(effects: &[Effect]) -> Vec<u8> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Close(ch) => Some(*ch),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A link with the trainer connected and broadcasting as of `now`.
+    fn trainer_live(now: Instant) -> AntLink {
+        let mut link = AntLink::default();
+        link.connect_trainer(now);
+        link.fec_heard(now);
+        assert!(link.connected);
+        link
+    }
+
+    /// A link with the trainer and the strap both live.
+    fn both_live(now: Instant) -> AntLink {
+        let mut link = trainer_live(now);
+        link.hr_heard(140);
+        assert!(link.hr_connected);
+        link
+    }
+
+    #[test]
+    fn should_wait_for_a_page_before_calling_the_trainer_connected() {
+        let now = Instant::now();
+        let mut link = AntLink::default();
+        assert!(connection_changes(&link.connect_trainer(now)).is_empty());
+        assert!(!link.connected);
+        let heard = link.fec_heard(now);
+        assert_eq!(connection_changes(&heard), vec![(ANT_FEC_ADDRESS, true)]);
+    }
+
+    #[test]
+    fn should_connect_at_once_to_a_trainer_heard_a_moment_ago() {
+        let now = Instant::now();
+        let mut link = AntLink::default();
+        link.fec_heard(now);
+        let effects = link.connect_trainer(now + Duration::from_secs(1));
+        assert_eq!(connection_changes(&effects), vec![(ANT_FEC_ADDRESS, true)]);
+    }
+
+    #[test]
+    fn should_not_call_a_trainer_that_went_quiet_before_connecting_connected() {
+        // Found and listed, then switched off before the rider pressed
+        // Connect. Going live on the old sighting flapped Connected and then
+        // Disconnected inside one loop, and accepted ERG targets in between.
+        let now = Instant::now();
+        let mut link = AntLink::default();
+        link.fec_heard(now);
+        let effects = link.connect_trainer(now + FEC_SILENCE_TIMEOUT);
+        assert!(connection_changes(&effects).is_empty());
+        assert!(!link.connected);
+        // It still connects the moment the trainer speaks again.
+        let heard = link.fec_heard(now + FEC_SILENCE_TIMEOUT + Duration::from_secs(5));
+        assert_eq!(connection_changes(&heard), vec![(ANT_FEC_ADDRESS, true)]);
+    }
+
+    #[test]
+    fn should_keep_the_trainer_until_it_has_been_silent_for_the_whole_timeout() {
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        let just_short = FEC_SILENCE_TIMEOUT - Duration::from_millis(1);
+        assert!(link.check_silence(now + just_short).is_empty());
+        assert!(link.connected);
+    }
+
+    #[test]
+    fn should_report_the_trainer_gone_once_silent_for_the_timeout() {
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        let effects = link.check_silence(now + FEC_SILENCE_TIMEOUT);
+        assert_eq!(connection_changes(&effects), vec![(ANT_FEC_ADDRESS, false)]);
+        assert!(!link.connected);
+        // Once, not every loop after.
+        assert!(link.check_silence(now + FEC_SILENCE_TIMEOUT * 2).is_empty());
+    }
+
+    #[test]
+    fn should_leave_the_strap_connected_when_the_trainer_goes_silent() {
+        let now = Instant::now();
+        let mut link = both_live(now);
+        let effects = link.check_silence(now + FEC_SILENCE_TIMEOUT);
+        assert_eq!(connection_changes(&effects), vec![(ANT_FEC_ADDRESS, false)]);
+        assert!(link.hr_connected);
+    }
+
+    #[test]
+    fn should_not_time_out_a_trainer_that_was_never_connected() {
+        let now = Instant::now();
+        let mut link = AntLink::default();
+        link.fec_heard(now);
+        assert!(link
+            .check_silence(now + FEC_SILENCE_TIMEOUT * 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn should_not_time_out_when_the_clock_reads_earlier_than_the_last_page() {
+        let now = Instant::now() + Duration::from_secs(60);
+        let mut link = trainer_live(now);
+        assert!(link.check_silence(now - Duration::from_secs(30)).is_empty());
+    }
+
+    #[test]
+    fn should_reconnect_a_silent_trainer_only_when_asked_again() {
+        // Silence clears the request: getting the trainer back is the Devices
+        // page's call (auto-reconnect, or the rider), not the link's.
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        link.check_silence(now + FEC_SILENCE_TIMEOUT);
+        let back = link.fec_heard(now + FEC_SILENCE_TIMEOUT * 2);
+        assert!(connection_changes(&back).is_empty());
+        assert_eq!(discoveries(&back), vec![ANT_FEC_ADDRESS]);
+    }
+
+    #[test]
+    fn should_leave_the_trainer_connected_when_the_strap_is_disconnected() {
+        let now = Instant::now();
+        let mut link = both_live(now);
+        let effects = link.disconnect_hr();
+        assert_eq!(connection_changes(&effects), vec![(ANT_HR_ADDRESS, false)]);
+        assert_eq!(closed(&effects), vec![HR_CHANNEL]);
+        assert!(link.connected);
+    }
+
+    #[test]
+    fn should_leave_the_strap_connected_when_the_trainer_is_disconnected() {
+        let now = Instant::now();
+        let mut link = both_live(now);
+        let effects = link.disconnect_trainer();
+        assert_eq!(connection_changes(&effects), vec![(ANT_FEC_ADDRESS, false)]);
+        assert_eq!(closed(&effects), vec![FEC_CHANNEL]);
+        assert!(link.hr_connected);
+    }
+
+    #[test]
+    fn should_announce_a_strap_once_however_often_it_is_heard() {
+        let mut link = AntLink::default();
+        let first = link.hr_heard(120);
+        let second = link.hr_heard(121);
+        assert_eq!(connection_changes(&first), vec![(ANT_HR_ADDRESS, true)]);
+        assert!(connection_changes(&second).is_empty());
+    }
+
+    #[test]
+    fn should_relist_a_live_strap_after_a_scan_without_reconnecting_it() {
+        let now = Instant::now();
+        let mut link = both_live(now);
+        link.scan(true);
+        let heard = link.hr_heard(130);
+        assert_eq!(discoveries(&heard), vec![ANT_HR_ADDRESS]);
+        assert!(connection_changes(&heard).is_empty());
+    }
+
+    #[test]
+    fn should_rearm_only_the_trainer_search_when_scanning_without_a_trainer() {
+        let mut link = AntLink::default();
+        link.hr_heard(120);
+        assert_eq!(opened(&link.scan(true)), vec![FEC_CHANNEL]);
+    }
+
+    #[test]
+    fn should_not_restart_a_connected_trainer_on_scan() {
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        assert!(opened(&link.scan(true)).is_empty());
+    }
+
+    #[test]
+    fn should_report_every_device_gone_when_the_stick_is_lost() {
+        let now = Instant::now();
+        let mut link = both_live(now);
+        let effects = link.stick_lost();
+        assert_eq!(
+            connection_changes(&effects),
+            vec![(ANT_FEC_ADDRESS, false), (ANT_HR_ADDRESS, false)]
+        );
+    }
+
+    #[test]
+    fn should_reopen_a_dead_channel_the_rider_did_not_shut() {
+        let link = AntLink::default();
+        assert_eq!(opened(&link.channel_dead(FEC_CHANNEL)), vec![FEC_CHANNEL]);
+        assert_eq!(opened(&link.channel_dead(HR_CHANNEL)), vec![HR_CHANNEL]);
+        assert!(link.channel_dead(0x07).is_empty());
+    }
+
+    #[test]
+    fn should_leave_a_trainer_channel_the_rider_shut_dead() {
+        let mut link = trainer_live(Instant::now());
+        link.disconnect_trainer();
+        assert!(link.channel_dead(FEC_CHANNEL).is_empty());
+        // The strap's channel was not shut, so it still comes back.
+        assert_eq!(opened(&link.channel_dead(HR_CHANNEL)), vec![HR_CHANNEL]);
+    }
+
+    #[test]
+    fn should_pass_on_the_heart_rate_the_strap_sent() {
+        let mut link = AntLink::default();
+        let effects = link.hr_heard(142);
+        let readings: Vec<&LiveReadings> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Emit(DeviceEvent::Readings(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].heart_rate_bpm, Some(142));
+        assert!(matches!(readings[0].source, ReadingSource::Ant));
+    }
+
+    #[test]
+    fn should_leave_a_channel_the_rider_shut_dead() {
+        let mut link = both_live(Instant::now());
+        link.disconnect_hr();
+        assert!(link.channel_dead(HR_CHANNEL).is_empty());
+    }
+
+    // A disconnect the rider asked for has to stay done. Every one of these
+    // used to be undone within seconds: the dropout rescan the Devices page
+    // starts on any disconnect reopened the muted channel.
+
+    #[test]
+    fn should_keep_a_disconnected_strap_off_through_a_scan() {
+        let mut link = both_live(Instant::now());
+        link.disconnect_hr();
+        let effects = link.scan(true);
+        assert!(!opened(&effects).contains(&HR_CHANNEL));
+        assert!(
+            link.hr_heard(140).is_empty(),
+            "a muted strap must stay quiet"
+        );
+    }
+
+    #[test]
+    fn should_keep_a_disconnected_trainer_off_through_a_scan() {
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        link.disconnect_trainer();
+        let effects = link.scan(true);
+        assert!(!opened(&effects).contains(&FEC_CHANNEL));
+        assert!(link.muted_channels().contains(&FEC_CHANNEL));
+    }
+
+    #[test]
+    fn should_ignore_a_page_from_a_trainer_the_rider_disconnected() {
+        // One may already be in flight when the channel is closed.
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        link.disconnect_trainer();
+        let late = link.fec_heard(now + Duration::from_millis(100));
+        assert!(late.is_empty());
+        assert!(!link.connected);
+    }
+
+    #[test]
+    fn should_bring_a_disconnected_strap_back_when_asked() {
+        let mut link = both_live(Instant::now());
+        link.disconnect_hr();
+        assert_eq!(opened(&link.connect_hr()), vec![HR_CHANNEL]);
+        let heard = link.hr_heard(140);
+        assert_eq!(connection_changes(&heard), vec![(ANT_HR_ADDRESS, true)]);
+    }
+
+    #[test]
+    fn should_not_restart_a_live_strap_when_asked_to_connect_it() {
+        let mut link = both_live(Instant::now());
+        assert!(link.connect_hr().is_empty());
+    }
+
+    #[test]
+    fn should_bring_a_disconnected_trainer_back_when_asked() {
+        let now = Instant::now();
+        let mut link = trainer_live(now);
+        link.disconnect_trainer();
+        assert_eq!(opened(&link.connect_trainer(now)), vec![FEC_CHANNEL]);
+        let heard = link.fec_heard(now + Duration::from_secs(1));
+        assert_eq!(connection_changes(&heard), vec![(ANT_FEC_ADDRESS, true)]);
+    }
+
+    #[test]
+    fn should_keep_the_riders_disconnects_when_the_stick_comes_back() {
+        let mut link = both_live(Instant::now());
+        link.disconnect_hr();
+        link.disconnect_trainer();
+        link.stick_lost();
+        assert_eq!(link.muted_channels(), vec![FEC_CHANNEL, HR_CHANNEL]);
+    }
 
     // ── Channel recovery ────────────────────────────────────────────────────
     // A channel that stops searching is inert, and the stick reports that once

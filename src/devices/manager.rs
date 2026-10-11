@@ -11,7 +11,7 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 
 use crate::data::session::{LiveReadings, ReadingSource};
-use crate::devices::ant::AntDevice;
+use crate::devices::ant::{AntCommand, AntDevice};
 use crate::devices::ftms::{
     compute_cadence_rpm, parse_csc_measurement, parse_cycling_power_measurement,
     parse_hr_measurement, parse_indoor_bike_data, request_control_command, set_simulation_command,
@@ -131,6 +131,23 @@ pub enum DeviceEvent {
 /// is not a display bug — it is a rider pushing against a wall mid-interval.
 fn erg_target(watts: u16) -> u16 {
     watts.min(MAX_ERG_TARGET_W)
+}
+
+/// What the ANT thread is told when the rider connects (`connect`) or
+/// disconnects one ANT+ device, or `None` when there is nothing to tell it.
+///
+/// Each device on the stick comes up and down on its own — dropping one must
+/// not take the rest of the stick with it.
+fn ant_command_for(device: AntDevice, connect: bool) -> Option<AntCommand> {
+    match (device, connect) {
+        (AntDevice::Trainer, true) => Some(AntCommand::ConnectTrainer),
+        (AntDevice::Trainer, false) => Some(AntCommand::DisconnectTrainer),
+        // Broadcast-only, so live the moment it is heard; this only matters
+        // for a strap the rider disconnected, whose channel has to reopen.
+        (AntDevice::HeartRate, true) => Some(AntCommand::ConnectHr),
+        (AntDevice::HeartRate, false) => Some(AntCommand::DisconnectHr),
+        (AntDevice::Unknown, _) => None,
+    }
 }
 
 /// The notification readers currently running, one per connected address.
@@ -537,24 +554,20 @@ impl DeviceManager {
 
                         DeviceCommand::Connect { address } => {
                             // ANT+ devices are handled by the ANT thread, not btleplug.
-                            match crate::devices::ant::classify_address(&address) {
-                                Some(AntDevice::Trainer) => {
-                                    let _ = ant_tx
-                                        .send(crate::devices::ant::AntCommand::ConnectTrainer);
+                            if let Some(device) = crate::devices::ant::classify_address(&address) {
+                                match ant_command_for(device, true) {
+                                    Some(cmd) => {
+                                        let _ = ant_tx.send(cmd);
+                                    }
+                                    None if device == AntDevice::Unknown => {
+                                        tracing::warn!("Connect: unknown ANT+ address {address}");
+                                    }
+                                    None => {}
+                                }
+                                if device == AntDevice::Trainer {
                                     ant_connected = true;
-                                    continue;
                                 }
-                                Some(AntDevice::HeartRate) => {
-                                    // Broadcast-only: live the moment it is heard, and
-                                    // the ANT thread has already said so.
-                                    tracing::debug!("Connect: {address} is broadcast-only");
-                                    continue;
-                                }
-                                Some(AntDevice::Unknown) => {
-                                    tracing::warn!("Connect: unknown ANT+ address {address}");
-                                    continue;
-                                }
-                                None => {}
+                                continue;
                             }
                             // A reconnect re-subscribes and starts a fresh reader, so
                             // whatever was reading this address has to stop first or both
@@ -729,23 +742,19 @@ impl DeviceManager {
                         DeviceCommand::Disconnect { address } => {
                             // Each ANT+ device comes down on its own — dropping one
                             // must not take the rest of the stick with it.
-                            match crate::devices::ant::classify_address(&address) {
-                                Some(AntDevice::Trainer) => {
-                                    let _ = ant_tx
-                                        .send(crate::devices::ant::AntCommand::DisconnectTrainer);
+                            if let Some(device) = crate::devices::ant::classify_address(&address) {
+                                match ant_command_for(device, false) {
+                                    Some(cmd) => {
+                                        let _ = ant_tx.send(cmd);
+                                    }
+                                    None => {
+                                        tracing::warn!("Disconnect: unknown ANT+ address {address}");
+                                    }
+                                }
+                                if device == AntDevice::Trainer {
                                     ant_connected = false;
-                                    continue;
                                 }
-                                Some(AntDevice::HeartRate) => {
-                                    let _ =
-                                        ant_tx.send(crate::devices::ant::AntCommand::DisconnectHr);
-                                    continue;
-                                }
-                                Some(AntDevice::Unknown) => {
-                                    tracing::warn!("Disconnect: unknown ANT+ address {address}");
-                                    continue;
-                                }
-                                None => {}
+                                continue;
                             }
                             if trainer_address.as_deref() == Some(address.as_str()) {
                                 if let Some(ref p) = trainer {
@@ -905,6 +914,32 @@ mod tests {
     use std::time::Duration;
 
     // ── ERG target ceiling (CLAUDE.md §5.1) ──────────────────────────────────
+
+    #[test]
+    fn should_send_each_ant_device_its_own_connect() {
+        assert_eq!(
+            ant_command_for(AntDevice::Trainer, true),
+            Some(AntCommand::ConnectTrainer)
+        );
+        assert_eq!(
+            ant_command_for(AntDevice::HeartRate, true),
+            Some(AntCommand::ConnectHr)
+        );
+        assert_eq!(ant_command_for(AntDevice::Unknown, true), None);
+    }
+
+    #[test]
+    fn should_send_each_ant_device_its_own_disconnect() {
+        assert_eq!(
+            ant_command_for(AntDevice::Trainer, false),
+            Some(AntCommand::DisconnectTrainer)
+        );
+        assert_eq!(
+            ant_command_for(AntDevice::HeartRate, false),
+            Some(AntCommand::DisconnectHr)
+        );
+        assert_eq!(ant_command_for(AntDevice::Unknown, false), None);
+    }
 
     #[test]
     fn should_pass_through_a_target_a_rider_could_actually_hold() {
