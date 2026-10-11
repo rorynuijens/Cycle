@@ -20,7 +20,9 @@ use crate::data::{
     workout::Workout,
 };
 use crate::training::cues::{SegmentCue, CLOSING_SECS};
-use crate::training::engine::{EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT};
+use crate::training::engine::{
+    is_pedalling, EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT, PRE_START_SECS,
+};
 use crate::ui::overlay::RideOverlay;
 use crate::ui::widgets::metric_column::{
     caption_text, metric_column, metric_column_parts, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS,
@@ -1019,13 +1021,13 @@ impl PlayerPage {
             let (snapshot, session, ftp) = {
                 let mut eng = engine_clone.borrow_mut();
 
-                // Auto-start: count consecutive seconds of power data.
-                // After 10 seconds, start the engine automatically.
+                // Auto-start: count consecutive seconds of pedalling, and start
+                // the engine once there are enough of them.
                 if eng.state == EngineState::Idle {
-                    if readings.power_watts.is_some() {
+                    if is_pedalling(readings.power_watts) {
                         let n = power_countdown.get() + 1;
                         power_countdown.set(n);
-                        if n >= 10 {
+                        if n >= PRE_START_SECS {
                             eng.start();
                             power_countdown.set(0);
                         }
@@ -1044,9 +1046,9 @@ impl PlayerPage {
             if snapshot.state == EngineState::Idle {
                 let n = power_countdown.get();
                 let title = if n == 0 {
-                    "Connect a power meter or trainer to begin".to_string()
+                    "Start pedalling to begin".to_string()
                 } else {
-                    format!("Starting in {} s…", 10u32.saturating_sub(n))
+                    format!("Starting in {} s…", PRE_START_SECS.saturating_sub(n))
                 };
                 page_clone.borrow().countdown_banner.set_title(&title);
             }

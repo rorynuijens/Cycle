@@ -8,6 +8,44 @@ use crate::data::route::Route;
 /// grade makes it lurch. At 1 %/s a 0 → 8 % wall arrives over 8 seconds.
 const MAX_GRADE_SLEW_PCT_PER_S: f32 = 1.0;
 
+/// The grade (%) actually sent to the trainer in SIM mode: the rate-limited road
+/// grade scaled by the rider's difficulty setting and live dial, and capped at
+/// their maximum gradient.
+///
+/// The settings come back from the database unvalidated, and `f32::clamp`
+/// panics on backwards or NaN bounds — which would end the ride on its first
+/// tick. A negative cap is read as its size, a NaN one as the default, and a
+/// NaN grade as a flat road: the one grade that is never wrong to send.
+pub fn grade_for_trainer(
+    trainer_grade_pct: f32,
+    difficulty: f32,
+    dial: f32,
+    max_grade_pct: f32,
+) -> f32 {
+    let cap = if max_grade_pct.is_nan() {
+        crate::data::settings::TrainingSettings::default().sim_max_gradient_pct
+    } else {
+        max_grade_pct.abs()
+    };
+    let grade = trainer_grade_pct * difficulty * dial;
+    if grade.is_nan() {
+        return 0.0;
+    }
+    grade.clamp(-cap, cap)
+}
+
+/// The command that lets the trainer go when a route ride pauses or ends — a
+/// flat road in SIM, no target in ERG emulation. A trainer holds whatever it
+/// was last told, so without this the rider steps off a climb still set.
+pub fn release_command(sim: bool) -> crate::devices::manager::DeviceCommand {
+    use crate::devices::manager::DeviceCommand;
+    if sim {
+        DeviceCommand::SetSimulation { grade_percent: 0.0 }
+    } else {
+        DeviceCommand::SetTargetPower { watts: 0 }
+    }
+}
+
 /// Driving state for a route simulation.
 pub struct RouteEngine {
     pub route: Route,
@@ -184,6 +222,64 @@ impl RouteEngine {
 mod tests {
     use super::*;
     use crate::data::route::RoutePoint;
+
+    // ── The grade the trainer is sent ───────────────────────────────────────
+    // Both settings feeding this are read back from the database unvalidated,
+    // and `f32::clamp` panics when its bounds are backwards or NaN — on the
+    // first tick of a route ride, losing it.
+
+    #[test]
+    fn should_release_a_sim_trainer_onto_a_flat_road() {
+        use crate::devices::manager::DeviceCommand;
+        assert!(matches!(
+            release_command(true),
+            DeviceCommand::SetSimulation { grade_percent } if grade_percent == 0.0
+        ));
+    }
+
+    #[test]
+    fn should_release_an_erg_trainer_to_no_target() {
+        use crate::devices::manager::DeviceCommand;
+        assert!(matches!(
+            release_command(false),
+            DeviceCommand::SetTargetPower { watts: 0 }
+        ));
+    }
+
+    #[test]
+    fn should_cap_a_climb_at_the_max_gradient() {
+        assert_eq!(grade_for_trainer(25.0, 1.0, 1.0, 20.0), 20.0);
+    }
+
+    #[test]
+    fn should_cap_a_descent_at_the_max_gradient() {
+        assert_eq!(grade_for_trainer(-25.0, 1.0, 1.0, 20.0), -20.0);
+    }
+
+    #[test]
+    fn should_scale_the_grade_by_difficulty_and_dial() {
+        assert_eq!(grade_for_trainer(8.0, 0.5, 0.9, 20.0), 3.6);
+    }
+
+    #[test]
+    fn should_read_a_negative_max_gradient_as_its_size() {
+        assert_eq!(grade_for_trainer(8.0, 1.0, 1.0, -5.0), 5.0);
+    }
+
+    #[test]
+    fn should_fall_back_to_the_default_cap_when_the_max_gradient_is_nan() {
+        assert_eq!(grade_for_trainer(25.0, 1.0, 1.0, f32::NAN), 20.0);
+    }
+
+    #[test]
+    fn should_send_a_flat_road_when_the_difficulty_is_nan() {
+        assert_eq!(grade_for_trainer(8.0, f32::NAN, 1.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn should_send_a_flat_road_when_the_max_gradient_is_zero() {
+        assert_eq!(grade_for_trainer(8.0, 1.0, 1.0, 0.0), 0.0);
+    }
 
     fn make_flat_route() -> Route {
         let points = vec![

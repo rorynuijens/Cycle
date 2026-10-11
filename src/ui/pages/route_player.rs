@@ -9,8 +9,11 @@ use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
 use crate::training::course_cues::{self, CourseCue};
-use crate::training::engine::{INTENSITY_STEP_PCT, MAX_INTENSITY_PCT, MIN_INTENSITY_PCT};
-use crate::training::route_engine::RouteEngine;
+use crate::training::engine::{
+    is_pedalling, PausedTime, INTENSITY_STEP_PCT, MAX_INTENSITY_PCT, MIN_INTENSITY_PCT,
+    PRE_START_SECS,
+};
+use crate::training::route_engine::{self, RouteEngine};
 use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
@@ -24,10 +27,6 @@ type ButtonCb = crate::ui::ReloadHolder;
 /// gradient %)`. Shared between the page and the two charts' draw functions,
 /// and replaced wholesale by `reset_route`.
 type ProfileSamples = Rc<RefCell<Vec<(f32, f32, f32)>>>;
-
-/// Consecutive seconds of power data required before a route ride starts,
-/// matching the workout player's pre-start gate.
-const PRE_START_SECS: u32 = 10;
 
 /// How much road the look-ahead chart shows behind and ahead of the rider, in
 /// metres. A little behind for context; two kilometres ahead is about four
@@ -79,8 +78,18 @@ const MAP_MIN_HEIGHT: i32 = 180;
 /// rider starts pedalling. Recording the real start keeps the ride's duration (and
 /// its TSS) free of the waiting time, and lines the session up with what a head
 /// unit or Intervals.icu records for the same ride.
-fn stamp_start(session: &Rc<RefCell<Session>>) {
-    session.borrow_mut().started_at = chrono::Utc::now();
+///
+/// Pauses pressed before this belong to the wait, not the ride, so the pause
+/// record starts again here — otherwise they would be taken off a duration that
+/// never included them. A ride started while paused is paused from now.
+fn stamp_start(session: &Rc<RefCell<Session>>, paused_time: &RefCell<PausedTime>, paused: bool) {
+    let now = chrono::Utc::now();
+    session.borrow_mut().started_at = now;
+    let mut fresh = PausedTime::default();
+    if paused {
+        fresh.pause(now);
+    }
+    *paused_time.borrow_mut() = fresh;
 }
 
 /// Sample a route into `(distance km, elevation m, gradient %)` for the profile
@@ -877,6 +886,9 @@ impl RoutePlayerPage {
         // route_timer_alive there, so a finished ride is never re-written.
         *page.live_session.borrow_mut() = Some(Rc::clone(&session));
         let paused = Rc::new(Cell::new(false));
+        // Wall-clock time spent paused, taken off `ended_at` so a paused
+        // minute is not saved as a ridden one — see `PausedTime`.
+        let paused_time = Rc::new(RefCell::new(PausedTime::default()));
         let elapsed_secs = Rc::new(Cell::new(0u32));
         // Grade last sent to the trainer — SIM commands go out only on a real
         // change (or as a periodic keepalive), not every tick.
@@ -888,11 +900,13 @@ impl RoutePlayerPage {
             let banner = page.countdown_banner.clone();
             let countdown = Rc::clone(&page.power_countdown);
             let session_btn = Rc::clone(&session);
+            let paused_btn = Rc::clone(&paused);
+            let paused_time_btn = Rc::clone(&paused_time);
             *page.start_now_cb.borrow_mut() = Some(Rc::new(move || {
                 started_btn.set(true);
                 countdown.set(0);
                 banner.set_revealed(false);
-                stamp_start(&session_btn);
+                stamp_start(&session_btn, &paused_time_btn, paused_btn.get());
             }));
         }
 
@@ -900,13 +914,26 @@ impl RoutePlayerPage {
         {
             let pause_btn = page.pause_btn.clone();
             let paused_c = Rc::clone(&paused);
+            let paused_time_c = Rc::clone(&paused_time);
+            let cmd_tx_c = cmd_tx.clone();
+            let sim_capable_c = Rc::clone(&sim_capable);
+            let last_sent_grade_c = Rc::clone(&last_sent_grade);
             *page.pause_cb.borrow_mut() = Some(Rc::new(move || {
                 let is_paused = !paused_c.get();
                 paused_c.set(is_paused);
+                let now = chrono::Utc::now();
                 if is_paused {
+                    paused_time_c.borrow_mut().pause(now);
+                    // Let the trainer go while the rider is off it; a paused
+                    // tick sends nothing, so this holds until they resume.
+                    let _ = cmd_tx_c.try_send(route_engine::release_command(sim_capable_c.get()));
+                    // And send the road again on the first tick back rather
+                    // than waiting for the keepalive.
+                    last_sent_grade_c.set(f32::NAN);
                     pause_btn.set_icon_name("media-playback-start-symbolic");
                     pause_btn.set_tooltip_text(Some("Resume ride"));
                 } else {
+                    paused_time_c.borrow_mut().resume(now);
                     pause_btn.set_icon_name("media-playback-pause-symbolic");
                     pause_btn.set_tooltip_text(Some("Pause ride"));
                 }
@@ -920,6 +947,9 @@ impl RoutePlayerPage {
             let on_complete_end = Rc::clone(&on_complete);
             let completed_end = Rc::clone(&completed);
             let timer_alive_end = Rc::clone(&timer_alive);
+            let paused_time_end = Rc::clone(&paused_time);
+            let cmd_tx_end = cmd_tx.clone();
+            let sim_capable_end = Rc::clone(&sim_capable);
             *page.end_cb.borrow_mut() = Some(Rc::new(move || {
                 let dialog = adw::AlertDialog::builder()
                     .heading("End Ride?")
@@ -935,12 +965,18 @@ impl RoutePlayerPage {
                 let on_complete_r = Rc::clone(&on_complete_end);
                 let completed_r = Rc::clone(&completed_end);
                 let timer_r = Rc::clone(&timer_alive_end);
+                let paused_time_r = Rc::clone(&paused_time_end);
+                let cmd_tx_r = cmd_tx_end.clone();
+                let sim_capable_r = Rc::clone(&sim_capable_end);
                 dialog.connect_response(None, move |_, resp| {
                     if resp == "end" && !completed_r.get() {
                         completed_r.set(true);
                         timer_r.set(false);
+                        let _ =
+                            cmd_tx_r.try_send(route_engine::release_command(sim_capable_r.get()));
                         let mut sess = session_r.borrow().clone();
-                        sess.ended_at = Some(chrono::Utc::now());
+                        let now = chrono::Utc::now();
+                        sess.ended_at = Some(now - paused_time_r.borrow().total(now));
                         on_complete_r(sess);
                     }
                 });
@@ -981,14 +1017,15 @@ impl RoutePlayerPage {
 
             // ── Pre-start: count consecutive seconds of power data ───────────
             if !started_tick.get() {
-                if readings.power_watts.is_some_and(|w| w > 0) {
+                if is_pedalling(readings.power_watts) {
                     let n = power_countdown.get() + 1;
                     power_countdown.set(n);
                     if n >= PRE_START_SECS {
                         started_tick.set(true);
                         power_countdown.set(0);
                         page.countdown_banner.set_revealed(false);
-                        stamp_start(&session);
+                        // Never paused here: a paused tick returns above.
+                        stamp_start(&session, &paused_time, false);
                     }
                 } else {
                     power_countdown.set(0);
@@ -1024,10 +1061,12 @@ impl RoutePlayerPage {
                 // and their live dial, and capped at their trainer's usable
                 // maximum. Virtual speed still comes from the true gradient —
                 // both change how the climb feels, not how fast the route goes by.
-                let max_grade = sim_max_grade.get();
-                let send_grade =
-                    (engine.borrow().trainer_grade_percent() * sim_difficulty.get() * dial)
-                        .clamp(-max_grade, max_grade);
+                let send_grade = route_engine::grade_for_trainer(
+                    engine.borrow().trainer_grade_percent(),
+                    sim_difficulty.get(),
+                    dial,
+                    sim_max_grade.get(),
+                );
                 // Send the grade on a ≥0.1% change, with a 5 s keepalive.
                 let last = last_sent_grade.get();
                 if (send_grade - last).abs() >= 0.1 || last.is_nan() || elapsed.is_multiple_of(5) {
@@ -1152,8 +1191,10 @@ impl RoutePlayerPage {
             if is_done && !completed_tick.get() {
                 completed_tick.set(true);
                 timer_alive_tick.set(false);
+                let _ = cmd_tx.try_send(route_engine::release_command(sim));
                 let mut sess = session.borrow().clone();
-                sess.ended_at = Some(chrono::Utc::now());
+                let now = chrono::Utc::now();
+                sess.ended_at = Some(now - paused_time.borrow().total(now));
                 on_complete(sess);
                 return glib::ControlFlow::Break;
             }
