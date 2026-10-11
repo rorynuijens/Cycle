@@ -90,6 +90,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.14.0" date="2026-10-11">
+      <description>
+        <p>Pausing, finishing and your devices behave properly:</p>
+        <ul>
+          <li>Time spent paused no longer counts as ride time, so it no longer
+              inflates TSS or marks the ride as missing power.</li>
+          <li>The trainer lets go of its resistance when you pause or finish,
+              instead of holding the last interval's target.</li>
+          <li>A workout now waits until you start pedalling, rather than starting
+              ten seconds after the trainer connects.</li>
+          <li>A device you disconnect stays disconnected until you connect it
+              again, and an ANT+ heart rate strap can be reconnected.</li>
+          <li>A trainer switched off before you connect it is no longer shown as
+              connected, and a bad maximum gradient setting can no longer stop a
+              route ride.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.5" date="2026-10-10">
       <description>
         <p>More variety in your training program:</p>
