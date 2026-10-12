@@ -569,6 +569,107 @@ pub fn show_intervals_detail(
     win.present();
 }
 
+/// Open a ride recorded here in its own window, fetching the workout it was
+/// ridden from first.
+///
+/// The one way in, shared by the ride's row in the week and by the day's list
+/// of rides inside a plan's dialog — a ride that closed its plan is drawn as
+/// the plan, and without the second door its window (and its Export button)
+/// could not be reached at all.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn open_session_detail(
+    record: &db::SessionRecord,
+    title: &str,
+    from: &gtk::Widget,
+    pool: SqlitePool,
+    rt_handle: &tokio::runtime::Handle,
+    reload_holder: ReloadHolder,
+    ftp: u32,
+    weight_kg: f32,
+) {
+    let local_dt = record.session.started_at.with_timezone(&Local);
+    let parent = from.root().and_downcast::<gtk::Window>();
+
+    // The ride's workout plan is fetched off the main thread; a block_on here
+    // stalled the GLib loop between the click and the dialog (CLAUDE.md §2.3).
+    let pool_w = pool.clone();
+    let workout_id = record.session.workout_id;
+    let session = record.session.clone();
+    let title = title.to_string();
+    let rt_show = rt_handle.clone();
+    crate::ui::spawn_to_main(
+        rt_handle,
+        async move {
+            match workout_id {
+                Some(wid) => db::load_workout_by_id(&pool_w, wid).await.ok().flatten(),
+                None => None,
+            }
+        },
+        move |workout| {
+            // A missing plan is normal (route rides have none) — the dialog
+            // opens either way.
+            show_session_detail(
+                &session,
+                &title,
+                local_dt,
+                ftp,
+                weight_kg,
+                workout.as_ref(),
+                parent.as_ref(),
+                pool,
+                rt_show,
+                reload_holder,
+            );
+        },
+    );
+}
+
+/// Opens the ride with the given session id, from the widget that asked.
+pub type OpenRide = Rc<dyn Fn(i64, &gtk::Widget)>;
+
+/// An [`OpenRide`] for the rides recorded on one day.
+///
+/// Holds its own copies of the day's sessions, so it captures nothing that
+/// owns the dialog it ends up in (CLAUDE.md §2.4).
+pub(super) fn ride_opener(
+    day_events: &[&crate::data::calendar::CalendarEvent],
+    pool: SqlitePool,
+    rt_handle: tokio::runtime::Handle,
+    reload_holder: ReloadHolder,
+    ftp: u32,
+    weight_kg: f32,
+) -> OpenRide {
+    let sessions: Vec<(db::SessionRecord, String)> = day_events
+        .iter()
+        .filter_map(|e| match e {
+            crate::data::calendar::CalendarEvent::Session(record, name) => Some((
+                record.clone(),
+                name.as_deref()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or("Unstructured Ride")
+                    .to_string(),
+            )),
+            _ => None,
+        })
+        .collect();
+    Rc::new(move |id, from| {
+        let Some((record, title)) = sessions.iter().find(|(r, _)| r.session.id == id) else {
+            tracing::warn!("Ride {id} is no longer on this day");
+            return;
+        };
+        open_session_detail(
+            record,
+            title,
+            from,
+            pool.clone(),
+            &rt_handle,
+            Rc::clone(&reload_holder),
+            ftp,
+            weight_kg,
+        );
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn show_session_detail(
     session: &crate::data::session::Session,

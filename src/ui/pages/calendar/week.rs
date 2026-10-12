@@ -103,6 +103,14 @@ pub fn build_week_view(
         // What the rider actually rode on this day. Same list for every entry
         // on the day.
         let day_rides = crate::training::matching::rides_on(day, day_events.iter().copied(), ftp);
+        let open_ride = super::detail::ride_opener(
+            day_events,
+            pool.clone(),
+            rt_handle.clone(),
+            Rc::clone(&reload_holder),
+            ftp,
+            weight_kg,
+        );
         // Plans that were ticked off by a ride recorded here: the plan and the
         // ride are one session, and the day shows them as one row.
         let closed = crate::training::matching::plans_closed_by_a_ride(day_events.iter().copied());
@@ -402,6 +410,7 @@ pub fn build_week_view(
                         let toast_d = Rc::clone(&on_toast);
                         let mark_d = mark.clone();
                         let rides_d = day_rides.clone();
+                        let open_ride_d = Rc::clone(&open_ride);
                         btn.connect_clicked(move |b| {
                             let rh_c = Rc::clone(&rh_d);
                             let reload_fn: Rc<dyn Fn()> = reload_fn(&rh_c);
@@ -417,6 +426,7 @@ pub fn build_week_view(
                                 Rc::clone(&toast_d),
                                 mark_d.clone(),
                                 rides_d.clone(),
+                                Rc::clone(&open_ride_d),
                                 ftp,
                             );
                         });
@@ -667,47 +677,15 @@ pub fn build_week_view(
                         let rt_det = rt_handle.clone();
                         let rh_det = Rc::clone(&reload_holder);
                         btn.connect_clicked(move |b| {
-                            let local_dt =
-                                session_det.session.started_at.with_timezone(&chrono::Local);
-                            let parent = b.root().and_downcast::<gtk::Window>();
-
-                            // The ride's workout plan is fetched off the main
-                            // thread; a block_on here stalled the GLib loop
-                            // between the click and the dialog (CLAUDE.md §2.3).
-                            let pool_w = pool_det.clone();
-                            let workout_id = session_det.session.workout_id;
-                            let session_w = session_det.clone();
-                            let title_w = title_det.clone();
-                            let pool_show = pool_det.clone();
-                            let rt_show = rt_det.clone();
-                            let rh_show = Rc::clone(&rh_det);
-                            crate::ui::spawn_to_main(
+                            super::detail::open_session_detail(
+                                &session_det,
+                                &title_det,
+                                b.upcast_ref(),
+                                pool_det.clone(),
                                 &rt_det,
-                                async move {
-                                    match workout_id {
-                                        Some(wid) => db::load_workout_by_id(&pool_w, wid)
-                                            .await
-                                            .ok()
-                                            .flatten(),
-                                        None => None,
-                                    }
-                                },
-                                move |workout| {
-                                    // A missing plan is normal (route rides
-                                    // have none) — the dialog opens either way.
-                                    super::detail::show_session_detail(
-                                        &session_w.session,
-                                        &title_w,
-                                        local_dt,
-                                        ftp,
-                                        weight_kg,
-                                        workout.as_ref(),
-                                        parent.as_ref(),
-                                        pool_show,
-                                        rt_show,
-                                        rh_show,
-                                    );
-                                },
+                                Rc::clone(&rh_det),
+                                ftp,
+                                weight_kg,
                             );
                         });
 

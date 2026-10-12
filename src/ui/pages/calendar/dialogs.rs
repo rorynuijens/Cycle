@@ -653,6 +653,7 @@ pub fn show_workout_detail_dialog(
     on_toast: Rc<dyn Fn(adw::Toast)>,
     mark: EntryMark,
     rides: Vec<crate::training::matching::DayRide>,
+    open_ride: super::detail::OpenRide,
     ftp: u32,
 ) {
     let toolbar_view = adw::ToolbarView::new();
@@ -752,6 +753,15 @@ pub fn show_workout_detail_dialog(
                 "A ride you did on this day",
             )]);
             row.add_prefix(&icon);
+            // A ride recorded here opens in its own window — for a ride that
+            // closed this plan, the only way to reach it and its Export.
+            if let Some(id) = ride.session_id {
+                row.set_activatable(true);
+                row.set_tooltip_text(Some("Open this ride"));
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                let open_ride = Rc::clone(&open_ride);
+                row.connect_activated(move |row| open_ride(id, row.upcast_ref()));
+            }
             rides_list.append(&row);
         }
         content.append(

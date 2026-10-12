@@ -179,6 +179,7 @@ fn shoot_detail_dialog(
         Rc::new(|_| {}),
         mark,
         rides,
+        Rc::new(|_, _| {}),
         211,
     );
     while glib::MainContext::default().iteration(false) {}
@@ -1036,6 +1037,7 @@ fn screenshots() {
             name: "Maltepe Road Cycling".into(),
             duration_secs: 5340,
             tss: Some(106.0),
+            session_id: None,
         }],
         "04-completed-keeps-graph",
         760,

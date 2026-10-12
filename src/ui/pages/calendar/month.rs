@@ -117,6 +117,14 @@ pub fn build_month_grid(
         // dialog is opened. Computed once per day rather than per entry: two
         // planned sessions on one day were ridden through by the same rides.
         let day_rides = crate::training::matching::rides_on(date, day_events.iter().copied(), ftp);
+        let open_ride = super::detail::ride_opener(
+            day_events,
+            pool.clone(),
+            rt_handle.clone(),
+            Rc::clone(&reload_holder),
+            ftp,
+            weight_kg,
+        );
 
         for (row_widget, item) in item_widgets.iter().zip(items.iter()) {
             let Some(entry) = item.entry.clone() else {
@@ -132,6 +140,7 @@ pub fn build_month_grid(
             let toast_i = Rc::clone(&on_toast);
             let mark = item.mark.clone();
             let rides_i = day_rides.clone();
+            let open_ride_i = Rc::clone(&open_ride);
             gesture.connect_released(move |g, _, _, _| {
                 let Some(widget) = g.widget() else { return };
                 super::dialogs::show_workout_detail_dialog(
@@ -146,6 +155,7 @@ pub fn build_month_grid(
                     Rc::clone(&toast_i),
                     mark.clone(),
                     rides_i.clone(),
+                    Rc::clone(&open_ride_i),
                     ftp,
                 );
             });

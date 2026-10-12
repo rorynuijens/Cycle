@@ -42,6 +42,9 @@ pub struct DayRide {
     /// `None` when the ride carries no load figure — an Intervals.icu activity
     /// synced without one, or a session with no power to score.
     pub tss: Option<f32>,
+    /// The ride's id when it was recorded here, so the day's list can open
+    /// it. `None` for an Intervals.icu activity, which has a window of its own.
+    pub session_id: Option<i64>,
 }
 
 impl DayRide {
@@ -94,6 +97,7 @@ pub fn rides_on<'a>(
                         .unwrap_or_else(|| "Recorded ride".to_string()),
                     duration_secs: session.duration_secs() as u32,
                     tss: session.tss(fallback_ftp),
+                    session_id: Some(session.id),
                 })
             }
             CalendarEvent::IcuActivity(activity) => {
@@ -106,6 +110,7 @@ pub fn rides_on<'a>(
                     name: activity.name.clone(),
                     duration_secs: activity.duration_secs.unwrap_or(0),
                     tss: activity.tss,
+                    session_id: None,
                 })
             }
             CalendarEvent::Scheduled(_) | CalendarEvent::TimeOff(_) => None,
@@ -366,6 +371,20 @@ mod tests {
             activity("i-m", "MTB", "MountainBikeRide", 60, Some(70.0)),
         ];
         assert_eq!(rides_on(day(), &events, FTP).len(), 3);
+    }
+
+    #[test]
+    fn should_carry_the_id_of_a_ride_recorded_here_so_it_can_be_opened() {
+        // A ride that closed its plan is drawn as the plan, so the day's list
+        // is the only way left to reach the ride's own window.
+        let events = vec![
+            session(42, Some("4x4 Intervals"), 48),
+            activity("i1", "Maltepe Road Cycling", "Ride", 90, Some(106.0)),
+        ];
+        let found = rides_on(day(), &events, FTP);
+        let id_of = |name: &str| found.iter().find(|r| r.name == name).map(|r| r.session_id);
+        assert_eq!(id_of("4x4 Intervals"), Some(Some(42)));
+        assert_eq!(id_of("Maltepe Road Cycling"), Some(None));
     }
 
     #[test]
