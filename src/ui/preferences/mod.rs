@@ -18,7 +18,7 @@ use crate::data::settings::{self, IntervalsSettings, TrainingSettings};
 /// athlete profile changes; `on_erg_rate_changed` whenever the ERG ramp rate
 /// changes; `on_sim_changed` with `(difficulty_percent, max_gradient_percent)`
 /// whenever either SIM setting changes; `on_cues_changed` whenever the interval
-/// cues are switched on or off.
+/// cues are switched on or off; `on_auto_pause_changed` likewise for auto-pause.
 ///
 /// The stored settings are read before the window is built, off the GTK main
 /// thread (CLAUDE.md §2.3). They used to be read with `block_on` partway through
@@ -38,6 +38,7 @@ pub fn show(
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
     on_cues_changed: impl Fn(bool) + 'static,
+    on_auto_pause_changed: impl Fn(bool) + 'static,
 ) {
     let parent = parent.clone();
     let pool_load = pool.clone();
@@ -62,6 +63,7 @@ pub fn show(
                 on_erg_rate_changed,
                 on_sim_changed,
                 on_cues_changed,
+                on_auto_pause_changed,
             ),
             Err(e) => {
                 tracing::error!("Could not read your settings: {e}");
@@ -92,6 +94,7 @@ fn build_and_present(
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
     on_cues_changed: impl Fn(bool) + 'static,
+    on_auto_pause_changed: impl Fn(bool) + 'static,
 ) {
     let win = adw::PreferencesWindow::builder()
         .transient_for(parent)
@@ -114,6 +117,7 @@ fn build_and_present(
         on_erg_rate_changed,
         on_sim_changed,
         on_cues_changed,
+        on_auto_pause_changed,
     ));
     win.add(&integrations::build(
         &win,

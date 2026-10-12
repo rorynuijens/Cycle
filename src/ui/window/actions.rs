@@ -24,6 +24,7 @@ pub fn install(
     workout_active: Rc<Cell<bool>>,
     sim_difficulty: Rc<Cell<f32>>,
     sim_max_grade: Rc<Cell<f32>>,
+    auto_pause: Rc<Cell<bool>>,
 ) {
     app.set_accels_for_action("app.quit", &["<Control>q"]);
     let close_action = gio::SimpleAction::new("close", None);
@@ -96,6 +97,7 @@ pub fn install(
     let sim_difficulty_for_prefs = Rc::clone(&sim_difficulty);
     let sim_max_grade_for_prefs = Rc::clone(&sim_max_grade);
     let player_for_prefs = Rc::clone(&player_rc);
+    let auto_pause_for_prefs = Rc::clone(&auto_pause);
     let prefs_action = gio::SimpleAction::new("preferences", None);
     prefs_action.connect_activate(move |_, _| {
         let current_athlete = athlete_for_prefs.borrow().clone();
@@ -104,6 +106,7 @@ pub fn install(
         let sim_difficulty_prefs = Rc::clone(&sim_difficulty_for_prefs);
         let sim_max_grade_prefs = Rc::clone(&sim_max_grade_for_prefs);
         let player_for_cues = Rc::clone(&player_for_prefs);
+        let auto_pause_prefs = Rc::clone(&auto_pause_for_prefs);
         crate::ui::preferences::show(
             &window_for_prefs,
             current_athlete,
@@ -124,6 +127,9 @@ pub fn install(
             move |on| {
                 player_for_cues.borrow().set_cues_enabled(on);
             },
+            // Both ride pages read this cell every tick, so a change applies
+            // to a ride already under way.
+            move |on| auto_pause_prefs.set(on),
         );
     });
     app.add_action(&prefs_action);

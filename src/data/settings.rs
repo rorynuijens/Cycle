@@ -32,6 +32,7 @@ pub mod keys {
     pub const SIM_DIFFICULTY: &str = "training.sim_difficulty";
     pub const SIM_MAX_GRADIENT: &str = "training.sim_max_gradient";
     pub const INTERVAL_CUES: &str = "training.interval_cues";
+    pub const AUTO_PAUSE: &str = "training.auto_pause";
 
     pub const INTERVALS_ATHLETE_ID: &str = "intervals.athlete_id";
     pub const INTERVALS_UPLOAD: &str = "intervals.upload";
@@ -82,6 +83,10 @@ pub struct TrainingSettings {
     /// has never opened Preferences is the one who benefits most from being
     /// told which rep they are on.
     pub interval_cues: bool,
+    /// Whether a ride pauses itself when the rider stops pedalling. On by
+    /// default — the rider asked for it, and a pause that never comes is the
+    /// failure they reported.
+    pub auto_pause: bool,
 }
 
 impl Default for TrainingSettings {
@@ -91,6 +96,7 @@ impl Default for TrainingSettings {
             sim_difficulty_pct: 100.0,
             sim_max_gradient_pct: 20.0,
             interval_cues: true,
+            auto_pause: true,
         }
     }
 }
@@ -115,6 +121,7 @@ pub async fn load_training(pool: &SqlitePool) -> Result<TrainingSettings> {
             db::get_setting(pool, keys::INTERVAL_CUES).await?,
             d.interval_cues,
         ),
+        auto_pause: flag(db::get_setting(pool, keys::AUTO_PAUSE).await?, d.auto_pause),
     })
 }
 
@@ -132,6 +139,10 @@ pub async fn set_sim_max_gradient_pct(pool: &SqlitePool, percent: f32) -> Result
 
 pub async fn set_interval_cues(pool: &SqlitePool, on: bool) -> Result<()> {
     db::set_setting(pool, keys::INTERVAL_CUES, flag_value(on)).await
+}
+
+pub async fn set_auto_pause(pool: &SqlitePool, on: bool) -> Result<()> {
+    db::set_setting(pool, keys::AUTO_PAUSE, flag_value(on)).await
 }
 
 // ── Intervals.icu ────────────────────────────────────────────────────────────
@@ -394,12 +405,29 @@ mod tests {
         set_sim_difficulty_pct(&pool, 75.0).await.unwrap();
         set_sim_max_gradient_pct(&pool, 12.5).await.unwrap();
         set_interval_cues(&pool, false).await.unwrap();
+        set_auto_pause(&pool, false).await.unwrap();
 
         let loaded = load_training(&pool).await.unwrap();
         assert_eq!(loaded.erg_ramp_rate, 40);
         assert_eq!(loaded.sim_difficulty_pct, 75.0);
         assert_eq!(loaded.sim_max_gradient_pct, 12.5);
         assert!(!loaded.interval_cues);
+        assert!(!loaded.auto_pause);
+    }
+
+    #[tokio::test]
+    async fn should_default_auto_pause_on() {
+        let pool = test_pool().await;
+        assert!(load_training(&pool).await.unwrap().auto_pause);
+    }
+
+    #[tokio::test]
+    async fn should_keep_auto_pause_off_once_turned_off() {
+        let pool = test_pool().await;
+        set_auto_pause(&pool, false).await.unwrap();
+        assert!(!load_training(&pool).await.unwrap().auto_pause);
+        set_auto_pause(&pool, true).await.unwrap();
+        assert!(load_training(&pool).await.unwrap().auto_pause);
     }
 
     #[tokio::test]
@@ -542,6 +570,7 @@ mod tests {
             keys::SIM_DIFFICULTY,
             keys::SIM_MAX_GRADIENT,
             keys::INTERVAL_CUES,
+            keys::AUTO_PAUSE,
             keys::INTERVALS_ATHLETE_ID,
             keys::INTERVALS_UPLOAD,
             keys::INTERVALS_SYNC,

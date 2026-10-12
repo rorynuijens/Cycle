@@ -19,6 +19,7 @@ use crate::data::{
     session::{LiveReadings, ReadingsTracker, Session},
     workout::Workout,
 };
+use crate::training::auto_pause::{self, AutoPause, RideState};
 use crate::training::cues::{SegmentCue, CLOSING_SECS};
 use crate::training::engine::{
     is_pedalling, EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT, PRE_START_SECS,
@@ -797,6 +798,9 @@ impl PlayerPage {
         self.countdown_banner
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
+        // A ride that ended while auto-paused leaves the banner saying
+        // "Resume now"; the next one has nothing to resume.
+        self.countdown_banner.set_button_label(Some("Start now"));
         self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
         // Cues belong to one workout. Clearing them here means a ride whose
@@ -857,6 +861,7 @@ impl PlayerPage {
         on_complete: impl Fn(Session) + 'static,
         on_cancel: impl Fn() + 'static,
         timer_alive: Rc<Cell<bool>>,
+        auto_pause_on: Rc<Cell<bool>>,
     ) {
         timer_alive.set(true);
         let on_complete: Rc<dyn Fn(Session)> = Rc::new(on_complete);
@@ -875,12 +880,21 @@ impl PlayerPage {
         }
 
         // ── Wire "Start now" button ──────────────────────────────────────────
+        // The same banner says "Resume now" while auto-paused. `start` on a
+        // paused engine would re-stamp the ride's start time, so a paused ride
+        // goes through the pause button's own path instead.
         {
             let engine_start_now = Rc::clone(&engine);
             let power_countdown_now = Rc::clone(&page.borrow().power_countdown);
             let countdown_banner_now = page.borrow().countdown_banner.clone();
+            let pause_cb_now = Rc::clone(&page.borrow().pause_cb);
             *page.borrow().start_now_cb.borrow_mut() = Some(Rc::new(move || {
-                engine_start_now.borrow_mut().start();
+                let state = engine_start_now.borrow().state;
+                match state {
+                    EngineState::Idle => engine_start_now.borrow_mut().start(),
+                    EngineState::Paused => crate::ui::call_reload(&pause_cb_now),
+                    _ => {}
+                }
                 power_countdown_now.set(0);
                 countdown_banner_now.set_revealed(false);
             }));
@@ -995,6 +1009,7 @@ impl PlayerPage {
         let stale_warned: Rc<RefCell<std::collections::HashSet<&'static str>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         let power_countdown = Rc::clone(&page.borrow().power_countdown);
+        let auto_pause = RefCell::new(AutoPause::default());
         let page_clone = Rc::clone(&page);
         let engine_clone = Rc::clone(&engine);
         let on_complete_timer = Rc::clone(&on_complete);
@@ -1053,8 +1068,49 @@ impl PlayerPage {
                 page_clone.borrow().countdown_banner.set_title(&title);
             }
 
+            // Auto-pause acts through the pause button's own callback, so the
+            // icon, the paused time and the trainer release all follow as they
+            // would for a press. The engine borrow above is already released.
+            // A ramp test opts out: it ends when the rider can no longer turn
+            // the pedals, and that must read as the end, not a pause.
+            let ride_state = match snapshot.state {
+                EngineState::Running => RideState::Running,
+                EngineState::Paused => RideState::Paused,
+                _ => RideState::NotRiding,
+            };
+            let enabled = auto_pause_on.get() && !page_clone.borrow().is_test_mode();
+            let action =
+                auto_pause
+                    .borrow_mut()
+                    .tick(ride_state, snapshot.readings.power_watts, enabled);
+            if action != auto_pause::Action::None {
+                page_clone.borrow().trigger_pause_toggle();
+            }
+            let pause_status = {
+                let ap = auto_pause.borrow();
+                if ap.is_auto_paused() {
+                    Some(auto_pause::banner_title(ap.pedalling_for()))
+                } else if engine_clone.borrow().state == EngineState::Paused {
+                    Some("Paused".to_string())
+                } else {
+                    None
+                }
+            };
+            let auto_paused = auto_pause.borrow().is_auto_paused();
+
             let p = page_clone.borrow();
             p.update_from_snapshot(&snapshot);
+            // The pre-start banner doubles as the auto-pause one. A pause the
+            // rider pressed needs no banner — the button they pressed says it.
+            if auto_paused {
+                if let Some(title) = &pause_status {
+                    p.countdown_banner.set_title(title);
+                }
+                p.countdown_banner.set_button_label(Some("Resume now"));
+                p.countdown_banner.set_revealed(true);
+            } else {
+                p.countdown_banner.set_button_label(Some("Start now"));
+            }
             p.update_session_totals(&session, ftp);
             p.graph.set_playhead(snapshot.elapsed_secs);
             p.graph.push_power(snapshot.readings.power_watts);
@@ -1062,6 +1118,7 @@ impl PlayerPage {
             // windows can never show different seconds of the same ride.
             if let Some(overlay) = p.overlay.borrow().as_ref() {
                 overlay.update(&snapshot, &stale);
+                overlay.set_pause_status(pause_status.as_deref());
             }
             drop(p);
 

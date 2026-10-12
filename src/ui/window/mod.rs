@@ -159,6 +159,9 @@ impl CycleGtkWindow {
             &athlete_rc.borrow(),
         )));
         player_rc.borrow().set_cues_enabled(training.interval_cues);
+        // Read live by both ride loops, so switching it in Preferences applies
+        // to a ride already under way.
+        let auto_pause = Rc::new(Cell::new(training.auto_pause));
         // Installed once, not per ride: the engine outlives each workout, so the
         // overlay reads the current one out of it when the rider opens it.
         crate::ui::pages::player::attach_overlay(
@@ -253,6 +256,7 @@ impl CycleGtkWindow {
             let timer_alive = Rc::clone(&timer_alive);
             let workout_active = Rc::clone(&workout_active);
             let start_btn = start_btn.clone();
+            let auto_pause = Rc::clone(&auto_pause);
             Rc::new(move || {
                 stack.set_visible_child_name("player");
                 workout_active.set(true);
@@ -271,6 +275,7 @@ impl CycleGtkWindow {
                             stack_cancel.set_visible_child_name("dashboard");
                         },
                         Rc::clone(&timer_alive),
+                        Rc::clone(&auto_pause),
                     );
                 }
             })
@@ -461,6 +466,7 @@ impl CycleGtkWindow {
             let sim_capable = Rc::clone(&sim_capable);
             let sim_difficulty = Rc::clone(&sim_difficulty);
             let sim_max_grade = Rc::clone(&sim_max_grade);
+            let auto_pause = Rc::clone(&auto_pause);
             let finish_for_route = Rc::clone(&finish_session);
             let athlete_for_route = Rc::clone(&athlete_rc);
             Rc::new(move |route: Route| {
@@ -484,6 +490,7 @@ impl CycleGtkWindow {
                         Rc::clone(&sim_capable),
                         Rc::clone(&sim_difficulty),
                         Rc::clone(&sim_max_grade),
+                        Rc::clone(&auto_pause),
                         move |session| {
                             // A route ride ends the same way a workout does: summary
                             // page, RPE, save and upload. It has no plan to compare
@@ -664,6 +671,7 @@ impl CycleGtkWindow {
             Rc::clone(&workout_active),
             Rc::clone(&sim_difficulty),
             Rc::clone(&sim_max_grade),
+            Rc::clone(&auto_pause),
         );
 
         // ── Mid-ride checkpointing ───────────────────────────────────────────

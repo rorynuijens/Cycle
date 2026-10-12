@@ -8,6 +8,7 @@ use crate::data::athlete::AthleteProfile;
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
+use crate::training::auto_pause::{self, AutoPause, RideState};
 use crate::training::course_cues::{self, CourseCue};
 use crate::training::engine::{
     is_pedalling, PausedTime, INTENSITY_STEP_PCT, MAX_INTENSITY_PCT, MIN_INTENSITY_PCT,
@@ -801,6 +802,9 @@ impl RoutePlayerPage {
         self.countdown_banner
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
+        // A ride that ended while auto-paused leaves the banner saying
+        // "Resume now"; the next one has nothing to resume.
+        self.countdown_banner.set_button_label(Some("Start now"));
         self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
         let total_dist_km = route.total_distance_m / 1000.0;
@@ -857,6 +861,7 @@ impl RoutePlayerPage {
         sim_capable: Rc<Cell<bool>>,
         sim_difficulty: Rc<Cell<f32>>,
         sim_max_grade: Rc<Cell<f32>>,
+        auto_pause_on: Rc<Cell<bool>>,
         on_complete: impl Fn(Session) + 'static,
         timer_alive: Rc<Cell<bool>>,
     ) {
@@ -895,6 +900,9 @@ impl RoutePlayerPage {
         let last_sent_grade = Rc::new(Cell::new(f32::NAN));
 
         // ── "Start now" — skip the pre-start wait ────────────────────────────
+        // The same banner says "Resume now" while auto-paused. Stamping the
+        // start again then would misdate the ride, so a started ride goes
+        // through the pause button's own path instead.
         {
             let started_btn = Rc::clone(&started);
             let banner = page.countdown_banner.clone();
@@ -902,7 +910,15 @@ impl RoutePlayerPage {
             let session_btn = Rc::clone(&session);
             let paused_btn = Rc::clone(&paused);
             let paused_time_btn = Rc::clone(&paused_time);
+            let pause_cb_btn = Rc::clone(&page.pause_cb);
             *page.start_now_cb.borrow_mut() = Some(Rc::new(move || {
+                if started_btn.get() {
+                    if paused_btn.get() {
+                        crate::ui::call_reload(&pause_cb_btn);
+                    }
+                    banner.set_revealed(false);
+                    return;
+                }
                 started_btn.set(true);
                 countdown.set(0);
                 banner.set_revealed(false);
@@ -993,6 +1009,7 @@ impl RoutePlayerPage {
         let completed_tick = Rc::clone(&completed);
         let started_tick = Rc::clone(&started);
         let power_countdown = Rc::clone(&page.power_countdown);
+        let auto_pause = RefCell::new(AutoPause::default());
 
         glib::timeout_add_local(Duration::from_secs(1), move || {
             if !timer_alive_tick.get() {
@@ -1010,6 +1027,38 @@ impl RoutePlayerPage {
                 }
             }
             page.set_stale_sensors(&stale);
+
+            // Auto-pause acts through the pause button's own callback, so the
+            // icon, the paused time and the trainer release all follow as they
+            // would for a press.
+            let ride_state = if !started_tick.get() {
+                RideState::NotRiding
+            } else if paused.get() {
+                RideState::Paused
+            } else {
+                RideState::Running
+            };
+            let action =
+                auto_pause
+                    .borrow_mut()
+                    .tick(ride_state, readings.power_watts, auto_pause_on.get());
+            if action != auto_pause::Action::None {
+                crate::ui::call_reload(&page.pause_cb);
+            }
+            // The pre-start banner doubles as the auto-pause one. A pause the
+            // rider pressed needs no banner — the button they pressed says it.
+            if started_tick.get() {
+                let ap = auto_pause.borrow();
+                if ap.is_auto_paused() {
+                    page.countdown_banner
+                        .set_title(&auto_pause::banner_title(ap.pedalling_for()));
+                    page.countdown_banner.set_button_label(Some("Resume now"));
+                    page.countdown_banner.set_revealed(true);
+                } else {
+                    page.countdown_banner.set_revealed(false);
+                    page.countdown_banner.set_button_label(Some("Start now"));
+                }
+            }
 
             if paused.get() {
                 return glib::ControlFlow::Continue;

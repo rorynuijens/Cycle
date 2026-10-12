@@ -66,6 +66,8 @@ pub struct RideOverlay {
     graph: WorkoutGraph,
     workout_progress: gtk::ProgressBar,
     dropout_label: gtk::Label,
+    /// "Paused", or the auto-pause countdown. Hidden while riding.
+    pause_label: gtk::Label,
 }
 
 impl RideOverlay {
@@ -243,6 +245,15 @@ impl RideOverlay {
             .visible(false)
             .build();
 
+        // Above the numbers, because a paused ride's numbers are the thing
+        // that would otherwise mislead: a rider watching a film glances here,
+        // sees 0 W and a clock that has stopped, and needs to know why.
+        let pause_label = gtk::Label::builder()
+            .css_classes(["heading", "accent"])
+            .wrap(true)
+            .visible(false)
+            .build();
+
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -251,6 +262,7 @@ impl RideOverlay {
             .margin_start(12)
             .margin_end(12)
             .build();
+        content.append(&pause_label);
         content.append(&power_row);
         content.append(&detail_row);
         content.append(graph.widget());
@@ -280,6 +292,7 @@ impl RideOverlay {
             graph,
             workout_progress,
             dropout_label,
+            pause_label,
         }
     }
 
@@ -317,6 +330,18 @@ impl RideOverlay {
             }
         }
         self.graph.set_trace(trace);
+    }
+
+    /// Say the ride is paused, and when auto-pause will resume it. `None`
+    /// while riding.
+    pub fn set_pause_status(&self, status: Option<&str>) {
+        match status {
+            Some(text) => {
+                self.pause_label.set_label(text);
+                self.pause_label.set_visible(true);
+            }
+            None => self.pause_label.set_visible(false),
+        }
     }
 
     /// One tick's worth of numbers. Driven from the player's existing timer, so
