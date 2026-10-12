@@ -726,7 +726,11 @@ pub fn show_session_detail(
     // Garmin Connect or a shared folder.
     let export_btn = gtk::Button::builder()
         .icon_name("document-save-symbolic")
-        .tooltip_text("Export this ride as a FIT file")
+        .tooltip_text(if crate::ui::ride_card::has_plan(session) {
+            "Export this ride as a FIT file, with a picture of the workout beside it"
+        } else {
+            "Export this ride as a FIT file"
+        })
         .css_classes(["flat", "circular"])
         .build();
     let session_for_export = session.clone();
@@ -737,6 +741,7 @@ pub fn show_session_detail(
         let parent = btn.root().and_downcast::<gtk::Window>();
         let session_save = session_for_export.clone();
         let filename = crate::data::fit::suggested_filename(&session_for_export, &title_export);
+        let title_card = title_export.clone();
         let pool_a = pool_export.clone();
 
         // The profile is read before the file chooser opens, off the GTK thread.
@@ -789,7 +794,28 @@ pub fn show_session_detail(
                                 &athlete,
                             ) {
                                 Ok(()) => tracing::info!("Exported FIT to {}", path.display()),
-                                Err(e) => tracing::error!("FIT export failed: {e}"),
+                                Err(e) => {
+                                    tracing::error!("FIT export failed: {e}");
+                                    return;
+                                }
+                            }
+                            // The card goes beside the file, to attach to the
+                            // activity once the FIT is uploaded. A card that
+                            // fails leaves the FIT, which is the part that
+                            // matters, where it is. Workouts only: a route
+                            // ride has its map, and no plan to draw.
+                            if !crate::ui::ride_card::has_plan(&session_save) {
+                                return;
+                            }
+                            let card = crate::ui::ride_card::card_path(&path);
+                            match crate::ui::ride_card::write_card(
+                                &card,
+                                &session_save,
+                                &title_card,
+                                athlete.ftp_watts,
+                            ) {
+                                Ok(()) => tracing::info!("Wrote ride card {}", card.display()),
+                                Err(e) => tracing::error!("Ride card failed: {e:#}"),
                             }
                         }
                         // The rider dismissing the file chooser is not an error.
