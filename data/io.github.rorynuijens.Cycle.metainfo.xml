@@ -90,6 +90,27 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.15.0" date="2026-10-13">
+      <description>
+        <p>Auto-pause, a picture of each workout, and the overlay on courses:</p>
+        <ul>
+          <li>A ride pauses itself after 10 seconds without pedalling, and carries
+              on after 10 seconds of pedalling again, with a countdown. A pause you
+              press yourself is never ended by pedalling. It can be switched off in
+              Preferences, and the ramp test never pauses.</li>
+          <li>Exporting a workout ride now saves a picture beside the FIT file: the
+              plan in zone colours with the power you rode over it, and the ride's
+              numbers, ready to attach to the activity in Garmin Connect or
+              Strava.</li>
+          <li>A ride that completed its planned workout can be opened again from the
+              plan's "You rode this day" list, so its details and Export are back
+              within reach.</li>
+          <li>The compact overlay now works on a course too, showing gradient,
+              distance and climbing left, and the road ahead. It also says when a
+              ride is paused.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.14.0" date="2026-10-11">
       <description>
         <p>Pausing, finishing and your devices behave properly:</p>
