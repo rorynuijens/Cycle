@@ -51,6 +51,11 @@ const DEFAULT_HEIGHT: i32 = 312;
 /// what is left once the numbers have had theirs.
 const GRAPH_HEIGHT_PX: i32 = 72;
 
+/// Reserved widths for the course readings, so a value gaining a digit never
+/// shifts the row: "+12.5" and "142.7" are the widest each will show.
+const GRADIENT_DIGITS: i32 = 5;
+const DISTANCE_DIGITS: i32 = 5;
+
 /// The opacity steps that are not the default, so switching between them can
 /// clear whichever was applied last.
 const OPACITY_CLASSES: [&str; 2] = ["semi", "faint"];
@@ -59,19 +64,67 @@ const OPACITY_CLASSES: [&str; 2] = ["semi", "faint"];
 pub struct RideOverlay {
     window: adw::ApplicationWindow,
     power_label: gtk::Label,
-    target_label: gtk::Label,
-    interval_label: gtk::Label,
     hr_label: gtk::Label,
-    cadence_label: gtk::Label,
-    graph: WorkoutGraph,
-    workout_progress: gtk::ProgressBar,
     dropout_label: gtk::Label,
     /// "Paused", or the auto-pause countdown. Hidden while riding.
+    pause_label: gtk::Label,
+    /// What the rest of the window says, which depends on the kind of ride.
+    readout: Readout,
+}
+
+/// The part of the overlay that differs between a workout and a course.
+///
+/// One window rather than two: the header, the menu, the opacity, the saved
+/// size, the dropout and pause lines and the pinning help are the same for
+/// both, and a second window type would mean keeping all of that in step.
+enum Readout {
+    /// What the plan asks, how long this effort lasts, and the session's shape.
+    Workout {
+        target_label: gtk::Label,
+        interval_label: gtk::Label,
+        cadence_label: gtk::Label,
+        graph: WorkoutGraph,
+        workout_progress: gtk::ProgressBar,
+    },
+    /// How steep it is now, how far and how much climbing is left, and the
+    /// road ahead.
+    Course {
+        gradient_label: gtk::Label,
+        to_go_label: gtk::Label,
+        climb_left_label: gtk::Label,
+        /// The route page's own look-ahead chart, drawing from the same
+        /// samples and playhead, so the two cannot show different roads.
+        chart: gtk::DrawingArea,
+        progress: gtk::ProgressBar,
+    },
+}
+
+/// One second of a course ride, as the overlay shows it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CourseReadings {
+    pub power_watts: Option<u32>,
+    pub heart_rate_bpm: Option<u32>,
+    pub gradient_pct: f32,
+    pub remaining_km: f32,
+    pub climb_left_m: f32,
+    /// Fraction of the route ridden, 0.0–1.0.
+    pub progress: f64,
+}
+
+/// What both kinds of overlay are built from.
+struct Shell {
+    window: adw::ApplicationWindow,
+    body: gtk::Box,
+    power_box: gtk::Box,
+    power_label: gtk::Label,
+    hr_box: gtk::Box,
+    hr_label: gtk::Label,
+    dropout_label: gtk::Label,
     pause_label: gtk::Label,
 }
 
 impl RideOverlay {
-    /// Build the overlay for a ride in progress.
+    /// Build the overlay for a workout in progress.
     ///
     /// `saved` carries the size and opacity from last time; `pool` and `rt` are
     /// only ever used to write those back.
@@ -83,13 +136,274 @@ impl RideOverlay {
         pool: sqlx::SqlitePool,
         rt: tokio::runtime::Handle,
     ) -> Self {
+        let shell = Shell::new(app, &workout.name, saved, pool, rt);
+
+        // ── Row 1: what the legs are giving, and what the plan asks ──────────
+        let (target_box, target_label) = metric_column(
+            "Target",
+            Some("W"),
+            "—",
+            &["cockpit-major", "numeric", "accent"],
+            POWER_DIGITS,
+        );
+
+        // ── Row 2: how long this effort lasts, and the body's answer ─────────
+        let (interval_box, interval_label) = metric_column(
+            "To go",
+            None,
+            "—",
+            &["cockpit-metric", "numeric"],
+            CLOCK_DIGITS,
+        );
+        let (cadence_box, cadence_label) = metric_column(
+            "Cadence",
+            Some("rpm"),
+            "—",
+            &["cockpit-metric", "numeric"],
+            RATE_DIGITS,
+        );
+
+        // ── The shape of the session, and where the ride has got to ──────────
+        let graph = WorkoutGraph::new(workout, ftp_watts);
+        // The cockpit's graph asks for 600×120. Left alone it would set this
+        // window's minimum width to something wider than the window itself.
+        graph.widget().set_content_width(0);
+        graph.widget().set_content_height(GRAPH_HEIGHT_PX);
+
+        let workout_progress = progress_bar();
+
+        shell.fill(
+            &target_box,
+            &[&interval_box, &cadence_box],
+            graph.widget().upcast_ref(),
+            &workout_progress,
+        );
+
+        Self {
+            window: shell.window,
+            power_label: shell.power_label,
+            hr_label: shell.hr_label,
+            dropout_label: shell.dropout_label,
+            pause_label: shell.pause_label,
+            readout: Readout::Workout {
+                target_label,
+                interval_label,
+                cadence_label,
+                graph,
+                workout_progress,
+            },
+        }
+    }
+
+    /// Build the overlay for a course in progress.
+    ///
+    /// `chart` is a look-ahead chart built from the route page's own samples
+    /// and playhead, so it moves when the page's does.
+    pub fn for_course(
+        app: &gtk::Application,
+        route_name: &str,
+        chart: gtk::DrawingArea,
+        saved: OverlaySettings,
+        pool: sqlx::SqlitePool,
+        rt: tokio::runtime::Handle,
+    ) -> Self {
+        let shell = Shell::new(app, route_name, saved, pool, rt);
+
+        // ── Row 1: what the legs are giving, and what the road is doing ──────
+        // Gradient takes the target's place: on a course it is the number that
+        // says how hard the next minute will be.
+        let (gradient_box, gradient_label) = metric_column(
+            "Gradient",
+            Some("%"),
+            "—",
+            &["cockpit-major", "numeric", "accent"],
+            GRADIENT_DIGITS,
+        );
+
+        // ── Row 2: how much is left, and the body's answer ──────────────────
+        let (to_go_box, to_go_label) = metric_column(
+            "To go",
+            Some("km"),
+            "—",
+            &["cockpit-metric", "numeric"],
+            DISTANCE_DIGITS,
+        );
+        let (climb_box, climb_left_label) = metric_column(
+            "Climb left",
+            Some("m"),
+            "—",
+            &["cockpit-metric", "numeric"],
+            POWER_DIGITS,
+        );
+
+        // Same treatment as the workout graph: a shape to glance at, kept from
+        // setting the window's minimum width.
+        chart.set_content_width(0);
+        chart.set_content_height(GRAPH_HEIGHT_PX);
+
+        let progress = progress_bar();
+
+        shell.fill(
+            &gradient_box,
+            &[&to_go_box, &climb_box],
+            chart.upcast_ref(),
+            &progress,
+        );
+
+        Self {
+            window: shell.window,
+            power_label: shell.power_label,
+            hr_label: shell.hr_label,
+            dropout_label: shell.dropout_label,
+            pause_label: shell.pause_label,
+            readout: Readout::Course {
+                gradient_label,
+                to_go_label,
+                climb_left_label,
+                chart,
+                progress,
+            },
+        }
+    }
+
+    /// The overlay's window, for presenting a dialog on it.
+    pub fn window(&self) -> &adw::ApplicationWindow {
+        &self.window
+    }
+
+    pub fn present(&self) {
+        self.window.present();
+    }
+
+    pub fn close(&self) {
+        self.window.close();
+    }
+
+    /// Run `on_closed` when the rider closes the window, so the page that owns
+    /// this overlay can let go of it.
+    pub fn connect_closed(&self, on_closed: impl Fn() + 'static) {
+        self.window.connect_close_request(move |_| {
+            on_closed();
+            glib::Propagation::Proceed
+        });
+    }
+
+    /// Fill the profile with a ride already under way.
+    ///
+    /// Without this the graph opens blank and only starts drawing from the
+    /// moment the overlay did, which reads as a ride that has not happened yet.
+    /// A course has nothing to fill: its chart is the road ahead.
+    pub fn backfill(&self, session: &Session, total_secs: u32) {
+        let Readout::Workout { graph, .. } = &self.readout else {
+            return;
+        };
+        let mut trace: Vec<Option<u32>> = vec![None; total_secs as usize];
+        for dp in &session.data_points {
+            if let Some(slot) = trace.get_mut(dp.elapsed_secs as usize) {
+                *slot = dp.power_watts;
+            }
+        }
+        graph.set_trace(trace);
+    }
+
+    /// Say the ride is paused, and when auto-pause will resume it. `None`
+    /// while riding.
+    pub fn set_pause_status(&self, status: Option<&str>) {
+        match status {
+            Some(text) => {
+                self.pause_label.set_label(text);
+                self.pause_label.set_visible(true);
+            }
+            None => self.pause_label.set_visible(false),
+        }
+    }
+
+    /// One tick of a workout. Driven from the player's existing timer, so the
+    /// two windows cannot disagree. Ignored by a course overlay.
+    pub fn update(&self, snap: &EngineSnapshot, stale: &[&'static str]) {
+        let Readout::Workout {
+            target_label,
+            interval_label,
+            cadence_label,
+            graph,
+            workout_progress,
+        } = &self.readout
+        else {
+            return;
+        };
+        // The units live in the captions (see `metric_column`), so a reading is
+        // its digits and nothing else.
+        self.power_label
+            .set_label(&reading(snap.readings.power_watts));
+        self.hr_label
+            .set_label(&reading(snap.readings.heart_rate_bpm));
+        cadence_label.set_label(&reading(snap.readings.cadence_rpm));
+        target_label.set_label(&snap.target_power_watts.to_string());
+        interval_label.set_label(&WorkoutEngine::format_duration(snap.segment_remaining_secs));
+
+        let total = snap.elapsed_secs + snap.remaining_secs;
+        if total > 0 {
+            workout_progress.set_fraction(snap.elapsed_secs as f64 / total as f64);
+        }
+
+        graph.set_playhead(snap.elapsed_secs);
+        graph.push_power(snap.readings.power_watts);
+
+        self.set_dropouts(stale);
+    }
+
+    /// One tick of a course. Driven from the route page's timer, for the same
+    /// reason as [`Self::update`]. Ignored by a workout overlay.
+    pub fn update_course(&self, now: &CourseReadings, stale: &[&'static str]) {
+        let Readout::Course {
+            gradient_label,
+            to_go_label,
+            climb_left_label,
+            chart,
+            progress,
+        } = &self.readout
+        else {
+            return;
+        };
+        self.power_label.set_label(&reading(now.power_watts));
+        self.hr_label.set_label(&reading(now.heart_rate_bpm));
+        gradient_label.set_label(&format!("{:+.1}", now.gradient_pct));
+        to_go_label.set_label(&format!("{:.1}", now.remaining_km.max(0.0)));
+        climb_left_label.set_label(&format!("{:.0}", now.climb_left_m.max(0.0)));
+        progress.set_fraction(now.progress.clamp(0.0, 1.0));
+        chart.queue_draw();
+
+        self.set_dropouts(stale);
+    }
+
+    fn set_dropouts(&self, stale: &[&'static str]) {
+        match dropout_banner_text(stale) {
+            Some(text) => {
+                self.dropout_label.set_label(&text);
+                self.dropout_label.set_visible(true);
+            }
+            None => self.dropout_label.set_visible(false),
+        }
+    }
+}
+
+/// A reading's digits, or a dash when there is none.
+fn reading(value: Option<u32>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "—".into())
+}
+
+impl Shell {
+    /// The window, its header and menu, and the readings every overlay has.
+    fn new(
+        app: &gtk::Application,
+        title: &str,
+        saved: OverlaySettings,
+        pool: sqlx::SqlitePool,
+        rt: tokio::runtime::Handle,
+    ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title(if workout.name.is_empty() {
-                "Ride"
-            } else {
-                &workout.name
-            })
+            .title(if title.is_empty() { "Ride" } else { title })
             .default_width(DEFAULT_WIDTH)
             .default_height(DEFAULT_HEIGHT)
             .resizable(true)
@@ -167,41 +481,23 @@ impl RideOverlay {
         actions.add_action(&help_action);
         window.insert_action_group("overlay", Some(&actions));
 
-        // ── Row 1: what the legs are giving, and what the plan asks ──────────
-        let power_row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .homogeneous(true)
-            .build();
+        body.append(&header);
+
+        // Remember the size, the way the main window does.
+        window.connect_close_request(move |win| {
+            let (width, height) = (win.width(), win.height());
+            spawn_write(&rt, &pool, "the overlay size", move |pool| async move {
+                settings::set_overlay_size(&pool, width, height).await
+            });
+            glib::Propagation::Proceed
+        });
+
         let (power_box, power_label) = metric_column(
             "Power",
             Some("W"),
             "—",
             &["cockpit-major", "numeric"],
             POWER_DIGITS,
-        );
-        let (target_box, target_label) = metric_column(
-            "Target",
-            Some("W"),
-            "—",
-            &["cockpit-major", "numeric", "accent"],
-            POWER_DIGITS,
-        );
-        power_row.append(&power_box);
-        power_row.append(&target_box);
-
-        // ── Row 2: how long this effort lasts, and the body's answer ─────────
-        let detail_row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(12)
-            .homogeneous(true)
-            .build();
-        let (interval_box, interval_label) = metric_column(
-            "To go",
-            None,
-            "—",
-            &["cockpit-metric", "numeric"],
-            CLOCK_DIGITS,
         );
         let (hr_box, hr_label) = metric_column(
             "HR",
@@ -210,30 +506,6 @@ impl RideOverlay {
             &["cockpit-metric", "numeric"],
             RATE_DIGITS,
         );
-        let (cadence_box, cadence_label) = metric_column(
-            "Cadence",
-            Some("rpm"),
-            "—",
-            &["cockpit-metric", "numeric"],
-            RATE_DIGITS,
-        );
-        detail_row.append(&interval_box);
-        detail_row.append(&hr_box);
-        detail_row.append(&cadence_box);
-
-        // ── The shape of the session, and where the ride has got to ──────────
-        let graph = WorkoutGraph::new(workout, ftp_watts);
-        // The cockpit's graph asks for 600×120. Left alone it would set this
-        // window's minimum width to something wider than the window itself.
-        graph.widget().set_content_width(0);
-        graph.widget().set_content_height(GRAPH_HEIGHT_PX);
-
-        // Built plain and classed afterwards, as the cockpit's bars are: setting
-        // `css-classes` through the builder replaces the default list, and
-        // GtkProgressBar's own `.horizontal` is what Adwaita hangs the trough's
-        // min-height on. Through the builder it measured 402x0 and drew nothing.
-        let workout_progress = gtk::ProgressBar::builder().fraction(0.0).build();
-        workout_progress.add_css_class("accent");
 
         // Silent until a sensor stops reporting. It matters more here than on
         // the cockpit: the whole point of this window is that the rider is
@@ -254,6 +526,52 @@ impl RideOverlay {
             .visible(false)
             .build();
 
+        Self {
+            window,
+            body,
+            power_box,
+            power_label,
+            hr_box,
+            hr_label,
+            dropout_label,
+            pause_label,
+        }
+    }
+
+    /// Lay the window out: pause line, power beside `beside_power`, then
+    /// `detail` followed by heart rate, the graph, progress and the dropout
+    /// line. Both kinds of ride read in the same order.
+    fn fill(
+        &self,
+        beside_power: &gtk::Box,
+        detail: &[&gtk::Box],
+        graph: &gtk::Widget,
+        progress: &gtk::ProgressBar,
+    ) {
+        let power_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .homogeneous(true)
+            .build();
+        power_row.append(&self.power_box);
+        power_row.append(beside_power);
+
+        let detail_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .homogeneous(true)
+            .build();
+        // Heart rate second in both: after the clock or the distance, which
+        // is what the eye goes to first.
+        let mut columns = detail.iter();
+        if let Some(first) = columns.next() {
+            detail_row.append(*first);
+        }
+        detail_row.append(&self.hr_box);
+        for column in columns {
+            detail_row.append(*column);
+        }
+
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -262,136 +580,26 @@ impl RideOverlay {
             .margin_start(12)
             .margin_end(12)
             .build();
-        content.append(&pause_label);
+        content.append(&self.pause_label);
         content.append(&power_row);
         content.append(&detail_row);
-        content.append(graph.widget());
-        content.append(&workout_progress);
-        content.append(&dropout_label);
+        content.append(graph);
+        content.append(progress);
+        content.append(&self.dropout_label);
 
-        body.append(&header);
-        body.append(&content);
-        window.set_content(Some(&body));
-
-        // Remember the size, the way the main window does.
-        window.connect_close_request(move |win| {
-            let (width, height) = (win.width(), win.height());
-            spawn_write(&rt, &pool, "the overlay size", move |pool| async move {
-                settings::set_overlay_size(&pool, width, height).await
-            });
-            glib::Propagation::Proceed
-        });
-
-        Self {
-            window,
-            power_label,
-            target_label,
-            interval_label,
-            hr_label,
-            cadence_label,
-            graph,
-            workout_progress,
-            dropout_label,
-            pause_label,
-        }
+        self.body.append(&content);
+        self.window.set_content(Some(&self.body));
     }
+}
 
-    /// The overlay's window, for presenting a dialog on it.
-    pub fn window(&self) -> &adw::ApplicationWindow {
-        &self.window
-    }
-
-    pub fn present(&self) {
-        self.window.present();
-    }
-
-    pub fn close(&self) {
-        self.window.close();
-    }
-
-    /// Run `on_closed` when the rider closes the window, so the page that owns
-    /// this overlay can let go of it.
-    pub fn connect_closed(&self, on_closed: impl Fn() + 'static) {
-        self.window.connect_close_request(move |_| {
-            on_closed();
-            glib::Propagation::Proceed
-        });
-    }
-
-    /// Fill the profile with a ride already under way.
-    ///
-    /// Without this the graph opens blank and only starts drawing from the
-    /// moment the overlay did, which reads as a ride that has not happened yet.
-    pub fn backfill(&self, session: &Session, total_secs: u32) {
-        let mut trace: Vec<Option<u32>> = vec![None; total_secs as usize];
-        for dp in &session.data_points {
-            if let Some(slot) = trace.get_mut(dp.elapsed_secs as usize) {
-                *slot = dp.power_watts;
-            }
-        }
-        self.graph.set_trace(trace);
-    }
-
-    /// Say the ride is paused, and when auto-pause will resume it. `None`
-    /// while riding.
-    pub fn set_pause_status(&self, status: Option<&str>) {
-        match status {
-            Some(text) => {
-                self.pause_label.set_label(text);
-                self.pause_label.set_visible(true);
-            }
-            None => self.pause_label.set_visible(false),
-        }
-    }
-
-    /// One tick's worth of numbers. Driven from the player's existing timer, so
-    /// the two windows cannot disagree.
-    pub fn update(&self, snap: &EngineSnapshot, stale: &[&'static str]) {
-        // The units live in the captions (see `metric_column`), so a reading is
-        // its digits and nothing else.
-        self.power_label.set_label(
-            &snap
-                .readings
-                .power_watts
-                .map(|w| w.to_string())
-                .unwrap_or_else(|| "—".into()),
-        );
-        self.hr_label.set_label(
-            &snap
-                .readings
-                .heart_rate_bpm
-                .map(|h| h.to_string())
-                .unwrap_or_else(|| "—".into()),
-        );
-        self.cadence_label.set_label(
-            &snap
-                .readings
-                .cadence_rpm
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "—".into()),
-        );
-        self.target_label
-            .set_label(&snap.target_power_watts.to_string());
-        self.interval_label
-            .set_label(&WorkoutEngine::format_duration(snap.segment_remaining_secs));
-
-        let total = snap.elapsed_secs + snap.remaining_secs;
-        if total > 0 {
-            self.workout_progress
-                .set_fraction(snap.elapsed_secs as f64 / total as f64);
-        }
-
-        self.graph.set_playhead(snap.elapsed_secs);
-        self.graph.push_power(snap.readings.power_watts);
-
-        match dropout_banner_text(stale) {
-            Some(text) => {
-                self.dropout_label.set_label(&text);
-                self.dropout_label.set_visible(true);
-            }
-            None => self.dropout_label.set_visible(false),
-        }
-    }
+/// Built plain and classed afterwards, as the cockpit's bars are: setting
+/// `css-classes` through the builder replaces the default list, and
+/// GtkProgressBar's own `.horizontal` is what Adwaita hangs the trough's
+/// min-height on. Through the builder it measured 402x0 and drew nothing.
+fn progress_bar() -> gtk::ProgressBar {
+    let bar = gtk::ProgressBar::builder().fraction(0.0).build();
+    bar.add_css_class("accent");
+    bar
 }
 
 /// Swap the panel to one opacity step, clearing whichever was applied before.
@@ -415,6 +623,37 @@ fn build_menu() -> gio::Menu {
 
     menu.append(Some("Keep This on Top…"), Some("overlay.pin-help"));
     menu
+}
+
+/// The first time the rider opens an overlay, explain how to pin it — the app
+/// cannot pin its own window, so this says who can — and remember it was said.
+///
+/// Presented on the *main* window, not the overlay: the overlay is 420 px wide,
+/// and an explanation squeezed into that is one the rider dismisses rather than
+/// reads. The main window is behind it and roomy. Falls back to the overlay if
+/// the main window has gone.
+pub fn show_pin_help_once(
+    app: &adw::Application,
+    overlay: &RideOverlay,
+    hint_seen: bool,
+    pool: &sqlx::SqlitePool,
+    rt: &tokio::runtime::Handle,
+) {
+    if hint_seen {
+        return;
+    }
+    let this = overlay.window().upcast_ref::<gtk::Widget>().clone();
+    let host = app
+        .windows()
+        .into_iter()
+        .find(|w| w.is_visible() && w.upcast_ref::<gtk::Widget>() != &this);
+    match host {
+        Some(w) => pin_help_dialog().present(Some(&w)),
+        None => pin_help_dialog().present(Some(overlay.window())),
+    }
+    spawn_write(rt, pool, "the overlay hint", |pool| async move {
+        settings::mark_overlay_hint_seen(&pool).await
+    });
 }
 
 /// How to pin the overlay, since the app is not allowed to do it.

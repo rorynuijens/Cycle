@@ -849,6 +849,65 @@ fn ride_overlay(
     overlay
 }
 
+/// The course overlay, partway up the climb.
+fn course_overlay(
+    app: &adw::Application,
+    pool: &sqlx::SqlitePool,
+    rt: &tokio::runtime::Runtime,
+    gradient_pct: f32,
+    remaining_km: f32,
+    climb_left_m: f32,
+) -> crate::ui::overlay::RideOverlay {
+    let page = crate::ui::pages::route_player::RoutePlayerPage::new(&climb(), 200);
+    page.reset_route(&climb());
+    let overlay = crate::ui::overlay::RideOverlay::for_course(
+        app.upcast_ref::<gtk::Application>(),
+        "Alpe d'Huez",
+        page.overlay_chart(),
+        crate::data::settings::OverlaySettings::default(),
+        pool.clone(),
+        rt.handle().clone(),
+    );
+    overlay.update_course(
+        &crate::ui::overlay::CourseReadings {
+            power_watts: Some(231),
+            heart_rate_bpm: Some(151),
+            gradient_pct,
+            remaining_km,
+            climb_left_m,
+            progress: 0.35,
+        },
+        &[],
+    );
+    overlay
+}
+
+/// The course overlay holds still too, from a descent to a long way to go.
+fn assert_the_course_overlay_holds_still() {
+    let (app, pool, rt) = overlay_context();
+    let widths: Vec<i32> = [
+        (0.0, 0.4, 0.0),
+        (8.1, 7.8, 624.0),
+        (-12.5, 142.7, 1240.0),
+        (12.5, 99.9, 3999.0),
+    ]
+    .into_iter()
+    .map(|(g, km, m)| {
+        let overlay = course_overlay(&app, &pool, &rt, g, km, m);
+        overlay.window().set_default_size(420, 312);
+        overlay.present();
+        while glib::MainContext::default().iteration(false) {}
+        let min = overlay.window().measure(gtk::Orientation::Horizontal, -1).0;
+        overlay.close();
+        min
+    })
+    .collect();
+    assert!(
+        widths.windows(2).all(|w| w[0] == w[1]),
+        "the course overlay's minimum width changes with its readings: {widths:?}"
+    );
+}
+
 /// The overlay must not move when a number gains a digit.
 ///
 /// The same rule the cockpit is held to, and it bites harder here: this window
@@ -924,6 +983,7 @@ fn screenshots() {
     assert_the_cockpit_holds_still();
     assert_the_route_cockpit_holds_still();
     assert_the_overlay_holds_still();
+    assert_the_course_overlay_holds_still();
 
     shoot_route_player("14-route-1100x780", 1100, 780);
     shoot_week("15-week-ridden-plan", 1000, 700);
@@ -964,6 +1024,20 @@ fn screenshots() {
             420,
             312,
             "19-overlay-dark",
+        );
+        theme(false);
+        shoot(
+            course_overlay(&app, &pool, &rt, 8.1, 7.8, 624.0).window(),
+            420,
+            312,
+            "19b-course-overlay-light",
+        );
+        theme(true);
+        shoot(
+            course_overlay(&app, &pool, &rt, 8.1, 7.8, 624.0).window(),
+            420,
+            312,
+            "19c-course-overlay-dark",
         );
         theme(false);
     }

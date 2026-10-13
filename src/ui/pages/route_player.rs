@@ -15,6 +15,7 @@ use crate::training::engine::{
     PRE_START_SECS,
 };
 use crate::training::route_engine::{self, RouteEngine};
+use crate::ui::overlay::{CourseReadings, RideOverlay};
 use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
@@ -211,6 +212,11 @@ pub struct RoutePlayerPage {
     /// The ride currently being recorded, published so the checkpoint timer in
     /// `window.rs` can persist it. `None` outside a route ride.
     live_session: RefCell<Option<Rc<RefCell<Session>>>>,
+    /// The compact window, while it is open. Fed from this page's tick.
+    overlay: Rc<RefCell<Option<RideOverlay>>>,
+    /// Builds and opens the overlay; installed by [`attach_overlay`], which is
+    /// the only place that knows the application and the database.
+    overlay_cb: ButtonCb,
 }
 
 impl RoutePlayerPage {
@@ -519,9 +525,19 @@ impl RoutePlayerPage {
             .action_name("win.toggle-fullscreen")
             .build();
 
+        // The same compact window as a workout's, saying what a course needs.
+        // Through the window action, so F10 and this button are one thing.
+        let overlay_btn = gtk::Button::builder()
+            .icon_name("view-restore-symbolic")
+            .tooltip_text("Open the compact overlay window")
+            .css_classes(["circular", "flat"])
+            .action_name("win.toggle-overlay")
+            .build();
+
         controls.append(&pause_btn);
         controls.append(&intensity_box);
         controls.append(&gtk::Box::builder().hexpand(true).build());
+        controls.append(&overlay_btn);
         controls.append(&fullscreen_btn);
         controls.append(&end_btn);
         inner.append(&controls);
@@ -609,11 +625,47 @@ impl RoutePlayerPage {
             playhead_dist,
             ele_pts: ele_pts_rc,
             live_session: RefCell::new(None),
+            overlay: Rc::new(RefCell::new(None)),
+            overlay_cb: Rc::new(RefCell::new(None)),
         }
     }
 
     pub fn widget(&self) -> &gtk::Box {
         &self.root
+    }
+
+    /// A look-ahead chart over this page's own route and position, for the
+    /// offscreen screenshots. The overlay builds its own through
+    /// [`attach_overlay`], which holds the same cells without the page.
+    #[cfg(test)]
+    pub(crate) fn overlay_chart(&self) -> gtk::DrawingArea {
+        Self::build_lookahead_chart(&self.ele_pts, &self.playhead_dist)
+    }
+
+    /// Open the compact overlay, or close it if it is already open.
+    pub fn toggle_overlay(&self) {
+        if self.overlay_is_open() {
+            self.close_overlay();
+            return;
+        }
+        crate::ui::call_reload(&self.overlay_cb);
+    }
+
+    /// Whether the compact overlay window is open.
+    pub fn overlay_is_open(&self) -> bool {
+        self.overlay.borrow().is_some()
+    }
+
+    /// Close the overlay if it is open, and forget it.
+    ///
+    /// Taken out of its cell *before* the window is closed: closing fires the
+    /// close handler, which clears the same cell, and holding the borrow across
+    /// that would panic (CLAUDE.md §2.4).
+    pub fn close_overlay(&self) {
+        let overlay = self.overlay.borrow_mut().take();
+        if let Some(overlay) = overlay {
+            overlay.close();
+        }
     }
 
     /// Lay the cockpit out for the room fullscreen gives it.
@@ -1013,6 +1065,9 @@ impl RoutePlayerPage {
 
         glib::timeout_add_local(Duration::from_secs(1), move || {
             if !timer_alive_tick.get() {
+                // Ended, or replaced by another ride: the overlay has nothing
+                // left to say about this one.
+                page.close_overlay();
                 return glib::ControlFlow::Break;
             }
 
@@ -1058,6 +1113,17 @@ impl RoutePlayerPage {
                     page.countdown_banner.set_revealed(false);
                     page.countdown_banner.set_button_label(Some("Start now"));
                 }
+            }
+            if let Some(overlay) = page.overlay.borrow().as_ref() {
+                let ap = auto_pause.borrow();
+                let status = if ap.is_auto_paused() {
+                    Some(auto_pause::banner_title(ap.pedalling_for()))
+                } else if started_tick.get() && paused.get() {
+                    Some("Paused".to_string())
+                } else {
+                    None
+                };
+                overlay.set_pause_status(status.as_deref());
             }
 
             if paused.get() {
@@ -1219,6 +1285,26 @@ impl RoutePlayerPage {
             page.lookahead_chart.queue_draw();
             page.zone_meter.set_power(readings.power_watts);
 
+            // The overlay rides this tick rather than one of its own, so the two
+            // windows can never show different seconds of the same ride.
+            if let Some(overlay) = page.overlay.borrow().as_ref() {
+                overlay.update_course(
+                    &CourseReadings {
+                        power_watts: readings.power_watts,
+                        heart_rate_bpm: readings.heart_rate_bpm,
+                        gradient_pct,
+                        remaining_km,
+                        climb_left_m: engine.borrow().route.gain_after(distance_m),
+                        progress: if total_dist > 0.0 {
+                            (distance_m / total_dist) as f64
+                        } else {
+                            0.0
+                        },
+                    },
+                    &stale,
+                );
+            }
+
             // The road ahead, on the map and in words. Both are read off the
             // route file, so they cost a handful of interpolations a second.
             let (lookahead, cue) = {
@@ -1240,6 +1326,7 @@ impl RoutePlayerPage {
             if is_done && !completed_tick.get() {
                 completed_tick.set(true);
                 timer_alive_tick.set(false);
+                page.close_overlay();
                 let _ = cmd_tx.try_send(route_engine::release_command(sim));
                 let mut sess = session.borrow().clone();
                 let now = chrono::Utc::now();
@@ -1388,4 +1475,76 @@ impl RoutePlayerPage {
 
         chart
     }
+}
+
+/// Wire the route page's overlay to the course it is riding.
+///
+/// Installed once. Each open reads the route's name off the page and builds a
+/// fresh look-ahead chart over the page's own samples and playhead, so the
+/// overlay always shows the ride that is running now. Nothing here captures
+/// the page itself, only the cells it shares, so no cycle forms (CLAUDE.md §2.4).
+pub fn attach_overlay(
+    page: &Rc<RoutePlayerPage>,
+    app: &adw::Application,
+    pool: sqlx::SqlitePool,
+    rt: tokio::runtime::Handle,
+) {
+    let overlay_cell = Rc::clone(&page.overlay);
+    let ele_pts = Rc::clone(&page.ele_pts);
+    let playhead = Rc::clone(&page.playhead_dist);
+    let name_label = page.route_name_label.clone();
+    let cb: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        app,
+        move || {
+            // Already open: bring it forward rather than opening a second one.
+            if let Some(open) = overlay_cell.borrow().as_ref() {
+                open.present();
+                return;
+            }
+            let name = name_label.label().to_string();
+            let cell = Rc::clone(&overlay_cell);
+            let ele_pts = Rc::clone(&ele_pts);
+            let playhead = Rc::clone(&playhead);
+            let pool_build = pool.clone();
+            let rt_build = rt.clone();
+            let pool_read = pool.clone();
+            crate::ui::spawn_to_main(
+                &rt,
+                async move { crate::data::settings::load_overlay(&pool_read).await },
+                move |loaded| {
+                    // Cosmetic, as for a workout's overlay: an unreadable
+                    // database costs the last size, not the window.
+                    let saved = loaded.unwrap_or_else(|e| {
+                        tracing::error!("Could not read the overlay settings: {e}");
+                        crate::data::settings::OverlaySettings::default()
+                    });
+                    let overlay = RideOverlay::for_course(
+                        app.upcast_ref::<gtk::Application>(),
+                        &name,
+                        RoutePlayerPage::build_lookahead_chart(&ele_pts, &playhead),
+                        saved,
+                        pool_build.clone(),
+                        rt_build.clone(),
+                    );
+                    let weak_cell = Rc::downgrade(&cell);
+                    overlay.connect_closed(move || {
+                        if let Some(cell) = weak_cell.upgrade() {
+                            *cell.borrow_mut() = None;
+                        }
+                    });
+                    overlay.present();
+                    crate::ui::overlay::show_pin_help_once(
+                        &app,
+                        &overlay,
+                        saved.hint_seen,
+                        &pool_build,
+                        &rt_build,
+                    );
+                    *cell.borrow_mut() = Some(overlay);
+                },
+            );
+        }
+    ));
+    *page.overlay_cb.borrow_mut() = Some(cb);
 }

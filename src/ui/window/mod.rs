@@ -442,6 +442,14 @@ impl CycleGtkWindow {
             &blank_route,
             athlete_rc.borrow().ftp_watts,
         ));
+        // Installed once, like the workout player's: each open reads the route
+        // the page is riding at that moment.
+        crate::ui::pages::route_player::attach_overlay(
+            &route_player_rc,
+            app,
+            pool.clone(),
+            rt_handle.clone(),
+        );
         let route_timer_alive = Rc::new(Cell::new(false));
         let route_timer_started = Rc::new(Cell::new(false));
 
@@ -672,6 +680,8 @@ impl CycleGtkWindow {
             Rc::clone(&sim_difficulty),
             Rc::clone(&sim_max_grade),
             Rc::clone(&auto_pause),
+            Rc::clone(&route_player_rc),
+            Rc::clone(&route_timer_alive),
         );
 
         // ── Mid-ride checkpointing ───────────────────────────────────────────

@@ -109,6 +109,28 @@ impl Route {
         (lo + hi) / 2.0
     }
 
+    /// Climbing still to come after `distance_m`, in metres.
+    ///
+    /// The same sum as [`Route::total_gain_m`] — every rise between
+    /// consecutive points, descents ignored — taken from the rider's position
+    /// on, so "climb left" at the start reads exactly the route's own total.
+    /// The stretch the rider is part-way along counts in proportion.
+    pub fn gain_after(&self, distance_m: f32) -> f32 {
+        self.points
+            .windows(2)
+            .filter(|w| w[1].distance_m > distance_m)
+            .map(|w| {
+                let rise = (w[1].elevation_m - w[0].elevation_m).max(0.0);
+                let span = w[1].distance_m - w[0].distance_m;
+                if w[0].distance_m >= distance_m || span <= 0.0 {
+                    rise
+                } else {
+                    rise * (w[1].distance_m - distance_m) / span
+                }
+            })
+            .sum()
+    }
+
     /// Elevation at `distance_m` by linear interpolation between route points.
     pub fn elevation_at(&self, distance_m: f32) -> f32 {
         let pts = &self.points;
@@ -530,6 +552,87 @@ mod tests {
         let route = parse_gpx(gpx).unwrap();
         assert_eq!(route.name, "Alpe d'Huez & Col de Sarenne");
     }
+    // ── gain_after ───────────────────────────────────────────────────────────
+
+    fn route_of(points: &[(f32, f32)]) -> Route {
+        let points: Vec<RoutePoint> = points
+            .iter()
+            .map(|&(d, e)| RoutePoint {
+                lat: 45.0,
+                lng: 6.0,
+                elevation_m: e,
+                distance_m: d,
+                gradient: 0.0,
+            })
+            .collect();
+        let gain = points
+            .windows(2)
+            .map(|w| (w[1].elevation_m - w[0].elevation_m).max(0.0))
+            .sum();
+        Route {
+            name: "test".into(),
+            total_distance_m: points.last().map(|p| p.distance_m).unwrap_or(0.0),
+            points,
+            total_gain_m: gain,
+        }
+    }
+
+    /// Up 100 m, down 50 m, up 30 m, each over a kilometre.
+    fn hills() -> Route {
+        route_of(&[(0.0, 0.0), (1000.0, 100.0), (2000.0, 50.0), (3000.0, 80.0)])
+    }
+
+    #[test]
+    fn should_have_the_whole_climb_left_at_the_start() {
+        let r = hills();
+        assert_eq!(r.gain_after(0.0), r.total_gain_m);
+        assert_eq!(r.gain_after(0.0), 130.0);
+    }
+
+    #[test]
+    fn should_have_nothing_left_at_the_finish_or_past_it() {
+        assert_eq!(hills().gain_after(3000.0), 0.0);
+        assert_eq!(hills().gain_after(5000.0), 0.0);
+    }
+
+    #[test]
+    fn should_count_the_climb_being_ridden_in_proportion() {
+        // A quarter of the way up the first hill: 75 m of it left, plus 30.
+        assert_eq!(hills().gain_after(250.0), 105.0);
+    }
+
+    #[test]
+    fn should_not_take_a_descent_off_what_is_left() {
+        // Halfway down the descent only the last hill remains.
+        assert_eq!(hills().gain_after(1500.0), 30.0);
+    }
+
+    #[test]
+    fn should_count_from_a_point_exactly_on_a_route_point() {
+        assert_eq!(hills().gain_after(1000.0), 30.0);
+        assert_eq!(hills().gain_after(2000.0), 30.0);
+    }
+
+    #[test]
+    fn should_treat_a_position_before_the_start_as_the_start() {
+        assert_eq!(hills().gain_after(-10.0), 130.0);
+    }
+
+    #[test]
+    fn should_have_no_climb_on_a_route_with_no_points() {
+        assert_eq!(route_of(&[]).gain_after(0.0), 0.0);
+    }
+
+    #[test]
+    fn should_not_divide_by_two_points_in_the_same_place() {
+        // A GPX file can repeat a point; the zero-length stretch must not
+        // produce NaN.
+        let r = route_of(&[(0.0, 0.0), (500.0, 50.0), (500.0, 60.0), (1000.0, 60.0)]);
+        assert_eq!(r.gain_after(500.0), 0.0);
+        assert!(r.gain_after(250.0).is_finite());
+        assert_eq!(r.gain_after(250.0), 35.0);
+    }
+
     // ── estimated_load ───────────────────────────────────────────────────────
 
     /// A route of `len_m` at a constant `gradient`, sampled every 10 m.
