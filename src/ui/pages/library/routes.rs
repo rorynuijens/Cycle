@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use crate::data::db::{self, SavedRoute};
 use crate::data::route::Route;
+use crate::data::route_pack::{self, PackState};
 
 use super::detail::show_route_detail;
 use super::RebuildHolder;
@@ -74,6 +75,30 @@ fn build_row(route: &SavedRoute, ctx: &Rc<RouteRows>) -> adw::ActionRow {
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("map-symbolic"));
+
+    // Offline 3D: whether the route's world is on disk, worked out off the
+    // main thread, and fetched in the background if any of it is missing.
+    let offline_btn = gtk::Button::builder()
+        .icon_name("folder-download-symbolic")
+        .tooltip_text("Download this route's 3D world for riding offline")
+        .css_classes(["flat", "circular"])
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    row.add_suffix(&offline_btn);
+    let pack = Rc::new(PackRow {
+        row: row.downgrade(),
+        button: offline_btn.downgrade(),
+        base: subtitle.clone(),
+        file_name: route.file_name.clone(),
+        rt: ctx.rt_handle.clone(),
+    });
+    {
+        let pack = Rc::clone(&pack);
+        offline_btn.connect_clicked(move |_| pack.download());
+    }
+    // Automatically only where the last automatic try did not just fail.
+    pack.check(false);
 
     let rename_btn = gtk::Button::builder()
         .icon_name("document-edit-symbolic")
@@ -273,6 +298,76 @@ fn build_row(route: &SavedRoute, ctx: &Rc<RouteRows>) -> adw::ActionRow {
     });
 
     row
+}
+
+/// One route row's offline-3D state, and how to change it.
+///
+/// Holds the row and its button weakly: the button's own handler holds this,
+/// and a strong hold back would keep every rebuilt row alive for good
+/// (CLAUDE.md §2.4).
+struct PackRow {
+    row: glib::WeakRef<adw::ActionRow>,
+    button: glib::WeakRef<gtk::Button>,
+    /// The row's subtitle before the offline note.
+    base: String,
+    file_name: String,
+    rt: tokio::runtime::Handle,
+}
+
+impl PackRow {
+    fn show(&self, note: &str, can_download: bool) {
+        if let Some(row) = self.row.upgrade() {
+            row.set_subtitle(&format!("{} · {note}", self.base));
+        }
+        if let Some(button) = self.button.upgrade() {
+            button.set_visible(can_download);
+        }
+    }
+
+    /// Look at what is on disk; with `fetch_missing`, start downloading
+    /// whatever is not.
+    fn check(self: &Rc<Self>, fetch_missing: bool) {
+        let file_name = self.file_name.clone();
+        let this = Rc::clone(self);
+        crate::ui::spawn_to_main(
+            &self.rt,
+            async move {
+                let path = db::routes_dir()?.join(file_name);
+                let route = Route::from_gpx_path(&path)?;
+                let state = route_pack::state_here(&route);
+                anyhow::Ok((route, state))
+            },
+            move |result| match result {
+                Ok((_, PackState::Ready)) => this.show("3D ready offline", false),
+                Ok((_, PackState::TooLarge)) => this.show("too large for 3D", false),
+                Ok((route, _)) if fetch_missing => this.fetch(route),
+                Ok((route, _)) if route_pack::auto_fetch_allowed(&route) => this.fetch(route),
+                Ok(_) => this.show("3D not downloaded", true),
+                Err(e) => tracing::warn!("Could not check a route's offline 3D: {e:#}"),
+            },
+        );
+    }
+
+    /// Download the route's pack — the rider's own Retry, never held back.
+    fn download(self: &Rc<Self>) {
+        self.check(true);
+    }
+
+    fn fetch(self: &Rc<Self>, route: Route) {
+        self.show("Downloading 3D…", false);
+        let this = Rc::clone(self);
+        crate::ui::spawn_to_main(
+            &self.rt,
+            route_pack::prepare(route),
+            move |result| match result {
+                Ok(()) => this.check(false),
+                Err(e) => {
+                    tracing::warn!("Offline 3D download failed: {e:#}");
+                    this.show("3D download failed", true);
+                }
+            },
+        );
+    }
 }
 
 /// Copy a loaded GPX into the library directory and record it, so the route can

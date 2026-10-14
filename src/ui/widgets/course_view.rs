@@ -24,8 +24,10 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use crate::data::course3d::{self, CourseScene, Mesh};
+use crate::data::osm::{self, Features};
 use crate::data::route::Route;
 use crate::data::terrain::{self, Dem, TileId};
+use std::sync::Arc;
 
 /// Vertical field of view, in degrees. Roughly what a rider takes in looking
 /// down the road, and wide enough that a bend does not leave the frame.
@@ -52,7 +54,11 @@ const SUN_DIR: [f32; 3] = [-0.45, 0.85, 0.40];
 
 const BUILDING: &str = "Building the 3D view…";
 
-/// Credit for the land, shown while it is on screen.
+/// Credits for what is on screen. OpenStreetMap's is required by its licence
+/// wherever its data is shown.
+const MAP_CREDIT: &str = "Map data © OpenStreetMap contributors";
+const MAP_SOURCES: &str = "Buildings, land use, water and coastline from OpenStreetMap, \
+    available under the Open Database License.";
 const ELEVATION_CREDIT: &str = "Elevation: Terrain Tiles · Mapzen, AWS Open Data";
 const ELEVATION_SOURCES: &str = "The Terrain Tiles combine open elevation data from \
     3DEP, SRTM, GMTED2010, ETOPO1, EU-DEM (Copernicus), ArcticDEM and national \
@@ -68,11 +74,21 @@ const REDRAW_EPSILON_M: f32 = 0.001;
 const VERTEX_SHADER: &str = r#"
 in vec3 a_pos;
 in vec4 a_colour;
+in vec2 a_uv;
 uniform mat4 u_mvp;
+uniform vec3 u_eye;
 out vec3 v_world;
+out vec3 v_rel;
 out vec4 v_colour;
+out vec2 v_uv;
 void main() {
+    v_uv = a_uv;
     v_world = a_pos;
+    // Relative to the eye, the numbers are small. Interpolated across a pixel
+    // at thousands of metres from the scene's origin, the absolute position
+    // loses the precision the lighting takes its slope from, and walls came
+    // out speckled.
+    v_rel = a_pos - u_eye;
     v_colour = a_colour;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
@@ -80,8 +96,9 @@ void main() {
 
 const FRAGMENT_SHADER: &str = r#"
 in vec3 v_world;
+in vec3 v_rel;
 in vec4 v_colour;
-uniform vec3 u_eye;
+in vec2 v_uv;
 uniform vec3 u_sky;
 uniform vec3 u_sun;
 uniform float u_fog_start;
@@ -94,19 +111,47 @@ float hash(vec2 p) {
 
 void main() {
     vec3 c = v_colour.rgb;
-    // Ground: two scales of mottling, so the grass slides past and the eye
-    // can read speed from it.
-    if (v_colour.a > 0.5) {
+    // The material is the whole part of the alpha; walls keep a fraction too.
+    float material = floor(v_colour.a + 0.0005);
+    // The face normal comes from how the position changes across the pixel,
+    // so no normals are stored.
+    vec3 n = normalize(cross(dFdx(v_rel), dFdy(v_rel)));
+    // Face the viewer. Flipping to face *up* instead decides a wall's side by
+    // the sign of a vertical component that is noise, and the wall comes out
+    // speckled light and dark pixel by pixel.
+    if (dot(n, v_rel) > 0.0) n = -n;
+    if (material == 1.0) {
+        // Ground: two scales of mottling, so the grass slides past and the
+        // eye can read speed from it.
         float fine = hash(floor(v_world.xz / 2.0));
         float coarse = hash(floor(v_world.xz / 14.0));
         c *= 0.84 + 0.16 * fine + 0.12 * (coarse - 0.5);
+    } else if (material == 2.0) {
+        // Asphalt: a fine grain, faded out where a grain is under a pixel so
+        // the distant road does not shimmer.
+        float grain = hash(floor(v_world.xz / 0.12));
+        float fade = 1.0 - smoothstep(0.04, 0.12, fwidth(v_world.x) + fwidth(v_world.z));
+        c *= 1.0 + (grain - 0.5) * 0.07 * fade;
+    } else if (material == 3.0) {
+        // Walls: a window in the middle half of every bay, every storey,
+        // laid out by the wall's own coordinates — bays along, metres up.
+        float storey = floor(v_uv.y / 3.0);
+        float bay = floor(v_uv.x);
+        float fx = v_uv.x - bay;
+        float fy = v_uv.y - storey * 3.0;
+        // Fade the grid out once a window is only a few pixels across.
+        float px = max(fwidth(v_uv.x) * 2.8, fwidth(v_uv.y));
+        float fade = 1.0 - smoothstep(0.25, 0.6, px);
+        if (v_uv.x >= 0.0 && storey >= 0.0 && fx > 0.25 && fx < 0.75 && fy > 0.9 && fy < 2.2) {
+            float seed = fract(v_colour.a) * 97.0;
+            float lit = hash(vec2(bay + seed, storey - seed));
+            vec3 glass = mix(vec3(0.15, 0.19, 0.24), vec3(0.34, 0.38, 0.42), lit);
+            c = mix(c, glass, fade);
+        }
     }
-    // Light each triangle by how it faces the sun. The face normal comes from
-    // how the position changes across the pixel, so no normals are stored.
-    vec3 n = normalize(cross(dFdx(v_world), dFdy(v_world)));
-    if (n.y < 0.0) n = -n;
+    // Light by how the face turns to the sun.
     c *= 0.62 + 0.45 * max(dot(n, normalize(u_sun)), 0.0);
-    float d = distance(v_world, u_eye);
+    float d = length(v_rel);
     float f = clamp((d - u_fog_start) / (u_fog_end - u_fog_start), 0.0, 1.0);
     frag = vec4(mix(c, u_sky, f), 1.0);
 }
@@ -133,13 +178,66 @@ void main() {
 }
 "#;
 
-/// Where the land is for the route on screen.
+/// How one of the view's two downloads — terrain, map data — stands for the
+/// route on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerrainState {
+enum Load {
     /// Not asked for yet: the view has not been shown for this route.
     Wanted,
     Loading,
     Ready,
+    /// Tried and failed; showing the view again tries again.
+    Failed,
+    /// Will never load for this route — it is too large to fetch.
+    Unavailable,
+}
+
+impl Load {
+    fn should_start(self) -> bool {
+        matches!(self, Self::Wanted | Self::Failed)
+    }
+}
+
+/// What the status line should say, given where both downloads stand and
+/// whether a scene is up yet. `None` is nothing to say.
+fn status_text(has_scene: bool, terrain: Load, map: Load) -> Option<&'static str> {
+    if !has_scene {
+        return Some(BUILDING);
+    }
+    Some(match (terrain, map) {
+        (Load::Loading, _) => "Loading terrain…",
+        (_, Load::Loading) => "Loading map data — the first time for a route takes up to a minute",
+        (Load::Failed, _) => "No terrain — check the connection. Flat ground for now",
+        (_, Load::Failed) => "No map data — check the connection. Open country for now",
+        (Load::Unavailable, _) => "This route is too large for terrain",
+        (_, Load::Unavailable) => "This route is too large for map data",
+        _ => return None,
+    })
+}
+
+/// The credit line as markup: OpenStreetMap's credit links to its copyright
+/// page, as the OSMF attribution guidelines ask — a click from the 3D view
+/// reaches the licence. The rest is escaped plain text.
+fn credit_markup(text: &str) -> String {
+    let escaped = glib::markup_escape_text(text).to_string();
+    escaped.replace(
+        "© OpenStreetMap contributors",
+        "© <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap contributors</a>",
+    )
+}
+
+/// The credit line and its tooltip for a scene built with terrain
+/// (`elevation`) and map data (`map`).
+fn credit_text(elevation: bool, map: bool) -> Option<(String, String)> {
+    match (elevation, map) {
+        (true, true) => Some((
+            format!("{MAP_CREDIT} · {ELEVATION_CREDIT}"),
+            format!("{MAP_SOURCES}\n{ELEVATION_SOURCES}"),
+        )),
+        (false, true) => Some((MAP_CREDIT.into(), MAP_SOURCES.into())),
+        (true, false) => Some((ELEVATION_CREDIT.into(), ELEVATION_SOURCES.into())),
+        (false, false) => None,
+    }
 }
 
 /// The distance last reported by the ride, and when.
@@ -201,7 +299,13 @@ struct Inner {
     /// screenshot harness, which never fetches anything.
     rt: RefCell<Option<tokio::runtime::Handle>>,
     route: RefCell<Option<Route>>,
-    terrain: Cell<TerrainState>,
+    terrain: Cell<Load>,
+    map: Cell<Load>,
+    dem: RefCell<Option<Arc<Dem>>>,
+    features: RefCell<Option<Arc<Features>>>,
+    /// Numbers each scene build; a build finishing after a newer one started
+    /// is dropped, so a slow early build cannot replace a fuller later one.
+    build_seq: Cell<u64>,
     scene: RefCell<Option<CourseScene>>,
     /// The scene changed and has not been uploaded yet.
     needs_upload: Cell<bool>,
@@ -246,6 +350,7 @@ impl CourseView {
             .build();
         let credit = gtk::Label::builder()
             .label(ELEVATION_CREDIT)
+            .use_markup(true)
             .tooltip_text(ELEVATION_SOURCES)
             .css_classes(["caption", "osd"])
             .halign(gtk::Align::End)
@@ -264,7 +369,11 @@ impl CourseView {
             credit,
             rt: RefCell::new(None),
             route: RefCell::new(None),
-            terrain: Cell::new(TerrainState::Wanted),
+            terrain: Cell::new(Load::Wanted),
+            map: Cell::new(Load::Wanted),
+            dem: RefCell::new(None),
+            features: RefCell::new(None),
+            build_seq: Cell::new(0),
             area: area.clone(),
             scene: RefCell::new(None),
             needs_upload: Cell::new(false),
@@ -300,7 +409,7 @@ impl CourseView {
         let weak = Rc::downgrade(&inner);
         root.connect_map(move |_| {
             if let Some(inner) = weak.upgrade() {
-                Inner::ensure_terrain(&inner);
+                Inner::ensure_world(&inner);
             }
         });
         // Runs only while the area is mapped, so a hidden view costs nothing.
@@ -335,51 +444,25 @@ impl CourseView {
 
     /// Show `route`, with the rider at its start.
     ///
-    /// The scene is built off the main thread — a long route's ground grid
-    /// takes long enough to stall a frame — and handed back here to upload.
+    /// The road goes up on flat ground at once; terrain and map data follow
+    /// the first time the view is shown, and the scene is rebuilt as each
+    /// arrives.
     pub fn set_route(&self, route: &Route) {
-        let generation = self.inner.generation.get() + 1;
-        self.inner.generation.set(generation);
-        *self.inner.scene.borrow_mut() = None;
-        self.inner.needs_upload.set(true);
-        self.inner.progress.set(Progress::default());
-        self.inner.drawn_m.set(None);
-        *self.inner.route.borrow_mut() = Some(route.clone());
-        self.inner.terrain.set(TerrainState::Wanted);
-        self.inner.credit.set_visible(false);
-        // Under a second for a long route in a release build, but never a
-        // blank sky with no word of why.
-        self.inner.show_status(Some(BUILDING));
-
-        let route = route.clone();
-        let weak = Rc::downgrade(&self.inner);
-        glib::spawn_future_local(async move {
-            let built = gtk::gio::spawn_blocking(move || CourseScene::build(&route)).await;
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            if inner.generation.get() != generation {
-                return;
-            }
-            match built {
-                // Terrain may have landed first on a cached route; flat
-                // ground must not replace it.
-                Ok(scene) if inner.terrain.get() != TerrainState::Ready => {
-                    *inner.scene.borrow_mut() = scene;
-                    inner.needs_upload.set(true);
-                    inner.area.queue_render();
-                    // Only its own message: a terrain status (still loading,
-                    // or failed already) stays up.
-                    if inner.status.label() == BUILDING {
-                        inner.show_status(None);
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => tracing::error!("Building the 3D course panicked"),
-            }
-        });
-        if self.inner.root.is_mapped() {
-            Inner::ensure_terrain(&self.inner);
+        let inner = &self.inner;
+        inner.generation.set(inner.generation.get() + 1);
+        *inner.scene.borrow_mut() = None;
+        inner.needs_upload.set(true);
+        inner.progress.set(Progress::default());
+        inner.drawn_m.set(None);
+        *inner.route.borrow_mut() = Some(route.clone());
+        inner.terrain.set(Load::Wanted);
+        inner.map.set(Load::Wanted);
+        *inner.dem.borrow_mut() = None;
+        *inner.features.borrow_mut() = None;
+        inner.credit.set_visible(false);
+        Inner::rebuild(inner);
+        if inner.root.is_mapped() {
+            Inner::ensure_world(inner);
         }
     }
 
@@ -395,13 +478,10 @@ impl CourseView {
 }
 
 impl Inner {
-    /// Fetch and lay the land for the current route, unless that is done or
-    /// under way. A failed attempt leaves it wanted, so showing the view again
-    /// tries again — with whatever tiles did arrive already in the cache.
-    fn ensure_terrain(this: &Rc<Self>) {
-        if this.terrain.get() != TerrainState::Wanted {
-            return;
-        }
+    /// Start whichever of terrain and map data the current route still needs.
+    /// A failed download is tried again each time the view is shown — with
+    /// whatever did arrive already in the cache.
+    fn ensure_world(this: &Rc<Self>) {
         let Some(rt) = this.rt.borrow().clone() else {
             return;
         };
@@ -411,21 +491,29 @@ impl Inner {
         if route.points.len() < 2 {
             return;
         }
-        let ids = match terrain::tiles_for_route(&route, terrain::CORRIDOR_M) {
+        if this.terrain.get().should_start() {
+            Self::start_terrain(this, &rt, &route);
+        }
+        if this.map.get().should_start() {
+            Self::start_map(this, &rt, route);
+        }
+        this.update_status();
+    }
+
+    fn start_terrain(this: &Rc<Self>, rt: &tokio::runtime::Handle, route: &Route) {
+        let ids = match terrain::tiles_for_route(route, terrain::CORRIDOR_M) {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::warn!("No terrain for this route: {e}");
-                this.show_status(Some("This route is too large for terrain — flat ground"));
-                this.terrain.set(TerrainState::Ready);
+                this.terrain.set(Load::Unavailable);
                 return;
             }
         };
-        this.terrain.set(TerrainState::Loading);
-        this.show_status(Some("Loading terrain…"));
+        this.terrain.set(Load::Loading);
         let generation = this.generation.get();
         let weak = Rc::downgrade(this);
         crate::ui::spawn_to_main(
-            &rt,
+            rt,
             terrain::load(terrain::cache_dir(), ids),
             move |loaded| {
                 let Some(inner) = weak.upgrade() else {
@@ -435,60 +523,132 @@ impl Inner {
                     return;
                 }
                 match loaded {
-                    Ok(tiles) => Self::lay_terrain(&inner, route, tiles, generation),
+                    Ok(tiles) => Self::decode_terrain(&inner, tiles, generation),
                     Err(e) => {
                         tracing::warn!("Terrain did not load: {e:#}");
-                        inner.terrain.set(TerrainState::Wanted);
-                        inner.show_status(Some(
-                            "No terrain — check the connection. Flat ground for now",
-                        ));
+                        inner.terrain.set(Load::Failed);
+                        inner.update_status();
                     }
                 }
             },
         );
     }
 
-    /// Decode `tiles` and rebuild the scene on them, off the main thread.
-    fn lay_terrain(this: &Rc<Self>, route: Route, tiles: Vec<(TileId, Vec<u8>)>, generation: u64) {
+    /// Decode the tiles off the main thread, then rebuild on them.
+    fn decode_terrain(this: &Rc<Self>, tiles: Vec<(TileId, Vec<u8>)>, generation: u64) {
         let weak = Rc::downgrade(this);
         glib::spawn_future_local(async move {
-            let built = gtk::gio::spawn_blocking(move || {
-                let dem = decode_tiles(tiles)?;
-                CourseScene::build_with(&route, Some(&dem))
-                    .ok_or_else(|| "route too short".to_string())
-            })
-            .await;
+            let decoded = gtk::gio::spawn_blocking(move || decode_tiles(tiles)).await;
             let Some(inner) = weak.upgrade() else {
                 return;
             };
             if inner.generation.get() != generation {
                 return;
             }
-            match built {
-                Ok(Ok(scene)) => {
-                    *inner.scene.borrow_mut() = Some(scene);
-                    inner.needs_upload.set(true);
-                    inner.terrain.set(TerrainState::Ready);
-                    inner.show_status(None);
-                    inner.credit.set_visible(true);
-                    inner.area.queue_render();
+            match decoded {
+                Ok(Ok(dem)) => {
+                    *inner.dem.borrow_mut() = Some(Arc::new(dem));
+                    inner.terrain.set(Load::Ready);
+                    Self::rebuild(&inner);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Terrain could not be used: {e}");
-                    inner.terrain.set(TerrainState::Wanted);
-                    inner.show_status(Some("The terrain data was damaged — flat ground for now"));
+                    inner.terrain.set(Load::Failed);
                 }
                 Err(_) => {
-                    tracing::error!("Laying the terrain panicked");
-                    inner.terrain.set(TerrainState::Wanted);
-                    inner.show_status(None);
+                    tracing::error!("Decoding the terrain panicked");
+                    inner.terrain.set(Load::Failed);
                 }
             }
+            inner.update_status();
         });
     }
 
-    fn show_status(&self, text: Option<&str>) {
-        match text {
+    fn start_map(this: &Rc<Self>, rt: &tokio::runtime::Handle, route: Route) {
+        this.map.set(Load::Loading);
+        let generation = this.generation.get();
+        let weak = Rc::downgrade(this);
+        crate::ui::spawn_to_main(rt, osm::load(osm::cache_dir(), route), move |loaded| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.generation.get() != generation {
+                return;
+            }
+            match loaded {
+                Ok(features) => {
+                    *inner.features.borrow_mut() = Some(Arc::new(features));
+                    inner.map.set(Load::Ready);
+                    Self::rebuild(&inner);
+                }
+                Err(e) if e.downcast_ref::<osm::RouteTooComplex>().is_some() => {
+                    tracing::warn!("No map data for this route: {e}");
+                    inner.map.set(Load::Unavailable);
+                }
+                Err(e) => {
+                    tracing::warn!("Map data did not load: {e:#}");
+                    inner.map.set(Load::Failed);
+                }
+            }
+            inner.update_status();
+        });
+    }
+
+    /// Build the scene from the route and whatever has arrived, off the main
+    /// thread — a long route takes long enough to stall a frame.
+    fn rebuild(this: &Rc<Self>) {
+        let Some(route) = this.route.borrow().clone() else {
+            return;
+        };
+        let dem = this.dem.borrow().clone();
+        let features = this.features.borrow().clone();
+        let seq = this.build_seq.get() + 1;
+        this.build_seq.set(seq);
+        let generation = this.generation.get();
+        this.update_status();
+        let weak = Rc::downgrade(this);
+        glib::spawn_future_local(async move {
+            let (with_dem, with_map) = (dem.is_some(), features.is_some());
+            let built = gtk::gio::spawn_blocking(move || {
+                CourseScene::build_with(&route, dem.as_deref(), features.as_deref())
+            })
+            .await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.generation.get() != generation || inner.build_seq.get() != seq {
+                return;
+            }
+            match built {
+                Ok(scene) => {
+                    let has_scene = scene.is_some();
+                    *inner.scene.borrow_mut() = scene;
+                    inner.needs_upload.set(true);
+                    inner.area.queue_render();
+                    match credit_text(with_dem && has_scene, with_map && has_scene) {
+                        Some((text, sources)) => {
+                            inner.credit.set_label(&credit_markup(&text));
+                            inner.credit.set_tooltip_text(Some(&sources));
+                            inner.credit.set_visible(true);
+                        }
+                        None => inner.credit.set_visible(false),
+                    }
+                }
+                Err(_) => tracing::error!("Building the 3D course panicked"),
+            }
+            inner.update_status();
+        });
+    }
+
+    /// Say what is happening, from where the scene and both downloads stand.
+    fn update_status(&self) {
+        let has_scene = self.scene.borrow().is_some()
+            || self
+                .route
+                .borrow()
+                .as_ref()
+                .is_none_or(|r| r.points.len() < 2);
+        match status_text(has_scene, self.terrain.get(), self.map.get()) {
             Some(t) => {
                 self.status.set_label(t);
                 self.status.set_visible(true);
@@ -580,7 +740,7 @@ impl GlState {
                 header,
                 VERTEX_SHADER,
                 FRAGMENT_SHADER,
-                &[(0, "a_pos"), (1, "a_colour")],
+                &[(0, "a_pos"), (1, "a_colour"), (2, "a_uv")],
             )?;
             let sky_program = link(&gl, header, SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER, &[])?;
             let sky_vao = gl.create_vertex_array()?;
@@ -596,6 +756,8 @@ impl GlState {
             gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
             gl.enable_vertex_attrib_array(1);
             gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 12);
+            gl.enable_vertex_attrib_array(2);
+            gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 28);
             gl.bind_vertex_array(None);
 
             Ok(Self {
@@ -834,7 +996,7 @@ fn decode_tiles(tiles: Vec<(TileId, Vec<u8>)>) -> Result<Dem, String> {
 fn vertex_bytes(mesh: &Mesh) -> Vec<u8> {
     mesh.vertices
         .iter()
-        .flat_map(|v| v.pos.iter().chain(v.colour.iter()))
+        .flat_map(|v| v.pos.iter().chain(v.colour.iter()).chain(v.uv.iter()))
         .flat_map(|f| f.to_ne_bytes())
         .collect()
 }
@@ -908,18 +1070,87 @@ mod tests {
         assert_eq!(p.distance_at(1_500_000), 100.0);
     }
 
+    // ── Status and credit ─────────────────────────────────────────────────────
+
     #[test]
-    fn should_pack_seven_floats_per_vertex() {
+    fn should_say_it_is_building_before_there_is_anything_to_see() {
+        assert_eq!(status_text(false, Load::Ready, Load::Ready), Some(BUILDING));
+    }
+
+    #[test]
+    fn should_say_nothing_once_everything_is_in() {
+        assert_eq!(status_text(true, Load::Ready, Load::Ready), None);
+        // Before the view is shown nothing has been asked for: nothing to say.
+        assert_eq!(status_text(true, Load::Wanted, Load::Wanted), None);
+    }
+
+    #[test]
+    fn should_report_the_slow_map_download_only_after_terrain_is_in() {
+        assert_eq!(
+            status_text(true, Load::Loading, Load::Loading),
+            Some("Loading terrain…")
+        );
+        let map = status_text(true, Load::Ready, Load::Loading).expect("a status");
+        assert!(map.starts_with("Loading map data"), "{map}");
+    }
+
+    #[test]
+    fn should_say_which_download_failed() {
+        let t = status_text(true, Load::Failed, Load::Ready).expect("a status");
+        assert!(t.starts_with("No terrain"), "{t}");
+        let m = status_text(true, Load::Ready, Load::Failed).expect("a status");
+        assert!(m.starts_with("No map data"), "{m}");
+    }
+
+    #[test]
+    fn should_retry_a_failure_but_never_an_impossible_route() {
+        assert!(Load::Wanted.should_start());
+        assert!(Load::Failed.should_start());
+        assert!(!Load::Loading.should_start());
+        assert!(!Load::Ready.should_start());
+        assert!(!Load::Unavailable.should_start());
+    }
+
+    #[test]
+    fn should_credit_openstreetmap_whenever_its_data_is_shown() {
+        let (text, _) = credit_text(false, true).expect("a credit");
+        assert!(text.contains("© OpenStreetMap contributors"));
+        let (text, sources) = credit_text(true, true).expect("a credit");
+        assert!(text.contains("© OpenStreetMap contributors") && text.contains("Terrain Tiles"));
+        assert!(sources.contains("Open Database License"));
+        let (text, _) = credit_text(true, false).expect("a credit");
+        assert!(!text.contains("OpenStreetMap"));
+        assert_eq!(credit_text(false, false), None);
+    }
+
+    #[test]
+    fn should_link_the_openstreetmap_credit_to_its_licence() {
+        let (text, _) = credit_text(true, true).expect("a credit");
+        let markup = credit_markup(&text);
+        assert!(markup.contains(r#"<a href="https://www.openstreetmap.org/copyright">"#));
+        // The elevation credit stays plain text.
+        assert!(markup.contains("Terrain Tiles"));
+        assert_eq!(credit_markup("a < b & c"), "a &lt; b &amp; c");
+    }
+
+    #[test]
+    fn should_pack_nine_floats_per_vertex() {
         let mesh = Mesh {
             vertices: vec![course3d::Vertex {
                 pos: [1.0, 2.0, 3.0],
                 colour: [0.1, 0.2, 0.3, 1.0],
+                uv: [7.0, 8.0],
             }],
             indices: vec![0, 0, 0],
         };
         let bytes = vertex_bytes(&mesh);
         assert_eq!(bytes.len(), std::mem::size_of::<course3d::Vertex>());
         assert_eq!(&bytes[12..16], &0.1f32.to_ne_bytes());
+        assert_eq!(
+            &bytes[28..32],
+            &7.0f32.to_ne_bytes(),
+            "uv after colour, at the offset GL reads"
+        );
         assert_eq!(index_bytes(&mesh).len(), 12);
     }
 }
@@ -964,6 +1195,10 @@ mod offscreen {
             .unwrap_or(200.0);
         let route = Route::from_gpx_path(std::path::Path::new(&gpx)).expect("a GPX");
         let started = std::time::Instant::now();
+        // CYCLE_3D_OSM=<saved Overpass answer> adds buildings, land use, water.
+        let features = std::env::var("CYCLE_3D_OSM")
+            .ok()
+            .map(|path| osm::parse(&std::fs::read(path).expect("the map file")).expect("map data"));
         let scene = match std::env::var("CYCLE_3D_TILES") {
             Ok(root) => {
                 let ids = terrain::tiles_for_route(&route, terrain::CORRIDOR_M).expect("tiles");
@@ -976,9 +1211,9 @@ mod offscreen {
                     })
                     .collect();
                 let dem = decode_tiles(tiles).expect("decodes");
-                CourseScene::build_with(&route, Some(&dem)).expect("a scene")
+                CourseScene::build_with(&route, Some(&dem), features.as_ref()).expect("a scene")
             }
-            Err(_) => CourseScene::build(&route).expect("a scene"),
+            Err(_) => CourseScene::build_with(&route, None, features.as_ref()).expect("a scene"),
         };
         eprintln!("scene built in {:.2} s", started.elapsed().as_secs_f64());
         let pose = course3d::camera_pose(&scene.road, at).expect("a pose");

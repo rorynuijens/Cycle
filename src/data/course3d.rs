@@ -13,7 +13,10 @@
 //! the climb they feel. The ground is fitted to the road, never the other way
 //! round.
 
+use crate::data::osm::AreaKind;
+use crate::data::roadway;
 use crate::data::route::Route;
+use crate::data::scenery::{self, Scenery, WATER_RGB};
 
 /// Height of the rider's eye above the road surface, in metres. A rider on
 /// the hoods of a road bike, not someone standing at the roadside — the rider
@@ -25,27 +28,10 @@ pub const EYE_HEIGHT_M: f32 = 1.3;
 /// the camera still turns into a bend rather than across it.
 pub const LOOK_AHEAD_M: f32 = 30.0;
 
-/// How far right of the centre line the rider rides, in metres: the middle of
-/// the right-hand lane, as on the roads these routes were recorded on.
-pub const LANE_OFFSET_M: f32 = 1.5;
-
-/// Half the width of the road surface, in metres.
-pub const ROAD_HALF_WIDTH_M: f32 = 3.0;
-
 /// GPX points either side averaged into each centreline point. A recorded ride
 /// is about one point every 8–9 m with a metre or two of GPS scatter, which
 /// drawn raw reads as a road with a kink every few metres.
 const SMOOTH_POINTS: usize = 3;
-
-/// Centre-line dashes: painted this long, then a gap of the rest of the period.
-/// The dashes are the main thing that tells the eye how fast the road is going.
-const DASH_M: f32 = 3.0;
-const DASH_PERIOD_M: f32 = 9.0;
-const DASH_HALF_WIDTH_M: f32 = 0.08;
-
-// The rider's line must be on the tarmac and clear of the paint. Checked when
-// the crate compiles, so retuning one width cannot quietly break it.
-const _: () = assert!(LANE_OFFSET_M > DASH_HALF_WIDTH_M && LANE_OFFSET_M < ROAD_HALF_WIDTH_M);
 
 /// The ground grid: vertex spacing, how far either side of the road it reaches,
 /// and how far below the road it sits so the road surface always wins the depth
@@ -55,22 +41,39 @@ pub const GROUND_RADIUS_M: f32 = 1_200.0;
 pub const GROUND_DROP_M: f32 = 0.3;
 
 /// Ground this close to the road is held flat just under it, whatever the
-/// terrain does. The width is what makes that a guarantee rather than a hope:
-/// any grid triangle over the road surface has its corners within one cell
-/// diagonal of it, the surface is within a half-width of the centreline, and
-/// the centreline within half a resampling step of a measured point — so all
-/// three corners are held, and the triangle cannot rise through the road.
-pub const SHOULDER_M: f32 = 35.0;
+/// terrain does: this much beyond however far the road reaches from the
+/// rider's line at that point. The margin is what makes that a guarantee
+/// rather than a hope: any grid triangle over the road surface has its corners
+/// within one cell diagonal of it, the surface is within the road's reach of
+/// the line, and the line within half a resampling step of a measured point —
+/// so all three corners are held, and the triangle cannot rise through the road.
+pub const SHOULDER_BASE_M: f32 = 31.0;
+
+/// How far the road the view draws where the map says nothing reaches from
+/// the rider's line — `roadway::Profile::DEFAULT.extent()`.
+pub const DEFAULT_EXTENT_M: f32 = 4.5;
+
+/// The shoulder beside that road.
+#[cfg(test)]
+pub const SHOULDER_M: f32 = SHOULDER_BASE_M + DEFAULT_EXTENT_M;
+
+/// Buildings keep this much clear of the road's edge: a pavement. The GPX can
+/// sit a few metres off the street the map draws, and a building on the tarmac
+/// is worse than a missing one.
+pub const PAVEMENT_M: f32 = 1.5;
 
 /// Spacing the centreline is resampled at before distances to it are taken,
 /// in metres. A recorded GPX is a point every 8–9 m; a planned one can be a
 /// point every 100.
 const RESAMPLE_M: f32 = 5.0;
 
-const _: () = assert!(
-    SHOULDER_M
-        >= GROUND_SPACING_M * std::f32::consts::SQRT_2 + ROAD_HALF_WIDTH_M + RESAMPLE_M / 2.0
-);
+const _: () =
+    assert!(SHOULDER_BASE_M >= GROUND_SPACING_M * std::f32::consts::SQRT_2 + RESAMPLE_M / 2.0);
+
+/// Under the ridden road's bridges the ground drops this far below the deck,
+/// this far either side of the road's edge — room for what the bridge spans.
+const UNDER_BRIDGE_M: f32 = 6.0;
+const UNDER_BRIDGE_REACH_M: f32 = 8.0;
 
 /// Beyond the shoulder the terrain blends in, reaching its own height here.
 const BLEND_END_M: f32 = 120.0;
@@ -87,22 +90,47 @@ const LOCAL_FIT_END_M: f32 = 600.0;
 /// and coloured as water. Low enough that a Dutch polder stays land.
 pub const SEABED_BELOW_M: f32 = -2.0;
 
-/// Surface lift of the road and its paint above the centreline, in metres —
-/// separate layers so they never fight each other in the depth buffer.
-const ROAD_LIFT_M: f32 = 0.0;
-const PAINT_LIFT_M: f32 = 0.02;
-
 /// What a vertex is made of. Sent to the shader in the colour's alpha, so one
 /// vertex layout carries everything.
 pub const MATERIAL_PLAIN: f32 = 0.0;
 pub const MATERIAL_GROUND: f32 = 1.0;
+/// Road surface: a fine asphalt grain.
+pub const MATERIAL_ROAD: f32 = 2.0;
+/// A building's walls: storeys and windows, laid out by the vertex's wall
+/// coordinates (see [`Vertex::uv`]). The fraction carries a seed for which
+/// windows are lit — see [`wall_material`].
+pub const MATERIAL_WALL: f32 = 3.0;
+
+/// Wall coordinates for anything that is not a wall.
+pub const NO_UV: [f32; 2] = [0.0, 0.0];
+
+/// The wall material for a building whose window pattern is seeded by `seed`
+/// (any value; only its fraction is used).
+pub fn wall_material(seed: f32) -> f32 {
+    // Kept below 1, or the fraction would roll over into the next material.
+    MATERIAL_WALL + seed.rem_euclid(1.0).min(0.999)
+}
 
 /// Scene colours, in linear RGB. Fixed rather than theme-derived, the same as
 /// the OSM tiles under the 2D map: a road is grey at night in dark mode too.
-const ROAD_RGB: [f32; 3] = [0.30, 0.31, 0.33];
-const PAINT_RGB: [f32; 3] = [0.92, 0.92, 0.88];
 const GROUND_RGB: [f32; 3] = [0.36, 0.52, 0.27];
-const WATER_RGB: [f32; 3] = [0.20, 0.36, 0.50];
+
+/// The ground grid's layout: vertex spacing, how far it reaches from the
+/// road, and how far below the road it is held.
+#[derive(Debug, Clone, Copy)]
+pub struct Grid {
+    pub spacing: f32,
+    pub radius: f32,
+    pub drop: f32,
+}
+
+impl Grid {
+    pub const VIEW: Grid = Grid {
+        spacing: GROUND_SPACING_M,
+        radius: GROUND_RADIUS_M,
+        drop: GROUND_DROP_M,
+    };
+}
 
 /// Raw terrain height at a scene position `(x, z)`, where the data reaches.
 pub type Terrain<'a> = &'a dyn Fn(f32, f32) -> Option<f32>;
@@ -150,6 +178,11 @@ impl LocalFrame {
         }
     }
 
+    /// The frame's origin, `(lat, lng)`.
+    pub fn origin(self) -> (f64, f64) {
+        (self.lat0, self.lng0)
+    }
+
     /// `(east, north)` in metres from the origin.
     pub fn to_local(self, lat: f64, lng: f64) -> (f64, f64) {
         (
@@ -183,6 +216,10 @@ pub struct RoadPoint {
 pub struct Vertex {
     pub pos: [f32; 3],
     pub colour: [f32; 4],
+    /// On a wall: window bays along it (whole numbers at the bay edges, or
+    /// negative for a wall too short for any) and metres up it from the
+    /// building's ground. Elsewhere [`NO_UV`].
+    pub uv: [f32; 2],
 }
 
 /// Triangles ready to upload.
@@ -219,12 +256,20 @@ pub struct CourseScene {
 impl CourseScene {
     /// Build the scene for `route`: the road, its paint, and flat ground.
     /// `None` for a route too short to draw — fewer than two points.
+    #[cfg(test)]
     pub fn build(route: &Route) -> Option<Self> {
-        Self::build_with(route, None)
+        Self::build_with(route, None, None)
     }
 
     /// Build the scene with the land shaped by `dem` where it has heights.
-    pub fn build_with(route: &Route, dem: Option<&crate::data::terrain::Dem>) -> Option<Self> {
+    ///
+    /// With `features`, the ground is coloured by land use, the sea is laid
+    /// flat and blue, and the buildings stand along the road.
+    pub fn build_with(
+        route: &Route,
+        dem: Option<&crate::data::terrain::Dem>,
+        features: Option<&crate::data::osm::Features>,
+    ) -> Option<Self> {
         let frame = LocalFrame::around(route)?;
         let road = centreline(route, &frame);
         if road.len() < 2 {
@@ -235,15 +280,12 @@ impl CourseScene {
             dem?.height_at(lat, lng)
         };
         let terrain: Option<Terrain> = dem.map(|_| &sample as Terrain);
-        let mut mesh = ground_mesh(
-            &road,
-            GROUND_SPACING_M,
-            GROUND_RADIUS_M,
-            GROUND_DROP_M,
-            terrain,
-        );
-        mesh.extend(road_mesh(&road, ROAD_HALF_WIDTH_M));
-        mesh.extend(dash_mesh(&road));
+        let scenery = features.map(|f| Scenery::new(f, &frame));
+        // The road the rider is on, matched from the map where it has one.
+        let ridden =
+            roadway::Ridden::new(&road, scenery.as_ref().map_or(&[][..], |s| &s.roads[..]));
+        let mut mesh = world_mesh(&road, &ridden, Grid::VIEW, terrain, scenery.as_ref());
+        mesh.extend(roadway::ridden_mesh(&road, &ridden));
         Some(Self { road, mesh })
     }
 }
@@ -333,107 +375,13 @@ pub fn camera_pose(road: &[RoadPoint], distance_m: f32) -> Option<CameraPose> {
         ahead
     };
 
-    // Both ends move into the lane, each by the road's direction where it is,
-    // so the view runs down the lane rather than angling across the paint.
-    let here = in_lane(here, heading_at(road, d));
-    let ahead = in_lane(ahead, heading_at(road, ahead_d.min(end)));
-
+    // The GPX is the line the rider rode — the middle of the right-hand lane,
+    // which the road is built around (see `roadway`) — so the eye is on it.
     Some(CameraPose {
         eye: [here[0], here[1] + EYE_HEIGHT_M, here[2]],
         // Aimed slightly below eye level, as a rider looks at the road.
         target: [ahead[0], ahead[1] + EYE_HEIGHT_M * 0.6, ahead[2]],
     })
-}
-
-/// Half the stretch of road the direction of travel is measured over, in
-/// metres — long enough to ride over a single GPS wobble.
-const HEADING_SPAN_M: f32 = 5.0;
-
-/// Direction of travel at `distance_m`, flat and of length 1. North when the
-/// road gives no direction at all.
-fn heading_at(road: &[RoadPoint], distance_m: f32) -> [f32; 3] {
-    let (Some(start), Some(end)) = (road.first(), road.last()) else {
-        return [0.0, 0.0, -1.0];
-    };
-    let behind = position_at(road, (distance_m - HEADING_SPAN_M).max(start.distance_m));
-    let ahead = position_at(road, (distance_m + HEADING_SPAN_M).min(end.distance_m));
-    match (behind, ahead) {
-        (Some(b), Some(a)) => normalise_xz(sub3(a, b)).unwrap_or([0.0, 0.0, -1.0]),
-        _ => [0.0, 0.0, -1.0],
-    }
-}
-
-/// `p` moved [`LANE_OFFSET_M`] to the right of a rider heading along `dir`.
-fn in_lane(p: [f32; 3], dir: [f32; 3]) -> [f32; 3] {
-    // Right of the direction of travel, in the ground plane: the mirror of the
-    // `left` the road ribbon is built with.
-    let right = [-dir[2], 0.0, dir[0]];
-    [
-        p[0] + right[0] * LANE_OFFSET_M,
-        p[1],
-        p[2] + right[2] * LANE_OFFSET_M,
-    ]
-}
-
-/// The road surface as a ribbon `half_width` either side of the centreline.
-pub fn road_mesh(road: &[RoadPoint], half_width: f32) -> Mesh {
-    ribbon(road, half_width, ROAD_LIFT_M, ROAD_RGB, |_| true)
-}
-
-/// Dashed centre line: painted for [`DASH_M`] of every [`DASH_PERIOD_M`].
-fn dash_mesh(road: &[RoadPoint]) -> Mesh {
-    ribbon(road, DASH_HALF_WIDTH_M, PAINT_LIFT_M, PAINT_RGB, |d| {
-        d.rem_euclid(DASH_PERIOD_M) < DASH_M
-    })
-}
-
-/// A strip along the centreline. A segment is drawn when `keep` accepts the
-/// distance at its start, which is how the dashes are cut from the same strip.
-fn ribbon(
-    road: &[RoadPoint],
-    half_width: f32,
-    lift: f32,
-    rgb: [f32; 3],
-    keep: impl Fn(f32) -> bool,
-) -> Mesh {
-    let mut mesh = Mesh::default();
-    if road.len() < 2 {
-        return mesh;
-    }
-    let colour = [rgb[0], rgb[1], rgb[2], MATERIAL_PLAIN];
-    for (i, p) in road.iter().enumerate() {
-        let prev = road[i.saturating_sub(1)].pos;
-        let next = road[(i + 1).min(road.len() - 1)].pos;
-        // Perpendicular to the direction of travel, in the ground plane.
-        let dir = normalise_xz(sub3(next, prev)).unwrap_or([0.0, 0.0, -1.0]);
-        let left = [dir[2], 0.0, -dir[0]];
-        let y = p.pos[1] + lift;
-        mesh.vertices.push(Vertex {
-            pos: [
-                p.pos[0] + left[0] * half_width,
-                y,
-                p.pos[2] + left[2] * half_width,
-            ],
-            colour,
-        });
-        mesh.vertices.push(Vertex {
-            pos: [
-                p.pos[0] - left[0] * half_width,
-                y,
-                p.pos[2] - left[2] * half_width,
-            ],
-            colour,
-        });
-    }
-    for (i, p) in road[..road.len() - 1].iter().enumerate() {
-        if !keep(p.distance_m) {
-            continue;
-        }
-        let a = (2 * i) as u32;
-        mesh.indices
-            .extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
-    }
-    mesh
 }
 
 /// A ground grid reaching `radius` either side of the road.
@@ -446,6 +394,7 @@ fn ribbon(
 ///
 /// Cells whose corners are not all within reach are left out, so the ground
 /// ends in a ragged edge the haze hides.
+#[cfg(test)]
 pub fn ground_mesh(
     road: &[RoadPoint],
     spacing: f32,
@@ -453,18 +402,74 @@ pub fn ground_mesh(
     drop: f32,
     terrain: Option<Terrain>,
 ) -> Mesh {
+    let grid = Grid {
+        spacing,
+        radius,
+        drop,
+    };
+    world_mesh(road, &roadway::Ridden::new(road, &[]), grid, terrain, None)
+}
+
+/// The ground, as [`ground_mesh`], and with `scenery` everything on it: land
+/// use coloured in, the sea laid flat at sea level and coloured as water, and
+/// the buildings standing on the very ground drawn — so none floats or sinks.
+///
+/// `extents[i]` is how far the road reaches from the rider's line at
+/// `road[i]` (missing entries are the default road); the flat shoulder and the
+/// buildings' clearance follow it. `matched` names the mapped roads that are
+/// the ridden road, so they are not drawn a second time as other roads.
+pub fn world_mesh(
+    road: &[RoadPoint],
+    ridden: &roadway::Ridden,
+    grid: Grid,
+    terrain: Option<Terrain>,
+    scenery: Option<&Scenery>,
+) -> Mesh {
+    let extents = ridden.extents();
+    let Grid {
+        spacing,
+        radius,
+        drop,
+    } = grid;
     let mut mesh = Mesh::default();
     if road.is_empty() || spacing <= 0.0 || radius <= 0.0 {
         return mesh;
     }
     let line = resample(road, RESAMPLE_M);
     let index = NearestIndex::new(&line, radius);
+    // How far the road reaches at each resampled point: the wider of the two
+    // measured points either side, so the shoulder never falls short.
+    let reach: Vec<f32> = line
+        .iter()
+        .map(|p| {
+            let i = road.partition_point(|q| q.distance_m <= p.distance_m);
+            let at = |k: usize| extents.get(k).copied().unwrap_or(DEFAULT_EXTENT_M);
+            at(i.saturating_sub(1)).max(at(i.min(road.len().saturating_sub(1))))
+        })
+        .collect();
 
     // How far the terrain sits from the road, point by point, and typically.
     let raw_at = |x: f32, z: f32| terrain.and_then(|t| t(x, z)).map(sea_level);
+    // Whether the road is a bridge at each resampled point: either measured
+    // point around it being one is enough.
+    let on_bridge: Vec<bool> = line
+        .iter()
+        .map(|p| {
+            let i = road.partition_point(|q| q.distance_m <= p.distance_m);
+            let at = |k: usize| ridden.levels.get(k).is_some_and(|l| l.bridge);
+            at(i.saturating_sub(1)) || at(i.min(road.len().saturating_sub(1)))
+        })
+        .collect();
+    // A bridge stands above the land by design; its height says nothing about
+    // where the land is, and fitting to it would lift the valley to the deck.
     let offsets: Vec<Option<f32>> = line
         .iter()
-        .map(|p| raw_at(p.pos[0], p.pos[2]).map(|h| p.pos[1] - h))
+        .zip(&on_bridge)
+        .map(|(p, &bridge)| {
+            (!bridge)
+                .then(|| raw_at(p.pos[0], p.pos[2]).map(|h| p.pos[1] - h))
+                .flatten()
+        })
         .collect();
     let typical = median(offsets.iter().flatten().copied()).unwrap_or(0.0);
 
@@ -484,37 +489,100 @@ pub fn ground_mesh(
     let cols = (i_hi - i_lo + 1) as usize;
     let rows = (j_hi - j_lo + 1) as usize;
 
-    let land = [GROUND_RGB[0], GROUND_RGB[1], GROUND_RGB[2], MATERIAL_GROUND];
     let water = [WATER_RGB[0], WATER_RGB[1], WATER_RGB[2], MATERIAL_PLAIN];
+    let land_at = |x: f32, z: f32| match scenery.and_then(|s| s.area_at(x, z)) {
+        Some(AreaKind::Water) => water,
+        Some(kind) => {
+            let rgb = scenery::area_rgb(kind);
+            [rgb[0], rgb[1], rgb[2], MATERIAL_GROUND]
+        }
+        None => [GROUND_RGB[0], GROUND_RGB[1], GROUND_RGB[2], MATERIAL_GROUND],
+    };
+    // The ground's height and colour at any point within reach: the grid's
+    // vertices, and the corners the buildings stand on.
+    let sample_one = |x: f32, z: f32| -> Option<(f32, [f32; 4])> {
+        let (d2, i) = index.nearest(x, z)?;
+        let dist = d2.sqrt();
+        let flat = line[i].pos[1] - drop;
+        let raw = terrain.and_then(|t| t(x, z));
+        if on_bridge[i] && dist <= SHOULDER_BASE_M + reach[i] {
+            // Under and beside a bridge the ground is the land's own, never
+            // above the deck, and dropped away beneath it so what passes under
+            // can be seen.
+            let land = raw.map(|raw| {
+                let sea = raw < SEABED_BELOW_M || scenery.is_some_and(|s| s.is_sea(x, z, raw));
+                let shift = offsets[i].unwrap_or(typical);
+                (if sea { 0.0 } else { sea_level(raw) } + shift, sea)
+            });
+            let mut y = land.map_or(flat, |(h, _)| h.min(flat));
+            if dist <= reach[i] + UNDER_BRIDGE_REACH_M {
+                y = y.min(line[i].pos[1] - UNDER_BRIDGE_M);
+            }
+            let colour = match land {
+                Some((_, true)) => water,
+                _ => land_at(x, z),
+            };
+            return Some((y, colour));
+        }
+        Some(match raw {
+            Some(raw) if dist > SHOULDER_BASE_M + reach[i] => {
+                let sea = raw < SEABED_BELOW_M || scenery.is_some_and(|s| s.is_sea(x, z, raw));
+                let near = offsets[i].unwrap_or(typical);
+                let shift = lerp(
+                    near,
+                    typical,
+                    smoothstep(BLEND_END_M, LOCAL_FIT_END_M, dist),
+                );
+                let fitted = if sea { 0.0 } else { sea_level(raw) } + shift;
+                let y = lerp(
+                    flat,
+                    fitted,
+                    smoothstep(SHOULDER_BASE_M + reach[i], BLEND_END_M, dist),
+                );
+                (y, if sea { water } else { land_at(x, z) })
+            }
+            _ => (flat, land_at(x, z)),
+        })
+    };
+
+    let widest = reach.iter().copied().fold(DEFAULT_EXTENT_M, f32::max);
+    // Where the route passes this way more than once — a loop, an interchange
+    // — the ground is never above the flat beside a lower pass, or it would
+    // bury that road under the shoulder of the one above.
+    let under_lower_pass = |x: f32, z: f32, i: usize, y: f32| -> f32 {
+        let mut y = y;
+        index.for_each_within(x, z, SHOULDER_BASE_M + widest, |j| {
+            let q = &line[j];
+            if (q.distance_m - line[i].distance_m).abs() > roadway::SAME_PASS_M
+                && (q.pos[0] - x).hypot(q.pos[2] - z) <= SHOULDER_BASE_M + reach[j]
+            {
+                y = y.min(q.pos[1] - drop);
+            }
+        });
+        y
+    };
+    let sample = |x: f32, z: f32| -> Option<(f32, [f32; 4])> {
+        let (y, colour) = sample_one(x, z)?;
+        let (d2, i) = index.nearest(x, z)?;
+        if d2.sqrt() > SHOULDER_BASE_M + widest {
+            return Some((y, colour));
+        }
+        Some((under_lower_pass(x, z, i, y), colour))
+    };
+
     let mut slot: Vec<Option<u32>> = vec![None; cols * rows];
     for r in 0..rows {
         for c in 0..cols {
             let x = (i_lo + c as i64) as f32 * spacing;
             let z = (j_lo + r as i64) as f32 * spacing;
-            let Some((d2, i)) = index.nearest(x, z) else {
+            let Some((y, colour)) = sample(x, z) else {
                 continue;
-            };
-            let dist = d2.sqrt();
-            let flat = line[i].pos[1] - drop;
-            let raw = terrain.and_then(|t| t(x, z));
-            let (y, colour) = match raw {
-                Some(raw) if dist > SHOULDER_M => {
-                    let near = offsets[i].unwrap_or(typical);
-                    let shift = lerp(
-                        near,
-                        typical,
-                        smoothstep(BLEND_END_M, LOCAL_FIT_END_M, dist),
-                    );
-                    let fitted = sea_level(raw) + shift;
-                    let y = lerp(flat, fitted, smoothstep(SHOULDER_M, BLEND_END_M, dist));
-                    (y, if raw < SEABED_BELOW_M { water } else { land })
-                }
-                _ => (flat, land),
             };
             slot[r * cols + c] = Some(mesh.vertices.len() as u32);
             mesh.vertices.push(Vertex {
                 pos: [x, y, z],
                 colour,
+                uv: NO_UV,
             });
         }
     }
@@ -530,6 +598,47 @@ pub fn ground_mesh(
                 mesh.indices.extend_from_slice(&[a, d, b, b, d, e]);
             }
         }
+    }
+
+    // The ridden road's own bridges and tunnels, their pillars on this ground.
+    mesh.extend(roadway::ridden_structures(road, ridden, |x, z| {
+        sample(x, z).map(|(y, _)| y)
+    }));
+
+    if let Some(scenery) = scenery {
+        // A building is blocked if any point of the road comes within the
+        // clearance of its outline, or lies inside it.
+        let blocked = |outline: &[(f32, f32)]| {
+            let (cx, cz) = outline
+                .iter()
+                .fold((0.0, 0.0), |(a, b), &(x, z)| (a + x, b + z));
+            let (cx, cz) = (cx / outline.len() as f32, cz / outline.len() as f32);
+            let span = outline
+                .iter()
+                .map(|&(x, z)| ((x - cx).powi(2) + (z - cz).powi(2)).sqrt())
+                .fold(0.0f32, f32::max);
+            let mut hit = false;
+            index.for_each_within(cx, cz, span + widest + PAVEMENT_M, |i| {
+                if hit {
+                    return;
+                }
+                let p = line[i].pos;
+                hit = scenery::near_or_inside(outline, p[0], p[2], reach[i] + PAVEMENT_M);
+            });
+            hit
+        };
+        mesh.extend(scenery::building_mesh(
+            &scenery.buildings,
+            scenery.region,
+            |x, z| sample(x, z).map(|(y, _)| y),
+            blocked,
+        ));
+        mesh.extend(roadway::other_roads_mesh(
+            &scenery.roads,
+            road,
+            ridden,
+            |x, z| sample(x, z).map(|(y, _)| y),
+        ));
     }
     mesh
 }
@@ -993,54 +1102,27 @@ mod tests {
     }
 
     #[test]
-    fn should_ride_in_the_right_hand_lane_heading_north() {
-        // Facing north (−z), right is east (+x).
-        let road = road_of(&straight_route(50, 10.0, 0.0));
-        let pose = camera_pose(&road, 200.0).expect("a road");
-        let centre = position_at(&road, 200.0).expect("a road");
-        assert!(
-            (pose.eye[0] - (centre[0] + LANE_OFFSET_M)).abs() < 1e-3,
-            "{pose:?}"
-        );
-        assert!((pose.eye[2] - centre[2]).abs() < 1e-3, "{pose:?}");
+    fn should_ride_on_the_gpx_line_whichever_way_the_road_runs() {
+        // The GPX is the middle of the rider's lane; the road is built around
+        // it (see `roadway`), so the eye is on it, not offset from it.
+        for road in [
+            road_of(&straight_route(50, 10.0, 0.0)),
+            road_of(&eastward_route(50)),
+        ] {
+            for d in [0.0, 200.0, 490.0, 5_000.0] {
+                let pose = camera_pose(&road, d).expect("a road");
+                let on = position_at(&road, d).expect("a road");
+                assert!((pose.eye[0] - on[0]).abs() < 1e-3, "at {d}: {pose:?}");
+                assert!((pose.eye[2] - on[2]).abs() < 1e-3, "at {d}: {pose:?}");
+            }
+        }
     }
 
     #[test]
-    fn should_ride_in_the_right_hand_lane_heading_east() {
-        // Facing east (+x), right is south (+z).
-        let road = road_of(&eastward_route(50));
-        let pose = camera_pose(&road, 200.0).expect("a road");
-        let centre = position_at(&road, 200.0).expect("a road");
-        assert!(
-            (pose.eye[2] - (centre[2] + LANE_OFFSET_M)).abs() < 1e-3,
-            "{pose:?}"
-        );
-        assert!((pose.eye[0] - centre[0]).abs() < 1e-3, "{pose:?}");
-    }
-
-    #[test]
-    fn should_look_down_its_own_lane_not_across_to_the_centre_line() {
-        // On a straight road the view runs parallel to the road.
+    fn should_look_straight_down_a_straight_road() {
         let road = road_of(&straight_route(50, 10.0, 0.0));
         let pose = camera_pose(&road, 200.0).expect("a road");
         assert!((pose.target[0] - pose.eye[0]).abs() < 1e-3, "{pose:?}");
-    }
-
-    #[test]
-    fn should_stay_in_lane_at_the_start_and_past_the_finish() {
-        let road = road_of(&straight_route(50, 10.0, 0.0));
-        for d in [0.0, 490.0, 5_000.0] {
-            let pose = camera_pose(&road, d).expect("a road");
-            let centre = position_at(&road, d).expect("a road");
-            assert!(
-                (pose.eye[0] - (centre[0] + LANE_OFFSET_M)).abs() < 1e-3,
-                "at {d} m: {pose:?}"
-            );
-            assert!(
-                (pose.target[0] - pose.eye[0]).abs() < 1e-3,
-                "at {d} m: {pose:?}"
-            );
-        }
     }
 
     #[test]
@@ -1075,29 +1157,11 @@ mod tests {
     // ── Meshes ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn should_make_the_road_exactly_its_width_across() {
-        let road = road_of(&straight_route(10, 10.0, 0.0));
-        let mesh = road_mesh(&road, ROAD_HALF_WIDTH_M);
-        let (l, r) = (mesh.vertices[8].pos, mesh.vertices[9].pos);
-        let width = ((l[0] - r[0]).powi(2) + (l[2] - r[2]).powi(2)).sqrt();
-        assert!((width - 2.0 * ROAD_HALF_WIDTH_M).abs() < 1e-3, "{width}");
-    }
-
-    #[test]
     fn should_index_only_vertices_that_exist() {
         let scene = CourseScene::build(&straight_route(40, 9.0, 0.3)).expect("a route");
         let n = scene.mesh.vertices.len() as u32;
         assert!(scene.mesh.indices.iter().all(|&i| i < n));
         assert_eq!(scene.mesh.indices.len() % 3, 0);
-    }
-
-    #[test]
-    fn should_paint_a_third_of_the_centre_line() {
-        // 900 m of road: 100 periods, each painted for 3 of its 9 metres.
-        let road = road_of(&straight_route(901, 1.0, 0.0));
-        let dashes = dash_mesh(&road);
-        let painted = dashes.indices.len() / 6;
-        assert_eq!(painted, 300);
     }
 
     #[test]
@@ -1158,13 +1222,22 @@ mod tests {
 
     #[test]
     fn should_shift_appended_indices_past_existing_vertices() {
-        let mut a = road_mesh(&road_of(&straight_route(3, 10.0, 0.0)), 1.0);
-        let before = a.vertices.len() as u32;
-        let b = road_mesh(&road_of(&straight_route(3, 10.0, 0.0)), 1.0);
-        let first_b = b.indices[0];
+        let v = Vertex {
+            pos: [0.0; 3],
+            colour: [0.0; 4],
+            uv: NO_UV,
+        };
+        let mut a = Mesh {
+            vertices: vec![v; 4],
+            indices: vec![0, 1, 2],
+        };
+        let b = Mesh {
+            vertices: vec![v; 3],
+            indices: vec![0, 1, 2],
+        };
         a.extend(b);
-        let tail = a.indices.len() - 12;
-        assert_eq!(a.indices[tail], first_b + before);
+        assert_eq!(a.vertices.len(), 7);
+        assert_eq!(a.indices, vec![0, 1, 2, 4, 5, 6]);
     }
 
     // ── Matrices ──────────────────────────────────────────────────────────────
@@ -1410,5 +1483,71 @@ mod tests {
             ground_mesh(&road, GROUND_SPACING_M, 300.0, GROUND_DROP_M, Some(&none)),
             ground_mesh(&road, GROUND_SPACING_M, 300.0, GROUND_DROP_M, None),
         );
+    }
+
+    // ── Materials ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_never_roll_a_wall_over_into_the_next_material() {
+        for i in -3000..3000 {
+            let m = wall_material(i as f32 * 0.001);
+            assert!((MATERIAL_WALL..MATERIAL_WALL + 1.0).contains(&m), "{m}");
+        }
+        // A NaN base (a building on missing ground) still stays a wall.
+        assert!(wall_material(f32::NAN) < MATERIAL_WALL + 1.0);
+    }
+
+    // ── The route over itself ─────────────────────────────────────────────────
+
+    #[test]
+    fn should_never_bury_the_lower_pass_of_a_loop() {
+        // North at 0 m, round a loop, back south at 8 m on a line 15 m to the
+        // side — close enough that its flat shoulder reaches over the lower
+        // road, as at 18.9 km of the rider's Maltepe route.
+        let mut line = Vec::new();
+        let mut d = 0.0;
+        for i in 0..50 {
+            line.push(RoadPoint {
+                pos: [0.0, 0.0, -(i as f32) * 8.0],
+                distance_m: d,
+            });
+            d += 8.0;
+        }
+        for i in 0..50 {
+            let t = i as f32 / 49.0;
+            let a = std::f32::consts::PI * t;
+            line.push(RoadPoint {
+                pos: [15.0 * t + 60.0 * a.sin(), 8.0 * t, -400.0 - 60.0 * a.sin()],
+                distance_m: d,
+            });
+            d += 8.0;
+        }
+        for i in 0..50 {
+            line.push(RoadPoint {
+                pos: [15.0, 8.0, -400.0 + (i as f32) * 8.0],
+                distance_m: d,
+            });
+            d += 8.0;
+        }
+        let ground = ground_mesh(&line, GROUND_SPACING_M, 200.0, GROUND_DROP_M, None);
+        let lower = &line[5..45];
+        // The ground only: the upper pass's parapets and pillars are meant to
+        // stand above the lower road.
+        for v in ground
+            .vertices
+            .iter()
+            .filter(|v| v.colour[3] == MATERIAL_GROUND)
+        {
+            let near_lower = lower
+                .iter()
+                .any(|p| (p.pos[0] - v.pos[0]).hypot(p.pos[2] - v.pos[2]) <= SHOULDER_M);
+            if near_lower {
+                assert!(
+                    v.pos[1] <= 0.0 - GROUND_DROP_M + 1e-3,
+                    "ground at {:?} stands over the lower road",
+                    v.pos
+                );
+            }
+        }
     }
 }

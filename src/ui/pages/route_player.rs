@@ -23,6 +23,25 @@ use crate::ui::widgets::zone_color::gradient_rgb;
 use crate::ui::widgets::zone_meter::ZoneMeter;
 use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 
+/// Debug builds only: set this to a power in watts and the route player rides
+/// itself — steady power, a heart rate and a cadence, in SIM mode — so the 3D
+/// course can be watched at a desk without a trainer.
+///
+/// ```text
+/// CYCLE_FAKE_RIDER=200 cargo run
+/// ```
+#[cfg(debug_assertions)]
+const FAKE_RIDER_ENV: &str = "CYCLE_FAKE_RIDER";
+
+/// The pretend rider's power from the environment variable's value, if it is
+/// a sensible one: a whole number of watts, held to the same 1000 W ceiling the
+/// trainer's targets are (CLAUDE.md §5.1). Zero or nonsense is no rider.
+#[cfg(any(debug_assertions, test))]
+fn fake_rider_watts(raw: Option<&str>) -> Option<u32> {
+    let watts: u32 = raw?.trim().parse().ok()?;
+    (watts > 0).then_some(watts.min(1_000))
+}
+
 /// A transport button's action — see the note on the player's own alias.
 type ButtonCb = crate::ui::ReloadHolder;
 
@@ -1153,6 +1172,21 @@ impl RoutePlayerPage {
             // has gone quiet must not have its last value recorded all ride.
             let now = std::time::Instant::now();
             let readings = readings_rc.borrow().current(now);
+            // Debug builds only: a pretend rider for watching the course at a
+            // desk. See `fake_rider_watts`.
+            #[cfg(debug_assertions)]
+            let fake = fake_rider_watts(std::env::var(FAKE_RIDER_ENV).ok().as_deref());
+            #[cfg(not(debug_assertions))]
+            let fake: Option<u32> = None;
+            let readings = match fake {
+                Some(watts) => LiveReadings {
+                    power_watts: Some(watts),
+                    heart_rate_bpm: Some(140),
+                    cadence_rpm: Some(88),
+                    ..readings
+                },
+                None => readings,
+            };
             let stale = readings_rc.borrow().stale_sensors(now);
             for sensor in &stale {
                 if stale_warned.borrow_mut().insert(*sensor) {
@@ -1246,7 +1280,9 @@ impl RoutePlayerPage {
             // It multiplies the Preferences baseline rather than replacing it.
             let dial = page.intensity_pct.get() as f32 / 100.0;
 
-            let sim = sim_capable.get();
+            // The pretend rider rides in SIM, so the course is ridden with the
+            // real physics; the grade it sends goes to no trainer.
+            let sim = sim_capable.get() || fake.is_some();
             let speed_ms = if sim {
                 let power = readings.power_watts.unwrap_or(0);
                 let speed_ms = engine.borrow_mut().tick_sim(power);
@@ -1630,4 +1666,34 @@ pub fn attach_overlay(
         }
     ));
     *page.overlay_cb.borrow_mut() = Some(cb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_read_a_pretend_riders_power() {
+        assert_eq!(fake_rider_watts(Some("200")), Some(200));
+        assert_eq!(fake_rider_watts(Some(" 180 ")), Some(180));
+    }
+
+    #[test]
+    fn should_hold_a_pretend_rider_to_the_trainer_ceiling() {
+        assert_eq!(fake_rider_watts(Some("65535")), Some(1_000));
+    }
+
+    #[test]
+    fn should_have_no_pretend_rider_for_nothing_or_nonsense() {
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-5"),
+            Some("fast"),
+            Some("2.5e2"),
+        ] {
+            assert_eq!(fake_rider_watts(raw), None, "{raw:?}");
+        }
+    }
 }
