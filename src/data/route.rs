@@ -67,11 +67,20 @@ impl Route {
     /// Uses a simplified road-cycling physics model:
     ///   P = (F_gravity + F_rolling + F_aero) × v
     pub fn power_at(speed_ms: f32, gradient: f32, mass_kg: f32) -> f32 {
+        let power = Self::resistance_n(speed_ms, gradient, mass_kg) * speed_ms;
+        power.max(0.0)
+    }
+
+    /// Force (N) holding a rider back at `speed_ms` on `gradient`: gravity,
+    /// rolling resistance and air. Negative on a descent steep enough that
+    /// gravity pulls harder than the rest resist. The one place the model's
+    /// constants are applied, so a speed worked out second by second and one
+    /// solved for steady state can never disagree.
+    pub fn resistance_n(speed_ms: f32, gradient: f32, mass_kg: f32) -> f32 {
         let f_gravity = mass_kg * G * gradient;
         let f_rolling = mass_kg * G * CRR;
         let f_aero = 0.5 * RHO * CDA * speed_ms * speed_ms;
-        let power = (f_gravity + f_rolling + f_aero) * speed_ms;
-        power.max(0.0)
+        f_gravity + f_rolling + f_aero
     }
 
     /// Speed (m/s) sustained at `power_watts` on the given `gradient` — the inverse
