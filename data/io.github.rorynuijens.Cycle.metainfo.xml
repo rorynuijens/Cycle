@@ -90,6 +90,14 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.16.2" date="2026-10-14">
+      <description>
+        <p>A route ridden indoors is now compared fairly with the same route ridden outdoors.
+           Power is still compared across both, and an earlier ride says when it was ridden
+           outdoors. Time and aerobic efficiency are only compared with rides in the same
+           setting, since a trainer has no wind or traffic and a warm room raises heart rate.</p>
+      </description>
+    </release>
     <release version="0.16.1" date="2026-10-14">
       <description>
         <p>Cycle is now called Tour du Salon. Your rides, settings and saved keys
