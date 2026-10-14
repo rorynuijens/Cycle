@@ -18,13 +18,24 @@ pub async fn load_or_create_athlete(pool: &SqlitePool) -> Result<AthleteProfile>
     .await?;
 
     if let Some(r) = row {
+        // A value that cannot be one falls back to what a new profile starts
+        // with, rather than wrapping to billions and scaling every zone by it.
+        let d = AthleteProfile::default();
         return Ok(AthleteProfile {
             id: r.get("id"),
             name: r.get("name"),
             weight_kg: r.get::<f64, _>("weight_kg") as f32,
-            ftp_watts: r.get::<i64, _>("ftp_watts") as u32,
-            max_hr: r.get::<i64, _>("max_hr") as u32,
-            resting_hr: r.get::<i64, _>("resting_hr") as u32,
+            ftp_watts: super::stored_count_or(
+                r.get("ftp_watts"),
+                d.ftp_watts,
+                "athletes.ftp_watts",
+            ),
+            max_hr: super::stored_count_or(r.get("max_hr"), d.max_hr, "athletes.max_hr"),
+            resting_hr: super::stored_count_or(
+                r.get("resting_hr"),
+                d.resting_hr,
+                "athletes.resting_hr",
+            ),
         });
     }
 
@@ -103,7 +114,7 @@ pub async fn latest_ftp_entry(pool: &SqlitePool) -> Result<Option<(String, u32, 
     Ok(row.map(|r| {
         (
             r.get::<String, _>("date"),
-            r.get::<i64, _>("ftp_watts") as u32,
+            super::stored_count_or(r.get("ftp_watts"), 0, "ftp_history.ftp_watts"),
             r.get::<String, _>("source"),
         )
     }))
@@ -192,6 +203,35 @@ pub async fn reset_athlete_data(pool: &SqlitePool, include_training_data: bool) 
 mod tests {
     use super::*;
     use crate::data::db::testing::*;
+
+    #[tokio::test]
+    async fn should_fall_back_to_the_defaults_for_a_negative_stored_profile() {
+        // CLAUDE.md §5.2. A negative FTP cast straight to u32 read as about
+        // four billion watts, and every zone and every TSS is scaled by it.
+        let pool = test_pool().await;
+        load_or_create_athlete(&pool).await.unwrap();
+        sqlx::query("UPDATE athletes SET ftp_watts = -1, max_hr = -185, resting_hr = -55")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let a = load_or_create_athlete(&pool).await.unwrap();
+        let d = AthleteProfile::default();
+        assert_eq!(a.ftp_watts, d.ftp_watts);
+        assert_eq!(a.max_hr, d.max_hr);
+        assert_eq!(a.resting_hr, d.resting_hr);
+    }
+
+    #[tokio::test]
+    async fn should_keep_a_stored_profile_that_is_valid() {
+        let pool = test_pool().await;
+        load_or_create_athlete(&pool).await.unwrap();
+        sqlx::query("UPDATE athletes SET ftp_watts = 0, max_hr = 201, resting_hr = 38")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let a = load_or_create_athlete(&pool).await.unwrap();
+        assert_eq!((a.ftp_watts, a.max_hr, a.resting_hr), (0, 201, 38));
+    }
 
     #[tokio::test]
     async fn load_or_create_athlete_creates_default_then_reuses_it() {

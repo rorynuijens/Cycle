@@ -39,7 +39,11 @@ pub async fn load_workouts(pool: &SqlitePool) -> Result<Vec<Workout>> {
             id: r.get("id"),
             name: r.get("name"),
             description: r.get("description"),
-            duration_secs: r.get::<i64, _>("duration_secs") as u32,
+            duration_secs: super::stored_count_or(
+                r.get("duration_secs"),
+                0,
+                "workouts.duration_secs",
+            ),
             tss: r.get::<f64, _>("tss") as f32,
             category: WorkoutCategory::from_db_str(&category_str),
             segments,
@@ -67,7 +71,11 @@ pub async fn load_workout_by_id(pool: &SqlitePool, id: i64) -> Result<Option<Wor
                 id: r.get("id"),
                 name: r.get("name"),
                 description: r.get("description"),
-                duration_secs: r.get::<i64, _>("duration_secs") as u32,
+                duration_secs: super::stored_count_or(
+                    r.get("duration_secs"),
+                    0,
+                    "workouts.duration_secs",
+                ),
                 tss: r.get::<f64, _>("tss") as f32,
                 category: WorkoutCategory::from_db_str(&category_str),
                 segments,
@@ -308,6 +316,26 @@ pub async fn create_workout_from_icu_activity(
 mod tests {
     use super::*;
     use crate::data::db::testing::*;
+
+    #[tokio::test]
+    async fn should_read_a_negative_stored_duration_as_zero() {
+        // A wrapped −1 is a 136-year workout, and the planner adds these up.
+        let pool = test_pool().await;
+        let id = save_workout(&pool, &sample_workout()).await.unwrap();
+        sqlx::query("UPDATE workouts SET duration_secs = -1 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let listed = load_workouts(&pool).await.unwrap();
+        let w = listed.iter().find(|w| w.id == id).expect("just saved");
+        assert_eq!(w.duration_secs, 0);
+        let one = load_workout_by_id(&pool, id)
+            .await
+            .unwrap()
+            .expect("just saved");
+        assert_eq!(one.duration_secs, 0);
+    }
 
     #[test]
     fn should_find_every_late_addition_in_the_library() {

@@ -181,7 +181,7 @@ fn row_to_entry(r: &sqlx::sqlite::SqliteRow) -> Option<CalendarEntry> {
                 ScheduledItem::Workout { id: wid, name },
                 WorkoutCategory::from_db_str(&category.unwrap_or_default()),
                 r.get::<Option<f32>, _>("tss").unwrap_or(0.0),
-                r.get::<Option<i64>, _>("duration_secs").unwrap_or(0) as u32,
+                super::stored_count(r.get("duration_secs")).unwrap_or(0),
             )
         }
         (None, Some(rid)) => {
@@ -195,8 +195,7 @@ fn row_to_entry(r: &sqlx::sqlite::SqliteRow) -> Option<CalendarEntry> {
                 // describe interval structure a route does not have.
                 WorkoutCategory::Endurance,
                 r.get::<Option<f64>, _>("planned_tss").unwrap_or(0.0) as f32,
-                r.get::<Option<i64>, _>("planned_duration_secs")
-                    .unwrap_or(0) as u32,
+                super::stored_count(r.get("planned_duration_secs")).unwrap_or(0),
             )
         }
         (None, None) => {
@@ -391,7 +390,11 @@ pub async fn load_today_entry(pool: &SqlitePool, date: &str) -> Result<Option<To
                     id: r.get("id"),
                     name: r.get("name"),
                     description: r.get("description"),
-                    duration_secs: r.get::<i64, _>("duration_secs") as u32,
+                    duration_secs: super::stored_count_or(
+                        r.get("duration_secs"),
+                        0,
+                        "workouts.duration_secs",
+                    ),
                     tss: r.get::<f64, _>("tss") as f32,
                     category: WorkoutCategory::from_db_str(&category_str),
                     segments,
@@ -431,6 +434,52 @@ pub async fn delete_calendar_entry_by_id(pool: &SqlitePool, id: i64) -> Result<(
 mod tests {
     use super::*;
     use crate::data::db::testing::test_pool;
+
+    #[tokio::test]
+    async fn should_read_a_negative_stored_duration_on_today_as_zero() {
+        let pool = test_pool().await;
+        let w = a_workout(&pool, "Endurance 60").await;
+        crate::data::db::schedule_workout(&pool, w, "2026-10-14", None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workouts SET duration_secs = -1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let today = load_today_entry(&pool, "2026-10-14")
+            .await
+            .unwrap()
+            .expect("scheduled for today");
+        assert_eq!(today.workout.duration_secs, 0);
+    }
+
+    #[tokio::test]
+    async fn should_read_a_negative_stored_duration_on_an_entry_as_zero() {
+        let pool = test_pool().await;
+        let w = a_workout(&pool, "Endurance 60").await;
+        let r = a_route(&pool, "Galibier").await;
+        let we = crate::data::db::schedule_workout(&pool, w, "2026-10-14", None)
+            .await
+            .unwrap();
+        let re = schedule_route(&pool, r, "2026-10-15", 90.0, 7200)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workouts SET duration_secs = -1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE calendar_entries SET planned_duration_secs = -1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [we, re] {
+            let e = load_calendar_entry_by_id(&pool, id)
+                .await
+                .unwrap()
+                .expect("just scheduled");
+            assert_eq!(e.duration_secs, 0, "entry {id}");
+        }
+    }
 
     async fn a_workout(pool: &SqlitePool, name: &str) -> i64 {
         sqlx::query(

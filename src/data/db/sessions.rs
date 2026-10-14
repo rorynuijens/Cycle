@@ -157,7 +157,7 @@ pub async fn load_session_summaries(pool: &SqlitePool) -> Result<Vec<SessionSumm
                 .map(|v| v as f32),
             average_power: r.get::<Option<f64>, _>("average_power").map(|v| v as f32),
             kilojoules: r.get::<Option<f64>, _>("kilojoules").unwrap_or(0.0) as f32,
-            ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
+            ftp_watts: super::stored_count(r.get("ftp_watts")),
             rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -662,7 +662,7 @@ async fn load_session_records_where(
                 ended_at,
                 data_points,
                 rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
-                ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
+                ftp_watts: super::stored_count(r.get("ftp_watts")),
                 title: r.get("title"),
                 icu_id: r.get("icu_id"),
                 integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
@@ -723,7 +723,7 @@ pub async fn load_sessions_between(
                 ended_at,
                 data_points,
                 rpe: r.get::<Option<i64>, _>("rpe").map(|v| v as u8),
-                ftp_watts: r.get::<Option<i64>, _>("ftp_watts").map(|v| v as u32),
+                ftp_watts: super::stored_count(r.get("ftp_watts")),
                 title: r.get("title"),
                 icu_id: r.get("icu_id"),
                 integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
@@ -763,6 +763,47 @@ mod tests {
     // reach the sibling modules through the parent's re-exports.
     use crate::data::db::testing::*;
     use crate::data::db::*;
+
+    #[tokio::test]
+    async fn should_treat_a_negative_stamped_ftp_as_no_stamp() {
+        // An unstamped ride is scored against today's FTP; a wrapped −1 would
+        // score it against four billion watts and call every ride easy.
+        let pool = test_pool().await;
+        let mut ride = Session::new(None);
+        ride.ftp_watts = Some(250);
+        ride.ended_at = Some(ride.started_at + chrono::Duration::minutes(30));
+        let id = save_session(&pool, &ride).await.unwrap();
+        sqlx::query("UPDATE sessions SET ftp_watts = -1 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let summary = load_session_summaries(&pool).await.unwrap();
+        assert_eq!(summary.iter().find(|s| s.id == id).unwrap().ftp_watts, None);
+        let records = load_session_records(&pool).await.unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r.session.id == id)
+                .unwrap()
+                .session
+                .ftp_watts,
+            None
+        );
+        let between = load_sessions_between(&pool, "2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            between
+                .iter()
+                .find(|r| r.session.id == id)
+                .unwrap()
+                .session
+                .ftp_watts,
+            None
+        );
+    }
 
     #[tokio::test]
     async fn save_session_persists_data_points() {

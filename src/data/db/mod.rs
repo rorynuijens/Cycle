@@ -113,6 +113,16 @@ fn stored_count(v: Option<i64>) -> Option<u32> {
     v.and_then(|v| u32::try_from(v).ok())
 }
 
+/// As [`stored_count`], for a column that cannot be missing: a value that
+/// cannot be a count reads as `fallback`, and the substitution is logged so a
+/// damaged database can be traced (CLAUDE.md §5.1).
+fn stored_count_or(v: i64, fallback: u32, column: &str) -> u32 {
+    stored_count(Some(v)).unwrap_or_else(|| {
+        tracing::warn!("{column} holds {v}, which cannot be a count — reading it as {fallback}");
+        fallback
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;

@@ -69,7 +69,8 @@ pub async fn active_program(pool: &SqlitePool) -> Result<Option<Program>> {
         Some(Program {
             id: r.get("id"),
             start_monday,
-            num_weeks: r.get::<i64, _>("num_weeks").max(1) as u32,
+            // At least a week: a program of none has no span to lay out.
+            num_weeks: super::stored_count_or(r.get("num_weeks"), 1, "programs.num_weeks").max(1),
             training_days: r.get("training_days"),
         })
     }))
@@ -170,7 +171,7 @@ pub async fn load_program_sessions(
             workout_name: r.get("workout_name"),
             category: WorkoutCategory::from_db_str(&r.get::<String, _>("category")),
             tss: r.get::<f32, _>("tss"),
-            duration_secs: r.get::<i64, _>("duration_secs") as u32,
+            duration_secs: super::stored_count_or(r.get("duration_secs"), 0, "duration_secs"),
             completed: r.get::<i64, _>("completed") != 0,
             adjusted_from: r.get("original_name"),
             previous_step_name: r.get("previous_step_name"),
@@ -451,6 +452,37 @@ mod tests {
     use super::*;
     use crate::data::db::testing::*;
     use crate::data::db::{save_workout, schedule_workout, set_entry_completed};
+
+    #[tokio::test]
+    async fn should_read_an_impossible_program_length_as_one_week() {
+        // Too big for a u32: cast straight, 5 000 000 000 wrapped to 705 032 704.
+        let pool = test_pool().await;
+        save_program(&pool, date(2026, 8, 3), 12, "").await.unwrap();
+        for weeks in ["5000000000", "-3", "0"] {
+            sqlx::query(&format!("UPDATE programs SET num_weeks = {weeks}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let p = active_program(&pool).await.unwrap().expect("just saved");
+            assert_eq!(p.num_weeks, 1, "stored {weeks}");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_read_a_negative_stored_session_duration_as_zero() {
+        let pool = test_pool().await;
+        let (program, _, _) = program_with_one_session(&pool).await;
+        sqlx::query("UPDATE calendar_entries SET duration_secs = -1")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("UPDATE workouts SET duration_secs = -1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sessions = load_program_sessions(&pool, program).await.unwrap();
+        assert_eq!(sessions[0].duration_secs, 0);
+    }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("hardcoded valid date")
