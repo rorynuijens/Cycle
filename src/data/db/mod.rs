@@ -103,6 +103,16 @@ pub async fn migrate_secrets_to_keyring(pool: &SqlitePool) -> Result<()> {
 }
 
 /// Fixtures shared by the tests in every `db` submodule.
+/// A stored count read back as a `u32`, or `None` if it cannot be one.
+///
+/// `v as u32` on a negative `i64` wraps rather than failing, so a damaged row
+/// holding −5 reads as 4,294,967,291 and is believed (CLAUDE.md §5.2). A value
+/// that cannot be a count is treated as missing, which every reader already
+/// handles.
+fn stored_count(v: Option<i64>) -> Option<u32> {
+    v.and_then(|v| u32::try_from(v).ok())
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -154,6 +164,15 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    #[test]
+    fn should_read_every_value_a_count_can_hold_and_nothing_else() {
+        assert_eq!(stored_count(Some(0)), Some(0));
+        assert_eq!(stored_count(Some(u32::MAX as i64)), Some(u32::MAX));
+        assert_eq!(stored_count(Some(u32::MAX as i64 + 1)), None);
+        assert_eq!(stored_count(Some(-1)), None);
+        assert_eq!(stored_count(None), None);
+    }
 
     #[tokio::test]
     async fn migrate_is_idempotent() {
