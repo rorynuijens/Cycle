@@ -450,6 +450,7 @@ impl SummaryPage {
             average_hr: session.average_hr().map(|h| h as u32),
             distance_m: (distance > 0.0).then_some(distance),
             rpe: session.rpe,
+            indoor: true,
         };
         progression_card::attach(&self.progression_holder, current, pool, rt_handle);
     }

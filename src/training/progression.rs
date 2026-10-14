@@ -21,7 +21,7 @@
 use chrono::NaiveDate;
 
 use crate::data::db::{IntervalsActivity, SessionSummary};
-use crate::data::sport::is_cycling;
+use crate::data::sport::{is_cycling, is_indoor};
 
 /// Two efforts count as the same route only when their distances agree this
 /// closely. Riding "the same loop" 20 % shorter is a different effort, and
@@ -40,6 +40,11 @@ pub struct Effort {
     pub average_hr: Option<u32>,
     pub distance_m: Option<f32>,
     pub rpe: Option<u8>,
+    /// Ridden on a trainer rather than on the road. A GPX route ridden indoors
+    /// meets its outdoor rides by name, and power compares fairly across the
+    /// two — but time and heart rate do not, so those are only ever compared
+    /// within one setting.
+    pub indoor: bool,
 }
 
 impl Effort {
@@ -133,6 +138,8 @@ pub fn build_history(sessions: &[SessionSummary], activities: &[IntervalsActivit
             average_hr: twin.and_then(|a| a.average_hr),
             distance_m: twin.and_then(|a| a.distance_m),
             rpe: s.rpe,
+            // The app only rides indoors, whatever the synced twin calls it.
+            indoor: true,
         });
     }
 
@@ -154,6 +161,7 @@ pub fn build_history(sessions: &[SessionSummary], activities: &[IntervalsActivit
             average_hr: a.average_hr,
             distance_m: a.distance_m,
             rpe: None,
+            indoor: is_indoor(&a.sport_type),
         });
     }
 
@@ -182,8 +190,14 @@ pub struct Comparison {
     pub attempt: usize,
     /// The date of the earliest attempt, for "N efforts since …".
     pub since: NaiveDate,
-    /// The attempt immediately before this one.
+    /// The attempt immediately before this one, indoors or out.
     pub previous: Effort,
+    /// The most recent earlier attempt ridden in the same setting as this one
+    /// — indoors against indoors, outdoors against outdoors. What heart rate
+    /// and time are compared against; see [`Effort::indoor`].
+    pub previous_like: Option<Effort>,
+    /// How many earlier attempts were ridden in the other setting.
+    pub other_setting: usize,
     /// The strongest previous attempt by power.
     pub best: Option<Effort>,
     /// 1 when this ride is the strongest yet; `None` when it has no power.
@@ -198,6 +212,33 @@ impl Comparison {
     pub fn is_best(&self) -> bool {
         self.power_rank == Some(1)
     }
+
+    /// The earlier attempt to compare aerobic efficiency against, when both
+    /// rides have one.
+    ///
+    /// Same setting only: indoor heat lifts heart rate at a given power, so an
+    /// indoor ride set against an outdoor one would read as lost fitness.
+    pub fn efficiency_baseline(&self, current: &Effort) -> Option<&Effort> {
+        current.efficiency()?;
+        self.previous_like
+            .as_ref()
+            .filter(|e| e.efficiency().is_some())
+    }
+
+    /// The earlier attempt to compare elapsed time against, if any.
+    ///
+    /// Same setting and the same ground only. Indoor speed comes from the
+    /// app's physics model, with no wind, traffic or braking; outdoor speed
+    /// comes from the road, so a gap between the two says nothing about the
+    /// rider.
+    pub fn time_baseline(&self, current: &Effort) -> Option<&Effort> {
+        if current.duration_secs == 0 {
+            return None;
+        }
+        self.previous_like
+            .as_ref()
+            .filter(|e| e.duration_secs > 0 && current.same_distance_as(e))
+    }
 }
 
 /// Place `current` against its earlier attempts.
@@ -207,6 +248,12 @@ impl Comparison {
 pub fn compare(current: &Effort, priors: &[Effort]) -> Option<Comparison> {
     let previous = priors.iter().max_by_key(|e| e.date)?.clone();
     let since = priors.iter().map(|e| e.date).min()?;
+    let previous_like = priors
+        .iter()
+        .filter(|e| e.indoor == current.indoor)
+        .max_by_key(|e| e.date)
+        .cloned();
+    let other_setting = priors.iter().filter(|e| e.indoor != current.indoor).count();
 
     let best = priors
         .iter()
@@ -235,6 +282,8 @@ pub fn compare(current: &Effort, priors: &[Effort]) -> Option<Comparison> {
         attempt: priors.len() + 1,
         since,
         previous,
+        previous_like,
+        other_setting,
         best,
         power_rank,
         power_series,
@@ -260,6 +309,7 @@ mod tests {
             average_hr: None,
             distance_m: None,
             rpe: None,
+            indoor: true,
         }
     }
 
@@ -605,5 +655,169 @@ mod tests {
         let priors = vec![effort(1, "Loop", None), effort(4, "Loop", Some(210))];
         let c = compare(&effort(9, "Loop", Some(230)), &priors).expect("two priors");
         assert_eq!(c.power_series, vec![0.0, 210.0, 230.0]);
+    }
+
+    // ── Indoor and outdoor ────────────────────────────────────────────────────
+
+    fn outdoor(d: u32, name: &str, power: Option<u32>) -> Effort {
+        Effort {
+            indoor: false,
+            ..effort(d, name, power)
+        }
+    }
+
+    #[test]
+    fn should_mark_the_apps_own_ride_indoor_even_when_its_twin_says_ride() {
+        // Garmin may file an uploaded trainer ride under plain "Ride"; the app
+        // knows better, because it has never recorded a ride on the road.
+        let sessions = vec![summary(1, at(2), "Loop", Some(200.0), Some("i1"))];
+        let activities = vec![activity("i1", 2, "Indoor Cycling", "Ride", Some(200))];
+        let history = build_history(&sessions, &activities);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].indoor);
+    }
+
+    #[test]
+    fn should_take_an_imported_rides_setting_from_its_sport() {
+        let activities = vec![
+            activity("i1", 1, "Loop", "Ride", Some(180)),
+            activity("i2", 2, "Loop", "VirtualRide", Some(190)),
+        ];
+        let history = build_history(&[], &activities);
+        assert!(!history[0].indoor, "a road ride");
+        assert!(history[1].indoor, "a virtual ride");
+    }
+
+    #[test]
+    fn should_pick_the_last_ride_in_the_same_setting_past_a_newer_one_in_the_other() {
+        let priors = vec![
+            effort(1, "Loop", Some(180)),
+            effort(3, "Loop", Some(185)),
+            outdoor(6, "Loop", Some(210)),
+        ];
+        let c = compare(&effort(9, "Loop", Some(200)), &priors).expect("three priors");
+        assert_eq!(c.previous.date, day(6), "power still sees the outdoor ride");
+        assert_eq!(c.previous_like.expect("an indoor prior").date, day(3));
+        assert_eq!(c.other_setting, 1);
+    }
+
+    #[test]
+    fn should_have_no_like_for_like_ride_when_every_prior_was_outdoors() {
+        let priors = vec![outdoor(1, "Loop", Some(180)), outdoor(4, "Loop", Some(190))];
+        let c = compare(&effort(9, "Loop", Some(200)), &priors).expect("two priors");
+        assert!(c.previous_like.is_none());
+        assert_eq!(c.other_setting, 2);
+    }
+
+    #[test]
+    fn should_match_an_outdoor_ride_with_outdoor_ones() {
+        // The rule is symmetric, not "indoor rides only".
+        let priors = vec![outdoor(1, "Loop", Some(180)), effort(4, "Loop", Some(190))];
+        let c = compare(&outdoor(9, "Loop", Some(200)), &priors).expect("two priors");
+        assert_eq!(c.previous_like.expect("an outdoor prior").date, day(1));
+        assert_eq!(c.other_setting, 1);
+    }
+
+    #[test]
+    fn should_still_rank_power_across_both_settings() {
+        // Watts are watts: the outdoor record stands against the indoor ride.
+        let priors = vec![outdoor(1, "Loop", Some(240)), effort(4, "Loop", Some(190))];
+        let c = compare(&effort(9, "Loop", Some(200)), &priors).expect("two priors");
+        assert_eq!(c.power_rank, Some(2));
+        assert_eq!(c.power_series, vec![240.0, 190.0, 200.0]);
+    }
+
+    fn with_hr(e: Effort, hr: u32) -> Effort {
+        Effort {
+            average_hr: Some(hr),
+            ..e
+        }
+    }
+
+    fn over(e: Effort, metres: f32) -> Effort {
+        Effort {
+            distance_m: Some(metres),
+            ..e
+        }
+    }
+
+    #[test]
+    fn should_never_set_indoor_efficiency_against_an_outdoor_ride() {
+        let priors = vec![with_hr(outdoor(4, "Loop", Some(200)), 140)];
+        let current = with_hr(effort(9, "Loop", Some(200)), 150);
+        let c = compare(&current, &priors).expect("one prior");
+        assert!(c.efficiency_baseline(&current).is_none());
+    }
+
+    #[test]
+    fn should_skip_the_newer_outdoor_ride_for_efficiency() {
+        let priors = vec![
+            with_hr(effort(2, "Loop", Some(190)), 150),
+            with_hr(outdoor(6, "Loop", Some(200)), 140),
+        ];
+        let current = with_hr(effort(9, "Loop", Some(200)), 150);
+        let c = compare(&current, &priors).expect("two priors");
+        assert_eq!(
+            c.efficiency_baseline(&current)
+                .expect("an indoor prior")
+                .date,
+            day(2)
+        );
+    }
+
+    #[test]
+    fn should_give_no_efficiency_baseline_when_this_ride_has_no_heart_rate() {
+        let priors = vec![with_hr(effort(2, "Loop", Some(190)), 150)];
+        let current = effort(9, "Loop", Some(200));
+        let c = compare(&current, &priors).expect("one prior");
+        assert!(c.efficiency_baseline(&current).is_none());
+    }
+
+    #[test]
+    fn should_give_no_efficiency_baseline_when_the_like_ride_has_no_heart_rate() {
+        let priors = vec![effort(2, "Loop", Some(190))];
+        let current = with_hr(effort(9, "Loop", Some(200)), 150);
+        let c = compare(&current, &priors).expect("one prior");
+        assert!(c.efficiency_baseline(&current).is_none());
+    }
+
+    #[test]
+    fn should_never_time_an_indoor_ride_against_an_outdoor_one_over_the_same_ground() {
+        // The real case: the GPX of a road ride, replayed on the trainer.
+        let priors = vec![over(outdoor(4, "Loop", Some(200)), 40_000.0)];
+        let current = over(effort(9, "Loop", Some(200)), 40_000.0);
+        let c = compare(&current, &priors).expect("one prior");
+        assert!(c.time_baseline(&current).is_none());
+    }
+
+    #[test]
+    fn should_time_against_the_last_ride_in_the_same_setting() {
+        let priors = vec![
+            over(effort(2, "Loop", Some(190)), 40_000.0),
+            over(outdoor(6, "Loop", Some(200)), 40_000.0),
+        ];
+        let current = over(effort(9, "Loop", Some(200)), 40_000.0);
+        let c = compare(&current, &priors).expect("two priors");
+        assert_eq!(
+            c.time_baseline(&current).expect("an indoor prior").date,
+            day(2)
+        );
+    }
+
+    #[test]
+    fn should_still_refuse_a_time_over_different_ground_in_the_same_setting() {
+        let priors = vec![over(effort(2, "Loop", Some(190)), 30_000.0)];
+        let current = over(effort(9, "Loop", Some(200)), 40_000.0);
+        let c = compare(&current, &priors).expect("one prior");
+        assert!(c.time_baseline(&current).is_none());
+    }
+
+    #[test]
+    fn should_not_time_against_a_ride_with_no_recorded_duration() {
+        let mut prior = over(effort(2, "Loop", Some(190)), 40_000.0);
+        prior.duration_secs = 0;
+        let current = over(effort(9, "Loop", Some(200)), 40_000.0);
+        let c = compare(&current, &[prior]).expect("one prior");
+        assert!(c.time_baseline(&current).is_none());
     }
 }

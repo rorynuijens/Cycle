@@ -16,7 +16,7 @@ use sqlx::SqlitePool;
 use crate::data::athlete::power_zone_index;
 use crate::data::db;
 use crate::data::keystore;
-use crate::data::sport::{is_cycling, is_run};
+use crate::data::sport::{is_cycling, is_indoor, is_run};
 use crate::data::streams::ActivityStreams;
 use crate::data::workout::Workout;
 use crate::training::analytics::{format_average_pace, format_distance};
@@ -245,6 +245,7 @@ pub fn show_intervals_detail(
                 average_hr: act.average_hr,
                 distance_m: act.distance_m,
                 rpe: None,
+                indoor: is_indoor(&act.sport_type),
             },
             pool.clone(),
             rt_handle,
@@ -1097,6 +1098,7 @@ pub fn show_session_detail(
             average_hr: session.average_hr().map(|h| h as u32),
             distance_m: (distance > 0.0).then_some(distance),
             rpe: session.rpe,
+            indoor: true,
         },
         pool.clone(),
         &rt_handle,

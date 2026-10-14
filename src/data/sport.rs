@@ -39,6 +39,20 @@ pub fn is_cycling(raw: &str) -> bool {
     normalize_sport_type(raw) == "Cycling"
 }
 
+/// True when `raw` names a ride done on a trainer rather than on the road.
+///
+/// Indoor and outdoor rides of one route are the same effort, but not the same
+/// conditions: indoors there is no wind, no traffic and no coasting, and the
+/// heat raises heart rate at a given power. Callers use this to keep those
+/// figures from being compared across the two. An empty string is indoor — the
+/// app's own rides are stored without a sport, and the app only rides indoors.
+pub fn is_indoor(raw: &str) -> bool {
+    matches!(
+        raw.to_lowercase().as_str(),
+        "" | "virtualride" | "indoorcycling"
+    )
+}
+
 /// True when `raw` names a running activity of any kind.
 ///
 /// Callers use this to decide whether to show pace and distance rather than
@@ -121,5 +135,39 @@ mod tests {
     fn should_not_treat_running_as_cycling() {
         assert!(!is_cycling("Run"));
         assert!(!is_cycling("TrailRun"));
+    }
+
+    #[test]
+    fn should_treat_virtual_and_indoor_rides_as_indoor_in_any_case() {
+        for raw in [
+            "",
+            "VirtualRide",
+            "VIRTUALRIDE",
+            "IndoorCycling",
+            "indoorcycling",
+        ] {
+            assert!(is_indoor(raw), "for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn should_treat_every_road_and_trail_ride_as_outdoor() {
+        // Each of these is cycling, so is_cycling alone would not separate them.
+        for raw in [
+            "Ride",
+            "GravelRide",
+            "MountainBikeRide",
+            "EBikeRide",
+            "Cycling",
+        ] {
+            assert!(is_cycling(raw), "for {raw}");
+            assert!(!is_indoor(raw), "for {raw}");
+        }
+    }
+
+    #[test]
+    fn should_not_call_a_treadmill_run_an_indoor_ride() {
+        // Indoor, but not a ride — and never reaches a ride comparison.
+        assert!(!is_indoor("VirtualRun"));
     }
 }

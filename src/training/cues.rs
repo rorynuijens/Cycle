@@ -260,6 +260,7 @@ mod tests {
             average_hr: None,
             distance_m: None,
             rpe: None,
+            indoor: true,
         }
     }
 

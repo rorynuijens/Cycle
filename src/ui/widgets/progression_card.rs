@@ -101,10 +101,12 @@ fn build(current: &Effort, comparison: &Comparison) -> gtk::Box {
         } else {
             "Average Power"
         };
+        // Power is the one figure compared across indoor and outdoor rides, so
+        // the earlier ride says which it was when that differs from this one.
         let row = metric_row(
             title,
             &format!("{now} W"),
-            &format!("was {then} W on {when}"),
+            &format!("was {then} W on {when}{}", setting_note(current, previous)),
             now as f32 - then as f32,
             then as f32,
             true,
@@ -118,12 +120,15 @@ fn build(current: &Effort, comparison: &Comparison) -> gtk::Box {
 
     // ── Aerobic efficiency ────────────────────────────────────────────────────
     // The same watts at a lower heart rate is the fitness signal the rider
-    // cannot see from either number on its own.
-    if let (Some(now), Some(then)) = (current.efficiency(), previous.efficiency()) {
+    // cannot see from either number on its own. Compared within one setting
+    // only — see `Comparison::efficiency_baseline`.
+    if let Some(baseline) = comparison.efficiency_baseline(current) {
+        let now = current.efficiency().unwrap_or_default();
+        let then = baseline.efficiency().unwrap_or_default();
         group.add(&metric_row(
             "Aerobic Efficiency",
             &format!("{now:.2} W/bpm"),
-            &format!("was {then:.2} W/bpm on {when}"),
+            &format!("was {then:.2} W/bpm on {}", format_date(baseline.date)),
             now - then,
             then,
             true,
@@ -132,17 +137,18 @@ fn build(current: &Effort, comparison: &Comparison) -> gtk::Box {
     }
 
     // ── Elapsed time, only over the same ground ───────────────────────────────
-    // Comparing times across different distances would be meaningless, so this
-    // row appears only when the two rides covered close to the same route.
-    if current.same_distance_as(previous) && current.duration_secs > 0 {
+    // Only against a ride over close to the same distance and in the same
+    // setting — see `Comparison::time_baseline`.
+    if let Some(baseline) = comparison.time_baseline(current) {
         let now = current.duration_secs as f32;
-        let then = previous.duration_secs as f32;
+        let then = baseline.duration_secs as f32;
         group.add(&metric_row(
             "Elapsed Time",
             &WorkoutEngine::format_duration(current.duration_secs),
             &format!(
-                "was {} on {when}",
-                WorkoutEngine::format_duration(previous.duration_secs)
+                "was {} on {}",
+                WorkoutEngine::format_duration(baseline.duration_secs),
+                format_date(baseline.date)
             ),
             now - then,
             then,
@@ -174,7 +180,7 @@ fn build(current: &Effort, comparison: &Comparison) -> gtk::Box {
     root.append(&group);
 
     // ── The series behind the headline ────────────────────────────────────────
-    if let Some(chart) = power_chart(comparison) {
+    if let Some(chart) = power_chart(current, comparison) {
         root.append(&chart);
     }
 
@@ -186,7 +192,7 @@ fn build(current: &Effort, comparison: &Comparison) -> gtk::Box {
 /// `None` when fewer than two attempts carry a power reading — the sparkline
 /// needs two points to draw a line, and an empty chart frame is worse than no
 /// chart.
-fn power_chart(comparison: &Comparison) -> Option<gtk::Box> {
+fn power_chart(current: &Effort, comparison: &Comparison) -> Option<gtk::Box> {
     let readings = comparison.power_series.iter().filter(|&&v| v > 0.0).count();
     if readings < 2 {
         return None;
@@ -207,7 +213,7 @@ fn power_chart(comparison: &Comparison) -> Option<gtk::Box> {
 
     vbox.append(
         &gtk::Label::builder()
-            .label("Power Across Every Effort")
+            .label(chart_caption(current.indoor, comparison.other_setting))
             .halign(gtk::Align::Start)
             .css_classes(["caption", "dim-label"])
             .build(),
@@ -228,6 +234,31 @@ fn power_chart(comparison: &Comparison) -> Option<gtk::Box> {
 
     card.append(&vbox);
     Some(card)
+}
+
+/// ", outdoors" or ", indoors" when `prior` was ridden in the other setting from
+/// `current`, and nothing when they match — the rider knows where they just
+/// rode, so only the exception needs saying.
+fn setting_note(current: &Effort, prior: &Effort) -> &'static str {
+    match (current.indoor, prior.indoor) {
+        (true, false) => ", outdoors",
+        (false, true) => ", indoors",
+        _ => "",
+    }
+}
+
+/// The sparkline's caption. The line mixes indoor and outdoor rides without
+/// marking which point is which, so the caption counts the ones ridden in the
+/// other setting from this ride.
+fn chart_caption(indoor: bool, other_setting: usize) -> String {
+    match other_setting {
+        0 => "Power Across Every Effort".to_string(),
+        n => format!(
+            "Power Across Every Effort · {n} {} {}",
+            if n == 1 { "ride" } else { "rides" },
+            if indoor { "outdoors" } else { "indoors" }
+        ),
+    }
 }
 
 /// Spoken description of the sparkline, for a rider using a screen reader.
@@ -367,5 +398,44 @@ mod tests {
     fn should_describe_an_empty_series_without_panicking() {
         assert_eq!(describe_series(&[]), "Power across earlier efforts");
         assert_eq!(describe_series(&[0.0]), "Power across earlier efforts");
+    }
+
+    fn ride(indoor: bool) -> Effort {
+        Effort {
+            date: NaiveDate::from_ymd_opt(2026, 6, 1).expect("hardcoded valid date"),
+            name: "Loop".into(),
+            duration_secs: 3600,
+            normalised_power: Some(200),
+            average_power: Some(200),
+            average_hr: None,
+            distance_m: None,
+            rpe: None,
+            indoor,
+        }
+    }
+
+    #[test]
+    fn should_name_the_setting_only_when_it_differs() {
+        assert_eq!(setting_note(&ride(true), &ride(false)), ", outdoors");
+        assert_eq!(setting_note(&ride(false), &ride(true)), ", indoors");
+        assert_eq!(setting_note(&ride(true), &ride(true)), "");
+        assert_eq!(setting_note(&ride(false), &ride(false)), "");
+    }
+
+    #[test]
+    fn should_leave_the_caption_plain_when_every_ride_shares_a_setting() {
+        assert_eq!(chart_caption(true, 0), "Power Across Every Effort");
+    }
+
+    #[test]
+    fn should_count_the_rides_from_the_other_setting_in_the_caption() {
+        assert_eq!(
+            chart_caption(true, 1),
+            "Power Across Every Effort · 1 ride outdoors"
+        );
+        assert_eq!(
+            chart_caption(false, 3),
+            "Power Across Every Effort · 3 rides indoors"
+        );
     }
 }
