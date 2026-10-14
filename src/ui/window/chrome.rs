@@ -99,7 +99,7 @@ pub fn build_sidebar_page(sidebar_list: &gtk::ListBox) -> adw::NavigationPage {
     );
 
     adw::NavigationPage::builder()
-        .title("Cycle")
+        .title("Tour du Salon")
         .tag("sidebar")
         .child(&sidebar_box)
         .build()
@@ -151,7 +151,7 @@ pub fn build_content(
     let main_menu = gio::Menu::new();
     main_menu.append(Some("Fullscreen"), Some("win.toggle-fullscreen"));
     main_menu.append(Some("Preferences"), Some("app.preferences"));
-    main_menu.append(Some("About Cycle"), Some("app.about"));
+    main_menu.append(Some("About Tour du Salon"), Some("app.about"));
     menu_button.set_menu_model(Some(&main_menu));
     content_header.pack_end(&menu_button);
 

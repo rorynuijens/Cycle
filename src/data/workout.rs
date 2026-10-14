@@ -101,7 +101,7 @@ impl Workout {
             RAMP_TEST_NAME,
             "Ridden to exhaustion, not completed. Ten minutes easy, then the \
              target rises 8% of FTP every minute. Ride until you cannot hold the \
-             step, then press \u{201c}I\u{2019}m done\u{201d} \u{2014} Cycle reads your FTP off \
+             step, then press \u{201c}I\u{2019}m Done\u{201d} \u{2014} Tour du Salon reads your FTP off \
              your best minute.",
             WorkoutCategory::Custom,
             segments,

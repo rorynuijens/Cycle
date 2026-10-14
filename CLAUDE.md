@@ -7,7 +7,7 @@ This file is read by Claude at the start of every session.
 
 ## Project identity
 
-- **App name:** Cycle
+- **App name:** Tour du Salon (renamed from Cycle in 0.16.1 — display name only; the app ID, binary, crate, data dir and keyring service keep "Cycle")
 - **App ID:** `io.github.rorynuijens.Cycle`
 - **Language:** Rust (2021 edition)
 - **UI toolkit:** GTK4 + libadwaita (`gtk4-rs` / `libadwaita` crates)

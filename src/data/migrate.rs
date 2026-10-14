@@ -214,8 +214,8 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
 
     if found > SCHEMA_VERSION {
         bail!(
-            "This database was written by a newer version of Cycle: its schema is v{found}, \
-             and this build understands v{SCHEMA_VERSION}. Update Cycle, or restore a backup \
+            "This database was written by a newer version of Tour du Salon: its schema is v{found}, \
+             and this build understands v{SCHEMA_VERSION}. Update Tour du Salon, or restore a backup \
              taken before the upgrade. Nothing has been changed."
         );
     }

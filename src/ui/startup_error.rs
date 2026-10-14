@@ -25,7 +25,7 @@ pub fn build(app: &adw::Application, heading: &str, message: &str) -> adw::Appli
         .label("_Quit")
         .use_underline(true)
         .halign(gtk::Align::Center)
-        .tooltip_text("Close Cycle")
+        .tooltip_text("Close Tour du Salon")
         .build();
     quit_btn.add_css_class("pill");
 
@@ -57,7 +57,7 @@ pub fn build(app: &adw::Application, heading: &str, message: &str) -> adw::Appli
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Cycle")
+        .title("Tour du Salon")
         .default_width(560)
         .default_height(520)
         .content(&view)

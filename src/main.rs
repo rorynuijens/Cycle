@@ -58,11 +58,11 @@ fn main() -> glib::ExitCode {
             // The path is resolved rather than written out, because it differs
             // between a flatpak install and a development build.
             let msg = format!(
-                "Cycle could not open its database.\n\n{e:#}\n\nDatabase location:\n{}",
+                "Tour du Salon could not open its database.\n\n{e:#}\n\nDatabase location:\n{}",
                 data::paths::data_dir().display()
             );
             app.connect_activate(move |app| {
-                ui::startup_error::build(app, "Cycle Could Not Start", &msg).present();
+                ui::startup_error::build(app, "Tour du Salon Could Not Start", &msg).present();
             });
             return app.run();
         }

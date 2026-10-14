@@ -968,7 +968,7 @@ impl PlayerPage {
                     adw::AlertDialog::builder()
                         .heading("Finished the Test?")
                         .body(
-                            "Cycle will read your FTP off your best minute and \
+                            "Tour du Salon will read your FTP off your best minute and \
                              offer you the number.",
                         )
                         .build()

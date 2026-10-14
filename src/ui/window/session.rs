@@ -135,14 +135,14 @@ pub fn offer_recovery(
         Some(w) => {
             let remaining = w.duration_secs.saturating_sub(ridden_secs);
             format!(
-                "“{name}” from {when} was still recording when Cycle closed.\n\n\
+                "“{name}” from {when} was still recording when Tour du Salon closed.\n\n\
                  {ridden} was saved, with {} still to ride. Continuing puts you \
                  back on the workout with ten seconds to get going.",
                 crate::training::engine::WorkoutEngine::format_duration(remaining)
             )
         }
         None => format!(
-            "“{name}” from {when} was still recording when Cycle closed.\n\n\
+            "“{name}” from {when} was still recording when Tour du Salon closed.\n\n\
              {ridden} of riding was saved."
         ),
     };

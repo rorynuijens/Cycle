@@ -755,7 +755,7 @@ pub fn show_workout_detail_dialog(
             icon.set_accessible_role(gtk::AccessibleRole::Img);
             icon.update_property(&[gtk::accessible::Property::Label(
                 if ride.session_id.is_some() {
-                    "A ride you recorded in Cycle on this day"
+                    "A ride you recorded in Tour du Salon on this day"
                 } else {
                     "A ride you did on this day"
                 },

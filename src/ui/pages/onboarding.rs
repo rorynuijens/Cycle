@@ -23,7 +23,7 @@ pub fn show(
     // dialog left to size itself collapses to a sliver. AdwDialog clamps this
     // down to the parent window on small screens, so an explicit height is safe.
     let dialog = adw::Dialog::builder()
-        .title("Welcome to Cycle")
+        .title("Welcome to Tour du Salon")
         .content_width(480)
         .content_height(600)
         .build();
@@ -285,7 +285,7 @@ pub fn show(
     let finish_btn = gtk::Button::builder()
         .label("Get Started")
         .css_classes(["pill", "suggested-action"])
-        .tooltip_text("Finish setup and start using Cycle")
+        .tooltip_text("Finish setup and start using Tour du Salon")
         .build();
     ai_btn_row.append(&skip_ai_btn);
     ai_btn_row.append(&finish_btn);

@@ -334,7 +334,7 @@ impl DashboardPage {
 
                             let status = adw::StatusPage::builder()
                                 .icon_name("media-playback-start-symbolic")
-                                .title("Welcome to Cycle")
+                                .title("Welcome to Tour du Salon")
                                 .description(
                                     "Set up your profile and connect your services to get \
                                      personalised training recommendations.",

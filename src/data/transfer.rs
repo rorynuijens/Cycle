@@ -59,7 +59,7 @@ impl ImportSummary {
 
 /// Default file name offered when exporting.
 pub fn suggested_export_name(now: DateTime<Local>) -> String {
-    format!("cycle-history-{}.db", now.format("%Y-%m-%d"))
+    format!("tour-du-salon-history-{}.db", now.format("%Y-%m-%d"))
 }
 
 /// Write the whole history to `target`, which must not already exist.
@@ -230,7 +230,7 @@ async fn inspect_pool(pool: &SqlitePool) -> Result<ImportSummary> {
         .collect();
     if !missing.is_empty() {
         bail!(
-            "this does not look like a Cycle database (no {})",
+            "this does not look like a Tour du Salon database (no {})",
             missing.join(", ")
         );
     }
@@ -241,7 +241,7 @@ async fn inspect_pool(pool: &SqlitePool) -> Result<ImportSummary> {
         .context("reading the schema version")?;
     if schema_version > SCHEMA_VERSION {
         bail!(
-            "this export came from a newer version of Cycle (schema v{schema_version}; \
+            "this export came from a newer version of Tour du Salon (schema v{schema_version}; \
              this build understands v{SCHEMA_VERSION})"
         );
     }
@@ -289,7 +289,7 @@ pub async fn replace_with(pool: SqlitePool, candidate: &Path) -> Result<PathBuf>
     // with nothing to read. Say so plainly: the underlying error is "attempted
     // to acquire a connection on a closed pool", which tells a rider nothing.
     if pool.is_closed() {
-        bail!("a history has already been imported in this session — restart Cycle first");
+        bail!("a history has already been imported in this session — restart Tour du Salon first");
     }
 
     let db_path = backup::main_db_path(&pool)
@@ -390,7 +390,10 @@ mod tests {
     #[test]
     fn should_name_an_export_after_the_day_it_was_taken() {
         let now = Local.with_ymd_and_hms(2026, 8, 8, 9, 15, 0).unwrap();
-        assert_eq!(suggested_export_name(now), "cycle-history-2026-08-08.db");
+        assert_eq!(
+            suggested_export_name(now),
+            "tour-du-salon-history-2026-08-08.db"
+        );
     }
 
     // ── describing a candidate ───────────────────────────────────────────────
@@ -500,7 +503,8 @@ mod tests {
         let err = inspect(&path).await.expect_err("should be rejected");
 
         assert!(
-            err.to_string().contains("does not look like a Cycle"),
+            err.to_string()
+                .contains("does not look like a Tour du Salon"),
             "{err}"
         );
     }
@@ -519,7 +523,10 @@ mod tests {
             .await
             .expect_err("a newer schema must be refused");
 
-        assert!(err.to_string().contains("newer version of Cycle"), "{err}");
+        assert!(
+            err.to_string().contains("newer version of Tour du Salon"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -613,7 +620,7 @@ mod tests {
 
         let message = err.to_string();
         assert!(
-            message.contains("restart Cycle"),
+            message.contains("restart Tour du Salon"),
             "the error should tell the rider what to do, got: {message}"
         );
         assert!(

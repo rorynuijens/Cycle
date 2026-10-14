@@ -1,10 +1,10 @@
-# Cycle
+# Tour du Salon
 
 This is my hobby project. I am not a coder, so all the code is written by Claude. Yes, I am one of those disliked vibe coders :-). That said, this app serves my needs and has been developed according to the hardware that I have available. If you would like to use this app you are of course free to do so. If you have any issues with the app, or if your hardware isn't supported or if you have any feature request, you are free to let me know.
 
 ---
 
-Cycle is a native GNOME application for indoor cycling training, built in Rust with GTK4 and libadwaita. It connects to smart trainers and sensors over Bluetooth LE and ANT+, executes structured workouts with automatic resistance control (ERG), records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
+Tour du Salon is a native GNOME application for indoor cycling training, built in Rust with GTK4 and libadwaita. It connects to smart trainers and sensors over Bluetooth LE and ANT+, executes structured workouts with automatic resistance control (ERG), records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
 
 The application targets GNOME desktop environments and is distributed as a Flatpak.
 
@@ -69,7 +69,7 @@ The application targets GNOME desktop environments and is distributed as a Flatp
 
 ## Install
 
-Cycle is not on Flathub. It is published from its own Flatpak repository instead, which works exactly the same way — you just have to tell your computer about it once.
+Tour du Salon is not on Flathub. It is published from its own Flatpak repository instead, which works exactly the same way — you just have to tell your computer about it once.
 
 **What is a Flatpak?** It is a way of installing Linux apps that keeps each app and everything it needs in its own box. Nothing it installs can break the rest of your system, and removing it leaves nothing behind. Most Linux systems already have Flatpak; if yours does not, install the `flatpak` package from your distribution.
 
@@ -86,10 +86,10 @@ Nothing is installed yet — this only saves the address.
 ### Step 2 — install the app
 
 ```bash
-flatpak install cycle io.github.rorynuijens.Cycle
+flatpak install cycle io.github.rorynuijens.Tour du Salon
 ```
 
-The first install also downloads the GNOME runtime (the shared set of libraries every GNOME Flatpak uses), so it may take a few minutes and a few hundred megabytes. Later updates are much smaller. Cycle then appears in your applications menu like any other app.
+The first install also downloads the GNOME runtime (the shared set of libraries every GNOME Flatpak uses), so it may take a few minutes and a few hundred megabytes. Later updates are much smaller. Tour du Salon then appears in your applications menu like any other app.
 
 ### Step 3 — keep it up to date
 
@@ -97,7 +97,7 @@ The first install also downloads the GNOME runtime (the shared set of libraries 
 flatpak update
 ```
 
-Run this whenever you like. It updates Cycle along with everything else you installed through Flatpak. There is nothing else to configure.
+Run this whenever you like. It updates Tour du Salon along with everything else you installed through Flatpak. There is nothing else to configure.
 
 ### Alternative: install a single file
 
@@ -112,11 +112,11 @@ This is handy for a machine that cannot reach the repository, but it is a one-of
 ### Uninstalling
 
 ```bash
-flatpak uninstall io.github.rorynuijens.Cycle
+flatpak uninstall io.github.rorynuijens.Tour du Salon
 flatpak remote-delete cycle
 ```
 
-Your training data lives outside the app and is not deleted by this. To remove that too, delete `~/.var/app/io.github.rorynuijens.Cycle`.
+Your training data lives outside the app and is not deleted by this. To remove that too, delete `~/.var/app/io.github.rorynuijens.Tour du Salon`.
 
 ### If something goes wrong
 
@@ -130,14 +130,14 @@ Your training data lives outside the app and is not deleted by this. To remove t
 
 ### Device connectivity
 
-Cycle communicates with BLE devices using standard GATT profiles:
+Tour du Salon communicates with BLE devices using standard GATT profiles:
 
 - **Smart trainers** — Fitness Machine Service (FTMS). ERG mode for structured workouts (the app sends a target power and the trainer adjusts resistance automatically) and SIM mode for route rides (the app sends the road gradient and the trainer sets resistance to match).
 - **Power meters** — Cycling Power Service (CPS). Read-only; power data is recorded but the meter cannot be commanded.
 - **Heart rate monitors** — Heart Rate Service (HRS). Supports both 8-bit and 16-bit HR measurement formats.
 - **Cadence sensors** — Cycling Speed and Cadence Service (CSC), crank revolution data.
 
-Trainers that expose no usable BLE interface are supported over **ANT+**: with a USB ANT+ stick, Cycle drives FE-C trainers with full ERG and SIM control plus power and speed readings.
+Trainers that expose no usable BLE interface are supported over **ANT+**: with a USB ANT+ stick, Tour du Salon drives FE-C trainers with full ERG and SIM control plus power and speed readings.
 
 Devices paired in a previous session are remembered and reconnected automatically on the next launch.
 
@@ -180,7 +180,7 @@ Connecting an Intervals.icu account enables syncing activity history (training l
 
 ### AI coaching
 
-Cycle integrates with the Anthropic Claude API to provide:
+Tour du Salon integrates with the Anthropic Claude API to provide:
 
 - **Morning briefing** — a daily readiness assessment based on current CTL, ATL, TSB, wellness data, scheduled workouts, and upcoming time off. The briefing concludes with a recommendation to proceed, modify the planned workout, or rest.
 - **Workout recommendation** — suggests a workout from the local library given the athlete's current training load and defined goals.
@@ -193,7 +193,7 @@ The Anthropic API key is stored in the GNOME Secret Service keyring.
 
 ## Target audience
 
-Cycle is intended for cyclists who train indoors on a smart trainer and want a self-contained GNOME application for session execution and training load management. It is most useful to athletes who already use Intervals.icu to track training history and wellness, prefer a native Linux desktop application over a browser-based or proprietary platform, and want AI-assisted training guidance without sending personal data to a third-party coaching service.
+Tour du Salon is intended for cyclists who train indoors on a smart trainer and want a self-contained GNOME application for session execution and training load management. It is most useful to athletes who already use Intervals.icu to track training history and wellness, prefer a native Linux desktop application over a browser-based or proprietary platform, and want AI-assisted training guidance without sending personal data to a third-party coaching service.
 
 The application assumes familiarity with power-based training concepts: FTP, TSS, CTL, ATL, and power zones.
 

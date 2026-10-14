@@ -173,7 +173,7 @@ jobs:
           # limit. Add --generate-static-deltas here if bandwidth ever matters
           # more than repo size; it roughly doubles the latter.
           flatpak build-update-repo "$PAGES/repo" \
-            --title="Cycle" \
+            --title="Tour du Salon" \
             --default-branch="$BRANCH" \
             --gpg-sign="$GPG_KEY_ID" \
             --prune --prune-depth=3
@@ -190,7 +190,7 @@ jobs:
 
           cat > "$PAGES/cycle.flatpakrepo" <<EOF
           [Flatpak Repo]
-          Title=Cycle
+          Title=Tour du Salon
           Url=$pages_url/repo/
           Homepage=https://github.com/${GITHUB_REPOSITORY}
           Comment=Indoor cycling training with smart trainer control
@@ -206,7 +206,7 @@ jobs:
           <!doctype html>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Cycle — Flatpak repository</title>
+          <title>Tour du Salon — Flatpak repository</title>
           <style>
             body { font-family: system-ui, sans-serif; max-width: 40rem;
                    margin: 4rem auto; padding: 0 1.5rem; line-height: 1.6; }
@@ -218,7 +218,7 @@ jobs:
               a    { color: #78aeed; }
             }
           </style>
-          <h1>Cycle</h1>
+          <h1>Tour du Salon</h1>
           <p>Indoor cycling training for GNOME — smart trainer control, structured
              workouts, session recording.</p>
           <h2>Install</h2>
@@ -236,7 +236,7 @@ jobs:
           git add -A
           git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -m "Publish Cycle ${{ steps.version.outputs.version }}"
+              commit -m "Publish Tour du Salon ${{ steps.version.outputs.version }}"
           # A fresh root commit each release: the OSTree repo carries its own
           # history, so git history here is pure weight.
           git push --force origin gh-pages
@@ -255,7 +255,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          name: Cycle ${{ steps.version.outputs.version }}
+          name: Tour du Salon ${{ steps.version.outputs.version }}
           files: cycle-${{ steps.version.outputs.version }}.flatpak
           generate_release_notes: true
           body: |

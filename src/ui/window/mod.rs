@@ -55,7 +55,7 @@ impl CycleGtkWindow {
     ) -> Self {
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("Cycle")
+            .title("Tour du Salon")
             .default_width(1100)
             .default_height(700)
             .icon_name("io.github.rorynuijens.Cycle")
@@ -591,7 +591,7 @@ impl CycleGtkWindow {
                 Some("player") => "Workout",
                 Some("route_player") => "Route Ride",
                 Some("summary") => "Summary",
-                _ => "Cycle",
+                _ => "Tour du Salon",
             };
             content_nav_for_title.set_title(title);
             // The way back to whichever ride is running. A route ride counts as

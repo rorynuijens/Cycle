@@ -1122,16 +1122,16 @@ fn screenshots() {
     // newer database produces, in both themes.
     {
         let (app, _pool, _rt) = overlay_context();
-        let msg = "Cycle could not open its database.\n\nThis database was written by a \
-                   newer version of Cycle: its schema is v8, and this build understands v7. \
-                   Update Cycle, or restore a backup taken before the upgrade. Nothing has \
+        let msg = "Tour du Salon could not open its database.\n\nThis database was written by a \
+                   newer version of Tour du Salon: its schema is v8, and this build understands v7. \
+                   Update Tour du Salon, or restore a backup taken before the upgrade. Nothing has \
                    been changed.\n\nDatabase location:\n\
                    /home/rider/.var/app/io.github.rorynuijens.Cycle/data/cycle";
         theme(false);
-        let window = crate::ui::startup_error::build(&app, "Cycle Could Not Start", msg);
+        let window = crate::ui::startup_error::build(&app, "Tour du Salon Could Not Start", msg);
         shoot(&window, 560, 520, "29-startup-error-light");
         theme(true);
-        let window = crate::ui::startup_error::build(&app, "Cycle Could Not Start", msg);
+        let window = crate::ui::startup_error::build(&app, "Tour du Salon Could Not Start", msg);
         shoot(&window, 560, 520, "30-startup-error-dark");
         theme(false);
     }

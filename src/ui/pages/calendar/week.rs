@@ -801,7 +801,7 @@ pub fn build_week_view(
                             crate::ui::widgets::dialog::confirm_destructive(
                                 btn,
                                 "Remove Activity?",
-                                "This will remove the activity from Cycle's local history. \
+                                "This will remove the activity from Tour du Salon's local history. \
                                  It will not be deleted from Intervals.icu.",
                                 "_Remove",
                                 move || {

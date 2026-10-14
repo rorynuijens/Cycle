@@ -89,7 +89,7 @@ pub fn install(
     let about_action = gio::SimpleAction::new("about", None);
     about_action.connect_activate(move |_, _| {
         let dialog = adw::AboutDialog::builder()
-            .application_name("Cycle")
+            .application_name("Tour du Salon")
             .application_icon("io.github.rorynuijens.Cycle")
             .version(env!("CARGO_PKG_VERSION"))
             .developer_name("Rory Nuijens")
@@ -180,7 +180,7 @@ pub fn connect_close(
         let dialog = adw::AlertDialog::builder()
             .heading("Quit with a ride in progress?")
             .body(
-                "The ride so far has been saved. Cycle will offer to recover it \
+                "The ride so far has been saved. Tour du Salon will offer to recover it \
              the next time it starts.\n\n\
              To finish it properly instead, cancel and end the ride from the \
              ride screen.",

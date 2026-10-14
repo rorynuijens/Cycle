@@ -231,7 +231,7 @@ fn import_row(
 
     let row = adw::ActionRow::builder()
         .title("Import History")
-        .subtitle("Replace everything in Cycle with an exported file")
+        .subtitle("Replace everything in Tour du Salon with an exported file")
         .activatable_widget(&button)
         .build();
     row.add_suffix(&button);
@@ -315,8 +315,8 @@ fn confirm_import(
         .heading("Replace your training history?")
         .body(format!(
             "The file holds {}, {} tracked days and {} workouts.\n\n\
-             Everything currently in Cycle is replaced. A copy of what you have \
-             now is saved beside the database first, and Cycle closes so the \
+             Everything currently in Tour du Salon is replaced. A copy of what you have \
+             now is saved beside the database first, and Tour du Salon closes so the \
              change takes effect.",
             summary.ride_span(),
             summary.wellness_days,
@@ -363,11 +363,11 @@ fn confirm_import(
                     let done = adw::AlertDialog::builder()
                         .heading("History imported")
                         .body(format!(
-                            "Cycle closes now so it reopens on the imported \
+                            "Tour du Salon closes now so it reopens on the imported \
                              history.\n\nWhat you had before is kept as {kept}."
                         ))
                         .build();
-                    done.add_response("quit", "_Close Cycle");
+                    done.add_response("quit", "_Close Tour du Salon");
                     done.set_default_response(Some("quit"));
                     done.set_close_response("quit");
 
@@ -396,7 +396,7 @@ fn confirm_import(
                         .heading("Import failed")
                         .body(format!(
                             "{e}\n\nYour history has not been replaced.\n\n\
-                             If Cycle behaves oddly from here, close it and reopen it."
+                             If Tour du Salon behaves oddly from here, close it and reopen it."
                         ))
                         .build();
                     failed.add_response("ok", "_OK");
@@ -456,7 +456,7 @@ fn location_group() -> adw::PreferencesGroup {
 
 fn db_filters() -> gtk::gio::ListStore {
     let filter = gtk::FileFilter::new();
-    filter.set_name(Some("Cycle history"));
+    filter.set_name(Some("Tour du Salon history"));
     filter.add_pattern("*.db");
     let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&filter);

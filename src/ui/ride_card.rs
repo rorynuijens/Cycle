@@ -230,7 +230,7 @@ fn render(session: &Session, title: &str, fallback_ftp: u32) -> Result<cairo::Im
     cr.select_font_face(FONT, cairo::FontSlant::Normal, cairo::FontWeight::Normal);
     cr.set_font_size(22.0);
     cr.set_source_rgba(FG.0, FG.1, FG.2, 0.35);
-    let mark = "Ridden with Cycle";
+    let mark = "Ridden with Tour du Salon";
     let ext = cr.text_extents(mark)?;
     cr.move_to(w - MARGIN - ext.x_advance(), CARD_HEIGHT as f64 - 36.0);
     cr.show_text(mark)?;
