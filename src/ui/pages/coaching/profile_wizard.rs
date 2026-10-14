@@ -474,10 +474,10 @@ pub fn show(
         "Goal",
         "When",
         "Approach",
-        "After a hard day",
-        "Hard days in a row",
-        "Structured training",
-        "Training days",
+        "After a Hard Day",
+        "Hard Days in a Row",
+        "Structured Training",
+        "Training Days",
     ]
     .iter()
     .map(|title| {

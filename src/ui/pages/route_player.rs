@@ -74,6 +74,18 @@ const LOOKAHEAD_CHART_HEIGHT: i32 = 144;
 /// room there is, so the spare height is distributed rather than demanded.
 const MAP_MIN_HEIGHT: i32 = 180;
 
+/// Below this window height the full layout no longer fits — the page needs
+/// 766 px, plus the header bar and the banner — and Pause and End Ride drop
+/// under the bottom edge. [`RoutePlayerPage::compact_breakpoint`] trades chart
+/// and map height for them there.
+const COMPACT_MAX_WINDOW_HEIGHT_PX: i32 = 860;
+
+/// The look-ahead chart and the map floor on a short window: the overlay's
+/// chart height, and a map that still shows the next junction. Together they
+/// bring the page to about 700 px tall, the same as the workout cockpit.
+const LOOKAHEAD_COMPACT_HEIGHT: i32 = 72;
+const MAP_COMPACT_MIN_HEIGHT: i32 = 96;
+
 /// Stamp the moment the ride actually begins.
 ///
 /// The session is created when the route page opens, which can be well before the
@@ -154,7 +166,7 @@ pub struct RoutePlayerPage {
     dropout_banner: adw::Banner,
     /// Consecutive seconds of power data seen while waiting to start.
     power_countdown: Rc<Cell<u32>>,
-    /// Callback wired by `start_timer` for the countdown banner's "Start now" button.
+    /// Callback wired by `start_timer` for the countdown banner's "Start Now" button.
     start_now_cb: ButtonCb,
     route_name_label: gtk::Label,
     mode_label: gtk::Label,
@@ -190,6 +202,8 @@ pub struct RoutePlayerPage {
     /// the one and tighten the other.
     clamp: adw::Clamp,
     inner: gtk::Box,
+    /// The on-page fullscreen button, which turns into the way back out.
+    fullscreen_btn: gtk::Button,
     pause_btn: gtk::Button,
     end_btn: gtk::Button,
     /// The intensity dial for this ride, in percent of the road as it is.
@@ -230,7 +244,7 @@ impl RoutePlayerPage {
         // pedalling before the clock and the route start moving.
         let countdown_banner = adw::Banner::builder()
             .title("Connect a power meter or trainer to begin")
-            .button_label("Start now")
+            .button_label("Start Now")
             .revealed(true)
             .build();
 
@@ -528,7 +542,7 @@ impl RoutePlayerPage {
         // The same compact window as a workout's, saying what a course needs.
         // Through the window action, so F10 and this button are one thing.
         let overlay_btn = gtk::Button::builder()
-            .icon_name("view-restore-symbolic")
+            .icon_name("picture-in-picture-symbolic")
             .tooltip_text("Open the compact overlay window")
             .css_classes(["circular", "flat"])
             .action_name("win.toggle-overlay")
@@ -615,6 +629,7 @@ impl RoutePlayerPage {
             cue_rendered: Cell::new(None),
             clamp,
             inner,
+            fullscreen_btn,
             pause_btn,
             end_btn,
             intensity_pct,
@@ -640,6 +655,32 @@ impl RoutePlayerPage {
     #[cfg(test)]
     pub(crate) fn overlay_chart(&self) -> gtk::DrawingArea {
         Self::build_lookahead_chart(&self.ele_pts, &self.playhead_dist)
+    }
+
+    /// A breakpoint for the window this page lives in, shrinking the chart and
+    /// the map floor on a short window so the controls stay on screen.
+    ///
+    /// A breakpoint rather than smaller sizes outright: on a tall window the
+    /// layout is the rider's, unchanged; only a window that cannot fit it
+    /// gives anything up.
+    pub fn compact_breakpoint(&self) -> adw::Breakpoint {
+        let condition = adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxHeight,
+            COMPACT_MAX_WINDOW_HEIGHT_PX as f64,
+            adw::LengthUnit::Px,
+        );
+        let breakpoint = adw::Breakpoint::new(condition);
+        breakpoint.add_setter(
+            &self.lookahead_chart,
+            "content-height",
+            Some(&LOOKAHEAD_COMPACT_HEIGHT.to_value()),
+        );
+        breakpoint.add_setter(
+            self.route_map.widget(),
+            "height-request",
+            Some(&MAP_COMPACT_MIN_HEIGHT.to_value()),
+        );
+        breakpoint
     }
 
     /// Open the compact overlay, or close it if it is already open.
@@ -675,6 +716,7 @@ impl RoutePlayerPage {
     /// goes where it does the most good: the map roughly doubles and the
     /// look-ahead profile grows with it.
     pub fn set_fullscreen(&self, fullscreen: bool) {
+        crate::ui::dress_fullscreen_button(&self.fullscreen_btn, fullscreen);
         self.clamp.set_maximum_size(if fullscreen {
             FULLSCREEN_CLAMP
         } else {
@@ -855,8 +897,8 @@ impl RoutePlayerPage {
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
         // A ride that ended while auto-paused leaves the banner saying
-        // "Resume now"; the next one has nothing to resume.
-        self.countdown_banner.set_button_label(Some("Start now"));
+        // "Resume Now"; the next one has nothing to resume.
+        self.countdown_banner.set_button_label(Some("Start Now"));
         self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
         let total_dist_km = route.total_distance_m / 1000.0;
@@ -899,7 +941,7 @@ impl RoutePlayerPage {
     /// is finished or the user ends the ride.
     ///
     /// The ride does not begin until 10 consecutive seconds of power data arrive
-    /// (or the rider presses "Start now" on the countdown banner).
+    /// (or the rider presses "Start Now" on the countdown banner).
     ///
     /// `sim_difficulty` (0.0–1.0) scales the road gradient before it reaches the
     /// trainer and `sim_max_grade` (percent) caps it; both are read live each tick
@@ -951,8 +993,8 @@ impl RoutePlayerPage {
         // change (or as a periodic keepalive), not every tick.
         let last_sent_grade = Rc::new(Cell::new(f32::NAN));
 
-        // ── "Start now" — skip the pre-start wait ────────────────────────────
-        // The same banner says "Resume now" while auto-paused. Stamping the
+        // ── "Start Now" — skip the pre-start wait ────────────────────────────
+        // The same banner says "Resume Now" while auto-paused. Stamping the
         // start again then would misdate the ride, so a started ride goes
         // through the pause button's own path instead.
         {
@@ -1107,11 +1149,11 @@ impl RoutePlayerPage {
                 if ap.is_auto_paused() {
                     page.countdown_banner
                         .set_title(&auto_pause::banner_title(ap.pedalling_for()));
-                    page.countdown_banner.set_button_label(Some("Resume now"));
+                    page.countdown_banner.set_button_label(Some("Resume Now"));
                     page.countdown_banner.set_revealed(true);
                 } else {
                     page.countdown_banner.set_revealed(false);
-                    page.countdown_banner.set_button_label(Some("Start now"));
+                    page.countdown_banner.set_button_label(Some("Start Now"));
                 }
             }
             if let Some(overlay) = page.overlay.borrow().as_ref() {
@@ -1420,10 +1462,14 @@ impl RoutePlayerPage {
                 let (r, g, b) = gradient_rgb(p1.2);
                 let alpha = if p1.0 < here_km { 0.30 } else { 0.85 };
                 cr.set_source_rgba(r, g, b, alpha);
-                cr.move_to(to_x(p0.0), base_y);
-                cr.line_to(to_x(p0.0), to_y(p0.1));
-                cr.line_to(to_x(p1.0), to_y(p1.1));
-                cr.line_to(to_x(p1.0), base_y);
+                // Sides on whole pixels: neighbouring slices share an edge, and
+                // two anti-aliased edges over the same pixel left a pale seam
+                // between every slice.
+                let (x0, x1) = (to_x(p0.0).round(), to_x(p1.0).round());
+                cr.move_to(x0, base_y);
+                cr.line_to(x0, to_y(p0.1));
+                cr.line_to(x1, to_y(p1.1));
+                cr.line_to(x1, base_y);
                 cr.close_path();
                 cr.fill().ok();
             }

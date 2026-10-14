@@ -20,7 +20,7 @@ use super::marks::EntryMark;
 ///
 /// One function for both, because the dialog stays open across a change: two
 /// copies of this — one at build time, one in the click handler — is how a row
-/// ends up saying "Marked done" beside a button offering "Mark done".
+/// ends up saying "Marked done" beside a button offering "Mark Done".
 fn dress_done_row(row: &adw::ActionRow, icon: &gtk::Image, btn: &gtk::Button, done: bool) {
     row.set_title(if done { "Marked done" } else { "Not done yet" });
     row.set_subtitle(if done {
@@ -39,7 +39,7 @@ fn dress_done_row(row: &adw::ActionRow, icon: &gtk::Image, btn: &gtk::Button, do
     } else {
         "Not done yet"
     })]);
-    btn.set_label(if done { "Mark not done" } else { "Mark done" });
+    btn.set_label(if done { "Mark Not Done" } else { "Mark Done" });
     btn.set_tooltip_text(Some(if done {
         "Put this session back to not done"
     } else {
@@ -747,10 +747,18 @@ pub fn show_workout_detail_dialog(
                 .subtitle(ride.summary())
                 .subtitle_lines(0)
                 .build();
-            let icon = gtk::Image::from_icon_name("emblem-shared-symbolic");
-            icon.set_css_classes(&["accent"]);
+            // The calendar's own ride icons: the trainer for a ride recorded
+            // here, the bike for one that came in from Intervals.icu. It was
+            // the share emblem, which says nothing about a ride.
+            let icon = crate::ui::resources::sport_icon("Ride", ride.session_id.is_some());
+            icon.add_css_class("accent");
+            icon.set_accessible_role(gtk::AccessibleRole::Img);
             icon.update_property(&[gtk::accessible::Property::Label(
-                "A ride you did on this day",
+                if ride.session_id.is_some() {
+                    "A ride you recorded in Cycle on this day"
+                } else {
+                    "A ride you did on this day"
+                },
             )]);
             row.add_prefix(&icon);
             // A ride recorded here opens in its own window — for a ride that
@@ -766,7 +774,7 @@ pub fn show_workout_detail_dialog(
         }
         content.append(
             &gtk::Label::builder()
-                .label("You rode this day")
+                .label("You Rode This Day")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),

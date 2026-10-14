@@ -91,7 +91,7 @@ pub struct PlayerPage {
     pub last_readings: Rc<RefCell<ReadingsTracker>>,
     /// Consecutive seconds of power data received while the engine is Idle.
     pub power_countdown: Rc<Cell<u32>>,
-    /// Callback wired by `start_timer` for the countdown banner's "Start now" button.
+    /// Callback wired by `start_timer` for the countdown banner's "Start Now" button.
     start_now_cb: ButtonCb,
     /// Playback-control callbacks — set (and replaced) each time `start_timer` is called,
     /// so that buttons are wired exactly once in `new()` and never accumulate handlers.
@@ -135,6 +135,8 @@ pub struct PlayerPage {
     /// the one and tighten the other — see [`PlayerPage::set_fullscreen`].
     clamp: adw::Clamp,
     inner: gtk::Box,
+    /// The on-page fullscreen button, which turns into the way back out.
+    fullscreen_btn: gtk::Button,
 }
 
 impl PlayerPage {
@@ -146,7 +148,7 @@ impl PlayerPage {
         // ── Countdown banner (pre-start) ─────────────────────────────────────
         let countdown_banner = adw::Banner::builder()
             .title("Connect a power meter or trainer to begin")
-            .button_label("Start now")
+            .button_label("Start Now")
             .revealed(true)
             .build();
 
@@ -492,7 +494,7 @@ impl PlayerPage {
         // header explains the pinning, which this app is not allowed to do
         // itself — see `crate::ui::overlay`.
         let overlay_btn = gtk::Button::builder()
-            .icon_name("view-restore-symbolic")
+            .icon_name("picture-in-picture-symbolic")
             .tooltip_text("Open the compact overlay window")
             .css_classes(["circular", "flat"])
             .action_name("win.toggle-overlay")
@@ -613,6 +615,7 @@ impl PlayerPage {
             ladder_steps: Cell::new(ladder_steps(workout)),
             clamp,
             inner,
+            fullscreen_btn,
         }
     }
 
@@ -642,7 +645,7 @@ impl PlayerPage {
                 "Step",
                 Some(&format!("of {}", self.ladder_steps.get())),
             ));
-            self.end_btn.set_label("I'm done");
+            self.end_btn.set_label("I'm Done");
             self.end_btn.set_tooltip_text(Some(
                 "Finish the test and read your FTP off your best minute",
             ));
@@ -665,6 +668,7 @@ impl PlayerPage {
     }
 
     pub fn set_fullscreen(&self, fullscreen: bool) {
+        crate::ui::dress_fullscreen_button(&self.fullscreen_btn, fullscreen);
         self.clamp.set_maximum_size(if fullscreen {
             FULLSCREEN_CLAMP
         } else {
@@ -799,8 +803,8 @@ impl PlayerPage {
             .set_title("Connect a power meter or trainer to begin");
         self.countdown_banner.set_revealed(true);
         // A ride that ended while auto-paused leaves the banner saying
-        // "Resume now"; the next one has nothing to resume.
-        self.countdown_banner.set_button_label(Some("Start now"));
+        // "Resume Now"; the next one has nothing to resume.
+        self.countdown_banner.set_button_label(Some("Start Now"));
         self.dropout_banner.set_revealed(false);
         self.power_countdown.set(0);
         // Cues belong to one workout. Clearing them here means a ride whose
@@ -854,7 +858,7 @@ impl PlayerPage {
     /// (exactly once) when the workout finishes.
     ///
     /// The engine starts automatically after 10 consecutive seconds of power data.
-    /// The countdown banner's "Start now" button bypasses the wait.
+    /// The countdown banner's "Start Now" button bypasses the wait.
     pub fn start_timer(
         page: Rc<RefCell<Self>>,
         engine: Rc<RefCell<WorkoutEngine>>,
@@ -879,8 +883,8 @@ impl PlayerPage {
             }));
         }
 
-        // ── Wire "Start now" button ──────────────────────────────────────────
-        // The same banner says "Resume now" while auto-paused. `start` on a
+        // ── Wire "Start Now" button ──────────────────────────────────────────
+        // The same banner says "Resume Now" while auto-paused. `start` on a
         // paused engine would re-stamp the ride's start time, so a paused ride
         // goes through the pause button's own path instead.
         {
@@ -962,7 +966,7 @@ impl PlayerPage {
                 // and it does not call itself ending a workout.
                 let dialog = if testing {
                     adw::AlertDialog::builder()
-                        .heading("Finished the test?")
+                        .heading("Finished the Test?")
                         .body(
                             "Cycle will read your FTP off your best minute and \
                              offer you the number.",
@@ -976,7 +980,7 @@ impl PlayerPage {
                 };
                 dialog.add_response("cancel", "_Cancel");
                 if testing {
-                    dialog.add_response("end", "_I'm done");
+                    dialog.add_response("end", "_I'm Done");
                     dialog.set_response_appearance("end", adw::ResponseAppearance::Suggested);
                 } else {
                     dialog.add_response("end", "_End Workout");
@@ -1106,10 +1110,10 @@ impl PlayerPage {
                 if let Some(title) = &pause_status {
                     p.countdown_banner.set_title(title);
                 }
-                p.countdown_banner.set_button_label(Some("Resume now"));
+                p.countdown_banner.set_button_label(Some("Resume Now"));
                 p.countdown_banner.set_revealed(true);
             } else {
-                p.countdown_banner.set_button_label(Some("Start now"));
+                p.countdown_banner.set_button_label(Some("Start Now"));
             }
             p.update_session_totals(&session, ftp);
             p.graph.set_playhead(snapshot.elapsed_secs);

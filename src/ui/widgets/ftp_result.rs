@@ -39,7 +39,7 @@ pub fn attach(holder: &gtk::Box, result: Option<RampResult>, on_accept: Rc<dyn F
 
 fn build(result: RampResult, on_accept: Rc<dyn Fn(u32)>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title("Your ramp test")
+        .title("Your Ramp Test")
         .description(OFFERED)
         .build();
 

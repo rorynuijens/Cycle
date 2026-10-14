@@ -214,7 +214,9 @@ pub fn build_content(
 
     // In fullscreen the header bar goes, and its exit button with it. This one
     // floats over the top-right corner of the page instead so there is always a
-    // visible way back that does not require knowing about F11.
+    // visible way back that does not require knowing about F11 — on every page
+    // but the two ride pages, whose own fullscreen button turns into the way
+    // out (see `float_exit_wanted`). There it only covered the banner's button.
     let fs_float_btn = gtk::Button::builder()
         .icon_name("view-restore-symbolic")
         .tooltip_text("Exit Fullscreen")
@@ -239,6 +241,12 @@ pub fn build_content(
         fs_exit_btn,
         fs_float_btn,
     }
+}
+
+/// Whether the floating Exit Fullscreen button should show: in fullscreen, on
+/// any page but the two ride pages, which carry their own way out.
+fn float_exit_wanted(fullscreen: bool, page: Option<&str>) -> bool {
+    fullscreen && !matches!(page, Some("player" | "route_player"))
 }
 
 /// Make fullscreen mean the ride and nothing else.
@@ -274,6 +282,21 @@ pub fn connect_fullscreen(
     // whose map makes the relayout — and so the selection — arrive later.
     let page_before_fullscreen: Rc<RefCell<Option<glib::GString>>> = Rc::new(RefCell::new(None));
 
+    // The page can change while fullscreen — a ride finishing into its summary —
+    // and the floating exit must come back with it.
+    chrome.stack.connect_visible_child_name_notify(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        fs_float_btn,
+        move |stack| {
+            fs_float_btn.set_visible(float_exit_wanted(
+                window.is_fullscreen(),
+                stack.visible_child_name().as_deref(),
+            ));
+        }
+    ));
+
     window.connect_fullscreened_notify(move |win| {
         let fs = win.is_fullscreen();
         // Order matters. A collapsed AdwNavigationSplitView shows whichever of
@@ -288,7 +311,7 @@ pub fn connect_fullscreen(
         split_view.set_collapsed(fs);
         header.set_visible(!fs);
         fs_exit_btn.set_visible(fs);
-        fs_float_btn.set_visible(fs);
+        fs_float_btn.set_visible(float_exit_wanted(fs, stack.visible_child_name().as_deref()));
         player_rc.borrow().set_fullscreen(fs);
         route_player_rc.set_fullscreen(fs);
 
@@ -371,4 +394,30 @@ pub fn make_nav_row(label: &str, icon_name: &str, page_name: &str) -> gtk::ListB
         .child(&row_box)
         .name(page_name)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_leave_the_ride_pages_to_their_own_exit_button() {
+        assert!(!float_exit_wanted(true, Some("player")));
+        assert!(!float_exit_wanted(true, Some("route_player")));
+    }
+
+    #[test]
+    fn should_float_the_exit_over_every_other_page_in_fullscreen() {
+        for page in ["dashboard", "calendar", "summary", "library"] {
+            assert!(float_exit_wanted(true, Some(page)), "{page}");
+        }
+        assert!(float_exit_wanted(true, None));
+    }
+
+    #[test]
+    fn should_never_float_the_exit_outside_fullscreen() {
+        for page in [Some("player"), Some("dashboard"), None] {
+            assert!(!float_exit_wanted(false, page));
+        }
+    }
 }

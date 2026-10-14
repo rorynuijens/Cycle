@@ -442,6 +442,9 @@ impl CycleGtkWindow {
             &blank_route,
             athlete_rc.borrow().ftp_watts,
         ));
+        // Keeps the route cockpit's controls on screen on a short window.
+        self.window
+            .add_breakpoint(route_player_rc.compact_breakpoint());
         // Installed once, like the workout player's: each open reads the route
         // the page is riding at that moment.
         crate::ui::pages::route_player::attach_overlay(

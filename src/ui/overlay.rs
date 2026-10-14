@@ -617,7 +617,7 @@ fn build_menu() -> gio::Menu {
 
     let background = gio::Menu::new();
     background.append(Some("Solid"), Some("overlay.opacity::solid"));
-    background.append(Some("Semi-transparent"), Some("overlay.opacity::semi"));
+    background.append(Some("Semi-Transparent"), Some("overlay.opacity::semi"));
     background.append(Some("Faint"), Some("overlay.opacity::faint"));
     menu.append_section(Some("Background"), &background);
 

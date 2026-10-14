@@ -503,7 +503,7 @@ impl PlanCard {
             row.add_prefix(&icon);
 
             let done = gtk::Button::builder()
-                .label("Mark done")
+                .label("Mark Done")
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
                 .tooltip_text("Mark this session done without riding it here")
@@ -913,7 +913,7 @@ impl PlanCard {
             .build();
         content.append(
             &gtk::Label::builder()
-                .label("Training days")
+                .label("Training Days")
                 .halign(gtk::Align::Start)
                 .css_classes(["caption-heading", "dim-label"])
                 .build(),

@@ -182,6 +182,20 @@ pub type ReloadHolder = std::rc::Rc<std::cell::RefCell<Option<ReloadFn>>>;
 ///
 /// Does nothing when the holder has not been filled in yet: a page whose rows
 /// exist before its rebuild closure does is the ordinary case, not an error.
+/// Show a ride page's fullscreen button as what pressing it will do: enter
+/// fullscreen, or leave it. It drives the same toggle either way, so only the
+/// icon and the label change — matching the window's own exit button.
+pub fn dress_fullscreen_button(btn: &gtk::Button, fullscreen: bool) {
+    use adw::prelude::*;
+    if fullscreen {
+        btn.set_icon_name("view-restore-symbolic");
+        btn.set_tooltip_text(Some("Exit Fullscreen"));
+    } else {
+        btn.set_icon_name("view-fullscreen-symbolic");
+        btn.set_tooltip_text(Some("Fullscreen"));
+    }
+}
+
 pub fn call_reload(holder: &ReloadHolder) {
     let f = holder.borrow().clone();
     if let Some(f) = f {

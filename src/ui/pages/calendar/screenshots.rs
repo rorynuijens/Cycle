@@ -257,11 +257,82 @@ fn player_page(power: u32) -> crate::ui::pages::player::PlayerPage {
     page
 }
 
+/// The cockpit auto-paused, partway through counting back in.
+///
+/// The banner is dressed directly: the tick that raises it needs a trainer.
+fn shoot_player_auto_paused(name: &str, width: i32, height: i32) {
+    let page = player_page(0);
+    let banner = find_banner(page.widget().upcast_ref()).expect("the player has a banner");
+    banner.set_title(&crate::training::auto_pause::banner_title(3));
+    banner.set_button_label(Some("Resume Now"));
+    banner.set_revealed(true);
+    let window = adw::Window::builder().content(page.widget()).build();
+    shoot(&window, width, height, name);
+}
+
+/// The ride pages' fullscreen button must offer the way back out once the
+/// window is fullscreen. It used to keep showing "enter fullscreen" there.
+fn assert_the_fullscreen_button_turns_around() {
+    fn tooltips(w: &gtk::Widget, out: &mut Vec<(String, String)>) {
+        if let Ok(b) = w.clone().downcast::<gtk::Button>() {
+            if let (Some(t), Some(i)) = (b.tooltip_text(), b.icon_name()) {
+                out.push((t.to_string(), i.to_string()));
+            }
+        }
+        let mut c = w.first_child();
+        while let Some(ch) = c {
+            tooltips(&ch, out);
+            c = ch.next_sibling();
+        }
+    }
+    let player = player_page(187);
+    let route = crate::ui::pages::route_player::RoutePlayerPage::new(&climb(), 200);
+    let pages: [(&dyn Fn(bool), gtk::Widget); 2] = [
+        (
+            &|fs| player.set_fullscreen(fs),
+            player.widget().clone().upcast(),
+        ),
+        (
+            &|fs| route.set_fullscreen(fs),
+            route.widget().clone().upcast(),
+        ),
+    ];
+    for (set, widget) in pages {
+        for (fs, tooltip, icon) in [
+            (true, "Exit Fullscreen", "view-restore-symbolic"),
+            (false, "Fullscreen", "view-fullscreen-symbolic"),
+        ] {
+            set(fs);
+            let mut found = Vec::new();
+            tooltips(&widget, &mut found);
+            assert!(
+                found.iter().any(|(t, i)| t == tooltip && i == icon),
+                "fullscreen = {fs}: no {tooltip:?} button with {icon}, found {found:?}"
+            );
+        }
+    }
+}
+
+/// The first `AdwBanner` under `w`.
+fn find_banner(w: &gtk::Widget) -> Option<adw::Banner> {
+    if let Ok(b) = w.clone().downcast::<adw::Banner>() {
+        return Some(b);
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(b) = find_banner(&c) {
+            return Some(b);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
 /// The cockpit riding the ramp test, part-way up the ladder.
 ///
 /// The two things test mode changes are both here: "Remaining" has become
 /// "Step (of 20)" with the step number under it, and "End Workout" has become
-/// "I'm done" and stopped being red.
+/// "I'm Done" and stopped being red.
 fn shoot_ramp_player(name: &str, width: i32, height: i32) {
     use crate::data::session::LiveReadings;
 
@@ -698,6 +769,7 @@ fn climb() -> crate::data::route::Route {
 fn shoot_route_player(name: &str, width: i32, height: i32) {
     let page = crate::ui::pages::route_player::RoutePlayerPage::new(&climb(), 200);
     let window = adw::Window::builder().content(page.widget()).build();
+    window.add_breakpoint(page.compact_breakpoint());
     // Its numbers are written by the ride loop, which needs a trainer. Dress
     // them directly so the shot shows a cockpit rather than a row of dashes.
     write_numbers(
@@ -956,6 +1028,7 @@ fn screenshots() {
     shoot_player("12-player-900x700", 900, 700);
     shoot_player_at("12b-player-sprint-900", 900, 700, 1240);
     shoot_player_cue("13-player-cue", 1100, 780);
+    shoot_player_auto_paused("13b-player-auto-paused-900", 900, 700);
 
     // Ahead of the route and week shots below, deliberately: `shoot_route_player`
     // builds a Shumate map, and with no tile server reachable it either fails to
@@ -984,8 +1057,11 @@ fn screenshots() {
     assert_the_route_cockpit_holds_still();
     assert_the_overlay_holds_still();
     assert_the_course_overlay_holds_still();
+    assert_the_fullscreen_button_turns_around();
 
     shoot_route_player("14-route-1100x780", 1100, 780);
+    shoot_route_player("14b-route-900x700", 900, 700);
+    shoot_route_player("14c-route-1400x900", 1400, 900);
     shoot_week("15-week-ridden-plan", 1000, 700);
 
     // The ramp test: the cockpit in test mode, and the result it offers after.
@@ -1116,6 +1192,19 @@ fn screenshots() {
         "04-completed-keeps-graph",
         760,
     );
+    // A ride recorded here opens from the list, and says so with a chevron.
+    shoot_detail_dialog(
+        &entry(3, "4x4 Intervals", true),
+        EntryMark::default(),
+        vec![crate::training::matching::DayRide {
+            name: "4x4 Intervals".into(),
+            duration_secs: 2880,
+            tss: Some(62.0),
+            session_id: Some(1),
+        }],
+        "04b-ridden-here-opens",
+        760,
+    );
 
     // A route has no power profile to draw, and must not get an empty one.
     let mut route_day = entry(1, "Alpe d'Huez", false);
@@ -1134,6 +1223,8 @@ fn screenshots() {
 
     theme(true);
     shoot_player("16-player-dark", 1100, 780);
+    shoot_route_player("14d-route-dark", 1100, 780);
+    shoot_player_auto_paused("13c-player-auto-paused-dark", 900, 700);
     shoot_detail_dialog(
         &entry(1, "Active Recovery 45", false),
         eased_twice_mark(),

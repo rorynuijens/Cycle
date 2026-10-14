@@ -2,7 +2,9 @@
 
 These icons come from the GNOME icon development kit
 (<https://gitlab.gnome.org/Teams/Design/icon-development-kit>), which is
-dedicated to the public domain under CC0-1.0.
+dedicated to the public domain under CC0-1.0 — all except
+`picture-in-picture.svg`, which the kit does not have and was drawn for Cycle
+in its style (the compact overlay's button, both ride pages).
 
 They are bundled because the GNOME HIG recommends apps ship any icon that is
 not part of the guaranteed icon-naming set — relying on the system theme for

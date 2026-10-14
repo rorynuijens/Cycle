@@ -49,7 +49,7 @@ fn build(
     on_count_anyway: Rc<dyn Fn()>,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title("Check this ride")
+        .title("Check This Ride")
         .description(if dismissed { COUNTED } else { WITHHELD })
         .build();
 
@@ -77,7 +77,7 @@ fn build(
 
     if !dismissed {
         let button = gtk::Button::builder()
-            .label("Count it anyway")
+            .label("Count It Anyway")
             .valign(gtk::Align::Center)
             .tooltip_text("Count this ride towards your fitness and show it to the coach")
             .build();
