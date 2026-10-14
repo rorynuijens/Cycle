@@ -51,8 +51,41 @@ const _: () = assert!(LANE_OFFSET_M > DASH_HALF_WIDTH_M && LANE_OFFSET_M < ROAD_
 /// and how far below the road it sits so the road surface always wins the depth
 /// test even where the grid's straight edges cut under a bend.
 pub const GROUND_SPACING_M: f32 = 20.0;
-pub const GROUND_RADIUS_M: f32 = 600.0;
+pub const GROUND_RADIUS_M: f32 = 1_200.0;
 pub const GROUND_DROP_M: f32 = 0.3;
+
+/// Ground this close to the road is held flat just under it, whatever the
+/// terrain does. The width is what makes that a guarantee rather than a hope:
+/// any grid triangle over the road surface has its corners within one cell
+/// diagonal of it, the surface is within a half-width of the centreline, and
+/// the centreline within half a resampling step of a measured point — so all
+/// three corners are held, and the triangle cannot rise through the road.
+pub const SHOULDER_M: f32 = 35.0;
+
+/// Spacing the centreline is resampled at before distances to it are taken,
+/// in metres. A recorded GPX is a point every 8–9 m; a planned one can be a
+/// point every 100.
+const RESAMPLE_M: f32 = 5.0;
+
+const _: () = assert!(
+    SHOULDER_M
+        >= GROUND_SPACING_M * std::f32::consts::SQRT_2 + ROAD_HALF_WIDTH_M + RESAMPLE_M / 2.0
+);
+
+/// Beyond the shoulder the terrain blends in, reaching its own height here.
+const BLEND_END_M: f32 = 120.0;
+
+/// The elevation tiles and the GPX rarely agree on height to the metre — a
+/// barometer drifts, a tile averages a valley. Near the road the land is
+/// shifted by the local difference so the road sits on it; by this distance
+/// the shift has eased to the route's typical difference, so two stretches of
+/// road that disagree do not tear the land between them.
+const LOCAL_FIT_END_M: f32 = 600.0;
+
+/// Raw elevation below this is seabed: the tiles carry ocean depths, which
+/// would draw the Marmara coast as a trench. Seabed is flattened to sea level
+/// and coloured as water. Low enough that a Dutch polder stays land.
+pub const SEABED_BELOW_M: f32 = -2.0;
 
 /// Surface lift of the road and its paint above the centreline, in metres —
 /// separate layers so they never fight each other in the depth buffer.
@@ -69,6 +102,10 @@ pub const MATERIAL_GROUND: f32 = 1.0;
 const ROAD_RGB: [f32; 3] = [0.30, 0.31, 0.33];
 const PAINT_RGB: [f32; 3] = [0.92, 0.92, 0.88];
 const GROUND_RGB: [f32; 3] = [0.36, 0.52, 0.27];
+const WATER_RGB: [f32; 3] = [0.20, 0.36, 0.50];
+
+/// Raw terrain height at a scene position `(x, z)`, where the data reaches.
+pub type Terrain<'a> = &'a dyn Fn(f32, f32) -> Option<f32>;
 
 /// Converts between WGS-84 degrees and local metres around one origin.
 ///
@@ -122,7 +159,6 @@ impl LocalFrame {
     }
 
     /// `(lat, lng)` of a point `east`, `north` metres from the origin.
-    #[cfg(test)]
     pub fn to_geo(self, east: f64, north: f64) -> (f64, f64) {
         (
             self.lat0 + north / self.m_per_deg_lat,
@@ -181,15 +217,31 @@ pub struct CourseScene {
 }
 
 impl CourseScene {
-    /// Build the scene for `route`: the road, its paint, and the ground.
+    /// Build the scene for `route`: the road, its paint, and flat ground.
     /// `None` for a route too short to draw — fewer than two points.
     pub fn build(route: &Route) -> Option<Self> {
+        Self::build_with(route, None)
+    }
+
+    /// Build the scene with the land shaped by `dem` where it has heights.
+    pub fn build_with(route: &Route, dem: Option<&crate::data::terrain::Dem>) -> Option<Self> {
         let frame = LocalFrame::around(route)?;
         let road = centreline(route, &frame);
         if road.len() < 2 {
             return None;
         }
-        let mut mesh = ground_mesh(&road, GROUND_SPACING_M, GROUND_RADIUS_M, GROUND_DROP_M);
+        let sample = |x: f32, z: f32| {
+            let (lat, lng) = frame.to_geo(f64::from(x), -f64::from(z));
+            dem?.height_at(lat, lng)
+        };
+        let terrain: Option<Terrain> = dem.map(|_| &sample as Terrain);
+        let mut mesh = ground_mesh(
+            &road,
+            GROUND_SPACING_M,
+            GROUND_RADIUS_M,
+            GROUND_DROP_M,
+            terrain,
+        );
         mesh.extend(road_mesh(&road, ROAD_HALF_WIDTH_M));
         mesh.extend(dash_mesh(&road));
         Some(Self { road, mesh })
@@ -384,18 +436,37 @@ fn ribbon(
     mesh
 }
 
-/// A ground grid reaching `radius` either side of the road, each vertex at the
-/// height of the nearest road point less `drop`.
+/// A ground grid reaching `radius` either side of the road.
 ///
-/// Until real terrain arrives this is the road's own landscape: flat across,
-/// rising and falling with the road. Cells whose corners are not all within
-/// reach are left out, so the ground ends in a ragged edge the fog hides.
-pub fn ground_mesh(road: &[RoadPoint], spacing: f32, radius: f32, drop: f32) -> Mesh {
+/// Without `terrain` every vertex sits at the height of the nearest road point
+/// less `drop`: the road's own landscape, flat across, rising and falling with
+/// the road. With it, the land takes its real shape away from the road —
+/// held flat within [`SHOULDER_M`], blended in to [`BLEND_END_M`], and
+/// shifted to agree with the road's height (see [`LOCAL_FIT_END_M`]).
+///
+/// Cells whose corners are not all within reach are left out, so the ground
+/// ends in a ragged edge the haze hides.
+pub fn ground_mesh(
+    road: &[RoadPoint],
+    spacing: f32,
+    radius: f32,
+    drop: f32,
+    terrain: Option<Terrain>,
+) -> Mesh {
     let mut mesh = Mesh::default();
     if road.is_empty() || spacing <= 0.0 || radius <= 0.0 {
         return mesh;
     }
-    let index = NearestIndex::new(road, radius);
+    let line = resample(road, RESAMPLE_M);
+    let index = NearestIndex::new(&line, radius);
+
+    // How far the terrain sits from the road, point by point, and typically.
+    let raw_at = |x: f32, z: f32| terrain.and_then(|t| t(x, z)).map(sea_level);
+    let offsets: Vec<Option<f32>> = line
+        .iter()
+        .map(|p| raw_at(p.pos[0], p.pos[2]).map(|h| p.pos[1] - h))
+        .collect();
+    let typical = median(offsets.iter().flatten().copied()).unwrap_or(0.0);
 
     let (mut x_lo, mut x_hi, mut z_lo, mut z_hi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
     for p in road {
@@ -413,19 +484,38 @@ pub fn ground_mesh(road: &[RoadPoint], spacing: f32, radius: f32, drop: f32) -> 
     let cols = (i_hi - i_lo + 1) as usize;
     let rows = (j_hi - j_lo + 1) as usize;
 
-    let colour = [GROUND_RGB[0], GROUND_RGB[1], GROUND_RGB[2], MATERIAL_GROUND];
+    let land = [GROUND_RGB[0], GROUND_RGB[1], GROUND_RGB[2], MATERIAL_GROUND];
+    let water = [WATER_RGB[0], WATER_RGB[1], WATER_RGB[2], MATERIAL_PLAIN];
     let mut slot: Vec<Option<u32>> = vec![None; cols * rows];
     for r in 0..rows {
         for c in 0..cols {
             let x = (i_lo + c as i64) as f32 * spacing;
             let z = (j_lo + r as i64) as f32 * spacing;
-            if let Some(y) = index.nearest_height(x, z) {
-                slot[r * cols + c] = Some(mesh.vertices.len() as u32);
-                mesh.vertices.push(Vertex {
-                    pos: [x, y - drop, z],
-                    colour,
-                });
-            }
+            let Some((d2, i)) = index.nearest(x, z) else {
+                continue;
+            };
+            let dist = d2.sqrt();
+            let flat = line[i].pos[1] - drop;
+            let raw = terrain.and_then(|t| t(x, z));
+            let (y, colour) = match raw {
+                Some(raw) if dist > SHOULDER_M => {
+                    let near = offsets[i].unwrap_or(typical);
+                    let shift = lerp(
+                        near,
+                        typical,
+                        smoothstep(BLEND_END_M, LOCAL_FIT_END_M, dist),
+                    );
+                    let fitted = sea_level(raw) + shift;
+                    let y = lerp(flat, fitted, smoothstep(SHOULDER_M, BLEND_END_M, dist));
+                    (y, if raw < SEABED_BELOW_M { water } else { land })
+                }
+                _ => (flat, land),
+            };
+            slot[r * cols + c] = Some(mesh.vertices.len() as u32);
+            mesh.vertices.push(Vertex {
+                pos: [x, y, z],
+                colour,
+            });
         }
     }
     for r in 0..rows.saturating_sub(1) {
@@ -444,18 +534,87 @@ pub fn ground_mesh(road: &[RoadPoint], spacing: f32, radius: f32, drop: f32) -> 
     mesh
 }
 
-/// Road points bucketed on a coarse grid, for "nearest road point within
-/// reach" without testing every point for every ground vertex.
+/// Seabed raised to sea level; land left alone.
+fn sea_level(raw: f32) -> f32 {
+    if raw < SEABED_BELOW_M {
+        0.0
+    } else {
+        raw
+    }
+}
+
+/// The centreline with a point at least every `step` metres, so a distance to
+/// the nearest point is within `step / 2` of the distance to the road.
+fn resample(road: &[RoadPoint], step: f32) -> Vec<RoadPoint> {
+    let mut out = Vec::with_capacity(road.len());
+    for pair in road.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        out.push(a);
+        let len = ((b.pos[0] - a.pos[0]).powi(2) + (b.pos[2] - a.pos[2]).powi(2)).sqrt();
+        let extra = (len / step).ceil() as usize;
+        for k in 1..extra {
+            let t = k as f32 / extra as f32;
+            out.push(RoadPoint {
+                pos: lerp3(a.pos, b.pos, t),
+                distance_m: a.distance_m + (b.distance_m - a.distance_m) * t,
+            });
+        }
+    }
+    if let Some(last) = road.last() {
+        out.push(*last);
+    }
+    out
+}
+
+fn median(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut v: Vec<f32> = values.filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    Some(v[v.len() / 2])
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// 0 at or before `lo`, 1 at or past `hi`, eased between.
+fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
+    let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Road points bucketed on a grid, for "nearest road point within reach"
+/// without testing every point for every ground vertex.
+///
+/// A ground grid has up to a million vertices, most of them far from the road,
+/// and searching outwards from each one cost a minute in a debug build — the
+/// rider saw only sky. So the search is done once per bucket instead: each
+/// bucket keeps the few road points that could be nearest to *anywhere* in it,
+/// and a vertex only measures those.
 struct NearestIndex<'a> {
     road: &'a [RoadPoint],
     cell: f32,
     reach: f32,
     buckets: std::collections::HashMap<(i64, i64), Vec<usize>>,
+    /// Per bucket, every road point that can be nearest to some position in
+    /// it — see [`NearestIndex::candidates`]. Filled as buckets are visited.
+    candidates: CandidateCache,
 }
 
+/// A bucket's place in the grid.
+type BucketKey = (i64, i64);
+/// Per-bucket candidate lists, shared out as cheap clones.
+type CandidateCache =
+    std::cell::RefCell<std::collections::HashMap<BucketKey, std::rc::Rc<[usize]>>>;
+
 impl<'a> NearestIndex<'a> {
+    /// Bucket width, in metres.
+    const CELL_M: f32 = 100.0;
+
     fn new(road: &'a [RoadPoint], reach: f32) -> Self {
-        let cell = reach.max(1.0);
+        let cell = Self::CELL_M;
         let mut buckets: std::collections::HashMap<(i64, i64), Vec<usize>> =
             std::collections::HashMap::new();
         for (i, p) in road.iter().enumerate() {
@@ -469,6 +628,7 @@ impl<'a> NearestIndex<'a> {
             cell,
             reach,
             buckets,
+            candidates: Default::default(),
         }
     }
 
@@ -476,26 +636,107 @@ impl<'a> NearestIndex<'a> {
         ((x / cell).floor() as i64, (z / cell).floor() as i64)
     }
 
-    /// Height of the nearest road point within reach of `(x, z)`, if any.
-    fn nearest_height(&self, x: f32, z: f32) -> Option<f32> {
+    fn d2(&self, i: usize, x: f32, z: f32) -> f32 {
+        let p = self.road[i].pos;
+        (p[0] - x).powi(2) + (p[2] - z).powi(2)
+    }
+
+    /// Calls `visit` for every road point in the buckets within `limit` of
+    /// the bucket holding `(x, z)`.
+    fn for_each_within(&self, x: f32, z: f32, limit: f32, mut visit: impl FnMut(usize)) {
         let (kx, kz) = Self::key(self.cell, x, z);
-        let mut best: Option<(f32, f32)> = None;
-        for dx in -1..=1 {
-            for dz in -1..=1 {
-                let Some(ids) = self.buckets.get(&(kx + dx, kz + dz)) else {
-                    continue;
-                };
-                for &i in ids {
-                    let p = self.road[i].pos;
-                    let d2 = (p[0] - x).powi(2) + (p[2] - z).powi(2);
-                    if best.is_none_or(|(b, _)| d2 < b) {
-                        best = Some((d2, p[1]));
+        let rings = (limit / self.cell).ceil() as i64 + 1;
+        for dx in -rings..=rings {
+            for dz in -rings..=rings {
+                if let Some(ids) = self.buckets.get(&(kx + dx, kz + dz)) {
+                    ids.iter().for_each(|&i| visit(i));
+                }
+            }
+        }
+    }
+
+    /// Squared distance to the nearest road point within `limit` of `(x, z)`,
+    /// searching rings of buckets outwards and stopping once no point in the
+    /// next ring could beat the best found: any point `k` rings out is at
+    /// least `(k − 1)` cells away.
+    fn nearest_by_rings(&self, x: f32, z: f32, limit: f32) -> Option<f32> {
+        let (kx, kz) = Self::key(self.cell, x, z);
+        let rings = (limit / self.cell).ceil() as i64 + 1;
+        let mut best: Option<f32> = None;
+        for k in 0..=rings {
+            if let Some(b) = best {
+                let floor = (k - 1).max(0) as f32 * self.cell;
+                if floor * floor > b {
+                    break;
+                }
+            }
+            for dx in -k..=k {
+                for dz in -k..=k {
+                    if dx.abs() != k && dz.abs() != k {
+                        continue; // inside the ring, already searched
+                    }
+                    let Some(ids) = self.buckets.get(&(kx + dx, kz + dz)) else {
+                        continue;
+                    };
+                    for &i in ids {
+                        let d2 = self.d2(i, x, z);
+                        if best.is_none_or(|b| d2 < b) {
+                            best = Some(d2);
+                        }
                     }
                 }
             }
         }
+        best.filter(|d2| *d2 <= limit * limit)
+    }
+
+    /// Every road point that can be the nearest one to some position in the
+    /// bucket `key`.
+    ///
+    /// With `c` the bucket's centre, `h` its half-diagonal and `m` the nearest
+    /// road point to `c`: for any `p` in the bucket, its nearest point `q`
+    /// has `|p − q| ≤ |p − m| ≤ |c − m| + h`, so `|c − q| ≤ |c − m| + 2h`.
+    /// Keeping every point that close to the centre therefore keeps the
+    /// nearest one of every position in the bucket — exactly, not roughly.
+    fn candidates(&self, key: (i64, i64)) -> std::rc::Rc<[usize]> {
+        if let Some(list) = self.candidates.borrow().get(&key) {
+            return list.clone();
+        }
+        let half_diagonal = self.cell * std::f32::consts::SQRT_2 / 2.0;
+        let (cx, cz) = (
+            (key.0 as f32 + 0.5) * self.cell,
+            (key.1 as f32 + 0.5) * self.cell,
+        );
+        let list: std::rc::Rc<[usize]> =
+            match self.nearest_by_rings(cx, cz, self.reach + half_diagonal) {
+                None => std::rc::Rc::from([]),
+                Some(d2) => {
+                    let keep = d2.sqrt() + 2.0 * half_diagonal;
+                    let mut ids = Vec::new();
+                    self.for_each_within(cx, cz, keep, |i| {
+                        if self.d2(i, cx, cz) <= keep * keep {
+                            ids.push(i);
+                        }
+                    });
+                    ids.into()
+                }
+            };
+        self.candidates.borrow_mut().insert(key, list.clone());
+        list
+    }
+
+    /// Squared distance to, and index of, the nearest road point within reach
+    /// of `(x, z)`.
+    fn nearest(&self, x: f32, z: f32) -> Option<(f32, usize)> {
+        let list = self.candidates(Self::key(self.cell, x, z));
+        let mut best: Option<(f32, usize)> = None;
+        for &i in list.iter() {
+            let d2 = self.d2(i, x, z);
+            if best.is_none_or(|(b, _)| d2 < b) {
+                best = Some((d2, i));
+            }
+        }
         best.filter(|(d2, _)| *d2 <= self.reach * self.reach)
-            .map(|(_, y)| y)
     }
 }
 
@@ -864,8 +1105,11 @@ mod tests {
         // Climbing 0.4 m every 10 m. Every ground vertex sits under the
         // nearest road point, so none can rise through the road surface.
         let road = road_of(&straight_route(200, 10.0, 0.4));
-        let ground = ground_mesh(&road, GROUND_SPACING_M, 100.0, GROUND_DROP_M);
+        let ground = ground_mesh(&road, GROUND_SPACING_M, 100.0, GROUND_DROP_M, None);
         assert!(!ground.vertices.is_empty());
+        // Heights come from the road resampled every few metres, so a vertex
+        // sits under the road where it is, not under the nearest GPX point.
+        let road = resample(&road, RESAMPLE_M);
         for v in &ground.vertices {
             let d2 = |p: &RoadPoint| (p.pos[0] - v.pos[0]).powi(2) + (p.pos[2] - v.pos[2]).powi(2);
             let best = road.iter().map(d2).fold(f32::MAX, f32::min);
@@ -885,7 +1129,7 @@ mod tests {
     #[test]
     fn should_not_reach_further_from_the_road_than_its_radius() {
         let road = road_of(&straight_route(50, 10.0, 0.0));
-        let ground = ground_mesh(&road, 10.0, 100.0, 0.0);
+        let ground = ground_mesh(&road, 10.0, 100.0, 0.0, None);
         let x0 = road[0].pos[0];
         for v in &ground.vertices {
             assert!((v.pos[0] - x0).abs() <= 100.0 + 1e-3, "{:?}", v.pos);
@@ -895,17 +1139,21 @@ mod tests {
     #[test]
     fn should_build_the_same_ground_twice() {
         let road = road_of(&straight_route(80, 10.0, 0.2));
-        let a = ground_mesh(&road, GROUND_SPACING_M, 200.0, GROUND_DROP_M);
-        let b = ground_mesh(&road, GROUND_SPACING_M, 200.0, GROUND_DROP_M);
+        let a = ground_mesh(&road, GROUND_SPACING_M, 200.0, GROUND_DROP_M, None);
+        let b = ground_mesh(&road, GROUND_SPACING_M, 200.0, GROUND_DROP_M, None);
         assert_eq!(a, b);
     }
 
     #[test]
     fn should_build_no_ground_from_nonsense_settings() {
         let road = road_of(&straight_route(10, 10.0, 0.0));
-        assert!(ground_mesh(&road, 0.0, 100.0, 0.0).vertices.is_empty());
-        assert!(ground_mesh(&road, 10.0, -1.0, 0.0).vertices.is_empty());
-        assert!(ground_mesh(&[], 10.0, 100.0, 0.0).vertices.is_empty());
+        assert!(ground_mesh(&road, 0.0, 100.0, 0.0, None)
+            .vertices
+            .is_empty());
+        assert!(ground_mesh(&road, 10.0, -1.0, 0.0, None)
+            .vertices
+            .is_empty());
+        assert!(ground_mesh(&[], 10.0, 100.0, 0.0, None).vertices.is_empty());
     }
 
     #[test]
@@ -982,5 +1230,185 @@ mod tests {
         let v = look_at([1.0, 2.0, 3.0], [4.0, 1.0, -9.0]);
         assert_eq!(mul4(&id, &v), v);
         assert_eq!(mul4(&v, &id), v);
+    }
+
+    // ── Terrain ───────────────────────────────────────────────────────────────
+
+    /// Distance from `(x, z)` to the nearest point of `line`, by brute force.
+    fn brute_nearest(line: &[RoadPoint], x: f32, z: f32) -> f32 {
+        line.iter()
+            .map(|p| ((p.pos[0] - x).powi(2) + (p.pos[2] - z).powi(2)).sqrt())
+            .fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn should_find_the_same_nearest_point_as_a_brute_force_search() {
+        // A road that wanders, so the nearest point is often not the obvious
+        // one and the ring search has to look past its first find.
+        let line: Vec<RoadPoint> = (0..400)
+            .map(|i| {
+                let t = i as f32 * 0.05;
+                RoadPoint {
+                    pos: [
+                        t.sin() * 300.0 + i as f32,
+                        0.0,
+                        t.cos() * 250.0 - i as f32 * 3.0,
+                    ],
+                    distance_m: i as f32,
+                }
+            })
+            .collect();
+        let index = NearestIndex::new(&line, 1_200.0);
+        for gx in -15..15 {
+            for gz in -15..15 {
+                let (x, z) = (gx as f32 * 97.0, gz as f32 * 113.0 - 600.0);
+                let want = brute_nearest(&line, x, z);
+                match index.nearest(x, z) {
+                    Some((d2, _)) => assert!((d2.sqrt() - want).abs() < 1e-2, "{x},{z}"),
+                    None => assert!(want > 1_200.0, "{x},{z} is {want} m from the road"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_resample_without_a_gap_wider_than_the_step() {
+        let road = road_of(&straight_route(5, 37.0, 1.0));
+        let line = resample(&road, RESAMPLE_M);
+        assert_eq!(line.first(), road.first());
+        assert_eq!(line.last(), road.last());
+        for pair in line.windows(2) {
+            let gap = ((pair[1].pos[0] - pair[0].pos[0]).powi(2)
+                + (pair[1].pos[2] - pair[0].pos[2]).powi(2))
+            .sqrt();
+            assert!(gap <= RESAMPLE_M + 1e-3, "{gap}");
+            assert!(pair[1].distance_m >= pair[0].distance_m);
+        }
+    }
+
+    /// A hillside rising 0.5 m for every metre east and west of the road,
+    /// standing `above` metres over it — far steeper than any road's verge.
+    fn valley(above: f32) -> impl Fn(f32, f32) -> Option<f32> {
+        move |x: f32, _z: f32| Some(10.0 + above + 0.5 * x.abs())
+    }
+
+    #[test]
+    fn should_hold_the_shoulder_flat_under_the_road_however_steep_the_land() {
+        let road = road_of(&straight_route(200, 10.0, 0.0));
+        let line = resample(&road, RESAMPLE_M);
+        let land = valley(40.0);
+        let ground = ground_mesh(&road, GROUND_SPACING_M, 400.0, GROUND_DROP_M, Some(&land));
+        let mut held = 0;
+        for v in &ground.vertices {
+            if brute_nearest(&line, v.pos[0], v.pos[2]) <= SHOULDER_M {
+                held += 1;
+                assert!(
+                    (v.pos[1] - (10.0 - GROUND_DROP_M)).abs() < 1e-3,
+                    "shoulder vertex at {:?} rose with the hillside",
+                    v.pos
+                );
+            }
+        }
+        assert!(held > 0);
+    }
+
+    #[test]
+    fn should_reach_the_lands_own_shape_far_from_the_road() {
+        // The land here is 40 m higher than the GPX says the road is. Near the
+        // road that is taken up as an offset; far away the land keeps its
+        // shape, shifted by the route's typical difference.
+        let road = road_of(&straight_route(200, 10.0, 0.0));
+        let line = resample(&road, RESAMPLE_M);
+        let land = valley(40.0);
+        let ground = ground_mesh(&road, GROUND_SPACING_M, 1_000.0, 0.0, Some(&land));
+        // At the road the land reads 50 m and the road is at 10: −40.
+        let typical = -40.0;
+        let far: Vec<&Vertex> = ground
+            .vertices
+            .iter()
+            .filter(|v| brute_nearest(&line, v.pos[0], v.pos[2]) > LOCAL_FIT_END_M + 1.0)
+            .collect();
+        assert!(!far.is_empty());
+        for v in far {
+            let raw = 50.0 + 0.5 * v.pos[0].abs();
+            assert!((v.pos[1] - (raw + typical)).abs() < 1e-2, "{:?}", v.pos);
+        }
+    }
+
+    #[test]
+    fn should_rise_steadily_from_the_shoulder_to_the_hills() {
+        let road = road_of(&straight_route(200, 10.0, 0.0));
+        let land = valley(0.0);
+        let ground = ground_mesh(&road, 10.0, 400.0, 0.0, Some(&land));
+        // Walk east along one row: never a step down on a hillside going up.
+        let z = (road[100].pos[2] / 10.0).round() * 10.0;
+        let mut row: Vec<[f32; 3]> = ground
+            .vertices
+            .iter()
+            .filter(|v| (v.pos[2] - z).abs() < 0.5 && v.pos[0] >= 0.0)
+            .map(|v| v.pos)
+            .collect();
+        row.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert!(row.len() > 10);
+        for w in row.windows(2) {
+            assert!(w[1][1] >= w[0][1] - 1e-3, "{:?} then {:?}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn should_fall_back_to_flat_ground_where_the_land_is_unknown() {
+        let road = road_of(&straight_route(100, 10.0, 0.0));
+        let patchy = |x: f32, _z: f32| (x < 0.0).then_some(60.0);
+        let ground = ground_mesh(&road, GROUND_SPACING_M, 400.0, GROUND_DROP_M, Some(&patchy));
+        for v in &ground.vertices {
+            assert!(v.pos[1].is_finite());
+            if v.pos[0] > 0.0 {
+                assert!(
+                    (v.pos[1] - (10.0 - GROUND_DROP_M)).abs() < 1e-3,
+                    "{:?}",
+                    v.pos
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_lay_seabed_flat_at_sea_level_and_keep_a_polder_as_land() {
+        // A coastal road at sea level: deep water to the west, a polder 1.5 m
+        // below sea level to the east.
+        let road = road_of(&straight_route(200, 10.0, 0.0));
+        let line = resample(&road, RESAMPLE_M);
+        let coast = |x: f32, _z: f32| {
+            Some(if x < -100.0 {
+                -40.0
+            } else if x > 100.0 {
+                -1.5
+            } else {
+                10.0
+            })
+        };
+        let ground = ground_mesh(&road, GROUND_SPACING_M, 1_000.0, 0.0, Some(&coast));
+        for v in &ground.vertices {
+            if brute_nearest(&line, v.pos[0], v.pos[2]) <= LOCAL_FIT_END_M + 1.0 {
+                continue;
+            }
+            if v.pos[0] < -100.0 {
+                assert_eq!(v.colour[..3], WATER_RGB, "seabed must read as water");
+                assert!((v.pos[1] - 0.0).abs() < 1e-3, "{:?}", v.pos);
+            } else if v.pos[0] > 100.0 {
+                assert_eq!(v.colour[..3], GROUND_RGB, "a polder is land");
+                assert!((v.pos[1] + 1.5).abs() < 1e-3, "{:?}", v.pos);
+            }
+        }
+    }
+
+    #[test]
+    fn should_shape_nothing_when_given_no_land_at_all() {
+        let road = road_of(&straight_route(100, 10.0, 0.2));
+        let none = |_: f32, _: f32| None;
+        assert_eq!(
+            ground_mesh(&road, GROUND_SPACING_M, 300.0, GROUND_DROP_M, Some(&none)),
+            ground_mesh(&road, GROUND_SPACING_M, 300.0, GROUND_DROP_M, None),
+        );
     }
 }

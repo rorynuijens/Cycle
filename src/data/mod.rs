@@ -15,6 +15,7 @@ pub mod session;
 pub mod settings;
 pub mod sport;
 pub mod streams;
+pub mod terrain;
 pub mod training_profile;
 pub mod transfer;
 pub mod workout;

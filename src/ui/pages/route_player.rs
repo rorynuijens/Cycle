@@ -713,6 +713,11 @@ impl RoutePlayerPage {
         breakpoint
     }
 
+    /// Hand over the runtime the 3D view fetches its terrain on.
+    pub fn set_runtime(&self, rt: tokio::runtime::Handle) {
+        self.course_view.set_runtime(rt);
+    }
+
     /// Open the compact overlay, or close it if it is already open.
     pub fn toggle_overlay(&self) {
         if self.overlay_is_open() {
