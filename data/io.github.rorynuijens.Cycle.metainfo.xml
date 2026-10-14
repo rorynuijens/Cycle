@@ -90,6 +90,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.16.0" date="2026-10-14">
+      <description>
+        <p>Polish, and data that cannot mislead:</p>
+        <ul>
+          <li>On a smaller window the route ride page now keeps Pause and End Ride
+              on screen, shrinking the map and the road profile instead.</li>
+          <li>The fullscreen button on the ride pages turns into the way back out,
+              and the compact overlay's button has a picture-in-picture icon of its
+              own.</li>
+          <li>The road profile no longer shows faint stripes, rides in a day's plan
+              show a proper ride icon, and buttons and headings follow GNOME's
+              capitalisation.</li>
+          <li>A damaged value in the database, such as a negative heart rate or
+              FTP, is now read as missing or as a safe default instead of as a
+              number in the billions.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.15.0" date="2026-10-13">
       <description>
         <p>Auto-pause, a picture of each workout, and the overlay on courses:</p>
