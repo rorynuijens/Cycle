@@ -1,5 +1,6 @@
 pub mod api_key_banner;
 pub mod api_key_row;
+pub mod course_view;
 pub mod day_toggles;
 pub mod dialog;
 pub mod fit_import;

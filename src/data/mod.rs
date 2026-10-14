@@ -2,6 +2,7 @@ pub mod ai_cache;
 pub mod athlete;
 pub mod backup;
 pub mod calendar;
+pub mod course3d;
 pub mod db;
 pub mod dedupe;
 pub mod fit;

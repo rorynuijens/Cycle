@@ -16,6 +16,7 @@ use crate::training::engine::{
 };
 use crate::training::route_engine::{self, RouteEngine};
 use crate::ui::overlay::{CourseReadings, RideOverlay};
+use crate::ui::widgets::course_view::CourseView;
 use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
@@ -186,6 +187,11 @@ pub struct RoutePlayerPage {
     zone_meter: ZoneMeter,
     /// Slippy map following the rider along the route.
     route_map: RouteMap,
+    /// The road from the saddle, in 3D — shown in the map's place on request.
+    course_view: CourseView,
+    /// Holds the map and the 3D view in one slot, one visible at a time. Sizes
+    /// are set on this rather than on either view, so both get the same room.
+    map_stack: gtk::Stack,
     /// The next two kilometres of road, drawn large.
     lookahead_chart: gtk::DrawingArea,
     /// ── Course cues ─────────────────────────────────────────────────────────
@@ -461,17 +467,24 @@ impl RoutePlayerPage {
         // so this needs no breakpoint.
         let route_map = RouteMap::new();
         route_map.widget().set_vexpand(true);
-        route_map.widget().set_size_request(-1, MAP_MIN_HEIGHT);
         route_map.widget().set_tooltip_text(Some(
             "Route map — drag to look around; following resumes automatically",
         ));
+        let course_view = CourseView::new();
+        let map_stack = gtk::Stack::builder()
+            .vexpand(true)
+            .height_request(MAP_MIN_HEIGHT)
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        map_stack.add_named(route_map.widget(), Some("map"));
+        map_stack.add_named(course_view.widget(), Some("3d"));
 
         let graph_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
             .vexpand(true)
             .build();
-        graph_column.append(route_map.widget());
+        graph_column.append(&map_stack);
         graph_column.append(&lookahead_chart);
         inner.append(&graph_column);
 
@@ -548,9 +561,24 @@ impl RoutePlayerPage {
             .action_name("win.toggle-overlay")
             .build();
 
+        // Map or road: the same slot, either way round.
+        let view_3d_btn = gtk::ToggleButton::builder()
+            .label("3D")
+            .tooltip_text("Show the road from the saddle instead of the map")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .build();
+        {
+            let map_stack = map_stack.clone();
+            view_3d_btn.connect_toggled(move |btn| {
+                map_stack.set_visible_child_name(if btn.is_active() { "3d" } else { "map" });
+            });
+        }
+
         controls.append(&pause_btn);
         controls.append(&intensity_box);
         controls.append(&gtk::Box::builder().hexpand(true).build());
+        controls.append(&view_3d_btn);
         controls.append(&overlay_btn);
         controls.append(&fullscreen_btn);
         controls.append(&end_btn);
@@ -622,6 +650,8 @@ impl RoutePlayerPage {
             progress_bar,
             zone_meter,
             route_map,
+            course_view,
+            map_stack,
             lookahead_chart,
             cue_box,
             cue_headline,
@@ -676,7 +706,7 @@ impl RoutePlayerPage {
             Some(&LOOKAHEAD_COMPACT_HEIGHT.to_value()),
         );
         breakpoint.add_setter(
-            self.route_map.widget(),
+            &self.map_stack,
             "height-request",
             Some(&MAP_COMPACT_MIN_HEIGHT.to_value()),
         );
@@ -935,6 +965,7 @@ impl RoutePlayerPage {
         let line: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lng)).collect();
         self.route_map.set_route(&line);
         self.route_map.set_lookahead(&[]);
+        self.course_view.set_route(route);
     }
 
     /// Start the 1 Hz ride loop. Calls `on_complete` with the session when the route
@@ -1364,6 +1395,7 @@ impl RoutePlayerPage {
             if let Some((lat, lng)) = position {
                 page.route_map.set_position(lat, lng);
             }
+            page.course_view.set_progress(distance_m, speed_ms);
 
             if is_done && !completed_tick.get() {
                 completed_tick.set(true);
