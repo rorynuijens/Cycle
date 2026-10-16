@@ -25,8 +25,9 @@ use std::sync::OnceLock;
 
 use crate::data::biome;
 use crate::data::course3d::{self, CameraPose, CourseScene, Mat4, Mesh, RiderPose, Sky};
+use crate::data::encounters;
 use crate::data::palette;
-use crate::data::props::{self, Shape};
+use crate::data::props::{self, Prop, Shape};
 use crate::data::rider;
 use crate::data::route::Route;
 
@@ -102,6 +103,7 @@ uniform float u_time;
 uniform float u_orbit;
 uniform float u_head;
 uniform vec2 u_hub;
+uniform float u_legs;
 out vec3 v_world;
 out vec3 v_rel;
 flat out vec4 v_colour;
@@ -111,14 +113,15 @@ void main() {
     vec3 p = a_pos;
     float yaw = i_size.y;
     float phase = i_motion.y;
-    if (i_motion.x > 0.5 && i_motion.x < 1.5) {
+    float motion = floor(i_motion.x + 0.5);
+    if (motion == 1.0) {
         yaw += 0.35 * sin(u_time * 0.25 + phase);
         if (p.x > u_head) {
             float dip = 0.5 + 0.5 * sin(u_time * 0.8 + phase * 3.0);
             p.y -= 0.3 * dip;
             p.x -= 0.06 * dip;
         }
-    } else if (i_motion.x > 3.5) {
+    } else if (motion == 4.0) {
         // Sails: everything in front of the hub turns about it.
         if (p.x > u_hub.x) {
             float a = u_time * 0.9 + phase;
@@ -128,15 +131,29 @@ void main() {
             p.z = q.x * c0 - q.y * s0;
             p.y = u_hub.y + q.x * s0 + q.y * c0;
         }
-    } else if (i_motion.x > 2.5) {
+    } else if (motion == 3.0) {
         // Afloat: rising and falling, turning a little on the swell.
         base.y += 0.12 * sin(u_time * 1.3 + phase);
         yaw += 0.08 * sin(u_time * 0.5 + phase * 2.0);
-    } else if (i_motion.x > 1.5) {
+    } else if (motion == 2.0) {
         float a = u_time * 0.35 + phase;
         base += vec3(cos(a) * u_orbit, 1.5 * sin(u_time * 0.6 + phase), sin(a) * u_orbit);
         yaw = a + 1.5707963;
         p.y += sin(u_time * 9.0 + phase * 5.0) * 0.6 * abs(p.z);
+    } else if (motion == 5.0) {
+        // Running: legs below the body swing in pairs, fore against hind
+        // and left against right; the body bounces with the stride.
+        if (p.y < u_legs) {
+            float pair = (p.x > 0.0 ? 0.0 : 3.1415927) + (p.z > 0.0 ? 1.5707963 : 0.0);
+            p.x += 0.16 * sin(u_time * 13.0 + phase + pair) * (u_legs - p.y) / u_legs;
+        }
+        base.y += 0.06 * i_size.x * abs(sin(u_time * 13.0 + phase));
+    } else if (motion == 6.0) {
+        // A snake: the body waves side to side, travelling down it.
+        p.z += 0.09 * sin(p.x * 11.0 - u_time * 9.0 + phase);
+    } else if (motion == 7.0) {
+        // Wings beating, the bird flown along by the encounter.
+        p.y += sin(u_time * 7.0 + phase * 5.0) * 0.5 * abs(p.z);
     }
     float c = cos(yaw);
     float s = sin(yaw);
@@ -384,6 +401,10 @@ struct PropShape {
     mesh: MeshGl,
     instances: glow::Buffer,
     chunks: Vec<props::Chunk>,
+    /// This frame's encounter animals of this shape: a few, sent anew each
+    /// frame.
+    live: glow::Buffer,
+    live_count: i32,
 }
 
 type Uniform = Option<glow::UniformLocation>;
@@ -403,6 +424,7 @@ struct SceneUniforms {
     orbit: Uniform,
     head: Uniform,
     hub: Uniform,
+    legs: Uniform,
 }
 
 impl SceneUniforms {
@@ -422,6 +444,7 @@ impl SceneUniforms {
             orbit: at("u_orbit"),
             head: at("u_head"),
             hub: at("u_hub"),
+            legs: at("u_legs"),
         }
     }
 
@@ -444,6 +467,7 @@ impl SceneUniforms {
             crate::data::kit::SAIL_FROM,
             crate::data::kit::HUB_Y,
         );
+        gl.uniform_1_f32(self.legs.as_ref(), crate::data::kit::LEGS_TOP);
     }
 }
 
@@ -473,6 +497,10 @@ struct Inner {
     /// What the world around the route is made of.
     scenery: Cell<biome::Scenery>,
     scene: RefCell<Option<CourseScene>>,
+    /// Runs the scene's animal encounters as the rider rides.
+    director: RefCell<Option<encounters::Director>>,
+    /// When the view was made: the encounters' clock starts here.
+    born_us: i64,
     /// The scene changed and has not been uploaded yet.
     needs_upload: Cell<bool>,
     gl: RefCell<Option<GlState>>,
@@ -524,6 +552,8 @@ impl CourseView {
             route: RefCell::new(None),
             scenery: Cell::new(biome::Scenery::default()),
             scene: RefCell::new(None),
+            director: RefCell::new(None),
+            born_us: glib::monotonic_time(),
             needs_upload: Cell::new(false),
             gl: RefCell::new(None),
             progress: Cell::new(Progress::default()),
@@ -585,6 +615,7 @@ impl CourseView {
         let inner = &self.inner;
         inner.generation.set(inner.generation.get() + 1);
         *inner.scene.borrow_mut() = None;
+        *inner.director.borrow_mut() = None;
         inner.needs_upload.set(true);
         inner.progress.set(Progress::default());
         inner.drawn_m.set(None);
@@ -625,6 +656,9 @@ impl Inner {
             }
             match built {
                 Ok(scene) => {
+                    *inner.director.borrow_mut() = scene
+                        .as_ref()
+                        .map(|s| encounters::Director::new(s.encounters.clone()));
                     *inner.scene.borrow_mut() = scene;
                     inner.needs_upload.set(true);
                     inner.area.queue_render();
@@ -720,7 +754,16 @@ impl Inner {
         // precision.
         let time_s = (now / 1_000 % 3_600_000) as f32 / 1_000.0;
 
-        state.draw(w, h, pose, sky, time_s);
+        // The encounters run on their own clock, which never wraps.
+        let clock_s = ((now - self.born_us) as f64 / 1e6) as f32;
+        let live = match (
+            self.scene.borrow().as_ref(),
+            self.director.borrow_mut().as_mut(),
+        ) {
+            (Some(s), Some(d)) => d.update(&s.road, distance, speed, clock_s),
+            _ => Vec::new(),
+        };
+        state.draw(w, h, pose, sky, time_s, &live);
         self.drawn_m.set(pose.map(|_| distance));
     }
 }
@@ -908,6 +951,32 @@ impl GlState {
         self.clouds.replace(&self.gl, scene.map(|s| &s.clouds));
     }
 
+    /// Send this frame's encounter animals, shape by shape. A frame with
+    /// none sends nothing.
+    fn upload_live(&mut self, live: &[Prop]) {
+        for shape in &mut self.props {
+            let mine = live.iter().filter(|p| p.shape == shape.shape);
+            let count = mine.clone().count() as i32;
+            if count == 0 && shape.live_count == 0 {
+                continue;
+            }
+            shape.live_count = count;
+            if count == 0 {
+                continue;
+            }
+            let bytes: Vec<u8> = props::instances(mine)
+                .iter()
+                .flat_map(|f| f.to_ne_bytes())
+                .collect();
+            unsafe {
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(shape.live));
+                self.gl
+                    .buffer_data_u8_slice(glow::ARRAY_BUFFER, &bytes, glow::STREAM_DRAW);
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            }
+        }
+    }
+
     /// The offscreen framebuffer at `width` × `height`, made or remade as
     /// the view's size changes.
     fn target(&mut self, width: i32, height: i32) -> Result<&Target, String> {
@@ -930,7 +999,9 @@ impl GlState {
         pose: Option<(CameraPose, RiderPose)>,
         sky: Sky,
         time_s: f32,
+        live: &[Prop],
     ) {
+        self.upload_live(live);
         // Logged on the first frame that has a scene to draw, which is the
         // one that matters if the rider sees only sky.
         let first = pose.is_some() && self.world.index_count > 0 && !self.reported.replace(true);
@@ -1041,6 +1112,7 @@ impl GlState {
                 u.props.set(gl, &mvp, &camera.eye, &sky, time_s);
                 for shape in &self.props {
                     shape.draw(gl, camera.eye);
+                    shape.draw_live(gl);
                 }
                 if first {
                     let err = gl.get_error();
@@ -1144,7 +1216,10 @@ impl GlState {
         }
         for shape in &self.props {
             shape.mesh.destroy(&self.gl);
-            unsafe { self.gl.delete_buffer(shape.instances) };
+            unsafe {
+                self.gl.delete_buffer(shape.instances);
+                self.gl.delete_buffer(shape.live);
+            }
         }
         unsafe {
             self.gl.delete_program(self.program);
@@ -1161,6 +1236,7 @@ impl PropShape {
     unsafe fn new(gl: &glow::Context, shape: Shape) -> Result<Self, String> {
         let mesh = MeshGl::new(gl, &shape.mesh())?;
         let instances = gl.create_buffer()?;
+        let live = gl.create_buffer()?;
         gl.bind_vertex_array(Some(mesh.vao));
         for slot in [3, 4, 5, 6] {
             gl.enable_vertex_attrib_array(slot);
@@ -1172,7 +1248,32 @@ impl PropShape {
             mesh,
             instances,
             chunks: Vec::new(),
+            live,
+            live_count: 0,
         })
+    }
+
+    /// Draw this frame's encounter animals of this shape.
+    unsafe fn draw_live(&self, gl: &glow::Context) {
+        if self.live_count == 0 || self.mesh.index_count == 0 {
+            return;
+        }
+        let stride = (props::INSTANCE_FLOATS * 4) as i32;
+        gl.bind_vertex_array(Some(self.mesh.vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.live));
+        gl.vertex_attrib_pointer_f32(3, 3, glow::FLOAT, false, stride, 0);
+        gl.vertex_attrib_pointer_f32(4, 2, glow::FLOAT, false, stride, 12);
+        gl.vertex_attrib_pointer_f32(5, 3, glow::FLOAT, false, stride, 20);
+        gl.vertex_attrib_pointer_f32(6, 2, glow::FLOAT, false, stride, 32);
+        gl.draw_elements_instanced(
+            glow::TRIANGLES,
+            self.mesh.index_count,
+            glow::UNSIGNED_INT,
+            0,
+            self.live_count,
+        );
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.bind_vertex_array(None);
     }
 
     /// Draw the props of every chunk within reach of the eye. Each chunk's
@@ -1471,7 +1572,7 @@ mod offscreen {
     fn render_course_offscreen() {
         let gpx = std::env::var("CYCLE_3D_GPX").expect("CYCLE_3D_GPX");
         let out = std::env::var("CYCLE_3D_OUT").expect("CYCLE_3D_OUT");
-        let at: f32 = std::env::var("CYCLE_3D_AT")
+        let mut at: f32 = std::env::var("CYCLE_3D_AT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(200.0);
@@ -1484,6 +1585,42 @@ mod offscreen {
             .unwrap_or_default();
         let scene = CourseScene::build(&route, scenery).expect("a scene");
         eprintln!("scene built in {:.2} s", started.elapsed().as_secs_f64());
+        // CYCLE_3D_ENCOUNTER=<n> CYCLE_3D_ENC_S=<seconds>: ride up to the
+        // route's n-th encounter at CYCLE_3D_SPEED and show it that many
+        // seconds after it began; the rider is wherever that leaves them.
+        let mut live = Vec::new();
+        for (k, t) in scene.encounters.iter().enumerate().take(12) {
+            eprintln!("encounter {k}: {:?} at {:.0} m", t.kind, t.at_m);
+        }
+        if let Some(n) = std::env::var("CYCLE_3D_ENCOUNTER")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            let t = scene.encounters[n];
+            let after: f32 = std::env::var("CYCLE_3D_ENC_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0);
+            let v: f32 = std::env::var("CYCLE_3D_SPEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8.0);
+            let mut d = encounters::Director::new(vec![t]);
+            let (mut m, mut clock, mut began) = (t.at_m - 400.0, 0.0f32, None);
+            while clock < 300.0 {
+                live = d.update(&scene.road, m, v, clock);
+                if !live.is_empty() && began.is_none() {
+                    began = Some(clock);
+                }
+                if began.is_some_and(|b| clock - b >= after) {
+                    break;
+                }
+                m += v / 30.0;
+                clock += 1.0 / 30.0;
+            }
+            at = m;
+            eprintln!("{} animals, rider at {at:.0} m", live.len());
+        }
         let speed: f32 = std::env::var("CYCLE_3D_SPEED")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1602,7 +1739,7 @@ mod offscreen {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0);
-            state.draw(W, H, Some((pose, rider)), scene.sky_at(at), time_s);
+            state.draw(W, H, Some((pose, rider)), scene.sky_at(at), time_s, &live);
             let err = state.gl.get_error();
             eprintln!("glGetError after draw: 0x{err:X}");
 

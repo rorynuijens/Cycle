@@ -20,7 +20,7 @@ use crate::data::props::Prop;
 use crate::data::roadway;
 use crate::data::route::Route;
 use crate::data::world::{splitmix, AreaKind, World};
-use crate::data::{animals, dressing, rider, sky, track, trees};
+use crate::data::{animals, dressing, encounters, rider, sky, track, trees};
 
 /// The chase camera: this far behind the rider and this high above the road,
 /// aimed at a point this far ahead of the rider and this high.
@@ -382,6 +382,9 @@ pub struct CourseScene {
     /// high, is [`Sky::backdrop`].
     pub horizons: Vec<(biome::Biome, Mesh)>,
     pub clouds: Mesh,
+    /// Where along the route each animal encounter happens — see
+    /// `data/encounters.rs`.
+    pub encounters: Vec<encounters::Trigger>,
     /// The sky every [`SKY_STEP_M`] along the road — see [`CourseScene::sky_at`].
     skies: Vec<Sky>,
 }
@@ -434,6 +437,13 @@ impl CourseScene {
                 )
             })
             .collect();
+        let open = |x: f32, z: f32| matches!(world.land(x, z), None | Some(AreaKind::Farmland));
+        let encounters = encounters::triggers(
+            &road,
+            &|x, z| look.biomes.dominant_at(x, z),
+            &open,
+            world.seed(),
+        );
         Some(Self {
             road,
             mesh,
@@ -441,6 +451,7 @@ impl CourseScene {
             horizons,
             clouds: sky::clouds(world.seed()),
             skies,
+            encounters,
         })
     }
 

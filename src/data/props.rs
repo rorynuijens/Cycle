@@ -47,10 +47,16 @@ pub enum Shape {
     Camel,
     Duck,
     Heron,
+    Dog,
+    Cat,
+    Snake,
+    Rat,
+    /// A shepherd with a crook.
+    Person,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 28] = [
+    pub const ALL: [Shape; 33] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -79,6 +85,11 @@ impl Shape {
         Shape::Camel,
         Shape::Duck,
         Shape::Heron,
+        Shape::Dog,
+        Shape::Cat,
+        Shape::Snake,
+        Shape::Rat,
+        Shape::Person,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -119,6 +130,12 @@ pub enum Motion {
     Bob = 3,
     /// Turns the sails in front of its hub — see `kit::SAIL_FROM`.
     Spin = 4,
+    /// Running: legs swinging in pairs, the body bouncing.
+    Run = 5,
+    /// A snake's body waving side to side.
+    Slither = 6,
+    /// Wings beating, in place: a bird flown by an encounter.
+    Flap = 7,
 }
 
 /// How far an orbiting prop strays from its spot, in metres — the view's
@@ -198,20 +215,7 @@ pub fn batches(props: &[Prop]) -> Vec<Batch> {
                     start: (instances.len() / INSTANCE_FLOATS) as u32,
                     count: members.len() as u32,
                 });
-                for p in members {
-                    instances.extend_from_slice(&[
-                        p.pos[0],
-                        p.pos[1],
-                        p.pos[2],
-                        p.size,
-                        p.yaw,
-                        p.colour[0],
-                        p.colour[1],
-                        p.colour[2],
-                        p.motion as u8 as f32,
-                        p.phase,
-                    ]);
-                }
+                instances.extend(self::instances(members));
             }
             Some(Batch {
                 shape,
@@ -220,6 +224,26 @@ pub fn batches(props: &[Prop]) -> Vec<Batch> {
             })
         })
         .collect()
+}
+
+/// `props` as the view reads them, [`INSTANCE_FLOATS`] each.
+pub fn instances<'a>(props: impl IntoIterator<Item = &'a Prop>) -> Vec<f32> {
+    let mut out = Vec::new();
+    for p in props {
+        out.extend_from_slice(&[
+            p.pos[0],
+            p.pos[1],
+            p.pos[2],
+            p.size,
+            p.yaw,
+            p.colour[0],
+            p.colour[1],
+            p.colour[2],
+            p.motion as u8 as f32,
+            p.phase,
+        ]);
+    }
+    out
 }
 
 /// Whether any of `chunk` lies within `reach` of the eye at `(x, z)`.

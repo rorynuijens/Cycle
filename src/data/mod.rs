@@ -9,6 +9,7 @@ pub mod course3d;
 pub mod db;
 pub mod dedupe;
 pub mod dressing;
+pub mod encounters;
 pub mod fit;
 pub mod import;
 pub mod keystore;

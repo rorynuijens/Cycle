@@ -22,6 +22,9 @@ use crate::data::props::{Shape, OWN_COLOUR};
 pub const SAIL_FROM: f32 = 0.21;
 /// The height of a windmill's hub, in mesh units.
 pub const HUB_Y: f32 = 0.78;
+/// A running animal's legs are every vertex below this, in mesh units: the
+/// view's shader swings them.
+pub const LEGS_TOP: f32 = 0.3;
 
 /// A plain colour from the base palette.
 fn c(rgb: Rgb) -> [f32; 4] {
@@ -570,6 +573,91 @@ pub fn mesh(shape: Shape) -> Mesh {
                 0.06,
                 0.03,
                 c(b.animal_dark),
+            ));
+        }
+        Shape::Dog => {
+            m.extend(cuboid([-0.38, 0.3, -0.11], [0.3, 0.55, 0.11], OWN));
+            m.extend(legs(0.26, 0.07, 0.07, 0.32, OWN));
+            m.extend(cuboid([0.3, 0.45, -0.09], [0.5, 0.66, 0.09], OWN));
+            m.extend(cuboid(
+                [0.5, 0.47, -0.05],
+                [0.6, 0.56, 0.05],
+                c(b.animal_dark),
+            ));
+            for z in [-0.08, 0.05] {
+                m.extend(cuboid(
+                    [0.33, 0.66, z],
+                    [0.39, 0.74, z + 0.03],
+                    c(b.animal_dark),
+                ));
+            }
+            m.extend(beam([-0.36, 0.5, 0.0], [-0.52, 0.68, 0.0], 0.05, 0.05, OWN));
+        }
+        Shape::Cat => {
+            m.extend(cuboid([-0.32, 0.25, -0.08], [0.25, 0.45, 0.08], OWN));
+            m.extend(legs(0.22, 0.05, 0.05, 0.27, OWN));
+            m.extend(cuboid([0.25, 0.36, -0.08], [0.42, 0.53, 0.08], OWN));
+            for z in [-0.07, 0.04] {
+                tri(
+                    &mut m,
+                    [[0.28, 0.53, z], [0.36, 0.53, z], [0.31, 0.62, z + 0.015]],
+                    OWN,
+                );
+            }
+            m.extend(beam(
+                [-0.3, 0.42, 0.0],
+                [-0.42, 0.76, 0.0],
+                0.035,
+                0.035,
+                OWN,
+            ));
+        }
+        Shape::Snake => {
+            // A low flat body in segments, the shader waving it; dark bands.
+            for k in 0..8 {
+                let (x0, x1) = (-0.5 + k as f32 * 0.115, -0.5 + (k + 1) as f32 * 0.115);
+                let w = 0.02 + 0.025 * (k as f32 / 7.0);
+                let colour = if k % 2 == 0 { OWN } else { c(b.animal_dark) };
+                m.extend(cuboid([x0, 0.0, -w], [x1, 0.045, w], colour));
+            }
+            m.extend(cuboid([0.42, 0.0, -0.05], [0.52, 0.055, 0.05], OWN));
+        }
+        Shape::Rat => {
+            m.extend(ball([0.0, 0.16, 0.0], [0.24, 0.16, 0.13], OWN));
+            m.extend(ball([0.25, 0.14, 0.0], [0.09, 0.08, 0.07], OWN));
+            m.extend(beam(
+                [-0.22, 0.12, 0.0],
+                [-0.55, 0.04, 0.0],
+                0.03,
+                0.03,
+                c(b.skin),
+            ));
+        }
+        Shape::Person => {
+            for z in [-0.06, 0.06] {
+                m.extend(cuboid(
+                    [-0.05, 0.0, z - 0.045],
+                    [0.05, 0.46, z + 0.045],
+                    c(b.kit),
+                ));
+            }
+            m.extend(cuboid([-0.09, 0.42, -0.15], [0.09, 0.8, 0.15], OWN));
+            m.extend(ball([0.0, 0.87, 0.0], [0.075, 0.08, 0.075], c(b.skin)));
+            m.extend(cuboid([-0.13, 0.92, -0.13], [0.13, 0.935, 0.13], c(b.hut)));
+            m.extend(cuboid([-0.07, 0.935, -0.07], [0.07, 1.0, 0.07], c(b.hut)));
+            m.extend(beam(
+                [0.12, 0.0, 0.2],
+                [0.12, 0.98, 0.2],
+                0.025,
+                0.025,
+                c(b.trunk),
+            ));
+            m.extend(beam(
+                [0.12, 0.98, 0.2],
+                [0.2, 0.98, 0.2],
+                0.025,
+                0.025,
+                c(b.trunk),
             ));
         }
         _ => {}

@@ -117,6 +117,16 @@ pub struct Palette {
     pub hut: Rgb,
     pub lighthouse: Rgb,
     pub windmill: Rgb,
+    pub dog_a: Rgb,
+    pub dog_b: Rgb,
+    pub dog_c: Rgb,
+    pub cat_a: Rgb,
+    pub cat_b: Rgb,
+    pub snake: Rgb,
+    pub rat: Rgb,
+    pub eagle: Rgb,
+    pub gull: Rgb,
+    pub coat: Rgb,
 }
 
 /// The shared base palette: the skill's names (§3, §7.1), tuned to the
@@ -194,6 +204,16 @@ pub const BASE: Palette = Palette {
     hut: hex(0x8B5A3A),
     lighthouse: hex(0xD8432F),
     windmill: hex(0x4A5A4E),
+    dog_a: hex(0xC9A66B),
+    dog_b: hex(0xEFE3C8),
+    dog_c: hex(0x7A5230),
+    cat_a: hex(0xE08A3C),
+    cat_b: hex(0x6E6E74),
+    snake: hex(0x9A8A3E),
+    rat: hex(0x7D746A),
+    eagle: hex(0x5A4030),
+    gull: hex(0xF4F6F8),
+    coat: hex(0x5B6E8C),
 };
 
 /// Names a biome may not override: the track and the rider look the same
@@ -287,6 +307,16 @@ impl Palette {
             "hut" => &mut self.hut,
             "lighthouse" => &mut self.lighthouse,
             "windmill" => &mut self.windmill,
+            "dog_a" => &mut self.dog_a,
+            "dog_b" => &mut self.dog_b,
+            "dog_c" => &mut self.dog_c,
+            "cat_a" => &mut self.cat_a,
+            "cat_b" => &mut self.cat_b,
+            "snake" => &mut self.snake,
+            "rat" => &mut self.rat,
+            "eagle" => &mut self.eagle,
+            "gull" => &mut self.gull,
+            "coat" => &mut self.coat,
             _ => return None,
         })
     }
@@ -355,7 +385,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 71] = [
+        const NAMES: [&str; 81] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -427,13 +457,23 @@ mod tests {
             "hut",
             "lighthouse",
             "windmill",
+            "dog_a",
+            "dog_b",
+            "dog_c",
+            "cat_a",
+            "cat_b",
+            "snake",
+            "rat",
+            "eagle",
+            "gull",
+            "coat",
         ];
         assert_eq!(NAMES.len(), size_of::<Palette>() / size_of::<Rgb>());
         let mut p = BASE;
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 71] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 81] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }
