@@ -1,0 +1,12 @@
+{
+  "temperate": {"palette": {}, "fog_density": 0.00072, "trees": {"forest_spacing_m": [6.0, 10.0], "open_per_hectare": 2.2, "cone_share": 0.2}},
+  "forest": {"palette": {"grass_low": "#5FAF48", "grass_high": "#3F8F3F", "rock": "#8E8778", "tree_a": "#2F7D4F", "tree_b": "#24663F", "tree_c": "#3E8E41", "sky_horizon": "#C9E3D6"}, "fog_density": 0.0009, "trees": {"forest_spacing_m": [5.0, 7.0], "open_per_hectare": 1.5, "cone_share": 0.55}},
+  "farmland": {"palette": {"tree_a": "#3E8E41", "tree_b": "#6BAA3A", "tree_c": "#4C9A3C"}, "fog_density": 0.00072, "trees": {"forest_spacing_m": [6.0, 10.0], "open_per_hectare": 0.3, "cone_share": 0.2}},
+  "polder": {"palette": {"tree_a": "#4C9A3C", "tree_b": "#6BAA3A", "tree_c": "#3E8E41", "sky_horizon": "#D3ECF8"}, "fog_density": 0.00072, "trees": {"forest_spacing_m": [6.0, 10.0], "open_per_hectare": 0.15, "cone_share": 0.1}},
+  "mediterranean": {"palette": {"grass_low": "#D8C36A", "grass_high": "#B9A85A", "rock": "#C9B49A", "tree_a": "#7E9A4E", "tree_b": "#4F6B3A", "tree_c": "#2E4F2E", "wall_a": "#F7F3EA", "wall_b": "#EFE6D2", "wall_c": "#E9DCC0", "roof_a": "#C8553D", "roof_b": "#B5653F", "roof_c": "#D07A4E", "sky_horizon": "#E8EFD8"}, "fog_density": 0.00075, "trees": {"forest_spacing_m": [7.0, 10.0], "open_per_hectare": 0.6, "cone_share": 0.45}},
+  "desert": {"palette": {"grass_low": "#F2C98A", "grass_high": "#E3AE6C", "rock": "#C9774A", "tree_a": "#6FA35A", "tree_b": "#4F8A4A", "tree_c": "#8DB86A", "sky_horizon": "#F5DDB8"}, "fog_density": 0.0008, "trees": {"forest_spacing_m": [9.0, 14.0], "open_per_hectare": 0.05, "cone_share": 0.0}},
+  "coast": {"palette": {"grass_low": "#8FD46A", "grass_high": "#6CB84C", "rock": "#B8AEA0", "sky_horizon": "#C4E8F7"}, "fog_density": 0.00072, "trees": {"forest_spacing_m": [7.0, 10.0], "open_per_hectare": 0.3, "cone_share": 0.6}},
+  "mountain": {"palette": {"grass_low": "#6DBB4E", "grass_high": "#4E9A45", "rock": "#9A93A0", "tree_a": "#2F6E4A", "tree_b": "#24583E", "tree_c": "#3A7A50", "sky_horizon": "#CFE6F5"}, "fog_density": 0.00072, "trees": {"forest_spacing_m": [6.0, 9.0], "open_per_hectare": 0.8, "cone_share": 0.9}},
+  "wetland": {"palette": {"grass_low": "#8FBF6A", "grass_high": "#6E9F58", "sky_horizon": "#CFDCD6"}, "fog_density": 0.00085, "trees": {"forest_spacing_m": [7.0, 11.0], "open_per_hectare": 0.4, "cone_share": 0.1}},
+  "urban": {"palette": {}, "fog_density": 0.00078, "trees": {"forest_spacing_m": [7.0, 10.0], "open_per_hectare": 0.2, "cone_share": 0.2}}
+}

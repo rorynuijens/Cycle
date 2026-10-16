@@ -245,7 +245,7 @@ impl Route {
 }
 
 /// Haversine distance in metres between two GPS coordinates.
-fn haversine(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f32 {
+pub(crate) fn haversine(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f32 {
     const R: f64 = 6_371_000.0; // Earth radius in metres
     let dlat = (lat2 - lat1).to_radians();
     let dlng = (lng2 - lng1).to_radians();
@@ -453,6 +453,72 @@ fn parse_gpx(data: &[u8]) -> Result<Route> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What the trainer is driven from (stylized-route skill, §11) ──────────
+
+    /// One point every 10 m at these heights: 90 m of road.
+    fn reference_route() -> Route {
+        let heights = [0.0, 1.0, 3.0, 6.0, 6.0, 5.0, 5.0, 5.0, 8.0, 8.0];
+        let points: Vec<RoutePoint> = heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| RoutePoint {
+                lat: 52.0 + i as f64 * 0.0001,
+                lng: 6.0,
+                elevation_m: h,
+                distance_m: i as f32 * 10.0,
+                gradient: 0.0,
+            })
+            .collect();
+        Route {
+            name: "Reference".into(),
+            total_distance_m: 90.0,
+            total_gain_m: 9.0,
+            points,
+        }
+    }
+
+    #[test]
+    fn should_keep_the_elevation_the_ride_is_driven_from() {
+        // Worked by hand: straight lines between the points, flat past the ends.
+        let r = reference_route();
+        for (d, want) in [
+            (-5.0, 0.0),
+            (15.0, 2.0),
+            (47.0, 5.3),
+            (90.0, 8.0),
+            (95.0, 8.0),
+        ] {
+            let got = r.elevation_at(d);
+            assert!(
+                (got - want).abs() < 1e-5,
+                "elevation at {d} m: {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_the_gradient_the_trainer_is_driven_from() {
+        // Worked by hand: rise over the ±25 m window, cut short at either end.
+        // If a change to the 3D view moves one of these, the view is feeding
+        // the physics — rule 5 of the stylized-route skill.
+        let r = reference_route();
+        for (d, want) in [
+            (0.0, 4.5 / 25.0),
+            (30.0, 4.5 / 50.0),
+            (45.0, 2.0 / 50.0),
+            (60.0, 2.0 / 50.0),
+            (75.0, 3.0 / 40.0),
+            (90.0, 3.0 / 25.0),
+            (200.0, 0.0),
+        ] {
+            let got = r.gradient_at(d);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "gradient at {d} m: {got}, want {want}"
+            );
+        }
+    }
 
     #[test]
     fn haversine_known_distance() {

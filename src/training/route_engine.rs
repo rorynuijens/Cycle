@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::data::course3d::{self, LocalFrame};
+use crate::data::bends;
 use crate::data::route::Route;
 
 /// Maximum change in the grade sent to the trainer, in percentage points per second.
@@ -64,11 +64,6 @@ pub const MAX_LATERAL_ACCEL: f32 = 2.0;
 /// How hard the virtual rider brakes for a bend ahead, m/s² — about a third of
 /// a g, firm but unhurried.
 pub const BRAKING_DECEL: f32 = 3.0;
-
-/// Half the chord a bend's radius is measured over, in metres. Long enough to
-/// ride over the metre or two of scatter in a recorded GPX, which over a short
-/// chord would read as a bend on every straight.
-const BEND_CHORD_M: f32 = 20.0;
 
 /// Steps each simulated second is integrated in. A tenth of a second keeps the
 /// speed honest through a change of gradient without costing anything.
@@ -310,61 +305,28 @@ impl RouteEngine {
 /// what braking at [`BRAKING_DECEL`] from there leaves room for, so the rider
 /// slows *before* a bend rather than in it.
 ///
-/// Radii are measured on the same smoothed line the 3D view draws, so the
-/// rider brakes for the bends they can see.
+/// Bends are measured on the GPX alone ([`bends::curvatures`]) — never on
+/// anything the 3D view draws, so restyling the scene can never change how
+/// fast a descent rides (stylized-route skill, rule 5). The view reads the
+/// same measurement to lay its road through the same bends.
 fn speed_limits(route: &Route) -> Vec<f32> {
-    let Some(frame) = LocalFrame::around(route) else {
-        return Vec::new();
-    };
-    let line = course3d::centreline(route, &frame);
-    let (Some(first), Some(last)) = (line.first(), line.last()) else {
-        return Vec::new();
-    };
-    let (start, end) = (first.distance_m, last.distance_m);
-    let mut limits: Vec<f32> = line
-        .iter()
-        .map(|p| {
-            let d = p.distance_m;
-            // Within a chord of either end the chord is cut short and the end
-            // point is unsmoothed, so its GPS scatter reads as a tight bend.
-            // Nothing within 20 m of the start or finish needs braking for.
-            if d - BEND_CHORD_M < start || d + BEND_CHORD_M > end {
-                return MAX_SPEED_MS;
-            }
-            let (Some(a), Some(c)) = (
-                course3d::position_at(&line, d - BEND_CHORD_M),
-                course3d::position_at(&line, d + BEND_CHORD_M),
-            ) else {
-                return MAX_SPEED_MS;
-            };
-            match bend_radius(a, p.pos, c) {
-                Some(r) => (MAX_LATERAL_ACCEL * r).sqrt().min(MAX_SPEED_MS),
-                None => MAX_SPEED_MS,
+    let mut limits: Vec<f32> = bends::curvatures(route)
+        .into_iter()
+        .map(|k| {
+            if k == 0.0 {
+                MAX_SPEED_MS
+            } else {
+                (MAX_LATERAL_ACCEL / k.abs()).sqrt().min(MAX_SPEED_MS)
             }
         })
         .collect();
+    let pts = &route.points;
     for i in (0..limits.len().saturating_sub(1)).rev() {
-        let gap = (line[i + 1].distance_m - line[i].distance_m).max(0.0);
+        let gap = (pts[i + 1].distance_m - pts[i].distance_m).max(0.0);
         let reach = (limits[i + 1].powi(2) + 2.0 * BRAKING_DECEL * gap).sqrt();
         limits[i] = limits[i].min(reach);
     }
     limits
-}
-
-/// Radius (m) of the circle through three points on the ground, or `None`
-/// when they are as good as in a line — or as good as one point, which a
-/// route with no shape to it is.
-fn bend_radius(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Option<f32> {
-    let side = |p: [f32; 3], q: [f32; 3]| ((p[0] - q[0]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
-    let (ab, bc, ca) = (side(a, b), side(b, c), side(c, a));
-    if ab < 1.0 || bc < 1.0 {
-        return None;
-    }
-    let twice_area = ((b[0] - a[0]) * (c[2] - a[2]) - (c[0] - a[0]) * (b[2] - a[2])).abs();
-    let r = ab * bc * ca / (2.0 * twice_area);
-    // Past this the road is straight for every purpose here: the ceiling
-    // binds long before a bend this gentle would.
-    (r.is_finite() && r < 10_000.0).then_some(r)
 }
 
 #[cfg(test)]

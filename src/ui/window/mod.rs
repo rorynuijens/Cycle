@@ -442,7 +442,6 @@ impl CycleGtkWindow {
             &blank_route,
             athlete_rc.borrow().ftp_watts,
         ));
-        route_player_rc.set_runtime(rt_handle.clone());
         // Keeps the route cockpit's controls on screen on a short window.
         self.window
             .add_breakpoint(route_player_rc.compact_breakpoint());

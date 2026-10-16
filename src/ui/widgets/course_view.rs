@@ -1,15 +1,15 @@
-//! The road from the saddle: a 3D view of the route, drawn with OpenGL.
+//! The road from behind the rider: a 3D view of the route, drawn with OpenGL.
 //!
 //! Everything it draws comes from [`crate::data::course3d`]; this module only
-//! uploads that geometry and moves the camera. The ride loop reports distance
-//! once a second, and a camera that jumped once a second would be unwatchable,
-//! so between reports the view carries the rider on at their last speed —
-//! for at most a second, so a paused ride stops instead of driving on.
+//! uploads that geometry, moves the camera and the rider, and lets the
+//! animals move. The ride loop reports distance once a second, and a camera
+//! that jumped once a second would be unwatchable, so between reports the
+//! view carries the rider on at their last speed — for at most a second, so
+//! a paused ride stops instead of driving on.
 //!
-//! The land comes in after the road. A route first shows on flat ground; the
-//! first time the view is shown for it, the elevation tiles are fetched (or
-//! read from the cache) on the tokio runtime, decoded off the main thread, and
-//! the scene is rebuilt with real terrain. Riding never waits on the network.
+//! The world is made up from the route alone (`data/world.rs`): nothing is
+//! downloaded, and a route rides the same with or without a network. It is
+//! built off the main thread when the route is set.
 //!
 //! GL is reached through `eglGetProcAddress`. GTK renders through EGL on
 //! Wayland and on X11 alike, and the GNOME runtime ships libEGL through
@@ -23,222 +23,261 @@ use std::ffi::{c_char, c_void, CString};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use crate::data::course3d::{self, CourseScene, Mesh};
-use crate::data::osm::{self, Features};
+use crate::data::biome;
+use crate::data::course3d::{self, CameraPose, CourseScene, Mat4, Mesh, RiderPose, Sky};
+use crate::data::palette;
+use crate::data::props::{self, Shape};
+use crate::data::rider;
 use crate::data::route::Route;
-use crate::data::terrain::{self, Dem, TileId};
-use std::sync::Arc;
 
-/// Vertical field of view, in degrees. Roughly what a rider takes in looking
-/// down the road, and wide enough that a bend does not leave the frame.
+/// Vertical field of view, in degrees. Wide enough that a bend does not
+/// leave the frame.
 const FOV_DEG: f32 = 60.0;
 const NEAR_M: f32 = 0.5;
-const FAR_M: f32 = 3000.0;
-
-/// Haze: geometry fades into the sky between these distances. It is what
-/// hides the edge of the ground, so it must be complete before the ground
-/// runs out — the eye is on the road, and the ground reaches
-/// `course3d::GROUND_RADIUS_M` from it in every direction.
-const FOG_START_M: f32 = 300.0;
-const FOG_END_M: f32 = 1_150.0;
-const _: () = assert!(FOG_END_M < course3d::GROUND_RADIUS_M);
-
-/// Haze at the horizon, and the sky overhead. Fixed, like the scene — see
-/// `course3d`.
-const SKY_RGB: [f32; 3] = [0.72, 0.81, 0.90];
-const ZENITH_RGB: [f32; 3] = [0.38, 0.56, 0.80];
+/// Past the mountains on the horizon.
+const FAR_M: f32 = 9_000.0;
 
 /// Where the sun is: high in the south-west, so slopes facing it are lit
 /// and slopes facing away fall into shade. Not normalised here; the shader does.
 const SUN_DIR: [f32; 3] = [-0.45, 0.85, 0.40];
 
-const BUILDING: &str = "Building the 3D view…";
+/// The clouds drift round the sky this fast, in radians a second.
+const CLOUD_DRIFT: f32 = 0.0025;
 
-/// Credits for what is on screen. OpenStreetMap's is required by its licence
-/// wherever its data is shown.
-const MAP_CREDIT: &str = "Map data © OpenStreetMap contributors";
-const MAP_SOURCES: &str = "Buildings, land use, water and coastline from OpenStreetMap, \
-    available under the Open Database License.";
-const ELEVATION_CREDIT: &str = "Elevation: Terrain Tiles · Mapzen, AWS Open Data";
-const ELEVATION_SOURCES: &str = "The Terrain Tiles combine open elevation data from \
-    3DEP, SRTM, GMTED2010, ETOPO1, EU-DEM (Copernicus), ArcticDEM and national \
-    mapping agencies, hosted on the AWS Registry of Open Data.";
+/// Props are drawn only in chunks this near the eye: the haze has the rest.
+const PROP_DRAW_M: f32 = 1_300.0;
+
+const BUILDING: &str = "Building the 3D view…";
 
 /// Longest the view will carry the rider on without a fresh distance, in
 /// seconds. A tick is due every second; past that, the ride has paused.
 const MAX_EXTRAPOLATE_S: f32 = 1.0;
 
-/// A camera that moved less than this since the last frame is not redrawn.
+/// A camera that moved less than this since the last frame is not redrawn —
+/// unless something in the world is moving.
 const REDRAW_EPSILON_M: f32 = 0.001;
 
+/// The world's vertices, placed by `u_model` (the identity for the land; the
+/// rider's pose for the rider; the eye for the horizon).
 const VERTEX_SHADER: &str = r#"
 in vec3 a_pos;
 in vec4 a_colour;
-in vec2 a_uv;
 uniform mat4 u_mvp;
+uniform mat4 u_model;
 uniform vec3 u_eye;
 out vec3 v_world;
 out vec3 v_rel;
-out vec4 v_colour;
-out vec2 v_uv;
+// Flat: each triangle takes one vertex's colour whole, so faces read as
+// facets, not gradients.
+flat out vec4 v_colour;
+flat out vec3 v_anchor;
 void main() {
-    v_uv = a_uv;
-    v_world = a_pos;
+    vec3 world = (u_model * vec4(a_pos, 1.0)).xyz;
+    v_world = world;
     // Relative to the eye, the numbers are small. Interpolated across a pixel
     // at thousands of metres from the scene's origin, the absolute position
     // loses the precision the lighting takes its slope from, and walls came
     // out speckled.
-    v_rel = a_pos - u_eye;
+    v_rel = world - u_eye;
     v_colour = a_colour;
-    gl_Position = u_mvp * vec4(a_pos, 1.0);
+    v_anchor = world;
+    gl_Position = u_mvp * vec4(world, 1.0);
 }
 "#;
 
+/// A prop: one of the few shapes, scaled, turned and set down where it
+/// stands, in its own colour where the shape asks for it. Animals move here:
+/// a grazing sheep turns this way and that and dips its head; a bird circles
+/// its spot, beating its wings. Feeds the same fragment shader as the world.
+const PROP_VERTEX_SHADER: &str = r#"
+in vec3 a_pos;
+in vec4 a_colour;
+in vec3 i_pos;
+in vec2 i_size;
+in vec3 i_colour;
+in vec2 i_motion;
+uniform mat4 u_mvp;
+uniform vec3 u_eye;
+uniform float u_time;
+uniform float u_orbit;
+uniform float u_head;
+out vec3 v_world;
+out vec3 v_rel;
+flat out vec4 v_colour;
+flat out vec3 v_anchor;
+void main() {
+    vec3 base = i_pos;
+    vec3 p = a_pos;
+    float yaw = i_size.y;
+    float phase = i_motion.y;
+    if (i_motion.x > 0.5 && i_motion.x < 1.5) {
+        yaw += 0.35 * sin(u_time * 0.25 + phase);
+        if (p.x > u_head) {
+            float dip = 0.5 + 0.5 * sin(u_time * 0.8 + phase * 3.0);
+            p.y -= 0.3 * dip;
+            p.x -= 0.06 * dip;
+        }
+    } else if (i_motion.x > 1.5) {
+        float a = u_time * 0.35 + phase;
+        base += vec3(cos(a) * u_orbit, 1.5 * sin(u_time * 0.6 + phase), sin(a) * u_orbit);
+        yaw = a + 1.5707963;
+        p.y += sin(u_time * 9.0 + phase * 5.0) * 0.6 * abs(p.z);
+    }
+    float c = cos(yaw);
+    float s = sin(yaw);
+    p *= i_size.x;
+    vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+    v_world = world;
+    v_rel = world - u_eye;
+    v_colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
+    v_anchor = world;
+    gl_Position = u_mvp * vec4(world, 1.0);
+}
+"#;
+
+/// Toon shading: three bands of sunlight, a touch of sky on faces that look
+/// up, a rim of haze light on edges turned away, and squared-exponential
+/// haze. The horizon's mountains take a fixed haze of their own, thicker at
+/// their feet; clouds take none. Writes the colour and the face's normal;
+/// the outline pass reads both.
 const FRAGMENT_SHADER: &str = r#"
 in vec3 v_world;
 in vec3 v_rel;
-in vec4 v_colour;
-in vec2 v_uv;
-uniform vec3 u_sky;
+flat in vec4 v_colour;
+flat in vec3 v_anchor;
+uniform vec3 u_horizon;
+uniform vec3 u_zenith;
 uniform vec3 u_sun;
+uniform vec3 u_foam;
 uniform float u_fog_start;
-uniform float u_fog_end;
-out vec4 frag;
+uniform float u_fog_density;
+uniform float u_time;
+layout(location = 0) out vec4 frag;
+layout(location = 1) out vec4 frag_normal;
 
-float hash(vec2 p) {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+float hash(vec3 p) {
+    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453);
 }
 
 void main() {
     vec3 c = v_colour.rgb;
-    // The material is the whole part of the alpha; walls keep a fraction too.
-    float material = floor(v_colour.a + 0.0005);
+    float material = floor(v_colour.a + 0.5);
     // The face normal comes from how the position changes across the pixel,
-    // so no normals are stored.
+    // so no normals are stored and every face is flat.
     vec3 n = normalize(cross(dFdx(v_rel), dFdy(v_rel)));
     // Face the viewer. Flipping to face *up* instead decides a wall's side by
     // the sign of a vertical component that is noise, and the wall comes out
     // speckled light and dark pixel by pixel.
     if (dot(n, v_rel) > 0.0) n = -n;
     if (material == 1.0) {
-        // Ground: two scales of mottling, so the grass slides past and the
-        // eye can read speed from it.
-        float fine = hash(floor(v_world.xz / 2.0));
-        float coarse = hash(floor(v_world.xz / 14.0));
-        c *= 0.84 + 0.16 * fine + 0.12 * (coarse - 0.5);
-    } else if (material == 2.0) {
-        // Asphalt: a fine grain, faded out where a grain is under a pixel so
-        // the distant road does not shimmer.
-        float grain = hash(floor(v_world.xz / 0.12));
-        float fade = 1.0 - smoothstep(0.04, 0.12, fwidth(v_world.x) + fwidth(v_world.z));
-        c *= 1.0 + (grain - 0.5) * 0.07 * fade;
-    } else if (material == 3.0) {
-        // Walls: a window in the middle half of every bay, every storey,
-        // laid out by the wall's own coordinates — bays along, metres up.
-        float storey = floor(v_uv.y / 3.0);
-        float bay = floor(v_uv.x);
-        float fx = v_uv.x - bay;
-        float fy = v_uv.y - storey * 3.0;
-        // Fade the grid out once a window is only a few pixels across.
-        float px = max(fwidth(v_uv.x) * 2.8, fwidth(v_uv.y));
-        float fade = 1.0 - smoothstep(0.25, 0.6, px);
-        if (v_uv.x >= 0.0 && storey >= 0.0 && fx > 0.25 && fx < 0.75 && fy > 0.9 && fy < 2.2) {
-            float seed = fract(v_colour.a) * 97.0;
-            float lit = hash(vec2(bay + seed, storey - seed));
-            vec3 glass = mix(vec3(0.15, 0.19, 0.24), vec3(0.34, 0.38, 0.42), lit);
-            c = mix(c, glass, fade);
-        }
+        // A hand-made look: each facet of the land a few per cent lighter or
+        // darker, seeded by where it is.
+        c *= 0.96 + 0.08 * hash(floor(v_anchor));
+    } else if (material == 4.0) {
+        // Water lies flat, with lighter stripes drifting along it.
+        n = vec3(0.0, 1.0, 0.0);
+        float w = sin(v_world.x * 0.21 + v_world.z * 0.13 + u_time * 1.6)
+            * sin(v_world.z * 0.17 - v_world.x * 0.07 - u_time * 1.1);
+        c = mix(c, u_foam, 0.35 * step(0.55, w));
     }
-    // Light by how the face turns to the sun.
-    c *= 0.62 + 0.45 * max(dot(n, normalize(u_sun)), 0.0);
-    float d = length(v_rel);
-    float f = clamp((d - u_fog_start) / (u_fog_end - u_fog_start), 0.0, 1.0);
-    frag = vec4(mix(c, u_sky, f), 1.0);
+    vec3 sun = normalize(u_sun);
+    float ndl = dot(n, sun);
+    float band = ndl > 0.5 ? 1.0 : (ndl > 0.1 ? 0.9 : 0.8);
+    vec3 ambient = mix(vec3(1.0), u_zenith * 1.6, 0.12 * (0.5 + 0.5 * n.y));
+    float rim = pow(1.0 - clamp(dot(n, normalize(-v_rel)), 0.0, 1.0), 4.0);
+    vec3 lit = c * (0.9 * band + 0.12) * ambient + u_horizon * rim * 0.1;
+    if (material == 5.0) {
+        // Far mountains: pale with distance, palest at their feet.
+        float up = clamp((v_rel.y + 120.0) / 1100.0, 0.0, 1.0);
+        frag = vec4(mix(lit, u_horizon, mix(0.72, 0.32, up)), 1.0);
+        frag_normal = vec4(0.5, 1.0, 0.5, 1.0);
+        return;
+    }
+    if (material == 6.0) {
+        // Clouds: white, a little shade underneath, no haze.
+        frag = vec4(c * (0.9 + 0.1 * clamp(n.y, 0.0, 1.0)) - 0.06 * clamp(-n.y, 0.0, 1.0), 1.0);
+        frag_normal = vec4(0.5, 1.0, 0.5, 1.0);
+        return;
+    }
+    float k = max(length(v_rel) - u_fog_start, 0.0) * u_fog_density;
+    frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), 1.0);
+    frag_normal = vec4(n * 0.5 + 0.5, 1.0);
 }
 "#;
 
-/// The sky: one triangle over the whole view, shaded from haze at the
-/// horizon to blue overhead. Drawn first, without depth, under everything.
-const SKY_VERTEX_SHADER: &str = r#"
-out float v_up;
+/// One triangle over the whole view, for the sky and the outline pass.
+const FULLSCREEN_VERTEX_SHADER: &str = r#"
+out vec2 v_uv;
 void main() {
     vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
-    v_up = p.y * 0.5 + 0.5;
+    v_uv = p * 0.5 + 0.5;
     gl_Position = vec4(p, 0.0, 1.0);
 }
 "#;
 
+/// The sky: shaded from haze at the horizon to blue overhead. Drawn first,
+/// without depth, under everything.
 const SKY_FRAGMENT_SHADER: &str = r#"
-in float v_up;
+in vec2 v_uv;
 uniform vec3 u_horizon;
 uniform vec3 u_zenith;
-out vec4 frag;
+layout(location = 0) out vec4 frag;
+layout(location = 1) out vec4 frag_normal;
 void main() {
-    frag = vec4(mix(u_horizon, u_zenith, smoothstep(0.45, 1.0, v_up)), 1.0);
+    frag = vec4(mix(u_horizon, u_zenith, smoothstep(0.45, 1.0, v_uv.y)), 1.0);
+    frag_normal = vec4(0.5, 1.0, 0.5, 1.0);
 }
 "#;
 
-/// How one of the view's two downloads — terrain, map data — stands for the
-/// route on screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Load {
-    /// Not asked for yet: the view has not been shown for this route.
-    Wanted,
-    Loading,
-    Ready,
-    /// Tried and failed; showing the view again tries again.
-    Failed,
-    /// Will never load for this route — it is too large to fetch.
-    Unavailable,
+/// Outlines: dark lines where the depth folds — an object's silhouette
+/// against what is behind it — or where the faces either side turn sharply,
+/// as at a building's corner. Gentle folds in the land are left unlined.
+/// Lines fade into the haze with what they outline.
+const OUTLINE_FRAGMENT_SHADER: &str = r#"
+precision highp sampler2D;
+in vec2 v_uv;
+uniform sampler2D u_colour;
+uniform sampler2D u_normal;
+uniform sampler2D u_depth;
+uniform vec2 u_texel;
+uniform float u_near;
+uniform float u_far;
+uniform vec3 u_outline;
+uniform float u_fog_start;
+uniform float u_fog_density;
+out vec4 frag;
+
+float linear(float z) {
+    float ndc = z * 2.0 - 1.0;
+    return 2.0 * u_near * u_far / (u_far + u_near - ndc * (u_far - u_near));
 }
 
-impl Load {
-    fn should_start(self) -> bool {
-        matches!(self, Self::Wanted | Self::Failed)
-    }
+void main() {
+    vec2 dx = vec2(u_texel.x, 0.0);
+    vec2 dy = vec2(0.0, u_texel.y);
+    float dc = linear(texture(u_depth, v_uv).r);
+    float dl = linear(texture(u_depth, v_uv - dx).r);
+    float dr = linear(texture(u_depth, v_uv + dx).r);
+    float dd = linear(texture(u_depth, v_uv - dy).r);
+    float du = linear(texture(u_depth, v_uv + dy).r);
+    // On a flat face the inverse depth changes evenly across the screen, so
+    // its second difference is zero; at a silhouette or a crease it is not.
+    float fold = (abs(1.0 / dl + 1.0 / dr - 2.0 / dc) + abs(1.0 / dd + 1.0 / du - 2.0 / dc)) * dc;
+    float edge = smoothstep(0.03, 0.08, fold);
+    vec3 nc = texture(u_normal, v_uv).xyz * 2.0 - 1.0;
+    float turn = min(
+        min(dot(nc, texture(u_normal, v_uv - dx).xyz * 2.0 - 1.0),
+            dot(nc, texture(u_normal, v_uv + dx).xyz * 2.0 - 1.0)),
+        min(dot(nc, texture(u_normal, v_uv - dy).xyz * 2.0 - 1.0),
+            dot(nc, texture(u_normal, v_uv + dy).xyz * 2.0 - 1.0)));
+    edge = max(edge, smoothstep(0.75, 0.5, turn));
+    float nearest = min(dc, min(min(dl, dr), min(dd, du)));
+    float k = max(nearest - u_fog_start, 0.0) * u_fog_density;
+    float clear = exp(-k * k);
+    vec3 c = texture(u_colour, v_uv).rgb;
+    frag = vec4(mix(c, u_outline, 0.85 * edge * clear), 1.0);
 }
-
-/// What the status line should say, given where both downloads stand and
-/// whether a scene is up yet. `None` is nothing to say.
-fn status_text(has_scene: bool, terrain: Load, map: Load) -> Option<&'static str> {
-    if !has_scene {
-        return Some(BUILDING);
-    }
-    Some(match (terrain, map) {
-        (Load::Loading, _) => "Loading terrain…",
-        (_, Load::Loading) => "Loading map data — the first time for a route takes up to a minute",
-        (Load::Failed, _) => "No terrain — check the connection. Flat ground for now",
-        (_, Load::Failed) => "No map data — check the connection. Open country for now",
-        (Load::Unavailable, _) => "This route is too large for terrain",
-        (_, Load::Unavailable) => "This route is too large for map data",
-        _ => return None,
-    })
-}
-
-/// The credit line as markup: OpenStreetMap's credit links to its copyright
-/// page, as the OSMF attribution guidelines ask — a click from the 3D view
-/// reaches the licence. The rest is escaped plain text.
-fn credit_markup(text: &str) -> String {
-    let escaped = glib::markup_escape_text(text).to_string();
-    escaped.replace(
-        "© OpenStreetMap contributors",
-        "© <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap contributors</a>",
-    )
-}
-
-/// The credit line and its tooltip for a scene built with terrain
-/// (`elevation`) and map data (`map`).
-fn credit_text(elevation: bool, map: bool) -> Option<(String, String)> {
-    match (elevation, map) {
-        (true, true) => Some((
-            format!("{MAP_CREDIT} · {ELEVATION_CREDIT}"),
-            format!("{MAP_SOURCES}\n{ELEVATION_SOURCES}"),
-        )),
-        (false, true) => Some((MAP_CREDIT.into(), MAP_SOURCES.into())),
-        (true, false) => Some((ELEVATION_CREDIT.into(), ELEVATION_SOURCES.into())),
-        (false, false) => None,
-    }
-}
+"#;
 
 /// The distance last reported by the ride, and when.
 #[derive(Debug, Clone, Copy, Default)]
@@ -260,6 +299,21 @@ impl Progress {
         let dt = ((now_us - at) as f32 / 1e6).clamp(0.0, MAX_EXTRAPOLATE_S);
         self.distance_m + self.speed_ms.max(0.0) * dt
     }
+
+    /// How fast the rider is going at `now_us`, as far as the view carries
+    /// them: the last report's speed, and none once the view has stopped
+    /// carrying them on — or before any report.
+    fn speed_at(&self, now_us: i64) -> f32 {
+        let Some(at) = self.at_us else {
+            return 0.0;
+        };
+        let dt = (now_us - at) as f32 / 1e6;
+        if dt < MAX_EXTRAPOLATE_S && self.speed_ms.is_finite() {
+            self.speed_ms.max(0.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Everything living in the GL context. Created on realize, dropped on
@@ -268,44 +322,130 @@ struct GlState {
     gl: glow::Context,
     program: glow::Program,
     sky_program: glow::Program,
+    outline_program: glow::Program,
+    prop_program: glow::Program,
     /// Core profiles draw nothing without a vertex array bound, even for a
     /// triangle made up in the shader.
-    sky_vao: glow::VertexArray,
-    u_horizon: Option<glow::UniformLocation>,
-    u_zenith: Option<glow::UniformLocation>,
-    vao: glow::VertexArray,
-    vbo: glow::Buffer,
-    ebo: glow::Buffer,
-    index_count: i32,
-    u_mvp: Option<glow::UniformLocation>,
-    u_eye: Option<glow::UniformLocation>,
-    u_sky: Option<glow::UniformLocation>,
-    u_sun: Option<glow::UniformLocation>,
-    u_fog_start: Option<glow::UniformLocation>,
-    u_fog_end: Option<glow::UniformLocation>,
+    empty_vao: glow::VertexArray,
+    /// The land, the road and everything fixed to them.
+    world: MeshGl,
+    mountains: MeshGl,
+    clouds: MeshGl,
+    rider_body: MeshGl,
+    rider_leg: MeshGl,
+    /// One per prop shape: its mesh, and every prop of that shape.
+    props: Vec<PropShape>,
+    /// The scene is drawn here first — colour, normals and depth — and the
+    /// outline pass draws it into GTK's framebuffer.
+    target: Option<Target>,
+    u: Uniforms,
     /// Whether the GL state GTK handed over has been logged — once per
     /// context, for the day a rider's screen shows only sky.
     reported: Cell<bool>,
 }
 
+/// A mesh on the GPU.
+struct MeshGl {
+    vao: glow::VertexArray,
+    vbo: glow::Buffer,
+    ebo: glow::Buffer,
+    index_count: i32,
+}
+
+/// The offscreen framebuffer the scene is drawn into, at the view's size.
+struct Target {
+    fbo: glow::Framebuffer,
+    colour: glow::Texture,
+    normal: glow::Texture,
+    depth: glow::Texture,
+    size: (i32, i32),
+}
+
+/// One prop shape on the GPU: its mesh, and the props drawn with it.
+struct PropShape {
+    shape: Shape,
+    mesh: MeshGl,
+    instances: glow::Buffer,
+    chunks: Vec<props::Chunk>,
+}
+
+type Uniform = Option<glow::UniformLocation>;
+
+/// What the world and prop programs both read.
+struct SceneUniforms {
+    mvp: Uniform,
+    model: Uniform,
+    eye: Uniform,
+    horizon: Uniform,
+    zenith: Uniform,
+    sun: Uniform,
+    foam: Uniform,
+    fog_start: Uniform,
+    fog_density: Uniform,
+    time: Uniform,
+    orbit: Uniform,
+    head: Uniform,
+}
+
+impl SceneUniforms {
+    fn of(gl: &glow::Context, p: glow::Program) -> Self {
+        let at = |name: &str| unsafe { gl.get_uniform_location(p, name) };
+        Self {
+            mvp: at("u_mvp"),
+            model: at("u_model"),
+            eye: at("u_eye"),
+            horizon: at("u_horizon"),
+            zenith: at("u_zenith"),
+            sun: at("u_sun"),
+            foam: at("u_foam"),
+            fog_start: at("u_fog_start"),
+            fog_density: at("u_fog_density"),
+            time: at("u_time"),
+            orbit: at("u_orbit"),
+            head: at("u_head"),
+        }
+    }
+
+    /// Set every one for a frame. The model starts as the identity.
+    unsafe fn set(&self, gl: &glow::Context, mvp: &Mat4, eye: &[f32; 3], sky: &Sky, time_s: f32) {
+        gl.uniform_matrix_4_f32_slice(self.mvp.as_ref(), false, mvp);
+        gl.uniform_matrix_4_f32_slice(self.model.as_ref(), false, &course3d::IDENTITY);
+        gl.uniform_3_f32_slice(self.eye.as_ref(), eye);
+        gl.uniform_3_f32_slice(self.horizon.as_ref(), &sky.horizon);
+        gl.uniform_3_f32_slice(self.zenith.as_ref(), &sky.top);
+        gl.uniform_3_f32_slice(self.sun.as_ref(), &SUN_DIR);
+        gl.uniform_3_f32_slice(self.foam.as_ref(), &palette::BASE.foam);
+        gl.uniform_1_f32(self.fog_start.as_ref(), biome::FOG_START_M);
+        gl.uniform_1_f32(self.fog_density.as_ref(), sky.fog_density);
+        gl.uniform_1_f32(self.time.as_ref(), time_s);
+        gl.uniform_1_f32(self.orbit.as_ref(), props::ORBIT_M);
+        gl.uniform_1_f32(self.head.as_ref(), crate::data::animals::HEAD_FROM);
+    }
+}
+
+/// Every uniform the programs read.
+struct Uniforms {
+    scene: SceneUniforms,
+    props: SceneUniforms,
+    sky_horizon: Uniform,
+    sky_zenith: Uniform,
+    o_colour: Uniform,
+    o_normal: Uniform,
+    o_depth: Uniform,
+    o_texel: Uniform,
+    o_near: Uniform,
+    o_far: Uniform,
+    o_outline: Uniform,
+    o_fog_start: Uniform,
+    o_fog_density: Uniform,
+}
+
 struct Inner {
     root: gtk::Overlay,
     area: gtk::GLArea,
-    /// "Loading terrain…" and the like, over the top left of the view.
+    /// "Building the 3D view…", over the top left of the view.
     status: gtk::Label,
-    /// The elevation data's credit, over the bottom right.
-    credit: gtk::Label,
-    /// Where downloads run; `None` until the window hands it over, and in the
-    /// screenshot harness, which never fetches anything.
-    rt: RefCell<Option<tokio::runtime::Handle>>,
     route: RefCell<Option<Route>>,
-    terrain: Cell<Load>,
-    map: Cell<Load>,
-    dem: RefCell<Option<Arc<Dem>>>,
-    features: RefCell<Option<Arc<Features>>>,
-    /// Numbers each scene build; a build finishing after a newer one started
-    /// is dropped, so a slow early build cannot replace a fuller later one.
-    build_seq: Cell<u64>,
     scene: RefCell<Option<CourseScene>>,
     /// The scene changed and has not been uploaded yet.
     needs_upload: Cell<bool>,
@@ -338,7 +478,7 @@ impl CourseView {
             .vexpand(true)
             .build();
         area.update_property(&[gtk::accessible::Property::Label(
-            "The road ahead, seen from the saddle",
+            "The road ahead, seen from behind the rider",
         )]);
         let status = gtk::Label::builder()
             .css_classes(["caption", "osd"])
@@ -348,33 +488,14 @@ impl CourseView {
             .margin_start(12)
             .visible(false)
             .build();
-        let credit = gtk::Label::builder()
-            .label(ELEVATION_CREDIT)
-            .use_markup(true)
-            .tooltip_text(ELEVATION_SOURCES)
-            .css_classes(["caption", "osd"])
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::End)
-            .margin_bottom(6)
-            .margin_end(6)
-            .visible(false)
-            .build();
         let root = gtk::Overlay::builder().child(&area).build();
         root.add_overlay(&status);
-        root.add_overlay(&credit);
 
         let inner = Rc::new(Inner {
             root: root.clone(),
             status,
-            credit,
-            rt: RefCell::new(None),
-            route: RefCell::new(None),
-            terrain: Cell::new(Load::Wanted),
-            map: Cell::new(Load::Wanted),
-            dem: RefCell::new(None),
-            features: RefCell::new(None),
-            build_seq: Cell::new(0),
             area: area.clone(),
+            route: RefCell::new(None),
             scene: RefCell::new(None),
             needs_upload: Cell::new(false),
             gl: RefCell::new(None),
@@ -404,15 +525,9 @@ impl CourseView {
             }
             glib::Propagation::Stop
         });
-        // The land is fetched the first time the view is actually shown for a
-        // route — a rider who never opens 3D never downloads anything.
-        let weak = Rc::downgrade(&inner);
-        root.connect_map(move |_| {
-            if let Some(inner) = weak.upgrade() {
-                Inner::ensure_world(&inner);
-            }
-        });
         // Runs only while the area is mapped, so a hidden view costs nothing.
+        // Animals and clouds move, so a shown scene is drawn every frame; the
+        // frame clock stops when the window is hidden or minimised.
         let weak = Rc::downgrade(&inner);
         area.add_tick_callback(move |area, _clock| {
             let Some(inner) = weak.upgrade() else {
@@ -424,7 +539,7 @@ impl CourseView {
                 .drawn_m
                 .get()
                 .is_none_or(|drawn| (d - drawn).abs() > REDRAW_EPSILON_M);
-            if moved || inner.needs_upload.get() {
+            if moved || inner.needs_upload.get() || inner.scene.borrow().is_some() {
                 area.queue_render();
             }
             glib::ControlFlow::Continue
@@ -437,16 +552,8 @@ impl CourseView {
         &self.inner.root
     }
 
-    /// Hand over the runtime terrain downloads run on.
-    pub fn set_runtime(&self, rt: tokio::runtime::Handle) {
-        *self.inner.rt.borrow_mut() = Some(rt);
-    }
-
-    /// Show `route`, with the rider at its start.
-    ///
-    /// The road goes up on flat ground at once; terrain and map data follow
-    /// the first time the view is shown, and the scene is rebuilt as each
-    /// arrives.
+    /// Show `route`, with the rider at its start. The world is built off the
+    /// main thread; the view says so until it is up.
     pub fn set_route(&self, route: &Route) {
         let inner = &self.inner;
         inner.generation.set(inner.generation.get() + 1);
@@ -455,15 +562,7 @@ impl CourseView {
         inner.progress.set(Progress::default());
         inner.drawn_m.set(None);
         *inner.route.borrow_mut() = Some(route.clone());
-        inner.terrain.set(Load::Wanted);
-        inner.map.set(Load::Wanted);
-        *inner.dem.borrow_mut() = None;
-        *inner.features.borrow_mut() = None;
-        inner.credit.set_visible(false);
         Inner::rebuild(inner);
-        if inner.root.is_mapped() {
-            Inner::ensure_world(inner);
-        }
     }
 
     /// Where the ride is: `distance_m` along the route, moving at `speed_ms`.
@@ -478,161 +577,28 @@ impl CourseView {
 }
 
 impl Inner {
-    /// Start whichever of terrain and map data the current route still needs.
-    /// A failed download is tried again each time the view is shown — with
-    /// whatever did arrive already in the cache.
-    fn ensure_world(this: &Rc<Self>) {
-        let Some(rt) = this.rt.borrow().clone() else {
-            return;
-        };
-        let Some(route) = this.route.borrow().clone() else {
-            return;
-        };
-        if route.points.len() < 2 {
-            return;
-        }
-        if this.terrain.get().should_start() {
-            Self::start_terrain(this, &rt, &route);
-        }
-        if this.map.get().should_start() {
-            Self::start_map(this, &rt, route);
-        }
-        this.update_status();
-    }
-
-    fn start_terrain(this: &Rc<Self>, rt: &tokio::runtime::Handle, route: &Route) {
-        let ids = match terrain::tiles_for_route(route, terrain::CORRIDOR_M) {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::warn!("No terrain for this route: {e}");
-                this.terrain.set(Load::Unavailable);
-                return;
-            }
-        };
-        this.terrain.set(Load::Loading);
-        let generation = this.generation.get();
-        let weak = Rc::downgrade(this);
-        crate::ui::spawn_to_main(
-            rt,
-            terrain::load(terrain::cache_dir(), ids),
-            move |loaded| {
-                let Some(inner) = weak.upgrade() else {
-                    return;
-                };
-                if inner.generation.get() != generation {
-                    return;
-                }
-                match loaded {
-                    Ok(tiles) => Self::decode_terrain(&inner, tiles, generation),
-                    Err(e) => {
-                        tracing::warn!("Terrain did not load: {e:#}");
-                        inner.terrain.set(Load::Failed);
-                        inner.update_status();
-                    }
-                }
-            },
-        );
-    }
-
-    /// Decode the tiles off the main thread, then rebuild on them.
-    fn decode_terrain(this: &Rc<Self>, tiles: Vec<(TileId, Vec<u8>)>, generation: u64) {
-        let weak = Rc::downgrade(this);
-        glib::spawn_future_local(async move {
-            let decoded = gtk::gio::spawn_blocking(move || decode_tiles(tiles)).await;
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            if inner.generation.get() != generation {
-                return;
-            }
-            match decoded {
-                Ok(Ok(dem)) => {
-                    *inner.dem.borrow_mut() = Some(Arc::new(dem));
-                    inner.terrain.set(Load::Ready);
-                    Self::rebuild(&inner);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Terrain could not be used: {e}");
-                    inner.terrain.set(Load::Failed);
-                }
-                Err(_) => {
-                    tracing::error!("Decoding the terrain panicked");
-                    inner.terrain.set(Load::Failed);
-                }
-            }
-            inner.update_status();
-        });
-    }
-
-    fn start_map(this: &Rc<Self>, rt: &tokio::runtime::Handle, route: Route) {
-        this.map.set(Load::Loading);
-        let generation = this.generation.get();
-        let weak = Rc::downgrade(this);
-        crate::ui::spawn_to_main(rt, osm::load(osm::cache_dir(), route), move |loaded| {
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            if inner.generation.get() != generation {
-                return;
-            }
-            match loaded {
-                Ok(features) => {
-                    *inner.features.borrow_mut() = Some(Arc::new(features));
-                    inner.map.set(Load::Ready);
-                    Self::rebuild(&inner);
-                }
-                Err(e) if e.downcast_ref::<osm::RouteTooComplex>().is_some() => {
-                    tracing::warn!("No map data for this route: {e}");
-                    inner.map.set(Load::Unavailable);
-                }
-                Err(e) => {
-                    tracing::warn!("Map data did not load: {e:#}");
-                    inner.map.set(Load::Failed);
-                }
-            }
-            inner.update_status();
-        });
-    }
-
-    /// Build the scene from the route and whatever has arrived, off the main
-    /// thread — a long route takes long enough to stall a frame.
+    /// Build the world from the route, off the main thread — a long route
+    /// takes long enough to stall a frame.
     fn rebuild(this: &Rc<Self>) {
         let Some(route) = this.route.borrow().clone() else {
             return;
         };
-        let dem = this.dem.borrow().clone();
-        let features = this.features.borrow().clone();
-        let seq = this.build_seq.get() + 1;
-        this.build_seq.set(seq);
         let generation = this.generation.get();
         this.update_status();
         let weak = Rc::downgrade(this);
         glib::spawn_future_local(async move {
-            let (with_dem, with_map) = (dem.is_some(), features.is_some());
-            let built = gtk::gio::spawn_blocking(move || {
-                CourseScene::build_with(&route, dem.as_deref(), features.as_deref())
-            })
-            .await;
+            let built = gtk::gio::spawn_blocking(move || CourseScene::build(&route)).await;
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if inner.generation.get() != generation || inner.build_seq.get() != seq {
+            if inner.generation.get() != generation {
                 return;
             }
             match built {
                 Ok(scene) => {
-                    let has_scene = scene.is_some();
                     *inner.scene.borrow_mut() = scene;
                     inner.needs_upload.set(true);
                     inner.area.queue_render();
-                    match credit_text(with_dem && has_scene, with_map && has_scene) {
-                        Some((text, sources)) => {
-                            inner.credit.set_label(&credit_markup(&text));
-                            inner.credit.set_tooltip_text(Some(&sources));
-                            inner.credit.set_visible(true);
-                        }
-                        None => inner.credit.set_visible(false),
-                    }
                 }
                 Err(_) => tracing::error!("Building the 3D course panicked"),
             }
@@ -640,21 +606,16 @@ impl Inner {
         });
     }
 
-    /// Say what is happening, from where the scene and both downloads stand.
+    /// Say the world is being built, until it is.
     fn update_status(&self) {
-        let has_scene = self.scene.borrow().is_some()
-            || self
+        let building = self.scene.borrow().is_none()
+            && self
                 .route
                 .borrow()
                 .as_ref()
-                .is_none_or(|r| r.points.len() < 2);
-        match status_text(has_scene, self.terrain.get(), self.map.get()) {
-            Some(t) => {
-                self.status.set_label(t);
-                self.status.set_visible(true);
-            }
-            None => self.status.set_visible(false),
-        }
+                .is_some_and(|r| r.points.len() >= 2);
+        self.status.set_label(BUILDING);
+        self.status.set_visible(building);
     }
 
     fn realize(&self, area: &gtk::GLArea) {
@@ -709,21 +670,89 @@ impl Inner {
         if self.needs_upload.get() {
             self.needs_upload.set(false);
             let scene = self.scene.borrow();
-            state.upload(scene.as_ref().map(|s| &s.mesh));
+            state.upload(scene.as_ref());
         }
 
         let scale = area.scale_factor();
         let (w, h) = (area.width() * scale, area.height() * scale);
         let now = glib::monotonic_time();
-        let distance = self.progress.get().distance_at(now);
-        let pose = self
-            .scene
-            .borrow()
-            .as_ref()
-            .and_then(|s| course3d::camera_pose(&s.road, distance));
+        let progress = self.progress.get();
+        let distance = progress.distance_at(now);
+        let speed = progress.speed_at(now);
+        let (pose, sky) = match self.scene.borrow().as_ref() {
+            Some(s) => (
+                course3d::rider_pose(&s.road, distance, speed)
+                    .map(|r| (course3d::chase_camera(&s.road, &r), r)),
+                s.sky_at(distance),
+            ),
+            None => (None, Sky::default()),
+        };
+        // Seconds, wrapped every hour so the animals' motion keeps its
+        // precision.
+        let time_s = (now / 1_000 % 3_600_000) as f32 / 1_000.0;
 
-        state.draw(w, h, pose);
+        state.draw(w, h, pose, sky, time_s);
         self.drawn_m.set(pose.map(|_| distance));
+    }
+}
+
+impl MeshGl {
+    /// `mesh` on the GPU, with the world's vertex layout.
+    unsafe fn new(gl: &glow::Context, mesh: &Mesh) -> Result<Self, String> {
+        let vao = gl.create_vertex_array()?;
+        let vbo = gl.create_buffer()?;
+        let ebo = gl.create_buffer()?;
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+        let stride = std::mem::size_of::<course3d::Vertex>() as i32;
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 12);
+        gl.bind_vertex_array(None);
+        let mut this = Self {
+            vao,
+            vbo,
+            ebo,
+            index_count: 0,
+        };
+        this.replace(gl, Some(mesh));
+        Ok(this)
+    }
+
+    /// Replace what is on the GPU with `mesh`, or with nothing.
+    fn replace(&mut self, gl: &glow::Context, mesh: Option<&Mesh>) {
+        let (vertices, indices) = match mesh {
+            Some(m) => (vertex_bytes(m), index_bytes(m)),
+            None => (Vec::new(), Vec::new()),
+        };
+        unsafe {
+            gl.bind_vertex_array(Some(self.vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &vertices, glow::STATIC_DRAW);
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.ebo));
+            gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, &indices, glow::STATIC_DRAW);
+            gl.bind_vertex_array(None);
+        }
+        self.index_count = mesh.map_or(0, |m| m.indices.len() as i32);
+    }
+
+    unsafe fn draw(&self, gl: &glow::Context) {
+        if self.index_count == 0 {
+            return;
+        }
+        gl.bind_vertex_array(Some(self.vao));
+        gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
+        gl.bind_vertex_array(None);
+    }
+
+    fn destroy(&self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_vertex_array(self.vao);
+            gl.delete_buffer(self.vbo);
+            gl.delete_buffer(self.ebo);
+        }
     }
 }
 
@@ -740,75 +769,155 @@ impl GlState {
                 header,
                 VERTEX_SHADER,
                 FRAGMENT_SHADER,
-                &[(0, "a_pos"), (1, "a_colour"), (2, "a_uv")],
+                &[(0, "a_pos"), (1, "a_colour")],
             )?;
-            let sky_program = link(&gl, header, SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER, &[])?;
-            let sky_vao = gl.create_vertex_array()?;
+            let sky_program = link(
+                &gl,
+                header,
+                FULLSCREEN_VERTEX_SHADER,
+                SKY_FRAGMENT_SHADER,
+                &[],
+            )?;
+            let outline_program = link(
+                &gl,
+                header,
+                FULLSCREEN_VERTEX_SHADER,
+                OUTLINE_FRAGMENT_SHADER,
+                &[],
+            )?;
+            let prop_program = link(
+                &gl,
+                header,
+                PROP_VERTEX_SHADER,
+                FRAGMENT_SHADER,
+                &[
+                    (0, "a_pos"),
+                    (1, "a_colour"),
+                    (3, "i_pos"),
+                    (4, "i_size"),
+                    (5, "i_colour"),
+                    (6, "i_motion"),
+                ],
+            )?;
+            let empty_vao = gl.create_vertex_array()?;
+            let empty = Mesh::default();
+            let world = MeshGl::new(&gl, &empty)?;
+            let mountains = MeshGl::new(&gl, &empty)?;
+            let clouds = MeshGl::new(&gl, &empty)?;
+            let rider_body = MeshGl::new(&gl, &rider::body(&rider::Avatar::default()))?;
+            let rider_leg = MeshGl::new(&gl, &rider::leg(&rider::Avatar::default()))?;
+            let props = Shape::ALL
+                .iter()
+                .map(|&shape| PropShape::new(&gl, shape))
+                .collect::<Result<Vec<_>, _>>()?;
 
-            let vao = gl.create_vertex_array()?;
-            let vbo = gl.create_buffer()?;
-            let ebo = gl.create_buffer()?;
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
-            let stride = std::mem::size_of::<course3d::Vertex>() as i32;
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 12);
-            gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 28);
-            gl.bind_vertex_array(None);
-
+            let at = |p: glow::Program, name: &str| gl.get_uniform_location(p, name);
+            let u = Uniforms {
+                scene: SceneUniforms::of(&gl, program),
+                props: SceneUniforms::of(&gl, prop_program),
+                sky_horizon: at(sky_program, "u_horizon"),
+                sky_zenith: at(sky_program, "u_zenith"),
+                o_colour: at(outline_program, "u_colour"),
+                o_normal: at(outline_program, "u_normal"),
+                o_depth: at(outline_program, "u_depth"),
+                o_texel: at(outline_program, "u_texel"),
+                o_near: at(outline_program, "u_near"),
+                o_far: at(outline_program, "u_far"),
+                o_outline: at(outline_program, "u_outline"),
+                o_fog_start: at(outline_program, "u_fog_start"),
+                o_fog_density: at(outline_program, "u_fog_density"),
+            };
             Ok(Self {
-                u_horizon: gl.get_uniform_location(sky_program, "u_horizon"),
-                u_zenith: gl.get_uniform_location(sky_program, "u_zenith"),
-                u_sun: gl.get_uniform_location(program, "u_sun"),
-                sky_program,
-                sky_vao,
-                u_mvp: gl.get_uniform_location(program, "u_mvp"),
-                u_eye: gl.get_uniform_location(program, "u_eye"),
-                u_sky: gl.get_uniform_location(program, "u_sky"),
-                u_fog_start: gl.get_uniform_location(program, "u_fog_start"),
-                u_fog_end: gl.get_uniform_location(program, "u_fog_end"),
                 gl,
                 program,
-                vao,
-                vbo,
-                ebo,
-                index_count: 0,
+                sky_program,
+                outline_program,
+                prop_program,
+                empty_vao,
+                world,
+                mountains,
+                clouds,
+                rider_body,
+                rider_leg,
+                props,
+                target: None,
+                u,
                 reported: Cell::new(false),
             })
         }
     }
 
-    /// Replace what is on the GPU with `mesh`, or with nothing.
-    fn upload(&mut self, mesh: Option<&Mesh>) {
-        let (vertices, indices) = match mesh {
-            Some(m) => (vertex_bytes(m), index_bytes(m)),
-            None => (Vec::new(), Vec::new()),
-        };
-        unsafe {
-            let gl = &self.gl;
-            gl.bind_vertex_array(Some(self.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &vertices, glow::STATIC_DRAW);
-            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.ebo));
-            gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, &indices, glow::STATIC_DRAW);
-            gl.bind_vertex_array(None);
+    /// Replace what is on the GPU with `scene`, or with nothing.
+    fn upload(&mut self, scene: Option<&CourseScene>) {
+        let batches = scene.map(|s| props::batches(&s.props)).unwrap_or_default();
+        for shape in &mut self.props {
+            let batch = batches.iter().find(|b| b.shape == shape.shape);
+            let data: Vec<u8> = batch
+                .map(|b| b.instances.iter().flat_map(|f| f.to_ne_bytes()).collect())
+                .unwrap_or_default();
+            unsafe {
+                self.gl
+                    .bind_buffer(glow::ARRAY_BUFFER, Some(shape.instances));
+                self.gl
+                    .buffer_data_u8_slice(glow::ARRAY_BUFFER, &data, glow::STATIC_DRAW);
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            }
+            shape.chunks = batch.map(|b| b.chunks.clone()).unwrap_or_default();
         }
-        self.index_count = mesh.map_or(0, |m| m.indices.len() as i32);
+        self.world.replace(&self.gl, scene.map(|s| &s.mesh));
+        self.mountains
+            .replace(&self.gl, scene.map(|s| &s.mountains));
+        self.clouds.replace(&self.gl, scene.map(|s| &s.clouds));
     }
 
-    fn draw(&self, width: i32, height: i32, pose: Option<course3d::CameraPose>) {
-        let gl = &self.gl;
+    /// The offscreen framebuffer at `width` × `height`, made or remade as
+    /// the view's size changes.
+    fn target(&mut self, width: i32, height: i32) -> Result<&Target, String> {
+        let size = (width.max(1), height.max(1));
+        if self.target.as_ref().is_some_and(|t| t.size != size) {
+            if let Some(old) = self.target.take() {
+                old.destroy(&self.gl);
+            }
+        }
+        if self.target.is_none() {
+            self.target = Some(unsafe { Target::new(&self.gl, size)? });
+        }
+        self.target.as_ref().ok_or_else(|| "no target".to_owned())
+    }
+
+    fn draw(
+        &mut self,
+        width: i32,
+        height: i32,
+        pose: Option<(CameraPose, RiderPose)>,
+        sky: Sky,
+        time_s: f32,
+    ) {
         // Logged on the first frame that has a scene to draw, which is the
         // one that matters if the rider sees only sky.
-        let first = pose.is_some() && self.index_count > 0 && !self.reported.replace(true);
+        let first = pose.is_some() && self.world.index_count > 0 && !self.reported.replace(true);
         if first {
             self.report_state(width, height, true);
         }
+        // Where GTK wants the picture: its framebuffer, bound now.
+        let screen = unsafe {
+            let id = self.gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
+            std::num::NonZeroU32::new(id as u32).map(glow::NativeFramebuffer)
+        };
+        let target = match self.target(width, height) {
+            Ok(t) => (t.fbo, t.colour, t.normal, t.depth),
+            Err(e) => {
+                tracing::error!("3D view could not make its framebuffer: {e}");
+                return;
+            }
+        };
+        let (fbo, colour_tex, normal_tex, depth_tex) = target;
+        let gl = &self.gl;
+        let u = &self.u;
+        let outline = palette::BASE.outline;
         unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1]);
             // GTK renders with the same context and leaves its own state
             // behind. Nothing here may be assumed: set everything the scene
             // relies on, every frame.
@@ -828,52 +937,99 @@ impl GlState {
             gl.clear_depth_f32(1.0);
             gl.front_face(glow::CCW);
             gl.viewport(0, 0, width, height);
-            gl.clear_color(SKY_RGB[0], SKY_RGB[1], SKY_RGB[2], 1.0);
+            gl.clear_color(sky.horizon[0], sky.horizon[1], sky.horizon[2], 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
             gl.use_program(Some(self.sky_program));
-            gl.uniform_3_f32(self.u_horizon.as_ref(), SKY_RGB[0], SKY_RGB[1], SKY_RGB[2]);
-            gl.uniform_3_f32(
-                self.u_zenith.as_ref(),
-                ZENITH_RGB[0],
-                ZENITH_RGB[1],
-                ZENITH_RGB[2],
+            gl.uniform_3_f32_slice(u.sky_horizon.as_ref(), &sky.horizon);
+            gl.uniform_3_f32_slice(u.sky_zenith.as_ref(), &sky.top);
+            gl.bind_vertex_array(Some(self.empty_vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+
+            if let (Some((camera, rider_pose)), true) = (pose, self.world.index_count > 0) {
+                let aspect = width as f32 / height.max(1) as f32;
+                let mvp = course3d::mul4(
+                    &course3d::perspective(FOV_DEG, aspect, NEAR_M, FAR_M),
+                    &course3d::look_at(camera.eye, camera.target),
+                );
+                gl.enable(glow::DEPTH_TEST);
+                gl.depth_func(glow::LEQUAL);
+                gl.use_program(Some(self.program));
+                u.scene.set(gl, &mvp, &camera.eye, &sky, time_s);
+
+                // The horizon, around the eye: mountains, and the clouds
+                // drifting slowly round. Then depth is cleared, so the world
+                // always stands in front of it.
+                let around = course3d::translation(camera.eye);
+                gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &around);
+                self.mountains.draw(gl);
+                let drift = course3d::mul4(&around, &course3d::yaw(time_s * CLOUD_DRIFT));
+                gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &drift);
+                self.clouds.draw(gl);
+                gl.clear(glow::DEPTH_BUFFER_BIT);
+
+                gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &course3d::IDENTITY);
+                self.world.draw(gl);
+
+                // The rider, and their legs turning with the cranks.
+                let body = course3d::rider_model(&rider_pose);
+                gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &body);
+                self.rider_body.draw(gl);
+                for side in [-1.0f32, 1.0] {
+                    let (swing, lift) = rider::leg_pose(rider_pose.crank, side);
+                    let hip = course3d::translation([
+                        rider::HIP[0],
+                        rider::HIP[1] + lift,
+                        rider::HIP[2] + side * rider::LEG_Z,
+                    ]);
+                    let leg = course3d::mul4(&body, &course3d::mul4(&hip, &course3d::pitch(swing)));
+                    gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &leg);
+                    self.rider_leg.draw(gl);
+                }
+
+                gl.use_program(Some(self.prop_program));
+                u.props.set(gl, &mvp, &camera.eye, &sky, time_s);
+                for shape in &self.props {
+                    shape.draw(gl, camera.eye);
+                }
+                if first {
+                    let err = gl.get_error();
+                    tracing::info!(
+                        "3D view first draw: {} indices, GL error 0x{err:X}",
+                        self.world.index_count
+                    );
+                }
+                gl.disable(glow::DEPTH_TEST);
+            }
+
+            // Into GTK's framebuffer, with the outlines.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, screen);
+            gl.viewport(0, 0, width, height);
+            gl.use_program(Some(self.outline_program));
+            for (unit, tex, uniform) in [
+                (0, colour_tex, &u.o_colour),
+                (1, normal_tex, &u.o_normal),
+                (2, depth_tex, &u.o_depth),
+            ] {
+                gl.active_texture(glow::TEXTURE0 + unit);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.uniform_1_i32(uniform.as_ref(), unit as i32);
+            }
+            gl.uniform_2_f32(
+                u.o_texel.as_ref(),
+                1.0 / width.max(1) as f32,
+                1.0 / height.max(1) as f32,
             );
-            gl.bind_vertex_array(Some(self.sky_vao));
+            gl.uniform_1_f32(u.o_near.as_ref(), NEAR_M);
+            gl.uniform_1_f32(u.o_far.as_ref(), FAR_M);
+            gl.uniform_3_f32_slice(u.o_outline.as_ref(), &outline);
+            gl.uniform_1_f32(u.o_fog_start.as_ref(), biome::FOG_START_M);
+            gl.uniform_1_f32(u.o_fog_density.as_ref(), sky.fog_density);
+            gl.bind_vertex_array(Some(self.empty_vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE0);
             gl.use_program(None);
-            let Some(pose) = pose else {
-                return;
-            };
-            if self.index_count == 0 {
-                return;
-            }
-            let aspect = width as f32 / height.max(1) as f32;
-            let mvp = course3d::mul4(
-                &course3d::perspective(FOV_DEG, aspect, NEAR_M, FAR_M),
-                &course3d::look_at(pose.eye, pose.target),
-            );
-            gl.enable(glow::DEPTH_TEST);
-            gl.depth_func(glow::LEQUAL);
-            gl.use_program(Some(self.program));
-            gl.uniform_matrix_4_f32_slice(self.u_mvp.as_ref(), false, &mvp);
-            gl.uniform_3_f32(self.u_eye.as_ref(), pose.eye[0], pose.eye[1], pose.eye[2]);
-            gl.uniform_3_f32(self.u_sky.as_ref(), SKY_RGB[0], SKY_RGB[1], SKY_RGB[2]);
-            gl.uniform_3_f32(self.u_sun.as_ref(), SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
-            gl.uniform_1_f32(self.u_fog_start.as_ref(), FOG_START_M);
-            gl.uniform_1_f32(self.u_fog_end.as_ref(), FOG_END_M);
-            gl.bind_vertex_array(Some(self.vao));
-            gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
-            if first {
-                let err = gl.get_error();
-                tracing::info!(
-                    "3D view first draw: {} indices, GL error 0x{err:X}",
-                    self.index_count
-                );
-            }
-            gl.bind_vertex_array(None);
-            gl.use_program(None);
-            gl.disable(glow::DEPTH_TEST);
         }
     }
 
@@ -925,14 +1081,150 @@ impl GlState {
         }
     }
 
-    fn destroy(self) {
+    fn destroy(mut self) {
+        if let Some(target) = self.target.take() {
+            target.destroy(&self.gl);
+        }
+        for mesh in [
+            &self.world,
+            &self.mountains,
+            &self.clouds,
+            &self.rider_body,
+            &self.rider_leg,
+        ] {
+            mesh.destroy(&self.gl);
+        }
+        for shape in &self.props {
+            shape.mesh.destroy(&self.gl);
+            unsafe { self.gl.delete_buffer(shape.instances) };
+        }
         unsafe {
             self.gl.delete_program(self.program);
             self.gl.delete_program(self.sky_program);
-            self.gl.delete_vertex_array(self.sky_vao);
-            self.gl.delete_vertex_array(self.vao);
-            self.gl.delete_buffer(self.vbo);
-            self.gl.delete_buffer(self.ebo);
+            self.gl.delete_program(self.outline_program);
+            self.gl.delete_program(self.prop_program);
+            self.gl.delete_vertex_array(self.empty_vao);
+        }
+    }
+}
+
+impl PropShape {
+    /// The shape's mesh on the GPU, with an empty buffer for its props.
+    unsafe fn new(gl: &glow::Context, shape: Shape) -> Result<Self, String> {
+        let mesh = MeshGl::new(gl, &shape.mesh())?;
+        let instances = gl.create_buffer()?;
+        gl.bind_vertex_array(Some(mesh.vao));
+        for slot in [3, 4, 5, 6] {
+            gl.enable_vertex_attrib_array(slot);
+            gl.vertex_attrib_divisor(slot, 1);
+        }
+        gl.bind_vertex_array(None);
+        Ok(Self {
+            shape,
+            mesh,
+            instances,
+            chunks: Vec::new(),
+        })
+    }
+
+    /// Draw the props of every chunk within reach of the eye. Each chunk's
+    /// run is reached by pointing the per-prop attributes at its start: GL
+    /// ES 3.0 has no base instance.
+    unsafe fn draw(&self, gl: &glow::Context, eye: [f32; 3]) {
+        if self.chunks.is_empty() || self.mesh.index_count == 0 {
+            return;
+        }
+        let stride = (props::INSTANCE_FLOATS * 4) as i32;
+        gl.bind_vertex_array(Some(self.mesh.vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
+        for chunk in &self.chunks {
+            if !props::in_reach(chunk, eye[0], eye[2], PROP_DRAW_M) {
+                continue;
+            }
+            let base = chunk.start as i32 * stride;
+            gl.vertex_attrib_pointer_f32(3, 3, glow::FLOAT, false, stride, base);
+            gl.vertex_attrib_pointer_f32(4, 2, glow::FLOAT, false, stride, base + 12);
+            gl.vertex_attrib_pointer_f32(5, 3, glow::FLOAT, false, stride, base + 20);
+            gl.vertex_attrib_pointer_f32(6, 2, glow::FLOAT, false, stride, base + 32);
+            gl.draw_elements_instanced(
+                glow::TRIANGLES,
+                self.mesh.index_count,
+                glow::UNSIGNED_INT,
+                0,
+                chunk.count as i32,
+            );
+        }
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.bind_vertex_array(None);
+    }
+}
+
+impl Target {
+    /// A framebuffer with a colour and a normal texture and a depth texture,
+    /// all `size`, every one readable by the outline pass.
+    unsafe fn new(gl: &glow::Context, size: (i32, i32)) -> Result<Self, String> {
+        let texture = |internal: u32, format: u32, kind: u32| -> Result<glow::Texture, String> {
+            let t = gl.create_texture()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal as i32,
+                size.0,
+                size.1,
+                0,
+                format,
+                kind,
+                glow::PixelUnpackData::Slice(None),
+            );
+            for (k, v) in [
+                (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
+            }
+            Ok(t)
+        };
+        let colour = texture(glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE)?;
+        let normal = texture(glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE)?;
+        let depth = texture(
+            glow::DEPTH_COMPONENT24,
+            glow::DEPTH_COMPONENT,
+            glow::UNSIGNED_INT,
+        )?;
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        let fbo = gl.create_framebuffer()?;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        for (attachment, t) in [
+            (glow::COLOR_ATTACHMENT0, colour),
+            (glow::COLOR_ATTACHMENT1, normal),
+            (glow::DEPTH_ATTACHMENT, depth),
+        ] {
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, attachment, glow::TEXTURE_2D, Some(t), 0);
+        }
+        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        let target = Self {
+            fbo,
+            colour,
+            normal,
+            depth,
+            size,
+        };
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            target.destroy(gl);
+            return Err(format!("framebuffer incomplete: 0x{status:X}"));
+        }
+        Ok(target)
+    }
+
+    fn destroy(self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_framebuffer(self.fbo);
+            gl.delete_texture(self.colour);
+            gl.delete_texture(self.normal);
+            gl.delete_texture(self.depth);
         }
     }
 }
@@ -974,29 +1266,10 @@ unsafe fn link(
     Ok(program)
 }
 
-/// Open each tile's PNG with GTK's image loader and decode its heights. Any
-/// tile that will not open or decode fails the lot — see `terrain::load`.
-fn decode_tiles(tiles: Vec<(TileId, Vec<u8>)>) -> Result<Dem, String> {
-    let mut dem = Dem::default();
-    for (id, bytes) in tiles {
-        let texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
-            .map_err(|e| format!("tile {id:?} is not an image: {e}"))?;
-        let mut downloader = gtk::gdk::TextureDownloader::new(&texture);
-        downloader.set_format(gtk::gdk::MemoryFormat::R8g8b8);
-        let (rgb, stride) = downloader.download_bytes();
-        let width = u32::try_from(texture.width()).unwrap_or(0);
-        let height = u32::try_from(texture.height()).unwrap_or(0);
-        let heights = terrain::decode_terrarium(&rgb, width, height, stride)
-            .map_err(|e| format!("tile {id:?}: {e}"))?;
-        dem.insert(id, heights);
-    }
-    Ok(dem)
-}
-
 fn vertex_bytes(mesh: &Mesh) -> Vec<u8> {
     mesh.vertices
         .iter()
-        .flat_map(|v| v.pos.iter().chain(v.colour.iter()).chain(v.uv.iter()))
+        .flat_map(|v| v.pos.iter().chain(v.colour.iter()))
         .flat_map(|f| f.to_ne_bytes())
         .collect()
 }
@@ -1058,6 +1331,29 @@ mod tests {
     }
 
     #[test]
+    fn should_report_no_speed_once_the_view_stops_carrying_the_rider() {
+        let p = Progress {
+            distance_m: 100.0,
+            speed_ms: 8.0,
+            at_us: Some(1_000_000),
+        };
+        assert_eq!(p.speed_at(1_500_000), 8.0);
+        // At the very moment the distance stops moving, so does the lean.
+        assert_eq!(p.speed_at(2_000_000), 0.0);
+        assert_eq!(Progress::default().speed_at(5_000_000), 0.0);
+        let bad = Progress {
+            speed_ms: f32::NAN,
+            ..p
+        };
+        assert_eq!(bad.speed_at(1_200_000), 0.0);
+        let back = Progress {
+            speed_ms: -3.0,
+            ..p
+        };
+        assert_eq!(back.speed_at(1_200_000), 0.0);
+    }
+
+    #[test]
     fn should_never_run_backwards() {
         // A clock read before the report, or a negative speed from a bad
         // reading, must not pull the camera back up the road.
@@ -1073,73 +1369,11 @@ mod tests {
     // ── Status and credit ─────────────────────────────────────────────────────
 
     #[test]
-    fn should_say_it_is_building_before_there_is_anything_to_see() {
-        assert_eq!(status_text(false, Load::Ready, Load::Ready), Some(BUILDING));
-    }
-
-    #[test]
-    fn should_say_nothing_once_everything_is_in() {
-        assert_eq!(status_text(true, Load::Ready, Load::Ready), None);
-        // Before the view is shown nothing has been asked for: nothing to say.
-        assert_eq!(status_text(true, Load::Wanted, Load::Wanted), None);
-    }
-
-    #[test]
-    fn should_report_the_slow_map_download_only_after_terrain_is_in() {
-        assert_eq!(
-            status_text(true, Load::Loading, Load::Loading),
-            Some("Loading terrain…")
-        );
-        let map = status_text(true, Load::Ready, Load::Loading).expect("a status");
-        assert!(map.starts_with("Loading map data"), "{map}");
-    }
-
-    #[test]
-    fn should_say_which_download_failed() {
-        let t = status_text(true, Load::Failed, Load::Ready).expect("a status");
-        assert!(t.starts_with("No terrain"), "{t}");
-        let m = status_text(true, Load::Ready, Load::Failed).expect("a status");
-        assert!(m.starts_with("No map data"), "{m}");
-    }
-
-    #[test]
-    fn should_retry_a_failure_but_never_an_impossible_route() {
-        assert!(Load::Wanted.should_start());
-        assert!(Load::Failed.should_start());
-        assert!(!Load::Loading.should_start());
-        assert!(!Load::Ready.should_start());
-        assert!(!Load::Unavailable.should_start());
-    }
-
-    #[test]
-    fn should_credit_openstreetmap_whenever_its_data_is_shown() {
-        let (text, _) = credit_text(false, true).expect("a credit");
-        assert!(text.contains("© OpenStreetMap contributors"));
-        let (text, sources) = credit_text(true, true).expect("a credit");
-        assert!(text.contains("© OpenStreetMap contributors") && text.contains("Terrain Tiles"));
-        assert!(sources.contains("Open Database License"));
-        let (text, _) = credit_text(true, false).expect("a credit");
-        assert!(!text.contains("OpenStreetMap"));
-        assert_eq!(credit_text(false, false), None);
-    }
-
-    #[test]
-    fn should_link_the_openstreetmap_credit_to_its_licence() {
-        let (text, _) = credit_text(true, true).expect("a credit");
-        let markup = credit_markup(&text);
-        assert!(markup.contains(r#"<a href="https://www.openstreetmap.org/copyright">"#));
-        // The elevation credit stays plain text.
-        assert!(markup.contains("Terrain Tiles"));
-        assert_eq!(credit_markup("a < b & c"), "a &lt; b &amp; c");
-    }
-
-    #[test]
-    fn should_pack_nine_floats_per_vertex() {
+    fn should_pack_seven_floats_per_vertex() {
         let mesh = Mesh {
             vertices: vec![course3d::Vertex {
                 pos: [1.0, 2.0, 3.0],
-                colour: [0.1, 0.2, 0.3, 1.0],
-                uv: [7.0, 8.0],
+                colour: [0.1, 0.2, 0.3, 7.0],
             }],
             indices: vec![0, 0, 0],
         };
@@ -1147,9 +1381,9 @@ mod tests {
         assert_eq!(bytes.len(), std::mem::size_of::<course3d::Vertex>());
         assert_eq!(&bytes[12..16], &0.1f32.to_ne_bytes());
         assert_eq!(
-            &bytes[28..32],
+            &bytes[24..28],
             &7.0f32.to_ne_bytes(),
-            "uv after colour, at the offset GL reads"
+            "the material last, at the offset GL reads"
         );
         assert_eq!(index_bytes(&mesh).len(), 12);
     }
@@ -1162,8 +1396,8 @@ mod tests {
 /// it shows is what the widget shows.
 ///
 /// ```text
-/// CYCLE_3D_GPX=route.gpx CYCLE_3D_OUT=/tmp/view.png [CYCLE_3D_TILES=<terrain cache>] \
-///   [CYCLE_3D_AT=<metres>] cargo test render_course_offscreen -- --ignored --nocapture
+/// CYCLE_3D_GPX=route.gpx CYCLE_3D_OUT=/tmp/view.png [CYCLE_3D_AT=<metres>] \
+///   [CYCLE_3D_TIME=<seconds>] cargo test render_course_offscreen -- --ignored --nocapture
 /// ```
 #[cfg(test)]
 mod offscreen {
@@ -1195,32 +1429,19 @@ mod offscreen {
             .unwrap_or(200.0);
         let route = Route::from_gpx_path(std::path::Path::new(&gpx)).expect("a GPX");
         let started = std::time::Instant::now();
-        // CYCLE_3D_OSM=<saved Overpass answer> adds buildings, land use, water.
-        let features = std::env::var("CYCLE_3D_OSM")
-            .ok()
-            .map(|path| osm::parse(&std::fs::read(path).expect("the map file")).expect("map data"));
-        let scene = match std::env::var("CYCLE_3D_TILES") {
-            Ok(root) => {
-                let ids = terrain::tiles_for_route(&route, terrain::CORRIDOR_M).expect("tiles");
-                let tiles: Vec<(TileId, Vec<u8>)> = ids
-                    .into_iter()
-                    .map(|id| {
-                        let bytes = terrain::read_cached(std::path::Path::new(&root), id)
-                            .unwrap_or_else(|| panic!("{id:?} not cached"));
-                        (id, bytes)
-                    })
-                    .collect();
-                let dem = decode_tiles(tiles).expect("decodes");
-                CourseScene::build_with(&route, Some(&dem), features.as_ref()).expect("a scene")
-            }
-            Err(_) => CourseScene::build_with(&route, None, features.as_ref()).expect("a scene"),
-        };
+        let scene = CourseScene::build(&route).expect("a scene");
         eprintln!("scene built in {:.2} s", started.elapsed().as_secs_f64());
-        let pose = course3d::camera_pose(&scene.road, at).expect("a pose");
+        let speed: f32 = std::env::var("CYCLE_3D_SPEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8.0);
+        let rider = course3d::rider_pose(&scene.road, at, speed).expect("a rider");
+        let pose = course3d::chase_camera(&scene.road, &rider);
         eprintln!(
-            "{} vertices, {} indices; eye {:?} target {:?}",
+            "{} vertices, {} indices, {} props; eye {:?} target {:?}",
             scene.mesh.vertices.len(),
             scene.mesh.indices.len(),
+            scene.props.len(),
             pose.eye,
             pose.target
         );
@@ -1314,7 +1535,7 @@ mod offscreen {
             );
 
             let mut state = GlState::new(gl, es).expect("shaders compile");
-            state.upload(Some(&scene.mesh));
+            state.upload(Some(&scene));
             // CYCLE_3D_GTK_STATE=1 leaves the context as GTK's renderer
             // leaves it — depth cleared to 0, depth test on — which once
             // showed the rider nothing but sky.
@@ -1323,7 +1544,12 @@ mod offscreen {
                 state.gl.enable(glow::DEPTH_TEST);
                 state.gl.depth_func(glow::GREATER);
             }
-            state.draw(W, H, Some(pose));
+            // CYCLE_3D_TIME=<seconds> sets where the animals are in their motion.
+            let time_s: f32 = std::env::var("CYCLE_3D_TIME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            state.draw(W, H, Some((pose, rider)), scene.sky_at(at), time_s);
             let err = state.gl.get_error();
             eprintln!("glGetError after draw: 0x{err:X}");
 

@@ -123,9 +123,10 @@ Use Adwaita semantic CSS classes — never hardcode font sizes:
   - Cairo drawing using `power_zone_index(watts, ftp)` to index `ZONE_COLORS`, or the
     helpers in `ui/widgets/zone_color.rs` — zone colours only. (`PowerZone::rgb()` names
     the same palette but nothing draws through it; see the note in `data/athlete.rs`.)
-  - The 3D course scene (`data/course3d.rs`, `ui/widgets/course_view.rs`) and the OSM map
-    tiles are the exception: they depict the world, which is not themed — a road is grey
-    and grass is green in dark mode too. Keep such colours as named constants in those files.
+  - The 3D course scene and the 2D map tiles are the exception: they depict the world,
+    which is not themed — a road is grey and grass is green in dark mode too. Every 3D
+    colour lives by name in `data/palette.rs`; a biome's overrides live in
+    `data/biomes.json`. No mesh builder or shader names a colour of its own.
 - Always support both light and dark themes (Adwaita handles this automatically if you don't hardcode)
 - Test UI in both themes before marking a task complete
 
