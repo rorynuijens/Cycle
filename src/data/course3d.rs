@@ -14,7 +14,7 @@
 //! the route, with no map data and no network; the ground is fitted to the
 //! road, never the other way round.
 
-use crate::data::biome::{self, BiomeDef, BiomeMap};
+use crate::data::biome::{self, BiomeDef, BiomeMap, Scenery};
 use crate::data::palette::Palette;
 use crate::data::props::Prop;
 use crate::data::roadway;
@@ -362,13 +362,13 @@ pub struct CourseScene {
 impl CourseScene {
     /// Build the world for `route`. `None` for a route too short to draw —
     /// fewer than two points.
-    pub fn build(route: &Route) -> Option<Self> {
-        Self::build_from(route, None)
+    pub fn build(route: &Route, scenery: Scenery) -> Option<Self> {
+        Self::build_from(route, None, scenery)
     }
 
     /// Build the world, with the land shaped by `terrain` — any height for
     /// any scene position — instead of the world's own hills.
-    pub fn build_from(route: &Route, terrain: Option<Terrain>) -> Option<Self> {
+    pub fn build_from(route: &Route, terrain: Option<Terrain>, scenery: Scenery) -> Option<Self> {
         let road = track::lay(route);
         if road.len() < 2 {
             return None;
@@ -376,7 +376,7 @@ impl CourseScene {
         let world = World::new(&road);
         let own = |x: f32, z: f32| Some(world.height(x, z));
         let terrain = terrain.unwrap_or(&own);
-        let look = look_for(&road, route.points[0].lat, &world);
+        let look = look_for(&road, route.points[0].lat, &world, scenery);
         let mut props = Vec::new();
         let mut mesh = world_mesh(
             &road,
@@ -468,9 +468,23 @@ fn skies_along(road: &[RoadPoint], biomes: &BiomeMap) -> Vec<Sky> {
 
 /// The look of the land around `road`: the biome map over everything the
 /// world reaches, voted from what grows there and the land's height.
-fn look_for(road: &[RoadPoint], lat: f64, world: &World) -> Look {
-    // The made-up world is the rider's own countryside wherever the route
-    // really is: temperate, woods leaning to forest, high ground to mountain.
+fn look_for(road: &[RoadPoint], lat: f64, world: &World, scenery: Scenery) -> Look {
+    let snow_line_m = biome::snow_line_m(lat);
+    let segments = match scenery {
+        Scenery::Only(b) => {
+            return Look {
+                biomes: BiomeMap::uniform(b),
+                snow_line_m,
+            }
+        }
+        Scenery::Mixed => {
+            let length = road.last().map_or(0.0, |p| p.distance_m);
+            Some(biome::mix_segments(world.seed(), length))
+        }
+        Scenery::Countryside => None,
+    };
+    // The countryside is the same wherever the route really is: temperate,
+    // woods leaning to forest, high ground to mountain.
     let climate = biome::Biome::Temperate;
     let (mut x_lo, mut x_hi, mut z_lo, mut z_hi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
     for p in road {
@@ -481,12 +495,15 @@ fn look_for(road: &[RoadPoint], lat: f64, world: &World) -> Look {
     }
     let r = crate::data::world::REACH_M;
     let biomes = BiomeMap::build((x_lo - r, x_hi + r), (z_lo - r, z_hi + r), |x, z| {
-        let raw = world.height(x, z);
-        (biome::votes(world.land(x, z), Some(raw), climate), false)
+        let weights = match &segments {
+            Some(segs) => biome::mix_weights(segs, world.road_along(x, z)),
+            None => biome::votes(world.land(x, z), Some(world.height(x, z)), climate),
+        };
+        (weights, false)
     });
     Look {
         biomes,
-        snow_line_m: biome::snow_line_m(lat),
+        snow_line_m,
     }
 }
 
@@ -1711,12 +1728,12 @@ mod tests {
     fn should_have_no_frame_for_an_empty_route() {
         let route = straight_route(0, 10.0, 0.0);
         assert!(LocalFrame::around(&route).is_none());
-        assert!(CourseScene::build(&route).is_none());
+        assert!(CourseScene::build(&route, Scenery::Countryside).is_none());
     }
 
     #[test]
     fn should_not_build_a_scene_from_a_single_point() {
-        assert!(CourseScene::build(&straight_route(1, 10.0, 0.0)).is_none());
+        assert!(CourseScene::build(&straight_route(1, 10.0, 0.0), Scenery::Countryside).is_none());
     }
 
     // ── The made-up road in the scene ─────────────────────────────────────────
@@ -1727,7 +1744,7 @@ mod tests {
         // side, so a one-point spike in the GPX stays a spike in the road.
         let mut route = straight_route(21, 10.0, 0.0);
         route.points[10].elevation_m += 7.0;
-        let scene = CourseScene::build(&route).expect("a scene");
+        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
         assert_eq!(position_at(&scene.road, 100.0).expect("a road")[1], 17.0);
         assert_eq!(position_at(&scene.road, 90.0).expect("a road")[1], 10.0);
         assert_eq!(position_at(&scene.road, 95.0).expect("a road")[1], 13.5);
@@ -2111,7 +2128,8 @@ mod tests {
 
     #[test]
     fn should_index_only_vertices_that_exist() {
-        let scene = CourseScene::build(&straight_route(40, 9.0, 0.3)).expect("a route");
+        let scene = CourseScene::build(&straight_route(40, 9.0, 0.3), Scenery::Countryside)
+            .expect("a route");
         let n = scene.mesh.vertices.len() as u32;
         assert!(scene.mesh.indices.iter().all(|&i| i < n));
         assert_eq!(scene.mesh.indices.len() % 3, 0);
@@ -2621,7 +2639,7 @@ mod tests {
         for (i, p) in route.points.iter_mut().enumerate() {
             p.elevation_m = 10.0 + (i as f32 * 0.05).sin() * 6.0;
         }
-        let scene = CourseScene::build(&route).expect("a scene");
+        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
         let line = resample(&scene.road, RESAMPLE_M);
         let mut water_seen = 0;
         for v in &scene.mesh.vertices {
@@ -2653,6 +2671,68 @@ mod tests {
         assert!(water_seen > 0, "a 6 km world has streams");
     }
 
+    // ── Scenery ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_lay_the_same_road_whatever_the_scenery() {
+        // Rules 1–4: the scenery is off the road. A road that rises and
+        // falls, built in every choice, is the same road every time.
+        let mut route = straight_route(150, 10.0, 0.0);
+        for (i, p) in route.points.iter_mut().enumerate() {
+            p.elevation_m = 10.0 + (i as f32 * 0.07).sin() * 8.0;
+        }
+        let base = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
+        for s in Scenery::CHOICES {
+            let scene = CourseScene::build(&route, s).expect("a scene");
+            assert!(scene.road == base.road, "{s:?} moved the road");
+        }
+    }
+
+    #[test]
+    fn should_paint_one_chosen_biome_over_the_whole_ride() {
+        let route = straight_route(150, 10.0, 0.0);
+        let desert =
+            CourseScene::build(&route, Scenery::Only(biome::Biome::Desert)).expect("a scene");
+        let want = biome::Biome::Desert.def().palette.sky_horizon;
+        for d in [0.0, 700.0, 1_490.0] {
+            assert_eq!(desert.sky_at(d).horizon, want, "at {d} m");
+        }
+        let countryside = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
+        assert_ne!(countryside.sky_at(700.0).horizon, want);
+        assert!(
+            desert.mesh != countryside.mesh,
+            "the ground was not repainted"
+        );
+    }
+
+    #[test]
+    fn should_change_biome_along_a_mixed_ride_where_the_mix_says() {
+        let route = straight_route(4_001, 10.0, 0.0);
+        let road = track::lay(&route);
+        let world = World::new(&road);
+        let look = look_for(&road, 52.0, &world, Scenery::Mixed);
+        let length = road.last().expect("a road").distance_m;
+        let segs = biome::mix_segments(world.seed(), length);
+        assert!(segs.len() >= 3, "40 km mixes at least three stretches");
+        for (k, &(start, b)) in segs.iter().enumerate() {
+            let end = segs.get(k + 1).map_or(length, |s| s.0);
+            let p = position_at(&road, (start + end) / 2.0).expect("a point");
+            // On the road and a kilometre off it, the stretch's biome.
+            assert_eq!(
+                look.biomes.dominant_at(p[0], p[2]),
+                b,
+                "stretch {k} on the road"
+            );
+            assert_eq!(
+                look.biomes.dominant_at(p[0] + 1_000.0, p[2]),
+                b,
+                "stretch {k} off it"
+            );
+        }
+        // And the same mix every time.
+        assert!(look_for(&road, 52.0, &World::new(&road), Scenery::Mixed) == look);
+    }
+
     // ── Determinism ───────────────────────────────────────────────────────────
 
     #[test]
@@ -2661,20 +2741,22 @@ mod tests {
         // flocks, mountains, clouds. Each build's hash maps are seeded
         // afresh, so an order taken from one shows here.
         let route = straight_route(300, 10.0, 0.05);
-        let first = CourseScene::build(&route).expect("a scene");
+        let first = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
         assert!(first.mesh.vertices.len() > 1_000, "a world was built");
         assert!(first.props.len() > 100, "{} props", first.props.len());
         for _ in 0..2 {
             assert!(
-                CourseScene::build(&route).expect("a scene") == first,
+                CourseScene::build(&route, Scenery::Countryside).expect("a scene") == first,
                 "two builds differ"
             );
         }
         // And with land of the caller's own shape.
         let hills =
             |x: f32, z: f32| Some(10.0 + (x * 0.01).sin() * 20.0 + (z * 0.013).cos() * 15.0);
-        let a = CourseScene::build_from(&route, Some(&hills)).expect("a scene");
-        let b = CourseScene::build_from(&route, Some(&hills)).expect("a scene");
+        let a =
+            CourseScene::build_from(&route, Some(&hills), Scenery::Countryside).expect("a scene");
+        let b =
+            CourseScene::build_from(&route, Some(&hills), Scenery::Countryside).expect("a scene");
         assert!(a == b);
     }
 
@@ -2682,7 +2764,7 @@ mod tests {
     fn should_keep_every_animal_off_the_road_in_a_whole_world() {
         // Rule 5 on a real build: flocks graze and birds circle well clear.
         let route = straight_route(600, 10.0, 0.0);
-        let scene = CourseScene::build(&route).expect("a scene");
+        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
         let line = resample(&scene.road, RESAMPLE_M);
         let animals: Vec<&Prop> = scene
             .props
@@ -2712,7 +2794,7 @@ mod tests {
     #[test]
     fn should_keep_every_tree_off_the_road_in_a_whole_world() {
         let route = straight_route(400, 10.0, 0.0);
-        let scene = CourseScene::build(&route).expect("a scene");
+        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
         let line = resample(&scene.road, RESAMPLE_M);
         for t in scene
             .props

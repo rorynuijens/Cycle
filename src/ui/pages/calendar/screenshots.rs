@@ -931,7 +931,7 @@ fn course_overlay(
     climb_left_m: f32,
 ) -> crate::ui::overlay::RideOverlay {
     let page = crate::ui::pages::route_player::RoutePlayerPage::new(&climb(), 200);
-    page.reset_route(&climb());
+    page.reset_route(&climb(), crate::data::biome::Scenery::default());
     let overlay = crate::ui::overlay::RideOverlay::for_course(
         app.upcast_ref::<gtk::Application>(),
         "Alpe d'Huez",

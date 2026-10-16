@@ -8,14 +8,14 @@ use std::rc::Rc;
 use crate::data::db::{self, SavedRoute};
 use crate::data::route::Route;
 
-use super::detail::show_route_detail;
+use super::detail::{show_route_detail, RememberScenery};
 use super::RebuildHolder;
 
 /// What a route row's buttons need.
 pub struct RouteRows {
     pub pool: SqlitePool,
     pub rt_handle: tokio::runtime::Handle,
-    pub on_start_route: Rc<dyn Fn(Route)>,
+    pub on_start_route: crate::ui::StartRoute,
     pub on_toast: Rc<dyn Fn(adw::Toast)>,
     /// Re-reads the saved routes — after a rename or a removal.
     pub reload: RebuildHolder,
@@ -193,20 +193,39 @@ fn build_row(route: &SavedRoute, ctx: &Rc<RouteRows>) -> adw::ActionRow {
     let on_start_open = Rc::clone(&ctx.on_start_route);
     let on_toast_open = Rc::clone(&ctx.on_toast);
     let file_name = route.file_name.clone();
+    let route_id = route.id;
     row.connect_activated(move |row| {
         let parent = row.root().and_downcast::<gtk::Window>();
         let on_start = Rc::clone(&on_start_open);
         let on_toast = Rc::clone(&on_toast_open);
         let file_name = file_name.clone();
-        let _ = &pool_open;
+        let pool = pool_open.clone();
+        let remember = RememberScenery {
+            route_id,
+            pool: pool_open.clone(),
+            rt_handle: rt_open.clone(),
+        };
         crate::ui::spawn_to_main(
             &rt_open,
             async move {
                 let dir = db::routes_dir()?;
-                Route::from_gpx_path(&dir.join(&file_name))
+                let route = Route::from_gpx_path(&dir.join(&file_name))?;
+                // Read fresh, not from the row: the window may have changed
+                // it since the list was built.
+                let scenery = db::route_scenery(&pool, route_id)
+                    .await
+                    .inspect_err(|e| tracing::warn!("Could not read the route's scenery: {e}"))
+                    .unwrap_or_default();
+                Ok::<_, anyhow::Error>((route, scenery))
             },
             move |parsed| match parsed {
-                Ok(route) => show_route_detail(route, parent.as_ref(), Rc::clone(&on_start)),
+                Ok((route, scenery)) => show_route_detail(
+                    route,
+                    scenery,
+                    Some(remember),
+                    parent.as_ref(),
+                    Rc::clone(&on_start),
+                ),
                 Err(e) => {
                     tracing::error!("Failed to read saved route: {e}");
                     on_toast(
@@ -288,6 +307,7 @@ pub fn save_route_to_library(
     rt: tokio::runtime::Handle,
     reload: Rc<dyn Fn()>,
     on_toast: Rc<dyn Fn(adw::Toast)>,
+    on_saved: Box<dyn FnOnce(Option<i64>)>,
 ) {
     let stem: String = route
         .name
@@ -308,6 +328,7 @@ pub fn save_route_to_library(
                     .timeout(4)
                     .build(),
             );
+            on_saved(None);
             return;
         }
     };
@@ -319,6 +340,7 @@ pub fn save_route_to_library(
                 .timeout(4)
                 .build(),
         );
+        on_saved(None);
         return;
     }
 
@@ -329,7 +351,8 @@ pub fn save_route_to_library(
         &rt,
         async move { db::save_route(&pool, &name, &file_name, distance_m, gain_m).await },
         move |result| match result {
-            Ok(_) => {
+            Ok(id) => {
+                on_saved(Some(id));
                 reload();
                 on_toast(
                     adw::Toast::builder()
@@ -346,6 +369,7 @@ pub fn save_route_to_library(
                         .timeout(4)
                         .build(),
                 );
+                on_saved(None);
             }
         },
     );

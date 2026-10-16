@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -204,6 +204,17 @@ const MIGRATIONS: &[Migration] = &[
             // which is NULL on every imported ride and can be cleared by
             // deleting the workout. What a ride was is a fact about the ride.
             "ALTER TABLE sessions ADD COLUMN is_ftp_test INTEGER NOT NULL DEFAULT 0",
+        ],
+    },
+    Migration {
+        version: 8,
+        name: "choose a route's 3D scenery",
+        statements: &[
+            // The key of a `biome::Scenery`, chosen where the route is picked
+            // to ride. NULL — every route saved before this — is the
+            // countryside the 3D view has always drawn, so nothing changes
+            // for a route until the rider changes it.
+            "ALTER TABLE routes ADD COLUMN scenery TEXT",
         ],
     },
 ];
@@ -896,6 +907,33 @@ mod tests {
             .await
             .expect("the column is NOT NULL, so this cannot come back empty");
         assert_eq!(flag, 0, "an existing ride was training, not a test");
+    }
+
+    // ── v8: a route's scenery ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_keep_a_route_saved_before_v8_in_the_countryside() {
+        let pool = empty_pool().await;
+        establish_baseline(&pool).await.unwrap();
+        set_user_version(&pool, 7).await.unwrap();
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 7) {
+            for stmt in m.statements {
+                sqlx::query(stmt).execute(&pool).await.ok();
+            }
+        }
+        sqlx::query(
+            "INSERT INTO routes (id, name, file_name, distance_m, elevation_gain_m, added_at)
+             VALUES (1, 'Alpe', 'alpe.gpx', 13800, 1071, '2026-09-01T09:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run(&pool).await.expect("v8 applies to a v7 database");
+
+        let routes = crate::data::db::load_routes(&pool).await.unwrap();
+        assert_eq!(routes.len(), 1, "the route survived");
+        assert_eq!(routes[0].scenery, crate::data::biome::Scenery::Countryside);
     }
 
     #[tokio::test]

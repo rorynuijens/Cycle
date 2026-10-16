@@ -4,6 +4,8 @@ use anyhow::Result;
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 
+use crate::data::biome::Scenery;
+
 /// A GPX route saved in the library.
 #[derive(Debug, Clone)]
 pub struct SavedRoute {
@@ -14,6 +16,16 @@ pub struct SavedRoute {
     pub file_name: String,
     pub distance_m: f32,
     pub elevation_gain_m: f32,
+    /// What the 3D world around it is made of.
+    pub scenery: Scenery,
+}
+
+/// A stored scenery key, read without trusting it: a missing, empty or
+/// unknown one is the countryside.
+fn scenery_from_column(key: Option<String>) -> Scenery {
+    key.as_deref()
+        .and_then(Scenery::from_key)
+        .unwrap_or_default()
 }
 
 /// Directory holding saved GPX files, created on first use.
@@ -48,7 +60,7 @@ pub async fn save_route(
 /// Every saved route, newest first.
 pub async fn load_routes(pool: &SqlitePool) -> Result<Vec<SavedRoute>> {
     let rows = sqlx::query(
-        "SELECT id, name, file_name, distance_m, elevation_gain_m
+        "SELECT id, name, file_name, distance_m, elevation_gain_m, scenery
          FROM routes ORDER BY added_at DESC",
     )
     .fetch_all(pool)
@@ -61,8 +73,29 @@ pub async fn load_routes(pool: &SqlitePool) -> Result<Vec<SavedRoute>> {
             file_name: r.get("file_name"),
             distance_m: r.get::<f64, _>("distance_m") as f32,
             elevation_gain_m: r.get::<f64, _>("elevation_gain_m") as f32,
+            scenery: scenery_from_column(r.get("scenery")),
         })
         .collect())
+}
+
+/// The scenery chosen for a saved route; the countryside for a route that
+/// has none, or is gone.
+pub async fn route_scenery(pool: &SqlitePool, id: i64) -> Result<Scenery> {
+    let key: Option<Option<String>> = sqlx::query_scalar("SELECT scenery FROM routes WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(scenery_from_column(key.flatten()))
+}
+
+/// Remember `scenery` for a saved route.
+pub async fn set_route_scenery(pool: &SqlitePool, id: i64, scenery: Scenery) -> Result<()> {
+    sqlx::query("UPDATE routes SET scenery = ? WHERE id = ?")
+        .bind(scenery.key())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Rename a saved route. A blank name is ignored rather than clearing the title,
@@ -125,6 +158,68 @@ mod tests {
         assert_eq!(routes[1].file_name, "alpe-1.gpx");
         assert!((routes[1].distance_m - 13_800.0).abs() < 0.5);
         assert!((routes[1].elevation_gain_m - 1071.0).abs() < 0.5);
+    }
+
+    #[tokio::test]
+    async fn should_remember_a_routes_scenery_and_start_in_the_countryside() {
+        let pool = test_pool().await;
+        let alpe = save_route(&pool, "Alpe", "alpe.gpx", 1.0, 1.0)
+            .await
+            .unwrap();
+        let sea = save_route(&pool, "Sea", "sea.gpx", 1.0, 1.0).await.unwrap();
+        assert_eq!(
+            route_scenery(&pool, alpe).await.unwrap(),
+            Scenery::Countryside
+        );
+
+        let desert = Scenery::Only(crate::data::biome::Biome::Desert);
+        set_route_scenery(&pool, alpe, desert).await.unwrap();
+        set_route_scenery(&pool, sea, Scenery::Mixed).await.unwrap();
+        assert_eq!(route_scenery(&pool, alpe).await.unwrap(), desert);
+        let routes = load_routes(&pool).await.unwrap();
+        let of = |name: &str| routes.iter().find(|r| r.name == name).unwrap().scenery;
+        assert_eq!(
+            (of("Alpe"), of("Sea")),
+            (desert, Scenery::Mixed),
+            "one route each"
+        );
+
+        // Changed back, it is the countryside again.
+        set_route_scenery(&pool, alpe, Scenery::Countryside)
+            .await
+            .unwrap();
+        assert_eq!(
+            route_scenery(&pool, alpe).await.unwrap(),
+            Scenery::Countryside
+        );
+        // A route that is gone has no choice to read.
+        assert_eq!(
+            route_scenery(&pool, 999).await.unwrap(),
+            Scenery::Countryside
+        );
+    }
+
+    #[tokio::test]
+    async fn should_read_a_tampered_scenery_as_the_countryside() {
+        let pool = test_pool().await;
+        let id = save_route(&pool, "r", "r.gpx", 1.0, 1.0).await.unwrap();
+        for bad in ["volcano", "", "DESERT", "mixed'; DROP TABLE routes; --"] {
+            sqlx::query("UPDATE routes SET scenery = ? WHERE id = ?")
+                .bind(bad)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                route_scenery(&pool, id).await.unwrap(),
+                Scenery::Countryside,
+                "{bad:?}"
+            );
+            assert_eq!(
+                load_routes(&pool).await.unwrap()[0].scenery,
+                Scenery::Countryside
+            );
+        }
     }
 
     #[tokio::test]

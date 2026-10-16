@@ -97,6 +97,8 @@ pub struct World {
     /// Per grid point: the road's height carried out over the land, and how
     /// far the nearest anchor of the road is.
     base: Vec<(f32, f32)>,
+    /// Per grid point: how far along the route the nearest road is.
+    along: Vec<f32>,
 }
 
 impl World {
@@ -107,15 +109,18 @@ impl World {
         });
         // Anchors: a point of road every so often, with its height.
         let mut anchors: Vec<[f32; 3]> = Vec::new();
+        let mut anchor_d: Vec<f32> = Vec::new();
         let mut next = f32::MIN;
         for p in road {
             if p.distance_m >= next && p.pos.iter().all(|v| v.is_finite()) {
                 anchors.push(p.pos);
+                anchor_d.push(p.distance_m);
                 next = p.distance_m + ANCHOR_EVERY_M;
             }
         }
         if let Some(last) = road.last().filter(|p| p.pos.iter().all(|v| v.is_finite())) {
             anchors.push(last.pos);
+            anchor_d.push(last.distance_m);
         }
         let (mut x_lo, mut x_hi, mut z_lo, mut z_hi) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         if let Some(first) = anchors.first() {
@@ -131,6 +136,7 @@ impl World {
         let cols = ((x_hi + REACH_M - x0) / BASE_CELL_M).ceil() as usize + 2;
         let rows = ((z_hi + REACH_M - z0) / BASE_CELL_M).ceil() as usize + 2;
         let mut base = Vec::with_capacity(cols * rows);
+        let mut along = Vec::with_capacity(cols * rows);
         for r in 0..rows {
             for c in 0..cols {
                 let (x, z) = (x0 + c as f32 * BASE_CELL_M, z0 + r as f32 * BASE_CELL_M);
@@ -140,16 +146,23 @@ impl World {
                 // to the anchors: they are 250 m apart, and a field's verge
                 // is measured in metres.
                 let (mut wsum, mut hsum, mut nearest) = (0.0f64, 0.0f64, f32::MAX);
+                let mut nearest_along = 0.0;
                 for (k, a) in anchors.iter().enumerate() {
                     let d2 = (a[0] - x).powi(2) + (a[2] - z).powi(2);
                     let w = 1.0 / (f64::from(d2) + 2_500.0).powi(2);
                     wsum += w;
                     hsum += w * f64::from(a[1]);
-                    nearest = nearest.min(match anchors.get(k + 1) {
-                        Some(b) => segment_d2((a[0], a[2]), (b[0], b[2]), x, z),
-                        None => d2,
-                    });
+                    let (seg_d2, t) = match anchors.get(k + 1) {
+                        Some(b) => segment_d2_t((a[0], a[2]), (b[0], b[2]), x, z),
+                        None => (d2, 0.0),
+                    };
+                    if seg_d2 < nearest {
+                        nearest = seg_d2;
+                        let (d0, d1) = (anchor_d[k], *anchor_d.get(k + 1).unwrap_or(&anchor_d[k]));
+                        nearest_along = d0 + (d1 - d0) * t;
+                    }
                 }
+                along.push(nearest_along);
                 let h = if wsum > 0.0 {
                     (hsum / wsum) as f32
                 } else {
@@ -165,6 +178,7 @@ impl World {
             cols,
             rows,
             base,
+            along,
         }
     }
 
@@ -190,6 +204,22 @@ impl World {
         let top = mix(g(r0, c0), g(r0, c1), tx);
         let bottom = mix(g(r1, c0), g(r1, c1), tx);
         mix(top, bottom, tz)
+    }
+
+    /// How far along the route, in metres, the road nearest `(x, z)` is —
+    /// from the nearest point of the coarse grid, never blended: between two
+    /// stretches of a lap, a blend would name a third that is nowhere near.
+    pub fn road_along(&self, x: f32, z: f32) -> f32 {
+        let at = |v: f32, lo: f32, n: usize| {
+            let f = ((v - lo) / BASE_CELL_M).round();
+            if f.is_finite() {
+                f.clamp(0.0, (n - 1) as f32) as usize
+            } else {
+                0
+            }
+        };
+        let (c, r) = (at(x, self.x0, self.cols), at(z, self.z0, self.rows));
+        self.along.get(r * self.cols + c).copied().unwrap_or(0.0)
     }
 
     /// Roughly how far `(x, z)` is from the road, in metres.
@@ -359,8 +389,9 @@ impl World {
     }
 }
 
-/// Squared distance from `(x, z)` to the segment `a`–`b`.
-fn segment_d2(a: (f32, f32), b: (f32, f32), x: f32, z: f32) -> f32 {
+/// Squared distance from `(x, z)` to the segment `a`–`b`, and how far
+/// along the segment, 0–1, its nearest point is.
+fn segment_d2_t(a: (f32, f32), b: (f32, f32), x: f32, z: f32) -> (f32, f32) {
     let (dx, dz) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dz * dz;
     let t = if len2 > 0.0 {
@@ -368,7 +399,7 @@ fn segment_d2(a: (f32, f32), b: (f32, f32), x: f32, z: f32) -> f32 {
     } else {
         0.0
     };
-    (a.0 + t * dx - x).powi(2) + (a.1 + t * dz - z).powi(2)
+    ((a.0 + t * dx - x).powi(2) + (a.1 + t * dz - z).powi(2), t)
 }
 
 fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
@@ -421,6 +452,43 @@ mod tests {
         let top = w.height(150.0, -3_000.0);
         assert!(foot < 40.0, "foot {foot}");
         assert!(top > 260.0, "top {top}");
+    }
+
+    #[test]
+    fn should_know_how_far_along_the_ride_the_nearest_road_is() {
+        let road = north_road(301, |_| 0.0);
+        let w = World::new(&road);
+        for z in [0.0, -1_234.0, -2_990.0] {
+            let along = w.road_along(400.0, z);
+            assert!((along + z).abs() <= 50.0, "{along} beside {z}");
+        }
+        // Beyond either end, the end.
+        assert!(w.road_along(0.0, 2_000.0) <= 50.0);
+        assert!(w.road_along(0.0, -6_000.0) >= 2_950.0);
+        assert!(w.road_along(f32::NAN, f32::INFINITY).is_finite());
+    }
+
+    #[test]
+    fn should_name_the_nearer_leg_of_an_out_and_back_not_a_blend() {
+        // North 3 km at x = 0, east 600 m, back south 3 km at x = 600.
+        let mut road = north_road(301, |_| 0.0);
+        for i in 1..=60 {
+            road.push(RoadPoint {
+                pos: [i as f32 * 10.0, 0.0, -3_000.0],
+                distance_m: 3_000.0 + i as f32 * 10.0,
+            });
+        }
+        for i in 1..=300 {
+            road.push(RoadPoint {
+                pos: [600.0, 0.0, -3_000.0 + i as f32 * 10.0],
+                distance_m: 3_600.0 + i as f32 * 10.0,
+            });
+        }
+        let w = World::new(&road);
+        let back = w.road_along(560.0, -1_000.0);
+        assert!((back - 5_600.0).abs() <= 50.0, "return leg: {back}");
+        let out = w.road_along(40.0, -1_000.0);
+        assert!((out - 1_000.0).abs() <= 50.0, "outward leg: {out}");
     }
 
     #[test]

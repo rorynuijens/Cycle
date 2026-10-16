@@ -5,6 +5,7 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 use std::rc::Rc;
 
+use crate::data::biome::Scenery;
 use crate::data::db;
 use crate::data::route::Route;
 use crate::data::workout::Workout;
@@ -226,10 +227,31 @@ pub fn show_workout_detail(
     win.present();
 }
 
+/// Where a saved route's scenery is remembered.
+pub struct RememberScenery {
+    pub route_id: i64,
+    pub pool: SqlitePool,
+    pub rt_handle: tokio::runtime::Handle,
+}
+
+/// What the scenery picker says under a choice.
+fn scenery_blurb(scenery: Scenery) -> &'static str {
+    match scenery {
+        Scenery::Countryside => "Meadows and woods, with mountains on high ground",
+        Scenery::Mixed => "Changes every 5 to 15 km along the ride",
+        Scenery::Only(_) => "The whole ride",
+    }
+}
+
+/// The route's stats, profile and map, its scenery, and the button that
+/// rides it. `scenery` is the choice so far; `remember` keeps a change to it
+/// for a saved route — a route that is not saved rides in it just this once.
 pub fn show_route_detail(
     route: Route,
+    scenery: Scenery,
+    remember: Option<RememberScenery>,
     parent: Option<&gtk::Window>,
-    on_start_route: Rc<dyn Fn(Route)>,
+    on_start_route: crate::ui::StartRoute,
 ) {
     let win = adw::Window::builder()
         .modal(true)
@@ -388,6 +410,66 @@ pub fn show_route_detail(
         inner.append(route_map.widget());
     }
 
+    // ── Scenery ───────────────────────────────────────────────────────────
+    // Chosen here, where the route is picked, not on the ride page: the
+    // world is built once, as the ride opens.
+    let chosen = Rc::new(std::cell::Cell::new(scenery));
+    let labels: Vec<&str> = Scenery::CHOICES.iter().map(|s| s.label()).collect();
+    let scenery_row = adw::ComboRow::builder()
+        .title("Scenery")
+        .subtitle(scenery_blurb(scenery))
+        .model(&gtk::StringList::new(&labels))
+        .selected(
+            Scenery::CHOICES
+                .iter()
+                .position(|s| *s == scenery)
+                .unwrap_or(0) as u32,
+        )
+        .build();
+    let scenery_group = adw::PreferencesGroup::builder()
+        .title("3D World")
+        .description("The road, its climbs and its distance stay the same")
+        .build();
+    scenery_group.add(&scenery_row);
+    inner.append(&scenery_group);
+
+    let toast_overlay = adw::ToastOverlay::new();
+    {
+        let chosen = Rc::clone(&chosen);
+        // Weak: the row and the overlay are both inside this window
+        // (CLAUDE.md §2.4).
+        scenery_row.connect_selected_notify(glib::clone!(
+            #[weak]
+            toast_overlay,
+            move |row| {
+                let Some(&picked) = Scenery::CHOICES.get(row.selected() as usize) else {
+                    return;
+                };
+                chosen.set(picked);
+                row.set_subtitle(scenery_blurb(picked));
+                let Some(remember) = &remember else {
+                    return;
+                };
+                let (pool, id) = (remember.pool.clone(), remember.route_id);
+                crate::ui::spawn_to_main(
+                    &remember.rt_handle,
+                    async move { db::set_route_scenery(&pool, id, picked).await },
+                    move |res| {
+                        if let Err(e) = res {
+                            tracing::error!("Could not save the route's scenery: {e}");
+                            toast_overlay.add_toast(
+                                adw::Toast::builder()
+                                    .title("Could not remember the scenery for next time")
+                                    .timeout(4)
+                                    .build(),
+                            );
+                        }
+                    },
+                );
+            }
+        ));
+    }
+
     // ── Ride this Route button ────────────────────────────────────────────
     let ride_btn = gtk::Button::builder()
         .label("Ride this Route")
@@ -403,7 +485,7 @@ pub fn show_route_detail(
         #[weak]
         win,
         move |_| {
-            on_start_route(route_for_ride.clone());
+            on_start_route(route_for_ride.clone(), chosen.get());
             win.close();
         }
     ));
@@ -411,7 +493,8 @@ pub fn show_route_detail(
     clamp.set_child(Some(&inner));
     scroll.set_child(Some(&clamp));
     toolbar_view.set_content(Some(&scroll));
-    win.set_content(Some(&toolbar_view));
+    toast_overlay.set_child(Some(&toolbar_view));
+    win.set_content(Some(&toast_overlay));
     win.present();
 }
 

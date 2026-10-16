@@ -461,14 +461,18 @@ pub fn show_schedule_dialog(
     dialog.present(Some(parent));
 }
 
-/// Read a saved route's GPX from disk.
-async fn load_saved_route(pool: &SqlitePool, route_id: i64) -> anyhow::Result<Route> {
+/// Read a saved route's GPX from disk, and the scenery chosen for it.
+async fn load_saved_route(
+    pool: &SqlitePool,
+    route_id: i64,
+) -> anyhow::Result<(Route, crate::data::biome::Scenery)> {
     let routes = db::load_routes(pool).await?;
     let saved = routes
         .into_iter()
         .find(|r| r.id == route_id)
         .ok_or_else(|| anyhow::anyhow!("route {route_id} is no longer in the library"))?;
-    Route::from_gpx_path(&db::routes_dir()?.join(&saved.file_name))
+    let route = Route::from_gpx_path(&db::routes_dir()?.join(&saved.file_name))?;
+    Ok((route, saved.scenery))
 }
 
 /// Parse a saved route's GPX and estimate what riding it will cost.
@@ -481,7 +485,7 @@ async fn estimate_route_load(
     ftp: u32,
     weight_kg: f32,
 ) -> anyhow::Result<(u32, f32)> {
-    let route = load_saved_route(pool, route_id).await?;
+    let (route, _) = load_saved_route(pool, route_id).await?;
     Ok(route.estimated_load(ftp, weight_kg))
 }
 
@@ -1251,12 +1255,12 @@ pub fn show_workout_detail_dialog(
                         &rt_rr,
                         async move { load_saved_route(&pool_c, route_id).await },
                         move |res| match res {
-                            Ok(route) => {
+                            Ok((route, scenery)) => {
                                 let cb = start_route.borrow().clone();
                                 match cb {
                                     Some(cb) => {
                                         dialog.close();
-                                        cb(route);
+                                        cb(route, scenery);
                                     }
                                     None => tracing::error!(
                                         "no route-start callback registered; cannot ride"

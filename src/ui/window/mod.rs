@@ -468,7 +468,7 @@ impl CycleGtkWindow {
         let trainer_addr: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // on_start_route: called from the library when the user clicks "Ride this Route"
-        let on_start_route: Rc<dyn Fn(Route)> = {
+        let on_start_route: crate::ui::StartRoute = {
             let route_player = Rc::clone(&route_player_rc);
             let stack = stack.clone();
             let cmd_tx = cmd_tx.clone();
@@ -480,10 +480,10 @@ impl CycleGtkWindow {
             let auto_pause = Rc::clone(&auto_pause);
             let finish_for_route = Rc::clone(&finish_session);
             let athlete_for_route = Rc::clone(&athlete_rc);
-            Rc::new(move |route: Route| {
+            Rc::new(move |route: Route, scenery| {
                 timer_alive.set(false);
                 timer_started.set(false);
-                route_player.reset_route(&route);
+                route_player.reset_route(&route, scenery);
                 stack.set_visible_child_name("route_player");
 
                 if !timer_started.get() {

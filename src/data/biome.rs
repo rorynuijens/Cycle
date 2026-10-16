@@ -250,7 +250,6 @@ impl BiomeMap {
     }
 
     /// One biome everywhere.
-    #[cfg(test)]
     pub fn uniform(biome: Biome) -> Self {
         let mut w = [0.0; COUNT];
         w[biome as usize] = 1.0;
@@ -330,6 +329,151 @@ pub fn sky(w: &Weights) -> (Rgb, Rgb, f32) {
         fog += d.fog_density * k;
     }
     (top, horizon, fog)
+}
+
+/// What the world around a route is made of. The rider picks it per route,
+/// where the route is picked to ride; it changes only what is off the road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Scenery {
+    /// Meadows and fields, woods leaning to forest, high ground to mountain.
+    #[default]
+    Countryside,
+    /// One biome for the whole ride.
+    Only(Biome),
+    /// Biomes that change along the ride — see [`mix_segments`].
+    Mixed,
+}
+
+impl Scenery {
+    /// Every choice, in the order the picker lists them.
+    pub const CHOICES: [Scenery; 11] = [
+        Scenery::Countryside,
+        Scenery::Only(Biome::Forest),
+        Scenery::Only(Biome::Farmland),
+        Scenery::Only(Biome::Polder),
+        Scenery::Only(Biome::Mediterranean),
+        Scenery::Only(Biome::Desert),
+        Scenery::Only(Biome::Coast),
+        Scenery::Only(Biome::Mountain),
+        Scenery::Only(Biome::Wetland),
+        Scenery::Only(Biome::Urban),
+        Scenery::Mixed,
+    ];
+
+    /// The name it is stored under.
+    pub fn key(self) -> &'static str {
+        match self {
+            Scenery::Countryside => "countryside",
+            Scenery::Mixed => "mixed",
+            Scenery::Only(b) => b.key(),
+        }
+    }
+
+    /// The choice stored as `key`; `None` for anything that is not one of
+    /// [`Scenery::CHOICES`] — the database is read, not trusted.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::CHOICES.into_iter().find(|s| s.key() == key)
+    }
+
+    /// The name the rider sees.
+    pub fn label(self) -> &'static str {
+        match self {
+            Scenery::Countryside => "Countryside",
+            Scenery::Mixed => "Mixed",
+            Scenery::Only(b) => match b {
+                Biome::Temperate => "Temperate",
+                Biome::Forest => "Forest",
+                Biome::Farmland => "Farmland",
+                Biome::Polder => "Polder",
+                Biome::Mediterranean => "Mediterranean",
+                Biome::Desert => "Desert",
+                Biome::Coast => "Coast",
+                Biome::Mountain => "Mountain",
+                Biome::Wetland => "Wetland",
+                Biome::Urban => "Urban",
+            },
+        }
+    }
+}
+
+impl Biome {
+    /// The biome's name in `biomes.json`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Biome::Temperate => "temperate",
+            Biome::Forest => "forest",
+            Biome::Farmland => "farmland",
+            Biome::Polder => "polder",
+            Biome::Mediterranean => "mediterranean",
+            Biome::Desert => "desert",
+            Biome::Coast => "coast",
+            Biome::Mountain => "mountain",
+            Biome::Wetland => "wetland",
+            Biome::Urban => "urban",
+        }
+    }
+}
+
+/// A mixed ride's stretches are this long, before the last is stretched to
+/// the finish (the stylized-route skill, §7.7).
+pub const MIX_MIN_M: f32 = 5_000.0;
+pub const MIX_MAX_M: f32 = 15_000.0;
+/// Two stretches blend over this much road, centred on their border.
+pub const MIX_BLEND_M: f32 = 400.0;
+
+/// The biomes of a mixed ride `length_m` long: where each stretch starts,
+/// and its biome. Never the same biome twice running; a remainder too short
+/// to be a stretch of its own goes to the one before it. Seeded, so a route
+/// always mixes the same way.
+pub fn mix_segments(seed: u64, length_m: f32) -> Vec<(f32, Biome)> {
+    let length = if length_m.is_finite() { length_m } else { 0.0 };
+    let pick = |k: u64, not: Option<Biome>| {
+        let pool: Vec<Biome> = Biome::ALL.into_iter().filter(|b| Some(*b) != not).collect();
+        pool[(splitmix(seed ^ 0x313C ^ k.wrapping_mul(0x9E37)) % pool.len() as u64) as usize]
+    };
+    let mut out = vec![(0.0, pick(0, None))];
+    let mut start = 0.0;
+    for k in 1u64.. {
+        let len = MIX_MIN_M + (MIX_MAX_M - MIX_MIN_M) * unit(splitmix(seed ^ 0x51E6 ^ k));
+        start += len;
+        if length - start < MIX_MIN_M {
+            break;
+        }
+        let prev = out.last().map(|s| s.1);
+        out.push((start, pick(k, prev)));
+    }
+    out
+}
+
+/// The weights `along_m` metres into a mixed ride of `segments`: its
+/// stretch's biome alone, or two of them across a border.
+pub fn mix_weights(segments: &[(f32, Biome)], along_m: f32) -> Weights {
+    let mut w = [0.0; COUNT];
+    let Some(first) = segments.first() else {
+        w[Biome::Temperate as usize] = 1.0;
+        return w;
+    };
+    let along = if along_m.is_finite() { along_m } else { 0.0 };
+    let i = segments.partition_point(|s| s.0 <= along).max(1) - 1;
+    let here = segments.get(i).unwrap_or(first).1;
+    let half = MIX_BLEND_M / 2.0;
+    // Into the next stretch, or still coming out of the last one.
+    let (a, b, t) = match (
+        segments.get(i + 1),
+        i.checked_sub(1).and_then(|p| segments.get(p)),
+    ) {
+        (Some(next), _) if along > next.0 - half => {
+            (here, next.1, (along - (next.0 - half)) / MIX_BLEND_M)
+        }
+        (_, Some(prev)) if along < segments[i].0 + half => {
+            (prev.1, here, (along - (segments[i].0 - half)) / MIX_BLEND_M)
+        }
+        _ => (here, here, 0.0),
+    };
+    let t = t.clamp(0.0, 1.0);
+    w[a as usize] += 1.0 - t;
+    w[b as usize] += t;
+    w
 }
 
 /// Box blur of radius `r` cells, along rows then columns; at the grid's edge
@@ -584,5 +728,103 @@ mod tests {
         assert_eq!(horizon, palette::BASE.sky_horizon);
         let (_, horizon, _) = sky(&[f32::NAN; COUNT]);
         assert!(horizon.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn should_store_every_scenery_under_its_own_key_and_read_it_back() {
+        let mut keys: Vec<&str> = Scenery::CHOICES.iter().map(|s| s.key()).collect();
+        for s in Scenery::CHOICES {
+            assert_eq!(Scenery::from_key(s.key()), Some(s), "{s:?}");
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            Scenery::CHOICES.len(),
+            "two choices share a key"
+        );
+        // Every biome but the countryside's own base can be picked alone.
+        for b in Biome::ALL {
+            let listed = Scenery::CHOICES.contains(&Scenery::Only(b));
+            assert_eq!(listed, b != Biome::Temperate, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn should_refuse_a_stored_scenery_it_does_not_know() {
+        for bad in ["", "Desert", "desert ", "temperate", "mixed;", "\u{0}"] {
+            assert_eq!(Scenery::from_key(bad), None, "{bad:?}");
+        }
+        assert_eq!(Scenery::default(), Scenery::Countryside);
+    }
+
+    #[test]
+    fn should_mix_stretches_of_five_to_fifteen_km_never_twice_running() {
+        for seed in 0..200u64 {
+            let length = 1_000.0 + seed as f32 * 997.0;
+            let segs = mix_segments(seed, length);
+            assert_eq!(segs[0].0, 0.0);
+            for pair in segs.windows(2) {
+                let len = pair[1].0 - pair[0].0;
+                assert!((MIX_MIN_M..=MIX_MAX_M).contains(&len), "{seed}: {len}");
+                assert_ne!(pair[0].1, pair[1].1, "{seed}: same biome twice");
+            }
+            // The last stretch runs to the finish: never under 5 km unless the
+            // whole ride is, never over the longest plus a shortest.
+            let last = length - segs.last().map(|s| s.0).unwrap_or(0.0);
+            if segs.len() > 1 {
+                assert!(
+                    (MIX_MIN_M..MIX_MAX_M + MIX_MIN_M).contains(&last),
+                    "{seed}: {last}"
+                );
+            }
+            assert_eq!(segs, mix_segments(seed, length), "not deterministic");
+        }
+    }
+
+    #[test]
+    fn should_give_a_short_ride_one_biome_and_survive_nonsense_lengths() {
+        assert_eq!(mix_segments(4, 9_999.0).len(), 1);
+        for bad in [f32::NAN, f32::INFINITY, -5.0, 0.0] {
+            assert_eq!(mix_segments(4, bad).len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn should_use_more_than_one_biome_over_many_long_rides() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..40u64 {
+            seen.extend(mix_segments(seed, 120_000.0).into_iter().map(|s| s.1));
+        }
+        assert_eq!(seen.len(), COUNT, "the mix never picks some biomes");
+    }
+
+    #[test]
+    fn should_blend_two_stretches_over_400_m_centred_on_their_border() {
+        let segs = [
+            (0.0, Biome::Desert),
+            (6_000.0, Biome::Forest),
+            (13_000.0, Biome::Coast),
+        ];
+        let at = |d: f32| mix_weights(&segs, d);
+        let (desert, forest) = (Biome::Desert as usize, Biome::Forest as usize);
+        assert_eq!(at(5_000.0)[desert], 1.0);
+        assert_eq!(
+            at(5_800.0)[desert],
+            1.0,
+            "blend starts 200 m before the border"
+        );
+        assert_eq!(at(6_000.0)[desert], 0.5);
+        assert_eq!(at(6_000.0)[forest], 0.5);
+        assert!((at(6_100.0)[forest] - 0.75).abs() < 1e-6);
+        assert_eq!(at(6_200.0)[forest], 1.0, "and ends 200 m after it");
+        assert_eq!(at(9_000.0)[forest], 1.0);
+        assert_eq!(at(13_000.0)[Biome::Coast as usize], 0.5);
+        assert_eq!(at(40_000.0)[Biome::Coast as usize], 1.0);
+        for d in [-1e9, f32::NAN, f32::INFINITY, 0.0, 1e12] {
+            let total: f32 = at(d).iter().sum();
+            assert_eq!(total, 1.0, "{d}");
+        }
+        assert_eq!(mix_weights(&[], 10.0)[Biome::Temperate as usize], 1.0);
     }
 }

@@ -446,6 +446,8 @@ struct Inner {
     /// "Building the 3D view…", over the top left of the view.
     status: gtk::Label,
     route: RefCell<Option<Route>>,
+    /// What the world around the route is made of.
+    scenery: Cell<biome::Scenery>,
     scene: RefCell<Option<CourseScene>>,
     /// The scene changed and has not been uploaded yet.
     needs_upload: Cell<bool>,
@@ -496,6 +498,7 @@ impl CourseView {
             status,
             area: area.clone(),
             route: RefCell::new(None),
+            scenery: Cell::new(biome::Scenery::default()),
             scene: RefCell::new(None),
             needs_upload: Cell::new(false),
             gl: RefCell::new(None),
@@ -552,9 +555,9 @@ impl CourseView {
         &self.inner.root
     }
 
-    /// Show `route`, with the rider at its start. The world is built off the
-    /// main thread; the view says so until it is up.
-    pub fn set_route(&self, route: &Route) {
+    /// Show `route` in `scenery`, with the rider at its start. The world is
+    /// built off the main thread; the view says so until it is up.
+    pub fn set_route(&self, route: &Route, scenery: biome::Scenery) {
         let inner = &self.inner;
         inner.generation.set(inner.generation.get() + 1);
         *inner.scene.borrow_mut() = None;
@@ -562,6 +565,7 @@ impl CourseView {
         inner.progress.set(Progress::default());
         inner.drawn_m.set(None);
         *inner.route.borrow_mut() = Some(route.clone());
+        inner.scenery.set(scenery);
         Inner::rebuild(inner);
     }
 
@@ -584,10 +588,11 @@ impl Inner {
             return;
         };
         let generation = this.generation.get();
+        let scenery = this.scenery.get();
         this.update_status();
         let weak = Rc::downgrade(this);
         glib::spawn_future_local(async move {
-            let built = gtk::gio::spawn_blocking(move || CourseScene::build(&route)).await;
+            let built = gtk::gio::spawn_blocking(move || CourseScene::build(&route, scenery)).await;
             let Some(inner) = weak.upgrade() else {
                 return;
             };
@@ -1397,7 +1402,7 @@ mod tests {
 ///
 /// ```text
 /// CYCLE_3D_GPX=route.gpx CYCLE_3D_OUT=/tmp/view.png [CYCLE_3D_AT=<metres>] \
-///   [CYCLE_3D_TIME=<seconds>] cargo test render_course_offscreen -- --ignored --nocapture
+///   [CYCLE_3D_TIME=<seconds>] [CYCLE_3D_SCENERY=<key>] cargo test render_course_offscreen -- --ignored --nocapture
 /// ```
 #[cfg(test)]
 mod offscreen {
@@ -1429,7 +1434,12 @@ mod offscreen {
             .unwrap_or(200.0);
         let route = Route::from_gpx_path(std::path::Path::new(&gpx)).expect("a GPX");
         let started = std::time::Instant::now();
-        let scene = CourseScene::build(&route).expect("a scene");
+        // CYCLE_3D_SCENERY=<key>, as stored: desert, mixed, countryside …
+        let scenery = std::env::var("CYCLE_3D_SCENERY")
+            .ok()
+            .map(|k| biome::Scenery::from_key(&k).expect("a known scenery"))
+            .unwrap_or_default();
+        let scene = CourseScene::build(&route, scenery).expect("a scene");
         eprintln!("scene built in {:.2} s", started.elapsed().as_secs_f64());
         let speed: f32 = std::env::var("CYCLE_3D_SPEED")
             .ok()

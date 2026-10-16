@@ -28,7 +28,8 @@ use crate::data::route::Route;
 use crate::data::workout::{Workout, WorkoutCategory};
 use crate::ui::widgets::zone_color::{category_zone_rgb, zone_swatch};
 
-use detail::show_route_detail;
+use crate::data::biome::Scenery;
+use detail::{show_route_detail, RememberScenery};
 use editor::show_workout_editor;
 use filter::Filter;
 use routes::{save_route_to_library, RouteRows};
@@ -100,7 +101,7 @@ impl LibraryPage {
         calendar_icon: &'static str,
         on_toast: Rc<dyn Fn(adw::Toast)>,
         athlete: Rc<RefCell<AthleteProfile>>,
-        on_start_route: Rc<dyn Fn(Route)>,
+        on_start_route: crate::ui::StartRoute,
     ) -> (Self, impl Fn() + 'static) {
         // Per-workout recommendations need CTL/TSB and the athlete's goals, all
         // loaded from the database. Rather than block the GLib loop while those
@@ -570,7 +571,7 @@ fn connect_gpx(
     gpx_btn: &gtk::Button,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
-    on_start_route: Rc<dyn Fn(Route)>,
+    on_start_route: crate::ui::StartRoute,
     on_toast: Rc<dyn Fn(adw::Toast)>,
     reload_routes: Rc<dyn Fn()>,
 ) {
@@ -616,6 +617,12 @@ fn connect_gpx(
                     Ok(route) => {
                         // Keep the route: copy the GPX into the library so
                         // it can be ridden again without finding the file.
+                        // The window opens once the route is saved, so a
+                        // scenery picked in it is remembered for the route.
+                        let parent = parent_for_closure.clone();
+                        let on_start = Rc::clone(&on_start_route_inner);
+                        let (pool, rt) = (pool_gpx_inner.clone(), rt_gpx_inner.clone());
+                        let route_shown = route.clone();
                         save_route_to_library(
                             &path,
                             &route,
@@ -623,11 +630,20 @@ fn connect_gpx(
                             rt_gpx_inner.clone(),
                             Rc::clone(&reload_routes_inner),
                             Rc::clone(&on_toast_inner),
-                        );
-                        show_route_detail(
-                            route,
-                            parent_for_closure.as_ref(),
-                            Rc::clone(&on_start_route_inner),
+                            Box::new(move |saved_id| {
+                                let remember = saved_id.map(|route_id| RememberScenery {
+                                    route_id,
+                                    pool,
+                                    rt_handle: rt,
+                                });
+                                show_route_detail(
+                                    route_shown,
+                                    Scenery::default(),
+                                    remember,
+                                    parent.as_ref(),
+                                    on_start,
+                                );
+                            }),
                         );
                     }
                     Err(e) => {
