@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
+use crate::data::dressing::PropRule;
 use crate::data::palette::{self, Palette, Rgb};
+use crate::data::props::Shape;
 use crate::data::world::{splitmix, AreaKind};
 
 /// The biomes, in the order their weights are stored.
@@ -63,17 +65,103 @@ pub struct TreeRules {
     pub forest_spacing_m: [f32; 2],
     /// Lone trees in open country, per hectare.
     pub open_per_hectare: f32,
-    /// Share of trees that are cones rather than round crowns, 0–1.
+    /// Share of trees that are the second of [`TreeRules::kinds`] rather
+    /// than the first, 0–1.
     pub cone_share: f32,
+    /// The two kinds of tree that grow: a round crown and a conifer in the
+    /// countryside, olives and cypresses by the Mediterranean.
+    pub kinds: [Shape; 2],
+}
+
+/// The herd that grazes beside the road, and the birds overhead.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnimalRules {
+    /// What grazes in herds; `None` for nothing.
+    pub herd: Option<Shape>,
+    /// Palette names a herd's coats are picked from.
+    pub coats: Vec<String>,
+    /// How long one is, in metres, drawn a little larger than life.
+    pub herd_size_m: f32,
+    /// Share of the places a herd could graze that have one, and how many.
+    pub herd_chance: f32,
+    pub herd_count: [u32; 2],
+    /// Whether the herd grazes among the trees, as deer do.
+    pub herd_in_woods: bool,
+    /// Birds circling overhead, and how big — in the palette's `bird`.
+    pub birds: bool,
+    pub bird_size_m: f32,
+}
+
+/// The shape of a biome's land (the stylized-route skill, §7.4). Every one
+/// is worked before the land is fitted to the road, so the road always wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Relief {
+    /// Low hills by the road, bigger ones further off.
+    Rolling,
+    /// Dead level to the horizon.
+    Flat,
+    /// Sand dunes in ridges along the wind, and flat-topped mesas far off.
+    Dunes,
+    /// Hillsides cut into steps.
+    Terraces,
+    /// Sharp ridges and high peaks away from the road.
+    Peaks,
+}
+
+/// The open water a biome has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaterKind {
+    None,
+    /// Brooks wandering alongside the road.
+    Streams,
+    /// Straight ditches between fields.
+    Ditches,
+    /// Pools between low mounds.
+    Pools,
+    /// The sea on one side, behind a beach.
+    Sea,
+    /// Now and then a pool in the sand.
+    Oasis,
+}
+
+/// How a biome's land lies and what covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandRules {
+    pub relief: Relief,
+    /// How high its hills are, against the countryside's.
+    pub relief_scale: f32,
+    /// More woods (positive) or fewer (negative): shifts where woods start,
+    /// on noise that runs about −0.6 to 0.6.
+    pub wood: f32,
+    /// Woods keep at least this far from the road's line, in metres.
+    pub wood_from_m: f32,
+    /// Fields cover the land where its noise is above this: −1 everywhere,
+    /// 1 nowhere.
+    pub fields: f32,
+    /// Share of fields under a crop rather than grass, 0–1.
+    pub crops: f32,
+    /// Ground within this far of the road's line is paved, in metres.
+    pub paving_m: f32,
+    pub water: WaterKind,
+    /// Rows of poplars along the road.
+    pub poplar_rows: bool,
 }
 
 /// One biome's look, resolved: the base palette with its overrides applied.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BiomeDef {
     pub palette: Palette,
     /// Exponential haze, per metre — see [`haze`].
     pub fog_density: f32,
     pub trees: TreeRules,
+    pub land: LandRules,
+    pub animals: AnimalRules,
+    /// Everything else it sets about its land.
+    pub props: Vec<PropRule>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +170,10 @@ struct RawDef {
     palette: std::collections::BTreeMap<String, String>,
     fog_density: f32,
     trees: TreeRules,
+    land: LandRules,
+    animals: AnimalRules,
+    #[serde(default)]
+    props: Vec<PropRule>,
 }
 
 /// The haze starts this far from the eye; nearer, the scene is clear.
@@ -122,14 +214,47 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             && spacing[0] <= spacing[1]
             && (0.0..=1.0).contains(&def.trees.cone_share)
             && def.trees.open_per_hectare.is_finite()
-            && def.trees.open_per_hectare >= 0.0;
-        if !in_range {
+            && def.trees.open_per_hectare >= 0.0
+            && (0.0..=4.0).contains(&def.land.relief_scale)
+            && (-1.0..=1.0).contains(&def.land.wood)
+            && (0.0..=1_000.0).contains(&def.land.wood_from_m)
+            && (-1.0..=1.0).contains(&def.land.fields)
+            && (0.0..=1.0).contains(&def.land.crops)
+            && (0.0..=500.0).contains(&def.land.paving_m);
+        let a = &def.animals;
+        let animals_sane = a.herd_size_m.is_finite()
+            && a.herd_size_m > 0.0
+            && (0.0..=1.0).contains(&a.herd_chance)
+            && (1..=a.herd_count[1].max(1)).contains(&a.herd_count[0])
+            && a.herd_count[1] <= 20
+            && a.bird_size_m.is_finite()
+            && a.bird_size_m > 0.0
+            && !a.coats.is_empty()
+            && a.coats.iter().all(|n| p.named(n).is_some());
+        if !in_range || !animals_sane {
             return Err(format!("{biome:?}: a number is out of range"));
+        }
+        if let Some(bad) = def.props.iter().find(|r| !r.is_sane()) {
+            return Err(format!(
+                "{biome:?}: the {:?} rule makes no sense",
+                bad.shape
+            ));
+        }
+        if let Some(bad) = def
+            .props
+            .iter()
+            .flat_map(|r| &r.colours)
+            .find(|n| p.named(n).is_none())
+        {
+            return Err(format!("{biome:?}: no colour {bad}"));
         }
         out.push(BiomeDef {
             palette: p,
             fog_density: def.fog_density,
             trees: def.trees,
+            land: def.land,
+            animals: def.animals.clone(),
+            props: def.props.clone(),
         });
     }
     out.try_into().map_err(|_| "wrong count".to_owned())

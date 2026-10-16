@@ -9,6 +9,7 @@
 //!
 //! Pure: no GTK, no GL. Scene space as in `course3d`: metres, x east, z south.
 
+use crate::data::biome::{Biome, BiomeMap, LandRules, Relief, WaterKind};
 use crate::data::course3d::RoadPoint;
 
 /// What covers the land at a place.
@@ -17,6 +18,10 @@ pub enum AreaKind {
     Water,
     Wood,
     Farmland,
+    /// A beach, or the sand round an oasis.
+    Sand,
+    /// Squares and pavements in town.
+    Paving,
 }
 
 /// A well-mixed hash, for every seeded choice.
@@ -73,6 +78,21 @@ pub fn fbm(seed: u64, x: f32, z: f32, scale_m: f32, octaves: u32) -> f32 {
 /// Fields keep this far back from the road: a grass verge.
 const VERGE_M: f32 = 22.0;
 
+/// The sea starts this far from the road's line, its beach a little nearer,
+/// and lies this far below the road beside it; the beach a little higher.
+const SEA_FROM_M: f32 = 90.0;
+const SEA_DROP_M: f32 = 2.0;
+const BEACH_DROP_M: f32 = 1.2;
+/// Pools and oases keep this far from the road's line, and lie this far
+/// below the road beside them.
+const POOL_FROM_M: f32 = 45.0;
+const OASIS_FROM_M: f32 = 80.0;
+const POOL_DROP_M: f32 = 0.7;
+/// Ditches are laid in steps this long, and one runs away from the road
+/// every this many metres of it.
+const DITCH_STEP_M: f32 = 12.0;
+const DITCH_ACROSS_EVERY_M: f32 = 90.0;
+
 /// The land is planned on a coarse grid this fine, in metres.
 const BASE_CELL_M: f32 = 100.0;
 /// Road points this far apart along the route anchor the land's height.
@@ -99,6 +119,12 @@ pub struct World {
     base: Vec<(f32, f32)>,
     /// Per grid point: how far along the route the nearest road is.
     along: Vec<f32>,
+    /// Per grid point: whether the nearest road passes it on its left
+    /// (true) or its right, going the way of the ride.
+    left: Vec<bool>,
+    /// Which biome is where, once the look is decided; until then the
+    /// land is the countryside's.
+    biomes: Option<BiomeMap>,
 }
 
 impl World {
@@ -137,6 +163,7 @@ impl World {
         let rows = ((z_hi + REACH_M - z0) / BASE_CELL_M).ceil() as usize + 2;
         let mut base = Vec::with_capacity(cols * rows);
         let mut along = Vec::with_capacity(cols * rows);
+        let mut left = Vec::with_capacity(cols * rows);
         for r in 0..rows {
             for c in 0..cols {
                 let (x, z) = (x0 + c as f32 * BASE_CELL_M, z0 + r as f32 * BASE_CELL_M);
@@ -147,6 +174,7 @@ impl World {
                 // is measured in metres.
                 let (mut wsum, mut hsum, mut nearest) = (0.0f64, 0.0f64, f32::MAX);
                 let mut nearest_along = 0.0;
+                let mut nearest_left = false;
                 for (k, a) in anchors.iter().enumerate() {
                     let d2 = (a[0] - x).powi(2) + (a[2] - z).powi(2);
                     let w = 1.0 / (f64::from(d2) + 2_500.0).powi(2);
@@ -160,9 +188,16 @@ impl World {
                         nearest = seg_d2;
                         let (d0, d1) = (anchor_d[k], *anchor_d.get(k + 1).unwrap_or(&anchor_d[k]));
                         nearest_along = d0 + (d1 - d0) * t;
+                        if let Some(b) = anchors.get(k + 1) {
+                            // Right of travel is (−dz, dx): a place on that
+                            // side has a positive cross product.
+                            let cross = (b[0] - a[0]) * (z - a[2]) - (b[2] - a[2]) * (x - a[0]);
+                            nearest_left = cross < 0.0;
+                        }
                     }
                 }
                 along.push(nearest_along);
+                left.push(nearest_left);
                 let h = if wsum > 0.0 {
                     (hsum / wsum) as f32
                 } else {
@@ -179,7 +214,25 @@ impl World {
             rows,
             base,
             along,
+            left,
+            biomes: None,
         }
+    }
+
+    /// Shape and cover the land by `biomes` from now on.
+    pub fn set_biomes(&mut self, biomes: BiomeMap) {
+        self.biomes = Some(biomes);
+    }
+
+    /// The biome that decides what covers the land at `(x, z)`.
+    pub fn biome_at(&self, x: f32, z: f32) -> Biome {
+        self.biomes
+            .as_ref()
+            .map_or(Biome::Temperate, |m| m.dominant_at(x, z))
+    }
+
+    fn rules_at(&self, x: f32, z: f32) -> &'static LandRules {
+        &self.biome_at(x, z).def().land
     }
 
     /// The world's seed: every choice in it starts from this.
@@ -210,6 +263,23 @@ impl World {
     /// from the nearest point of the coarse grid, never blended: between two
     /// stretches of a lap, a blend would name a third that is nowhere near.
     pub fn road_along(&self, x: f32, z: f32) -> f32 {
+        self.along
+            .get(self.nearest_cell(x, z))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Whether `(x, z)` is left of the road nearest it, going the way of
+    /// the ride — on the coarse grid, like [`World::road_along`].
+    pub fn left_of_road(&self, x: f32, z: f32) -> bool {
+        self.left
+            .get(self.nearest_cell(x, z))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The coarse grid point nearest `(x, z)`, as an index.
+    fn nearest_cell(&self, x: f32, z: f32) -> usize {
         let at = |v: f32, lo: f32, n: usize| {
             let f = ((v - lo) / BASE_CELL_M).round();
             if f.is_finite() {
@@ -218,8 +288,7 @@ impl World {
                 0
             }
         };
-        let (c, r) = (at(x, self.x0, self.cols), at(z, self.z0, self.rows));
-        self.along.get(r * self.cols + c).copied().unwrap_or(0.0)
+        at(z, self.z0, self.rows) * self.cols + at(x, self.x0, self.cols)
     }
 
     /// Roughly how far `(x, z)` is from the road, in metres.
@@ -230,12 +299,146 @@ impl World {
     /// The land's own height at `(x, z)`, before it is fitted to the road:
     /// the road's height carried out over the land, plus hills that grow
     /// with distance from the road.
+    ///
+    /// Each biome shapes its land its own way; where two meet, their
+    /// heights blend by weight. Water lies dead flat whatever the blend.
     pub fn height(&self, x: f32, z: f32) -> f32 {
         let (base, from_road) = self.base_at(x, z);
+        if let Some((level, _)) = self.water_at(x, z, base, from_road, from_road) {
+            return level;
+        }
+        let Some(map) = &self.biomes else {
+            return self.relief(Relief::Rolling, 1.0, base, from_road, x, z);
+        };
+        let w = map.weights_at(x, z);
+        let (mut sum, mut total) = (0.0, 0.0);
+        for b in Biome::ALL {
+            let k = w[b as usize];
+            if k.is_nan() || k <= 0.01 {
+                continue;
+            }
+            let rules = &b.def().land;
+            let mut h = self.relief(rules.relief, rules.relief_scale, base, from_road, x, z);
+            if rules.water == WaterKind::Sea {
+                h = self.shore(h, base, x, z, from_road);
+            }
+            sum += k * h;
+            total += k;
+        }
+        if total > 0.0 {
+            sum / total
+        } else {
+            self.relief(Relief::Rolling, 1.0, base, from_road, x, z)
+        }
+    }
+
+    /// The land's height in one kind of relief, `scale` times as high.
+    fn relief(&self, relief: Relief, scale: f32, base: f32, from_road: f32, x: f32, z: f32) -> f32 {
         let t = smoothstep(HILLS_FROM_M, HILLS_FULL_M, from_road);
         let rolling = fbm(self.seed ^ 0x4111, x, z, 380.0, 4);
         let broad = fbm(self.seed ^ 0xB120, x, z, 1_600.0, 3).max(0.0);
-        base + NEAR_HILLS_M * rolling + (FAR_HILLS_M * broad + 14.0 * rolling) * t
+        let hills = NEAR_HILLS_M * rolling + (FAR_HILLS_M * broad + 14.0 * rolling) * t;
+        match relief {
+            Relief::Rolling => base + scale * hills,
+            Relief::Flat => base + scale * NEAR_HILLS_M * rolling,
+            Relief::Dunes => {
+                // Crests across a wind that blows one way over the whole
+                // world: noise stretched along the crest.
+                let a = unit(splitmix(self.seed ^ 0x3171D)) * std::f32::consts::PI;
+                let (c, s) = (a.cos(), a.sin());
+                let (u, v) = (x * c + z * s, z * c - x * s);
+                let n = fbm(self.seed ^ 0xD0E, u * 0.3, v, 150.0, 3);
+                let crest = (1.0 - n.abs() * 2.5).max(0.0);
+                let dunes = (4.0 + 18.0 * smoothstep(40.0, 500.0, from_road)) * crest * crest;
+                // Far off, now and then, a flat-topped mesa.
+                let m = fbm(self.seed ^ 0x3E5A, x, z, 700.0, 2);
+                let mesa = 55.0 * smoothstep(0.2, 0.26, m) * smoothstep(400.0, 1_200.0, from_road);
+                base + scale * (dunes + 0.4 * hills + mesa)
+            }
+            Relief::Terraces => {
+                // Hillsides cut into steps three metres high, flat treads
+                // with a short bank at the back.
+                let rel = scale * hills;
+                let step = 3.0;
+                let q = (rel / step).floor();
+                let stepped = (q + smoothstep(0.7, 1.0, rel / step - q)) * step;
+                base + lerp(rel, stepped, smoothstep(50.0, 150.0, from_road))
+            }
+            Relief::Peaks => {
+                // Ridges and peaks that start close to the road.
+                let near = smoothstep(80.0, 1_000.0, from_road);
+                let r = 1.0 - (fbm(self.seed ^ 0x9EA, x, z, 900.0, 4) * 2.0).abs();
+                let ridged = r.clamp(0.0, 1.0);
+                base + scale
+                    * (2.0 * NEAR_HILLS_M * rolling
+                        + (260.0 * ridged.powi(3) + 40.0 * broad + 20.0 * rolling) * near)
+            }
+        }
+    }
+
+    /// The land `h` brought down to a beach on the sea side of the road.
+    fn shore(&self, h: f32, base: f32, x: f32, z: f32, from_road: f32) -> f32 {
+        if !self.sea_side(x, z) {
+            return h;
+        }
+        lerp(
+            h,
+            base - BEACH_DROP_M,
+            smoothstep(SEA_FROM_M - 70.0, SEA_FROM_M - 20.0, from_road),
+        )
+    }
+
+    /// Whether the sea lies this side of the road at `(x, z)`: one side,
+    /// seeded, for the whole ride, as a coast road runs.
+    fn sea_side(&self, x: f32, z: f32) -> bool {
+        self.left_of_road(x, z) == (splitmix(self.seed ^ 0x5EA) & 1 == 0)
+    }
+
+    /// Open water at `(x, z)`, if its biome has any there: its flat level
+    /// and its kind. Decided on the world's own coarse measure of the
+    /// distance to the road, which [`World::height`] uses too, so where
+    /// the land is water it is level — and on `exact`, the caller's own
+    /// measure where it has one: the coarse one can be tens of metres out,
+    /// and water near the road would stand above it (rule 7). Where the
+    /// two disagree the land is laid level but is not water.
+    fn water_at(
+        &self,
+        x: f32,
+        z: f32,
+        base: f32,
+        coarse: f32,
+        exact: f32,
+    ) -> Option<(f32, AreaKind)> {
+        let from_road = coarse.min(exact);
+        let rules = self.biomes.as_ref()?;
+        let rules = &rules.dominant_at(x, z).def().land;
+        match rules.water {
+            WaterKind::Sea if from_road > SEA_FROM_M && self.sea_side(x, z) => {
+                Some((base - SEA_DROP_M, AreaKind::Water))
+            }
+            WaterKind::Pools
+                if from_road > POOL_FROM_M && fbm(self.seed ^ 0x9001, x, z, 90.0, 3) > -0.02 =>
+            {
+                Some((base - POOL_DROP_M, AreaKind::Water))
+            }
+            WaterKind::Oasis
+                if from_road > OASIS_FROM_M && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > 0.46 =>
+            {
+                Some((base - POOL_DROP_M, AreaKind::Water))
+            }
+            _ => None,
+        }
+    }
+
+    /// Sand at `(x, z)`: the beach before the sea, the ring round an oasis.
+    fn sand_at(&self, x: f32, z: f32, rules: &LandRules, from_road: f32) -> bool {
+        match rules.water {
+            WaterKind::Sea => from_road > SEA_FROM_M - 45.0 && self.sea_side(x, z),
+            WaterKind::Oasis => {
+                from_road > OASIS_FROM_M - 20.0 && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > 0.38
+            }
+            _ => false,
+        }
     }
 
     /// What covers the land at `(x, z)`: woods on patches that grow larger
@@ -248,17 +451,91 @@ impl World {
     /// road's line — exactly, where the caller can measure it: the world's
     /// own measure cuts the corners of bends.
     pub fn land_at(&self, x: f32, z: f32, from_road: f32) -> Option<AreaKind> {
+        let rules = self.rules_at(x, z);
+        let (base, coarse) = self.base_at(x, z);
+        if let Some((_, kind)) = self.water_at(x, z, base, coarse, from_road) {
+            return Some(kind);
+        }
+        if self.sand_at(x, z, rules, coarse.min(from_road)) {
+            return Some(AreaKind::Sand);
+        }
+        if from_road < rules.paving_m {
+            return Some(AreaKind::Paving);
+        }
         let wood = fbm(self.seed ^ 0x3009, x, z, 320.0, 3);
         // Woods keep back from the road, and gather on the far hills.
-        let wood_line = 0.42 - 0.22 * smoothstep(200.0, 2_000.0, from_road);
-        if from_road > 60.0 && wood > wood_line {
+        let wood_line = 0.42 - 0.22 * smoothstep(200.0, 2_000.0, from_road) - rules.wood;
+        if from_road > rules.wood_from_m && wood > wood_line {
             return Some(AreaKind::Wood);
         }
         // Fields keep back behind a grass verge.
-        if from_road > VERGE_M && fbm(self.seed ^ 0xF1E1, x, z, 160.0, 3) > 0.02 {
+        if from_road > VERGE_M && fbm(self.seed ^ 0xF1E1, x, z, 160.0, 3) > rules.fields {
             return Some(AreaKind::Farmland);
         }
         None
+    }
+
+    /// Straight ditches between the fields wherever the biome digs them:
+    /// alongside the road at a few distances, and across the land away from
+    /// it every so often — never within `clear_m` of the road, by
+    /// `from_road(x, z)`.
+    pub fn ditches(
+        &self,
+        road: &[RoadPoint],
+        clear_m: f32,
+        from_road: impl Fn(f32, f32) -> f32,
+    ) -> Vec<Vec<(f32, f32)>> {
+        let mut out = Vec::new();
+        let (Some(first), Some(last)) = (road.first(), road.last()) else {
+            return out;
+        };
+        let dug = |x: f32, z: f32| {
+            self.rules_at(x, z).water == WaterKind::Ditches && from_road(x, z) >= clear_m
+        };
+        // Cut a line into the stretches that may be dug.
+        let mut keep = |points: &mut dyn Iterator<Item = (f32, f32)>| {
+            let mut line = Vec::new();
+            for (x, z) in points {
+                if dug(x, z) {
+                    line.push((x, z));
+                } else if line.len() >= 2 {
+                    out.push(std::mem::take(&mut line));
+                } else {
+                    line.clear();
+                }
+            }
+            if line.len() >= 2 {
+                out.push(line);
+            }
+        };
+        let length = last.distance_m - first.distance_m;
+        if !(length.is_finite() && clear_m.is_finite()) {
+            return Vec::new();
+        }
+        let steps = (length / DITCH_STEP_M) as usize;
+        for off in [clear_m + 6.0, clear_m + 80.0, clear_m + 190.0] {
+            for side in [-1.0, 1.0] {
+                keep(&mut (0..=steps).filter_map(|k| {
+                    beside(road, first.distance_m + k as f32 * DITCH_STEP_M, side * off)
+                }));
+            }
+        }
+        let mut along = first.distance_m + DITCH_ACROSS_EVERY_M / 2.0;
+        while along < last.distance_m {
+            for side in [-1.0, 1.0] {
+                let (Some(a), Some(b)) = (beside(road, along, 0.0), beside(road, along, side))
+                else {
+                    continue;
+                };
+                let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+                keep(&mut (0..=(600.0 / DITCH_STEP_M) as usize).map(|k| {
+                    let o = clear_m + k as f32 * DITCH_STEP_M;
+                    (a.0 + dx * o, a.1 + dz * o)
+                }));
+            }
+            along += DITCH_ACROSS_EVERY_M;
+        }
+        out
     }
 
     /// Meandering streams, as lines, that never come within `clear_m` of
@@ -402,6 +679,10 @@ fn segment_d2_t(a: (f32, f32), b: (f32, f32), x: f32, z: f32) -> (f32, f32) {
     ((a.0 + t * dx - x).powi(2) + (a.1 + t * dz - z).powi(2), t)
 }
 
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
     let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -489,6 +770,95 @@ mod tests {
         assert!((back - 5_600.0).abs() <= 50.0, "return leg: {back}");
         let out = w.road_along(40.0, -1_000.0);
         assert!((out - 1_000.0).abs() <= 50.0, "outward leg: {out}");
+    }
+
+    /// A flat road due north, its world shaped and covered as `biome`.
+    fn world_of(biome: Biome) -> (World, Vec<RoadPoint>) {
+        let road = north_road(401, |_| 10.0);
+        let mut w = World::new(&road);
+        w.set_biomes(BiomeMap::uniform(biome));
+        (w, road)
+    }
+
+    /// Places on a grid either side of the road, from `near` to `far`
+    /// metres out.
+    fn beside_road(near: f32, far: f32) -> impl Iterator<Item = (f32, f32)> {
+        (0..40).flat_map(move |i| {
+            (0..30).flat_map(move |j| {
+                let x = near + (far - near) * j as f32 / 29.0;
+                let z = -(i as f32) * 100.0;
+                [(x, z), (-x, z)]
+            })
+        })
+    }
+
+    #[test]
+    fn should_lay_a_polder_dead_level_to_the_horizon() {
+        let (w, _) = world_of(Biome::Polder);
+        for (x, z) in beside_road(30.0, 3_000.0) {
+            let h = w.height(x, z);
+            assert!((h - 10.0).abs() < 1e-3, "{h} at {x}, {z}");
+        }
+    }
+
+    #[test]
+    fn should_raise_mountains_well_above_the_road_and_dunes_above_the_desert() {
+        let (mountain, _) = world_of(Biome::Mountain);
+        let peak = beside_road(200.0, 3_000.0)
+            .map(|(x, z)| mountain.height(x, z))
+            .fold(f32::MIN, f32::max);
+        assert!(peak > 150.0, "highest mountain only {peak} m");
+        let (desert, _) = world_of(Biome::Desert);
+        let (countryside, _) = world_of(Biome::Temperate);
+        let differs = beside_road(150.0, 600.0)
+            .filter(|&(x, z)| (desert.height(x, z) - countryside.height(x, z)).abs() > 2.0)
+            .count();
+        assert!(
+            differs > 200,
+            "the desert is shaped like the countryside ({differs})"
+        );
+    }
+
+    #[test]
+    fn should_grow_no_woods_or_fields_in_the_desert_and_pave_the_town() {
+        let (desert, _) = world_of(Biome::Desert);
+        for (x, z) in beside_road(10.0, 1_500.0) {
+            let kind = desert.land_at(x, z, x.abs());
+            assert!(
+                !matches!(kind, Some(AreaKind::Wood | AreaKind::Farmland)),
+                "{kind:?} at {x}, {z}"
+            );
+        }
+        let (town, _) = world_of(Biome::Urban);
+        assert_eq!(town.land_at(30.0, -500.0, 30.0), Some(AreaKind::Paving));
+        assert_eq!(town.land_at(-89.0, -500.0, 89.0), Some(AreaKind::Paving));
+        assert_ne!(town.land_at(-91.0, -500.0, 91.0), Some(AreaKind::Paving));
+    }
+
+    #[test]
+    fn should_put_the_sea_on_one_side_of_the_road_only_and_never_near_it() {
+        let (coast, _) = world_of(Biome::Coast);
+        let wet = |x: f32| {
+            (0..30)
+                .filter(|&i| {
+                    let z = -100.0 - i as f32 * 100.0;
+                    coast.land_at(x, z, x.abs()) == Some(AreaKind::Water)
+                })
+                .count()
+        };
+        let (east, west) = (wet(300.0), wet(-300.0));
+        assert!(
+            (east == 30 && west == 0) || (east == 0 && west == 30),
+            "sea east {east}, west {west}"
+        );
+        // Not within 89 m of the road's line, by any measure: the exact one
+        // wins even where the coarse grid says otherwise.
+        for x in [-89.0, -60.0, -30.0, 30.0, 60.0, 89.0] {
+            assert_eq!(wet(x), 0, "sea at {x}");
+            for z in [-500.0, -1_500.0] {
+                assert_ne!(coast.land_at(x, z, 10.0), Some(AreaKind::Water));
+            }
+        }
     }
 
     #[test]

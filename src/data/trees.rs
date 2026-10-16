@@ -28,6 +28,10 @@ fn height_m(shape: Shape) -> f32 {
     match shape {
         Shape::Cone => 10.0,
         Shape::Poplar => 13.0,
+        Shape::Olive => 6.0,
+        Shape::Cypress => 11.0,
+        Shape::Palm => 9.0,
+        Shape::Birch => 10.0,
         _ => 8.0,
     }
 }
@@ -56,7 +60,7 @@ pub fn mesh(kind: Shape) -> Mesh {
             m.extend(prism(0.022, 0.0, 0.2, trunk));
             m.extend(ball([0.0, 0.58, 0.0], [0.13, 0.42, 0.13], CROWN));
         }
-        Shape::Sheep | Shape::Bird => {}
+        _ => {}
     }
     m
 }
@@ -105,7 +109,7 @@ fn cone(base: f32, radius: f32, tip: f32, colour: [f32; 4]) -> Mesh {
 }
 
 /// A low-poly ball: three rings between two poles, stretched by `radius`.
-fn ball(centre: [f32; 3], radius: [f32; 3], colour: [f32; 4]) -> Mesh {
+pub(crate) fn ball(centre: [f32; 3], radius: [f32; 3], colour: [f32; 4]) -> Mesh {
     let mut m = Mesh::default();
     let at = |x: f32, y: f32, z: f32| {
         [
@@ -152,6 +156,8 @@ pub const REACH_M: f32 = 1_100.0;
 /// Past this far from the road a wood is planted at half the density each
 /// way: from there the eye takes in its outline, not its trees.
 const THIN_FROM_M: f32 = 350.0;
+/// And past this far at a third: a far wood is a dark line in the haze.
+const THINNEST_FROM_M: f32 = 700.0;
 
 /// No tree stands closer than this to the road's edge — a crown over the
 /// track would be in the rider's face, and round a tight bend the camera
@@ -214,8 +220,14 @@ pub fn scatter(land: &Land) -> Vec<Prop> {
                 let spacing =
                     lo + (hi - lo) * biome::unit(biome::seed_at(cx, cz, CELL_M, 0x5_9AC3));
                 let k = (CELL_M / spacing).round().max(1.0) as usize;
-                let far = (land.from_road)(cx, cz).is_some_and(|d| d > THIN_FROM_M);
-                let k = if far { k.div_ceil(2) } else { k };
+                let from = (land.from_road)(cx, cz).unwrap_or(f32::MAX);
+                let k = if from > THINNEST_FROM_M {
+                    k.div_ceil(3)
+                } else if from > THIN_FROM_M {
+                    k.div_ceil(2)
+                } else {
+                    k
+                };
                 let step = CELL_M / k as f32;
                 for a in 0..k {
                     for b in 0..k {
@@ -294,9 +306,9 @@ fn plant(land: &Land, trees: &mut Vec<Prop>, x: f32, z: f32, seed: u64, kind: Op
     let def = (land.biome)(x, z);
     let kind = kind.unwrap_or_else(|| {
         if biome::unit(seed.rotate_left(7)) < def.trees.cone_share {
-            Shape::Cone
+            def.trees.kinds[1]
         } else {
-            Shape::Round
+            def.trees.kinds[0]
         }
     });
     let scale = 0.8 + 0.5 * biome::unit(seed.rotate_left(37));

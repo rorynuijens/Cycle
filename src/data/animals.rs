@@ -7,6 +7,7 @@
 //!
 //! Pure: no GTK, no GL. Scene space as in `course3d`: metres, x east, z south.
 
+use crate::data::biome::BiomeDef;
 use crate::data::course3d::{Mesh, RoadPoint, Vertex, MATERIAL_PLAIN};
 use crate::data::palette;
 use crate::data::props::{Motion, Prop, Shape, ORBIT_M, OWN_COLOUR};
@@ -18,14 +19,8 @@ pub const CLEAR_OF_ROAD_M: f32 = 18.0;
 /// A flock may graze every this many metres of route, on one side or the
 /// other.
 const FLOCK_EVERY_M: f32 = 110.0;
-/// Share of those places that have a flock.
-const FLOCK_CHANCE: f32 = 0.45;
 /// Birds circle over the land every this many metres of route.
 const BIRDS_EVERY_M: f32 = 450.0;
-
-/// Drawn a little larger than life, so they read from the saddle.
-const SHEEP_SIZE_M: f32 = 1.9;
-const BIRD_SIZE_M: f32 = 1.3;
 
 /// The x a sheep's head starts at, in mesh units: the shader dips every
 /// vertex past this while it grazes.
@@ -84,8 +79,8 @@ pub fn mesh(shape: Shape) -> Mesh {
             }
         }
         Shape::Bird => {
-            let b = palette::BASE.bird;
-            let bird = [b[0], b[1], b[2], MATERIAL_PLAIN];
+            // The prop's own colour: dark birds inland, white gulls.
+            let bird = own;
             m.extend(cuboid([-0.25, -0.05, -0.06], [0.25, 0.05, 0.06], bird));
             // Wings: thin slabs out to either side; the shader beats them.
             m.extend(cuboid([-0.1, -0.01, 0.06], [0.14, 0.01, 0.62], bird));
@@ -104,8 +99,10 @@ pub struct Land<'a> {
     pub area: &'a dyn Fn(f32, f32) -> Option<AreaKind>,
     /// The drawn ground's height, where there is ground.
     pub ground: &'a dyn Fn(f32, f32) -> Option<f32>,
-    /// Taken by something else: a stream.
+    /// Taken by something else: a stream, a house.
     pub taken: &'a dyn Fn(f32, f32) -> bool,
+    /// Which biome's herds and birds are at `(x, z)`.
+    pub biome: &'a dyn Fn(f32, f32) -> &'static BiomeDef,
 }
 
 fn unit(h: u64) -> f32 {
@@ -119,11 +116,6 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
     let (Some(first), Some(last)) = (road.first(), road.last()) else {
         return out;
     };
-    let fleece = [
-        palette::BASE.fleece_a,
-        palette::BASE.fleece_b,
-        palette::BASE.fleece_c,
-    ];
     let mut k = 0u64;
     let mut along = first.distance_m + FLOCK_EVERY_M / 2.0;
     while along < last.distance_m {
@@ -131,15 +123,21 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
         k += 1;
         let here = along;
         along += FLOCK_EVERY_M;
-        if unit(h) >= FLOCK_CHANCE {
-            continue;
-        }
         let side = if h & 2 == 0 { 1.0 } else { -1.0 };
         let off = side * (23.0 + 22.0 * unit(h.rotate_left(11)));
         let Some((cx, cz)) = beside(road, here, off) else {
             continue;
         };
-        let count = 3 + (h.rotate_left(23) % 6) as usize;
+        let rules = &(land.biome)(cx, cz).animals;
+        let Some(herd) = rules.herd else {
+            continue;
+        };
+        if unit(h) >= rules.herd_chance {
+            continue;
+        }
+        let [lo, hi] = rules.herd_count;
+        let count = (lo + (h.rotate_left(23) % u64::from(hi - lo + 1)) as u32) as usize;
+        let def = (land.biome)(cx, cz);
         for s in 0..count {
             let g = splitmix(h ^ (s as u64 + 1));
             let r = 9.0 * unit(g).sqrt();
@@ -148,18 +146,21 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
             if (land.from_road)(x, z) < CLEAR_OF_ROAD_M || (land.taken)(x, z) {
                 continue;
             }
-            if matches!((land.area)(x, z), Some(AreaKind::Water | AreaKind::Wood)) {
-                continue;
+            match (land.area)(x, z) {
+                Some(AreaKind::Water | AreaKind::Sand | AreaKind::Paving) => continue,
+                Some(AreaKind::Wood) if !rules.herd_in_woods => continue,
+                _ => {}
             }
             let Some(y) = (land.ground)(x, z) else {
                 continue;
             };
+            let coat = &rules.coats[(g % 3) as usize % rules.coats.len()];
             out.push(Prop {
-                shape: Shape::Sheep,
+                shape: herd,
                 pos: [x, y, z],
-                size: SHEEP_SIZE_M * (0.9 + 0.2 * unit(g.rotate_left(29))),
+                size: rules.herd_size_m * (0.9 + 0.2 * unit(g.rotate_left(29))),
                 yaw: unit(g.rotate_left(37)) * std::f32::consts::TAU,
-                colour: fleece[(g % 3) as usize],
+                colour: def.palette.named(coat).unwrap_or(def.palette.fleece_a),
                 motion: Motion::Graze,
                 phase: unit(g.rotate_left(47)) * std::f32::consts::TAU,
             });
@@ -180,6 +181,10 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
         if (land.from_road)(cx, cz) < CLEAR_OF_ROAD_M + ORBIT_M {
             continue;
         }
+        let def = (land.biome)(cx, cz);
+        if !def.animals.birds {
+            continue;
+        }
         let Some(y) = (land.ground)(cx, cz) else {
             continue;
         };
@@ -190,9 +195,9 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
             out.push(Prop {
                 shape: Shape::Bird,
                 pos: [cx, y + lift + 4.0 * unit(g), cz],
-                size: BIRD_SIZE_M,
+                size: def.animals.bird_size_m,
                 yaw: 0.0,
-                colour: palette::BASE.bird,
+                colour: def.palette.bird,
                 motion: Motion::Orbit,
                 // Spread round the circle: a loose flock.
                 phase: b as f32 * 0.5 + unit(g.rotate_left(9)) * 0.3,
@@ -228,6 +233,10 @@ mod tests {
         false
     }
 
+    fn temperate(_: f32, _: f32) -> &'static BiomeDef {
+        crate::data::biome::Biome::Temperate.def()
+    }
+
     fn land(seed: u64) -> Land<'static> {
         Land {
             seed,
@@ -235,6 +244,7 @@ mod tests {
             area: &grass,
             ground: &ground,
             taken: &free,
+            biome: &temperate,
         }
     }
 

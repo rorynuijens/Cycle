@@ -92,6 +92,31 @@ pub struct Palette {
     pub kit: Rgb,
     pub frame: Rgb,
     pub tyre: Rgb,
+    /// Desert plants and the dressing of every biome's own scenery.
+    pub cactus: Rgb,
+    pub palm_leaf: Rgb,
+    pub reed: Rgb,
+    pub cattail: Rgb,
+    pub hay: Rgb,
+    pub barn: Rgb,
+    pub cow_a: Rgb,
+    pub cow_b: Rgb,
+    pub patch: Rgb,
+    pub deer: Rgb,
+    pub goat_a: Rgb,
+    pub goat_b: Rgb,
+    pub camel: Rgb,
+    pub duck: Rgb,
+    pub heron: Rgb,
+    pub beak: Rgb,
+    pub boat_a: Rgb,
+    pub boat_b: Rgb,
+    pub sail: Rgb,
+    pub birch_bark: Rgb,
+    pub lamp: Rgb,
+    pub hut: Rgb,
+    pub lighthouse: Rgb,
+    pub windmill: Rgb,
 }
 
 /// The shared base palette: the skill's names (§3, §7.1), tuned to the
@@ -145,6 +170,30 @@ pub const BASE: Palette = Palette {
     kit: hex(0x2A2E3A),
     frame: hex(0xE2463B),
     tyre: hex(0x23252C),
+    cactus: hex(0x5E9E4A),
+    palm_leaf: hex(0x5DAA3C),
+    reed: hex(0xB9B45A),
+    cattail: hex(0x6B4A2E),
+    hay: hex(0xE9C86A),
+    barn: hex(0xB8432F),
+    cow_a: hex(0x2C2C30),
+    cow_b: hex(0x8A5A3C),
+    patch: hex(0xF5F2EA),
+    deer: hex(0xA8703F),
+    goat_a: hex(0xEDE6D6),
+    goat_b: hex(0x6E5038),
+    camel: hex(0xD3A35F),
+    duck: hex(0x8A6A48),
+    heron: hex(0x9AA3AE),
+    beak: hex(0xF2A33A),
+    boat_a: hex(0xD9503F),
+    boat_b: hex(0x3F7FBF),
+    sail: hex(0xF7F5EE),
+    birch_bark: hex(0xF2F0E8),
+    lamp: hex(0x3A3F4A),
+    hut: hex(0x8B5A3A),
+    lighthouse: hex(0xD8432F),
+    windmill: hex(0x4A5A4E),
 };
 
 /// Names a biome may not override: the track and the rider look the same
@@ -214,6 +263,30 @@ impl Palette {
             "kit" => &mut self.kit,
             "frame" => &mut self.frame,
             "tyre" => &mut self.tyre,
+            "cactus" => &mut self.cactus,
+            "palm_leaf" => &mut self.palm_leaf,
+            "reed" => &mut self.reed,
+            "cattail" => &mut self.cattail,
+            "hay" => &mut self.hay,
+            "barn" => &mut self.barn,
+            "cow_a" => &mut self.cow_a,
+            "cow_b" => &mut self.cow_b,
+            "patch" => &mut self.patch,
+            "deer" => &mut self.deer,
+            "goat_a" => &mut self.goat_a,
+            "goat_b" => &mut self.goat_b,
+            "camel" => &mut self.camel,
+            "duck" => &mut self.duck,
+            "heron" => &mut self.heron,
+            "beak" => &mut self.beak,
+            "boat_a" => &mut self.boat_a,
+            "boat_b" => &mut self.boat_b,
+            "sail" => &mut self.sail,
+            "birch_bark" => &mut self.birch_bark,
+            "lamp" => &mut self.lamp,
+            "hut" => &mut self.hut,
+            "lighthouse" => &mut self.lighthouse,
+            "windmill" => &mut self.windmill,
             _ => return None,
         })
     }
@@ -226,6 +299,12 @@ impl Palette {
         }
         *self.slot(name)? = rgb;
         Some(self)
+    }
+
+    /// The colour called `name`, if there is one.
+    pub fn named(&self, name: &str) -> Option<Rgb> {
+        let mut copy = *self;
+        copy.slot(name).map(|c| *c)
     }
 
     /// A tree crown colour, picked by `seed`.
@@ -276,7 +355,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 47] = [
+        const NAMES: [&str; 71] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -324,13 +403,37 @@ mod tests {
             "kit",
             "frame",
             "tyre",
+            "cactus",
+            "palm_leaf",
+            "reed",
+            "cattail",
+            "hay",
+            "barn",
+            "cow_a",
+            "cow_b",
+            "patch",
+            "deer",
+            "goat_a",
+            "goat_b",
+            "camel",
+            "duck",
+            "heron",
+            "beak",
+            "boat_a",
+            "boat_b",
+            "sail",
+            "birch_bark",
+            "lamp",
+            "hut",
+            "lighthouse",
+            "windmill",
         ];
         assert_eq!(NAMES.len(), size_of::<Palette>() / size_of::<Rgb>());
         let mut p = BASE;
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 47] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 71] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

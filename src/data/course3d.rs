@@ -20,7 +20,7 @@ use crate::data::props::Prop;
 use crate::data::roadway;
 use crate::data::route::Route;
 use crate::data::world::{splitmix, AreaKind, World};
-use crate::data::{animals, rider, sky, track, trees};
+use crate::data::{animals, dressing, rider, sky, track, trees};
 
 /// The chase camera: this far behind the rider and this high above the road,
 /// aimed at a point this far ahead of the rider and this high.
@@ -152,8 +152,10 @@ fn ground_colour(def: &BiomeDef, area: Option<AreaKind>, x: f32, z: f32, rise: f
     let p = &def.palette;
     let rgb = match area {
         Some(AreaKind::Water) => return [p.water[0], p.water[1], p.water[2], MATERIAL_WATER],
-        Some(AreaKind::Farmland) => field(p, x, z),
+        Some(AreaKind::Farmland) => field(p, def.land.crops, x, z),
         Some(AreaKind::Wood) => p.grass_high,
+        Some(AreaKind::Sand) => p.sand,
+        Some(AreaKind::Paving) => p.paving,
         None => lerp3(p.grass_low, p.grass_high, smoothstep(0.0, 40.0, rise)),
     };
     [rgb[0], rgb[1], rgb[2], MATERIAL_GROUND]
@@ -162,7 +164,7 @@ fn ground_colour(def: &BiomeDef, area: Option<AreaKind>, x: f32, z: f32, rise: f
 /// The crop in the field at `(x, z)`: fields are the cells round seeded
 /// points about [`FIELD_M`] apart, each sown at random from the palette's
 /// field colours — the same field every ride.
-fn field(p: &Palette, x: f32, z: f32) -> [f32; 3] {
+fn field(p: &Palette, crops: f32, x: f32, z: f32) -> [f32; 3] {
     let (ci, cj) = ((x / FIELD_M).floor() as i64, (z / FIELD_M).floor() as i64);
     let mut best = (f32::MAX, 0u64);
     for di in -1..=1 {
@@ -177,17 +179,41 @@ fn field(p: &Palette, x: f32, z: f32) -> [f32; 3] {
             }
         }
     }
-    // Crops scattered through meadows: most fields are grass.
-    [
+    // Crops scattered through meadows: half the fields are grass in the
+    // countryside, and a biome with more or fewer crops turns some over.
+    let pick = (best.1 % 8) as usize;
+    let crop = [true, true, true, false, false, true, false, false][pick];
+    let turn = biome::unit(splitmix(best.1 ^ 0xC0B5));
+    let crop = if crop {
+        turn >= (0.5 - crops) * 2.0
+    } else {
+        turn < (crops - 0.5) * 2.0
+    };
+    let crops_of = [
         p.field_wheat,
         p.field_ploughed,
         p.field_green,
-        p.grass_low,
-        p.grass_low,
         p.field_wheat,
-        p.grass_high,
-        p.grass_low,
-    ][(best.1 % 8) as usize]
+    ];
+    let grass_of = [p.grass_low, p.grass_low, p.grass_high, p.grass_low];
+    match (
+        crop,
+        [true, true, true, false, false, true, false, false][pick],
+    ) {
+        // Unturned: the countryside's own field, as it always was.
+        (true, true) | (false, false) => [
+            p.field_wheat,
+            p.field_ploughed,
+            p.field_green,
+            p.grass_low,
+            p.grass_low,
+            p.field_wheat,
+            p.grass_high,
+            p.grass_low,
+        ][pick],
+        (true, false) => crops_of[(best.1 >> 8) as usize % 4],
+        (false, true) => grass_of[(best.1 >> 8) as usize % 4],
+    }
 }
 
 /// The ground grid's layout: vertex spacing, how far it reaches from the
@@ -373,10 +399,11 @@ impl CourseScene {
         if road.len() < 2 {
             return None;
         }
-        let world = World::new(&road);
+        let mut world = World::new(&road);
+        let look = look_for(&road, route.points[0].lat, &world, scenery);
+        world.set_biomes(look.biomes.clone());
         let own = |x: f32, z: f32| Some(world.height(x, z));
         let terrain = terrain.unwrap_or(&own);
-        let look = look_for(&road, route.points[0].lat, &world, scenery);
         let mut props = Vec::new();
         let mut mesh = world_mesh(
             &road,
@@ -914,9 +941,16 @@ pub fn world_mesh(
     // Clear by the stream's own width too, and by half a step of its line,
     // which may cut a corner between two of its points.
     let stream_clear = STREAM_CLEAR_M + reach + STREAM_HALF_M + 6.0;
-    let streams = world.streams(road, STREAM_EVERY_M, stream_clear, |x, z| {
-        index.nearest(x, z).map_or(f32::MAX, |(d2, _)| d2.sqrt())
+    let from_line = |x: f32, z: f32| index.nearest(x, z).map_or(f32::MAX, |(d2, _)| d2.sqrt());
+    // Brooks only where the biome has them, by where each starts; ditches
+    // wherever it digs them.
+    let mut streams = world.streams(road, STREAM_EVERY_M, stream_clear, from_line);
+    streams.retain(|s| {
+        s.first().is_some_and(|&(x, z)| {
+            world.biome_at(x, z).def().land.water == biome::WaterKind::Streams
+        })
     });
+    streams.extend(world.ditches(road, stream_clear, from_line));
     let ground = surface;
     for s in &streams {
         mesh.extend(stream_mesh(s, &ground, &look_at));
@@ -940,9 +974,40 @@ pub fn world_mesh(
     };
 
     if let Some(out) = props_out {
+        let far_from = |x: f32, z: f32| from_edge(x, z).unwrap_or(f32::MAX);
+        let toward_road = |x: f32, z: f32| {
+            index.nearest(x, z).map_or(0.0, |(_, i)| {
+                let p = line[i].pos;
+                (p[2] - z).atan2(p[0] - x)
+            })
+        };
+        let dressing_margin = dressing::MAX_REACH_M + reach;
+        // Houses, landmarks and the rest first: what claims ground keeps
+        // the trees and the herds off it.
+        let dressed = dressing::place(
+            road,
+            &dressing::Land {
+                seed: world.seed(),
+                bounds: (
+                    (x_lo - dressing_margin, x_hi + dressing_margin),
+                    (z_lo - dressing_margin, z_hi + dressing_margin),
+                ),
+                from_road: &far_from,
+                area: &area_at,
+                ground: &ground,
+                taken: &taken,
+                biome: &|x, z| world.biome_at(x, z),
+                toward_road: &toward_road,
+            },
+        );
+        let taken = |x: f32, z: f32| taken(x, z) || dressed.claimed(x, z);
         let near = |x: f32, z: f32| from_edge(x, z).filter(|d| *d <= trees::REACH_M);
         let biome_at = |x: f32, z: f32| look_at(x, z);
-        let rows = world.poplar_rows(road, ROW_EVERY_M, ROW_NEAR_M + reach);
+        let mut rows = world.poplar_rows(road, ROW_EVERY_M, ROW_NEAR_M + reach);
+        rows.retain(|r| {
+            r.first()
+                .is_some_and(|&(x, z)| world.biome_at(x, z).def().land.poplar_rows)
+        });
         let margin = trees::REACH_M + reach;
         let mut props = trees::scatter(&trees::Land {
             bounds: (
@@ -957,7 +1022,6 @@ pub fn world_mesh(
             rows: &rows,
             lone: &[],
         });
-        let far_from = |x: f32, z: f32| from_edge(x, z).unwrap_or(f32::MAX);
         props.extend(animals::place(
             road,
             &animals::Land {
@@ -966,8 +1030,10 @@ pub fn world_mesh(
                 area: &area_at,
                 ground: &ground,
                 taken: &taken,
+                biome: &biome_at,
             },
         ));
+        props.extend(dressed.props);
         *out = props;
     }
     mesh
@@ -2632,43 +2698,110 @@ mod tests {
     #[test]
     fn should_never_draw_water_above_the_road_beside_it() {
         // Rule 7: water within 30 m of the road's edge must lie at least half
-        // a metre below it. Streams keep further off than that; this holds
-        // the whole world to it, on a road that rises and falls.
-        let route = straight_route(600, 10.0, 0.0);
-        let mut route = route;
+        // a metre below it — streams, ditches, pools, an oasis and the sea,
+        // in every scenery, on a road that rises and falls.
+        let mut route = straight_route(400, 10.0, 0.0);
         for (i, p) in route.points.iter_mut().enumerate() {
             p.elevation_m = 10.0 + (i as f32 * 0.05).sin() * 6.0;
         }
-        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
-        let line = resample(&scene.road, RESAMPLE_M);
-        let mut water_seen = 0;
-        for v in &scene.mesh.vertices {
-            if v.colour[3] != MATERIAL_WATER {
-                continue;
+        for scenery in Scenery::CHOICES {
+            let scene = CourseScene::build(&route, scenery).expect("a scene");
+            let line = resample(&scene.road, RESAMPLE_M);
+            let index = NearestIndex::new(&line, DEFAULT_EXTENT_M + 40.0);
+            let mut water_seen = 0;
+            for v in &scene.mesh.vertices {
+                if v.colour[3] != MATERIAL_WATER {
+                    continue;
+                }
+                water_seen += 1;
+                let Some((d2, i)) = index.nearest(v.pos[0], v.pos[2]) else {
+                    continue;
+                };
+                if d2.sqrt() <= DEFAULT_EXTENT_M + 30.0 {
+                    assert!(
+                        v.pos[1] <= line[i].pos[1] - 0.5,
+                        "{scenery:?}: water at {:?}, {:.1} m from a road at {} m",
+                        v.pos,
+                        d2.sqrt(),
+                        line[i].pos[1]
+                    );
+                }
             }
-            water_seen += 1;
-            let (d2, i) = line
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        (p.pos[0] - v.pos[0]).powi(2) + (p.pos[2] - v.pos[2]).powi(2),
-                        i,
+            let wet = matches!(
+                scenery,
+                Scenery::Countryside
+                    | Scenery::Only(
+                        biome::Biome::Polder | biome::Biome::Coast | biome::Biome::Wetland
                     )
-                })
-                .min_by(|a, b| a.0.total_cmp(&b.0))
-                .expect("a road");
-            if d2.sqrt() <= DEFAULT_EXTENT_M + 30.0 {
+            );
+            if wet {
+                assert!(water_seen > 0, "{scenery:?} has no water in 4 km");
+            }
+        }
+    }
+
+    #[test]
+    fn should_keep_every_prop_off_the_track_and_every_animal_well_clear() {
+        // Rule 5 and the skill's encounters rule: nothing stands on the
+        // asphalt — not a house, not a lamp post — and nothing that moves
+        // comes within the animals' clearance of the edge.
+        let route = straight_route(400, 10.0, 0.0);
+        for scenery in Scenery::CHOICES {
+            let scene = CourseScene::build(&route, scenery).expect("a scene");
+            let line = resample(&scene.road, RESAMPLE_M);
+            let index = NearestIndex::new(&line, 200.0);
+            for p in &scene.props {
+                let Some((d2, _)) = index.nearest(p.pos[0], p.pos[2]) else {
+                    continue;
+                };
+                let from_edge = d2.sqrt() - DEFAULT_EXTENT_M;
                 assert!(
-                    v.pos[1] <= line[i].pos[1] - 0.5,
-                    "water at {:?}, {:.1} m from a road at {} m",
-                    v.pos,
-                    d2.sqrt(),
-                    line[i].pos[1]
+                    from_edge >= 3.0,
+                    "{scenery:?}: {p:?} is {from_edge} m from the edge"
+                );
+                let moves = matches!(
+                    p.motion,
+                    crate::data::props::Motion::Graze | crate::data::props::Motion::Bob
+                );
+                if moves {
+                    assert!(
+                        from_edge >= animals::CLEAR_OF_ROAD_M - 0.01,
+                        "{scenery:?}: {p:?} grazes {from_edge} m from the edge"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_keep_trees_and_herds_off_the_ground_a_house_takes() {
+        let route = straight_route(400, 10.0, 0.0);
+        let scene =
+            CourseScene::build(&route, Scenery::Only(biome::Biome::Urban)).expect("a scene");
+        let houses: Vec<&Prop> = scene
+            .props
+            .iter()
+            .filter(|p| p.shape == crate::data::props::Shape::House)
+            .collect();
+        assert!(houses.len() > 100, "{} houses in a 4 km town", houses.len());
+        for t in scene.props.iter().filter(|p| p.shape.is_tree()) {
+            for h in &houses {
+                let d = (t.pos[0] - h.pos[0]).hypot(t.pos[2] - h.pos[2]);
+                assert!(
+                    d >= 3.0,
+                    "a tree at {:?} stands in a house at {:?}",
+                    t.pos,
+                    h.pos
                 );
             }
         }
-        assert!(water_seen > 0, "a 6 km world has streams");
+        // Houses never stand in one another either.
+        for (k, a) in houses.iter().enumerate() {
+            for b in &houses[k + 1..] {
+                let d = (a.pos[0] - b.pos[0]).hypot(a.pos[2] - b.pos[2]);
+                assert!(d >= 4.0, "two houses {d} m apart at {:?}", a.pos);
+            }
+        }
     }
 
     // ── Scenery ───────────────────────────────────────────────────────────────
@@ -2796,11 +2929,7 @@ mod tests {
         let route = straight_route(400, 10.0, 0.0);
         let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
         let line = resample(&scene.road, RESAMPLE_M);
-        for t in scene
-            .props
-            .iter()
-            .filter(|p| p.shape <= crate::data::props::Shape::Poplar)
-        {
+        for t in scene.props.iter().filter(|p| p.shape.is_tree()) {
             let d = brute_nearest(&line, t.pos[0], t.pos[2]) - DEFAULT_EXTENT_M;
             assert!(
                 d >= trees::CLEAR_OF_ROAD_M - 0.01,

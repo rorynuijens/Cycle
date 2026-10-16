@@ -101,6 +101,7 @@ uniform vec3 u_eye;
 uniform float u_time;
 uniform float u_orbit;
 uniform float u_head;
+uniform vec2 u_hub;
 out vec3 v_world;
 out vec3 v_rel;
 flat out vec4 v_colour;
@@ -117,6 +118,20 @@ void main() {
             p.y -= 0.3 * dip;
             p.x -= 0.06 * dip;
         }
+    } else if (i_motion.x > 3.5) {
+        // Sails: everything in front of the hub turns about it.
+        if (p.x > u_hub.x) {
+            float a = u_time * 0.9 + phase;
+            float c0 = cos(a);
+            float s0 = sin(a);
+            vec2 q = vec2(p.z, p.y - u_hub.y);
+            p.z = q.x * c0 - q.y * s0;
+            p.y = u_hub.y + q.x * s0 + q.y * c0;
+        }
+    } else if (i_motion.x > 2.5) {
+        // Afloat: rising and falling, turning a little on the swell.
+        base.y += 0.12 * sin(u_time * 1.3 + phase);
+        yaw += 0.08 * sin(u_time * 0.5 + phase * 2.0);
     } else if (i_motion.x > 1.5) {
         float a = u_time * 0.35 + phase;
         base += vec3(cos(a) * u_orbit, 1.5 * sin(u_time * 0.6 + phase), sin(a) * u_orbit);
@@ -385,6 +400,7 @@ struct SceneUniforms {
     time: Uniform,
     orbit: Uniform,
     head: Uniform,
+    hub: Uniform,
 }
 
 impl SceneUniforms {
@@ -403,6 +419,7 @@ impl SceneUniforms {
             time: at("u_time"),
             orbit: at("u_orbit"),
             head: at("u_head"),
+            hub: at("u_hub"),
         }
     }
 
@@ -420,6 +437,11 @@ impl SceneUniforms {
         gl.uniform_1_f32(self.time.as_ref(), time_s);
         gl.uniform_1_f32(self.orbit.as_ref(), props::ORBIT_M);
         gl.uniform_1_f32(self.head.as_ref(), crate::data::animals::HEAD_FROM);
+        gl.uniform_2_f32(
+            self.hub.as_ref(),
+            crate::data::kit::SAIL_FROM,
+            crate::data::kit::HUB_Y,
+        );
     }
 }
 

@@ -11,8 +11,10 @@
 
 use crate::data::course3d::Mesh;
 
-/// The shapes a prop can take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// The shapes a prop can take. The biome data file names them in lower
+/// case, words joined: `haybale`, `lamppost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Shape {
     /// A ball of leaves on a short trunk.
     Round,
@@ -22,15 +24,61 @@ pub enum Shape {
     Poplar,
     Sheep,
     Bird,
+    Olive,
+    Cypress,
+    Palm,
+    Cactus,
+    Birch,
+    Reeds,
+    Bush,
+    Boulder,
+    HayBale,
+    Barn,
+    House,
+    Villa,
+    Hut,
+    Windmill,
+    Lighthouse,
+    LampPost,
+    Boat,
+    Cow,
+    Deer,
+    Goat,
+    Camel,
+    Duck,
+    Heron,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 5] = [
+    pub const ALL: [Shape; 28] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
         Shape::Sheep,
         Shape::Bird,
+        Shape::Olive,
+        Shape::Cypress,
+        Shape::Palm,
+        Shape::Cactus,
+        Shape::Birch,
+        Shape::Reeds,
+        Shape::Bush,
+        Shape::Boulder,
+        Shape::HayBale,
+        Shape::Barn,
+        Shape::House,
+        Shape::Villa,
+        Shape::Hut,
+        Shape::Windmill,
+        Shape::Lighthouse,
+        Shape::LampPost,
+        Shape::Boat,
+        Shape::Cow,
+        Shape::Deer,
+        Shape::Goat,
+        Shape::Camel,
+        Shape::Duck,
+        Shape::Heron,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -39,7 +87,23 @@ impl Shape {
         match self {
             Shape::Round | Shape::Cone | Shape::Poplar => crate::data::trees::mesh(self),
             Shape::Sheep | Shape::Bird => crate::data::animals::mesh(self),
+            _ => crate::data::kit::mesh(self),
         }
+    }
+
+    /// A tree, of any kind: what the tree rules plant.
+    #[cfg(test)]
+    pub fn is_tree(self) -> bool {
+        matches!(
+            self,
+            Shape::Round
+                | Shape::Cone
+                | Shape::Poplar
+                | Shape::Olive
+                | Shape::Cypress
+                | Shape::Palm
+                | Shape::Birch
+        )
     }
 }
 
@@ -51,6 +115,10 @@ pub enum Motion {
     Graze = 1,
     /// Circles its spot high up, wings beating.
     Orbit = 2,
+    /// Rides the water, rising and falling and turning a little.
+    Bob = 3,
+    /// Turns the sails in front of its hub — see `kit::SAIL_FROM`.
+    Spin = 4,
 }
 
 /// How far an orbiting prop strays from its spot, in metres — the view's
