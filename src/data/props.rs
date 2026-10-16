@@ -53,10 +53,17 @@ pub enum Shape {
     Rat,
     /// A shepherd with a crook.
     Person,
+    Rabbit,
+    Frog,
+    Tumbleweed,
+    Squirrel,
+    Chicken,
+    Dolphin,
+    Marmot,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 33] = [
+    pub const ALL: [Shape; 40] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -90,6 +97,13 @@ impl Shape {
         Shape::Snake,
         Shape::Rat,
         Shape::Person,
+        Shape::Rabbit,
+        Shape::Frog,
+        Shape::Tumbleweed,
+        Shape::Squirrel,
+        Shape::Chicken,
+        Shape::Dolphin,
+        Shape::Marmot,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -136,6 +150,8 @@ pub enum Motion {
     Slither = 6,
     /// Wings beating, in place: a bird flown by an encounter.
     Flap = 7,
+    /// Rolling over and over along the way it faces: tumbleweed.
+    Roll = 8,
 }
 
 /// How far an orbiting prop strays from its spot, in metres — the view's

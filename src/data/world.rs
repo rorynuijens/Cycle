@@ -80,7 +80,7 @@ const VERGE_M: f32 = 22.0;
 
 /// The sea starts this far from the road's line, its beach a little nearer,
 /// and lies this far below the road beside it; the beach a little higher.
-const SEA_FROM_M: f32 = 90.0;
+const SEA_FROM_M: f32 = 65.0;
 const SEA_DROP_M: f32 = 2.0;
 const BEACH_DROP_M: f32 = 1.2;
 /// Pools and oases keep this far from the road's line, and lie this far
@@ -384,7 +384,7 @@ impl World {
         lerp(
             h,
             base - BEACH_DROP_M,
-            smoothstep(SEA_FROM_M - 70.0, SEA_FROM_M - 20.0, from_road),
+            smoothstep(SEA_FROM_M - 50.0, SEA_FROM_M - 10.0, from_road),
         )
     }
 
@@ -433,7 +433,7 @@ impl World {
     /// Sand at `(x, z)`: the beach before the sea, the ring round an oasis.
     fn sand_at(&self, x: f32, z: f32, rules: &LandRules, from_road: f32) -> bool {
         match rules.water {
-            WaterKind::Sea => from_road > SEA_FROM_M - 45.0 && self.sea_side(x, z),
+            WaterKind::Sea => from_road > SEA_FROM_M - 40.0 && self.sea_side(x, z),
             WaterKind::Oasis => {
                 from_road > OASIS_FROM_M - 20.0 && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > 0.38
             }
@@ -851,9 +851,9 @@ mod tests {
             (east == 30 && west == 0) || (east == 0 && west == 30),
             "sea east {east}, west {west}"
         );
-        // Not within 89 m of the road's line, by any measure: the exact one
+        // Not within 64 m of the road's line, by any measure: the exact one
         // wins even where the coarse grid says otherwise.
-        for x in [-89.0, -60.0, -30.0, 30.0, 60.0, 89.0] {
+        for x in [-64.0, -45.0, -30.0, 30.0, 45.0, 64.0] {
             assert_eq!(wet(x), 0, "sea at {x}");
             for z in [-500.0, -1_500.0] {
                 assert_ne!(coast.land_at(x, z, 10.0), Some(AreaKind::Water));

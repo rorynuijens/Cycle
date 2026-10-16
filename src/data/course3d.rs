@@ -442,6 +442,7 @@ impl CourseScene {
             &road,
             &|x, z| look.biomes.dominant_at(x, z),
             &open,
+            &|x, z| world.land(x, z) == Some(AreaKind::Water),
             world.seed(),
         );
         Some(Self {

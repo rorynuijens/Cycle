@@ -660,11 +660,109 @@ pub fn mesh(shape: Shape) -> Mesh {
                 c(b.trunk),
             ));
         }
+        Shape::Rabbit => {
+            m.extend(ball([-0.05, 0.3, 0.0], [0.32, 0.22, 0.18], OWN));
+            m.extend(ball([0.3, 0.44, 0.0], [0.14, 0.13, 0.12], OWN));
+            for z in [-0.05, 0.05] {
+                m.extend(beam([0.26, 0.54, z], [0.2, 0.88, z * 1.4], 0.06, 0.03, OWN));
+            }
+            m.extend(ball([-0.38, 0.36, 0.0], [0.07, 0.07, 0.07], c(b.patch)));
+        }
+        Shape::Frog => {
+            m.extend(ball([0.0, 0.2, 0.0], [0.4, 0.2, 0.3], OWN));
+            for z in [-0.12, 0.12] {
+                m.extend(ball([0.24, 0.38, z], [0.07, 0.07, 0.07], c(b.patch)));
+                m.extend(ball(
+                    [0.28, 0.4, z],
+                    [0.035, 0.035, 0.035],
+                    c(b.animal_dark),
+                ));
+                m.extend(beam(
+                    [-0.2, 0.1, z * 1.6],
+                    [-0.42, 0.04, z * 2.4],
+                    0.07,
+                    0.05,
+                    OWN,
+                ));
+            }
+        }
+        Shape::Tumbleweed => {
+            // Hoops of dry twigs round a centre half a unit up: the shader
+            // rolls it about that centre.
+            for k in 0..6 {
+                let tilt = k as f32 * std::f32::consts::PI / 6.0;
+                let mut last: Option<[f32; 3]> = None;
+                for s in 0..=8 {
+                    let a = s as f32 / 8.0 * std::f32::consts::TAU;
+                    let (r, y) = (0.45 * a.cos(), 0.45 * a.sin());
+                    let p = [r * tilt.cos(), 0.5 + y, r * tilt.sin()];
+                    if let Some(q) = last {
+                        m.extend(beam(q, p, 0.035, 0.035, OWN));
+                    }
+                    last = Some(p);
+                }
+            }
+        }
+        Shape::Squirrel => {
+            m.extend(cuboid([-0.25, 0.16, -0.08], [0.2, 0.36, 0.08], OWN));
+            m.extend(legs(0.16, 0.05, 0.05, 0.18, OWN));
+            m.extend(cuboid([0.2, 0.26, -0.07], [0.36, 0.42, 0.07], OWN));
+            for z in [-0.05, 0.03] {
+                m.extend(cuboid([0.24, 0.42, z], [0.28, 0.5, z + 0.02], OWN));
+            }
+            m.extend(ball([-0.38, 0.55, 0.0], [0.16, 0.3, 0.11], OWN));
+        }
+        Shape::Chicken => {
+            for z in [-0.06, 0.06] {
+                m.extend(beam([0.0, 0.0, z], [0.0, 0.22, z], 0.03, 0.03, c(b.beak)));
+            }
+            m.extend(ball([0.0, 0.4, 0.0], [0.32, 0.22, 0.2], OWN));
+            m.extend(ball([0.27, 0.66, 0.0], [0.1, 0.11, 0.09], OWN));
+            m.extend(cuboid(
+                [0.22, 0.75, -0.02],
+                [0.32, 0.82, 0.02],
+                c(b.lighthouse),
+            ));
+            m.extend(cuboid([0.36, 0.63, -0.025], [0.44, 0.67, 0.025], c(b.beak)));
+            m.extend(beam([-0.28, 0.45, 0.0], [-0.4, 0.66, 0.0], 0.1, 0.04, OWN));
+        }
+        Shape::Dolphin => {
+            m.extend(ball([0.0, 0.2, 0.0], [0.5, 0.16, 0.14], OWN));
+            m.extend(beam([0.45, 0.17, 0.0], [0.62, 0.15, 0.0], 0.05, 0.05, OWN));
+            tri(
+                &mut m,
+                [[-0.1, 0.33, 0.0], [0.1, 0.33, 0.0], [-0.12, 0.5, 0.0]],
+                OWN,
+            );
+            tri(
+                &mut m,
+                [[-0.48, 0.2, 0.0], [-0.62, 0.22, 0.16], [-0.62, 0.22, -0.16]],
+                OWN,
+            );
+        }
+        Shape::Marmot => {
+            m.extend(ball([0.0, 0.3, 0.0], [0.2, 0.3, 0.18], OWN));
+            m.extend(ball([0.05, 0.66, 0.0], [0.12, 0.11, 0.11], OWN));
+            m.extend(cuboid(
+                [0.15, 0.62, -0.03],
+                [0.19, 0.67, 0.03],
+                c(b.animal_dark),
+            ));
+            for z in [-0.08, 0.08] {
+                m.extend(beam([0.12, 0.45, z], [0.2, 0.36, z], 0.05, 0.05, OWN));
+            }
+        }
         _ => {}
     }
-    // A leaning beam's corner can dip a hair under its foot: stand the whole
-    // shape on the ground, never in it.
-    let lowest = m.vertices.iter().map(|v| v.pos[1]).fold(0.0f32, f32::min);
+    // A leaning beam's corner can dip a hair under its foot, and a body
+    // with no legs can float: stand the whole shape on the ground, never in
+    // it or over it.
+    let lowest = m
+        .vertices
+        .iter()
+        .map(|v| v.pos[1])
+        .fold(f32::INFINITY, f32::min);
+    let lowest = if lowest.is_finite() { lowest } else { 0.0 };
     for v in &mut m.vertices {
         v.pos[1] -= lowest;
     }

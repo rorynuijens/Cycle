@@ -154,6 +154,12 @@ void main() {
     } else if (motion == 7.0) {
         // Wings beating, the bird flown along by the encounter.
         p.y += sin(u_time * 7.0 + phase * 5.0) * 0.5 * abs(p.z);
+    } else if (motion == 8.0) {
+        // Rolling forward about its centre, half a unit up.
+        float a = -(u_time * 5.0 + phase);
+        vec2 q = vec2(p.x, p.y - 0.5);
+        p.x = q.x * cos(a) - q.y * sin(a);
+        p.y = 0.5 + q.x * sin(a) + q.y * cos(a);
     }
     float c = cos(yaw);
     float s = sin(yaw);
