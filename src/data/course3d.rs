@@ -377,9 +377,10 @@ pub struct CourseScene {
     /// Trees and animals, drawn apart from the mesh: many copies of a few
     /// shapes.
     pub props: Vec<Prop>,
-    /// The horizon's mountains and the clouds, around the eye — see
-    /// `data/sky.rs`.
-    pub mountains: Mesh,
+    /// The horizon of every biome the ride shows one of, and the clouds,
+    /// around the eye — see `data/sky.rs`. Which horizon stands, and how
+    /// high, is [`Sky::backdrop`].
+    pub horizons: Vec<(biome::Biome, Mesh)>,
     pub clouds: Mesh,
     /// The sky every [`SKY_STEP_M`] along the road — see [`CourseScene::sky_at`].
     skies: Vec<Sky>,
@@ -414,12 +415,30 @@ impl CourseScene {
             Some(&mut props),
         );
         mesh.extend(roadway::ridden_mesh(&road));
-        let skies = skies_along(&road, &look.biomes);
+        let length = road.last().map_or(0.0, |p| p.distance_m);
+        let segments = if scenery == Scenery::Mixed {
+            biome::mix_segments(world.seed(), length)
+        } else {
+            Vec::new()
+        };
+        let backdrop = |d: f32| biome::backdrop(scenery, &segments, d);
+        let skies = skies_along(&road, &look.biomes, &backdrop);
+        // A horizon for every biome that stands round the rider anywhere.
+        let horizons = biome::Biome::ALL
+            .into_iter()
+            .filter(|&b| skies.iter().any(|s| s.backdrop[b as usize] > 0.0))
+            .map(|b| {
+                (
+                    b,
+                    sky::horizon(world.seed(), &b.def().horizon, &b.def().palette),
+                )
+            })
+            .collect();
         Some(Self {
             road,
             mesh,
             props,
-            mountains: sky::mountains(world.seed()),
+            horizons,
             clouds: sky::clouds(world.seed()),
             skies,
         })
@@ -428,7 +447,7 @@ impl CourseScene {
     /// The sky and haze for a rider at `distance_m`.
     pub fn sky_at(&self, distance_m: f32) -> Sky {
         let Some(first) = self.skies.first() else {
-            return Sky::of(&[0.0; biome::COUNT]);
+            return Sky::default();
         };
         let k = ((distance_m - self.road[0].distance_m) / SKY_STEP_M).max(0.0);
         if !k.is_finite() {
@@ -447,22 +466,29 @@ pub struct Sky {
     /// The sky at the horizon, and the haze colour.
     pub horizon: [f32; 3],
     pub fog_density: f32,
+    /// How high each biome's horizon stands, 0–1: one at full height, or
+    /// one sinking as the next rises on a mixed ride.
+    pub backdrop: biome::Weights,
 }
 
 impl Default for Sky {
     /// The temperate sky, for a view with no route yet.
     fn default() -> Self {
-        Self::of(&[0.0; biome::COUNT])
+        Self::of(
+            &[0.0; biome::COUNT],
+            biome::backdrop(Scenery::Countryside, &[], 0.0),
+        )
     }
 }
 
 impl Sky {
-    fn of(weights: &biome::Weights) -> Self {
+    fn of(weights: &biome::Weights, backdrop: biome::Weights) -> Self {
         let (top, horizon, fog_density) = biome::sky(weights);
         Self {
             top,
             horizon,
             fog_density,
+            backdrop,
         }
     }
 
@@ -472,6 +498,7 @@ impl Sky {
             top: lerp3(self.top, o.top, t),
             horizon: lerp3(self.horizon, o.horizon, t),
             fog_density: lerp(self.fog_density, o.fog_density, t),
+            backdrop: std::array::from_fn(|b| lerp(self.backdrop[b], o.backdrop[b], t)),
         }
     }
 }
@@ -479,8 +506,13 @@ impl Sky {
 /// Spacing of the sky samples along the road, in metres.
 const SKY_STEP_M: f32 = 50.0;
 
-/// The sky every [`SKY_STEP_M`] along the road, from the biomes at the rider.
-fn skies_along(road: &[RoadPoint], biomes: &BiomeMap) -> Vec<Sky> {
+/// The sky every [`SKY_STEP_M`] along the road, from the biomes at the
+/// rider, and the horizon `backdrop(d)` that far along.
+fn skies_along(
+    road: &[RoadPoint],
+    biomes: &BiomeMap,
+    backdrop: &dyn Fn(f32) -> biome::Weights,
+) -> Vec<Sky> {
     let (Some(first), Some(last)) = (road.first(), road.last()) else {
         return Vec::new();
     };
@@ -488,8 +520,10 @@ fn skies_along(road: &[RoadPoint], biomes: &BiomeMap) -> Vec<Sky> {
         .ceil()
         .max(0.0) as usize;
     (0..=steps)
-        .filter_map(|k| position_at(road, first.distance_m + k as f32 * SKY_STEP_M))
-        .map(|p| Sky::of(&biomes.weights_at(p[0], p[2])))
+        .filter_map(|k| {
+            let d = first.distance_m + k as f32 * SKY_STEP_M;
+            position_at(road, d).map(|p| Sky::of(&biomes.weights_at(p[0], p[2]), backdrop(d)))
+        })
         .collect()
 }
 
@@ -2836,6 +2870,47 @@ mod tests {
             desert.mesh != countryside.mesh,
             "the ground was not repainted"
         );
+    }
+
+    #[test]
+    fn should_stand_one_biomes_horizon_round_the_rider_and_only_that_one() {
+        let route = straight_route(150, 10.0, 0.0);
+        for (scenery, want) in [
+            (Scenery::Countryside, biome::Biome::Temperate),
+            (Scenery::Only(biome::Biome::Desert), biome::Biome::Desert),
+            (Scenery::Only(biome::Biome::Polder), biome::Biome::Polder),
+        ] {
+            let scene = CourseScene::build(&route, scenery).expect("a scene");
+            let kinds: Vec<biome::Biome> = scene.horizons.iter().map(|(b, _)| *b).collect();
+            assert_eq!(kinds, vec![want], "{scenery:?}");
+            for d in [0.0, 700.0, 1_490.0] {
+                let mut full = [0.0; biome::COUNT];
+                full[want as usize] = 1.0;
+                assert_eq!(scene.sky_at(d).backdrop, full, "{scenery:?} at {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn should_sink_one_horizon_as_the_next_rises_on_a_mixed_ride() {
+        let route = straight_route(4_001, 10.0, 0.0);
+        let scene = CourseScene::build(&route, Scenery::Mixed).expect("a scene");
+        let world = World::new(&scene.road);
+        let length = scene.road.last().expect("a road").distance_m;
+        let segs = biome::mix_segments(world.seed(), length);
+        assert!(segs.len() >= 3);
+        // Every biome of the mix has its horizon, and no other does.
+        let mut want: Vec<biome::Biome> = segs.iter().map(|s| s.1).collect();
+        want.sort_by_key(|b| *b as usize);
+        want.dedup();
+        let have: Vec<biome::Biome> = scene.horizons.iter().map(|(b, _)| *b).collect();
+        assert_eq!(have, want);
+        let (border, before, after) = (segs[1].0, segs[0].1, segs[1].1);
+        let at = |d: f32| scene.sky_at(d).backdrop;
+        assert_eq!(at(border - 400.0)[before as usize], 1.0);
+        assert!((at(border)[before as usize] - 0.5).abs() < 0.05);
+        assert!((at(border)[after as usize] - 0.5).abs() < 0.05);
+        assert_eq!(at(border + 400.0)[after as usize], 1.0);
     }
 
     #[test]

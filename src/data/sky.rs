@@ -8,8 +8,9 @@
 //! Pure: no GTK, no GL. Eye space: metres, x east, y up from the eye, z south.
 
 use crate::data::animals::cuboid;
+use crate::data::biome::{HorizonKind, HorizonRules};
 use crate::data::course3d::{Mesh, Vertex, MATERIAL_BACKDROP, MATERIAL_CLOUD};
-use crate::data::palette;
+use crate::data::palette::{self, Palette};
 use crate::data::world::splitmix;
 
 fn unit(h: u64) -> f32 {
@@ -24,40 +25,61 @@ pub const MOUNTAINS_TO_M: f32 = 5_600.0;
 /// No mountain's foot reaches nearer than this: the land ends inside it.
 const LAND_EDGE_M: f32 = 3_400.0;
 /// Their feet are this far below the eye, under the land's own edge.
-const FOOT_M: f32 = -120.0;
+pub const FOOT_M: f32 = -120.0;
 /// Peaks this tall carry snow on their top part.
 const SNOW_FROM_M: f32 = 700.0;
-/// Sides of a mountain: a low-poly pyramid.
+/// Sides of a mountain: a low-poly pyramid. Hills are rounder.
 const MOUNTAIN_SIDES: usize = 5;
+const HILL_SIDES: usize = 7;
 
-/// The mountains round the horizon, seeded by `seed`: a few ranges of
-/// pyramids of different heights, with snow on the tallest.
-pub fn mountains(seed: u64) -> Mesh {
+/// The horizon of a biome with `rules`, coloured from `palette`, seeded by
+/// `seed`: ranges of mountains, snow on the tallest where the biome has
+/// snow; low hills; mesas; or nothing at all.
+pub fn horizon(seed: u64, rules: &HorizonRules, palette: &Palette) -> Mesh {
     let mut m = Mesh::default();
-    let rock = palette::BASE.mountain;
-    let snow = palette::BASE.mountain_snow;
+    let rock = palette.mountain;
+    let snow = palette.mountain_snow;
+    if rules.kind == HorizonKind::None {
+        return m;
+    }
     for k in 0..PEAKS {
         let h = splitmix(seed ^ 0x3047 ^ k);
         let azimuth = (k as f32 + unit(h)) / PEAKS as f32 * std::f32::consts::TAU;
         let dist = MOUNTAINS_FROM_M + (MOUNTAINS_TO_M - MOUNTAINS_FROM_M) * unit(h.rotate_left(9));
         // Ranges: some stretches of horizon have high peaks, some low hills.
         let range = (azimuth * 2.0 + unit(seed) * 6.0).sin() * 0.5 + 0.5;
-        let height = 180.0 + (250.0 + 900.0 * range) * (0.4 + 0.6 * unit(h.rotate_left(21)));
-        let radius = (height * (1.2 + 0.8 * unit(h.rotate_left(33)))).min(dist - LAND_EDGE_M);
+        let peak = 180.0 + (250.0 + 900.0 * range) * (0.4 + 0.6 * unit(h.rotate_left(21)));
+        // Hills and mesas stand lower, but always high enough to clear the
+        // edge of the land.
+        let (height, spread, sides) = match rules.kind {
+            HorizonKind::Hills => (190.0 + 0.3 * peak * rules.scale, 3.0, HILL_SIDES),
+            HorizonKind::Mesas => (200.0 + 0.25 * peak * rules.scale, 1.6, MOUNTAIN_SIDES + 1),
+            _ => (
+                peak * rules.scale,
+                1.2 + 0.8 * unit(h.rotate_left(33)),
+                MOUNTAIN_SIDES,
+            ),
+        };
+        let radius = (height * spread).min(dist - LAND_EDGE_M);
         let (cx, cz) = (dist * azimuth.cos(), dist * azimuth.sin());
         let turn = unit(h.rotate_left(45)) * std::f32::consts::TAU;
         let top = FOOT_M + height;
         let ring = |r: f32, y: f32| -> Vec<[f32; 3]> {
-            (0..MOUNTAIN_SIDES)
+            (0..sides)
                 .map(|s| {
-                    let a = turn + s as f32 / MOUNTAIN_SIDES as f32 * std::f32::consts::TAU;
+                    let a = turn + s as f32 / sides as f32 * std::f32::consts::TAU;
                     [cx + r * a.cos(), y, cz + r * a.sin()]
                 })
                 .collect()
         };
         let foot = ring(radius, FOOT_M);
         let apex = [cx, top, cz];
-        if height > SNOW_FROM_M {
+        if rules.kind == HorizonKind::Mesas {
+            // Steep sides up to a flat top of the lighter rock.
+            let rim = ring(radius * 0.72, top);
+            band(&mut m, &foot, &rim, rock);
+            cap(&mut m, &rim, apex, snow);
+        } else if rules.kind == HorizonKind::Peaks && rules.snow && height > SNOW_FROM_M {
             // The snow line two thirds up: a band of rock, then a snow cap.
             let f = 0.66;
             let line = ring(radius * (1.0 - f), FOOT_M + height * f);
@@ -152,6 +174,63 @@ pub fn clouds(seed: u64) -> Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::biome::Biome;
+
+    /// The countryside's horizon.
+    fn mountains(seed: u64) -> Mesh {
+        horizon(seed, &Biome::Temperate.def().horizon, &palette::BASE)
+    }
+
+    fn of(biome: Biome, seed: u64) -> Mesh {
+        horizon(seed, &biome.def().horizon, &biome.def().palette)
+    }
+
+    #[test]
+    fn should_leave_the_polder_and_the_wetland_a_bare_horizon() {
+        assert!(of(Biome::Polder, 3).vertices.is_empty());
+        assert!(of(Biome::Wetland, 3).vertices.is_empty());
+    }
+
+    #[test]
+    fn should_put_snow_only_where_the_biome_has_snowy_peaks() {
+        for b in Biome::ALL {
+            let def = b.def();
+            let snowy = of(b, 11)
+                .vertices
+                .iter()
+                .any(|v| v.colour[..3] == def.palette.mountain_snow);
+            // A mesa's flat top is its lighter rock, under the same name.
+            let wants = match def.horizon.kind {
+                HorizonKind::Peaks => def.horizon.snow,
+                HorizonKind::Mesas => true,
+                _ => false,
+            };
+            assert_eq!(snowy, wants, "{b:?}");
+        }
+        assert!(of(Biome::Desert, 11)
+            .vertices
+            .iter()
+            .all(|v| v.colour[..3] != palette::BASE.mountain_snow));
+    }
+
+    #[test]
+    fn should_raise_the_mountains_above_the_countryside_and_keep_hills_low_but_seen() {
+        let top = |m: &Mesh| m.vertices.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+        let base = top(&mountains(4));
+        assert!(top(&of(Biome::Mountain, 4)) > base * 1.4);
+        for b in [
+            Biome::Mediterranean,
+            Biome::Farmland,
+            Biome::Coast,
+            Biome::Urban,
+            Biome::Desert,
+        ] {
+            let t = top(&of(b, 4));
+            assert!(t < base * 0.7, "{b:?} stands {t} m");
+            // Clear of the land's edge seen from the saddle.
+            assert!(t > 40.0, "{b:?} sinks out of sight at {t} m");
+        }
+    }
 
     fn horizontal(p: [f32; 3]) -> f32 {
         p[0].hypot(p[2])

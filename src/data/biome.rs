@@ -127,6 +127,31 @@ pub enum WaterKind {
     Oasis,
 }
 
+/// What stands on a biome's horizon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HorizonKind {
+    /// Mountain ranges, snow on the tallest if the biome has snow.
+    Peaks,
+    /// Low rounded hills.
+    Hills,
+    /// Flat-topped mesas and buttes.
+    Mesas,
+    /// Nothing: a flat horizon.
+    None,
+}
+
+/// A biome's horizon: what kind, how high against the countryside's, and
+/// whether its tallest peaks carry snow. Its colours are the palette's
+/// `mountain` and `mountain_snow` — for a mesa, its sides and its top.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HorizonRules {
+    pub kind: HorizonKind,
+    pub scale: f32,
+    pub snow: bool,
+}
+
 /// How a biome's land lies and what covers it.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,6 +187,7 @@ pub struct BiomeDef {
     pub animals: AnimalRules,
     /// Everything else it sets about its land.
     pub props: Vec<PropRule>,
+    pub horizon: HorizonRules,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +200,7 @@ struct RawDef {
     animals: AnimalRules,
     #[serde(default)]
     props: Vec<PropRule>,
+    horizon: HorizonRules,
 }
 
 /// The haze starts this far from the eye; nearer, the scene is clear.
@@ -220,7 +247,9 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             && (0.0..=1_000.0).contains(&def.land.wood_from_m)
             && (-1.0..=1.0).contains(&def.land.fields)
             && (0.0..=1.0).contains(&def.land.crops)
-            && (0.0..=500.0).contains(&def.land.paving_m);
+            && (0.0..=500.0).contains(&def.land.paving_m)
+            && def.horizon.scale > 0.0
+            && def.horizon.scale <= 3.0;
         let a = &def.animals;
         let animals_sane = a.herd_size_m.is_finite()
             && a.herd_size_m > 0.0
@@ -255,6 +284,7 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             land: def.land,
             animals: def.animals.clone(),
             props: def.props.clone(),
+            horizon: def.horizon,
         });
     }
     out.try_into().map_err(|_| "wrong count".to_owned())
@@ -568,6 +598,20 @@ pub fn mix_segments(seed: u64, length_m: f32) -> Vec<(f32, Biome)> {
         out.push((start, pick(k, prev)));
     }
     out
+}
+
+/// Which biome's horizon stands round the rider `along_m` metres into a
+/// ride in `scenery`, by weight: the countryside's own for the countryside
+/// — its woods and high ground lean the land, not the far view — the one
+/// biome's, or the mix's at that distance.
+pub fn backdrop(scenery: Scenery, segments: &[(f32, Biome)], along_m: f32) -> Weights {
+    let mut w = [0.0; COUNT];
+    match scenery {
+        Scenery::Countryside => w[Biome::Temperate as usize] = 1.0,
+        Scenery::Only(b) => w[b as usize] = 1.0,
+        Scenery::Mixed => return mix_weights(segments, along_m),
+    }
+    w
 }
 
 /// The weights `along_m` metres into a mixed ride of `segments`: its

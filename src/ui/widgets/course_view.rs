@@ -344,7 +344,9 @@ struct GlState {
     empty_vao: glow::VertexArray,
     /// The land, the road and everything fixed to them.
     world: MeshGl,
-    mountains: MeshGl,
+    /// Each biome's horizon, by `Biome as usize`; empty where the ride has
+    /// none of it.
+    horizons: Vec<MeshGl>,
     clouds: MeshGl,
     rider_body: MeshGl,
     rider_leg: MeshGl,
@@ -829,7 +831,9 @@ impl GlState {
             let empty_vao = gl.create_vertex_array()?;
             let empty = Mesh::default();
             let world = MeshGl::new(&gl, &empty)?;
-            let mountains = MeshGl::new(&gl, &empty)?;
+            let horizons = (0..biome::COUNT)
+                .map(|_| MeshGl::new(&gl, &empty))
+                .collect::<Result<Vec<_>, _>>()?;
             let clouds = MeshGl::new(&gl, &empty)?;
             let rider_body = MeshGl::new(&gl, &rider::body(&rider::Avatar::default()))?;
             let rider_leg = MeshGl::new(&gl, &rider::leg(&rider::Avatar::default()))?;
@@ -862,7 +866,7 @@ impl GlState {
                 prop_program,
                 empty_vao,
                 world,
-                mountains,
+                horizons,
                 clouds,
                 rider_body,
                 rider_leg,
@@ -892,8 +896,15 @@ impl GlState {
             shape.chunks = batch.map(|b| b.chunks.clone()).unwrap_or_default();
         }
         self.world.replace(&self.gl, scene.map(|s| &s.mesh));
-        self.mountains
-            .replace(&self.gl, scene.map(|s| &s.mountains));
+        for (k, horizon) in self.horizons.iter_mut().enumerate() {
+            let mesh = scene.and_then(|s| {
+                s.horizons
+                    .iter()
+                    .find(|(b, _)| *b as usize == k)
+                    .map(|(_, m)| m)
+            });
+            horizon.replace(&self.gl, mesh);
+        }
         self.clouds.replace(&self.gl, scene.map(|s| &s.clouds));
     }
 
@@ -987,8 +998,21 @@ impl GlState {
                 // drifting slowly round. Then depth is cleared, so the world
                 // always stands in front of it.
                 let around = course3d::translation(camera.eye);
+                // Each biome's horizon at its height: on a mixed ride one
+                // sinks into the haze as the next rises out of it.
+                for (k, horizon) in self.horizons.iter().enumerate() {
+                    let rise = sky.backdrop[k].clamp(0.0, 1.0);
+                    if rise < 0.01 || horizon.index_count == 0 {
+                        continue;
+                    }
+                    let mut grow = course3d::IDENTITY;
+                    grow[5] = rise;
+                    grow[13] = crate::data::sky::FOOT_M * (1.0 - rise);
+                    let model = course3d::mul4(&around, &grow);
+                    gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &model);
+                    horizon.draw(gl);
+                }
                 gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &around);
-                self.mountains.draw(gl);
                 let drift = course3d::mul4(&around, &course3d::yaw(time_s * CLOUD_DRIFT));
                 gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &drift);
                 self.clouds.draw(gl);
@@ -1112,14 +1136,11 @@ impl GlState {
         if let Some(target) = self.target.take() {
             target.destroy(&self.gl);
         }
-        for mesh in [
-            &self.world,
-            &self.mountains,
-            &self.clouds,
-            &self.rider_body,
-            &self.rider_leg,
-        ] {
+        for mesh in [&self.world, &self.clouds, &self.rider_body, &self.rider_leg] {
             mesh.destroy(&self.gl);
+        }
+        for horizon in &self.horizons {
+            horizon.destroy(&self.gl);
         }
         for shape in &self.props {
             shape.mesh.destroy(&self.gl);
