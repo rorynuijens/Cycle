@@ -116,6 +116,33 @@ impl Shape {
         }
     }
 
+    /// An animal: hidden, with the encounters, when the rider turns animals
+    /// off.
+    pub fn is_animal(self) -> bool {
+        matches!(
+            self,
+            Shape::Sheep
+                | Shape::Bird
+                | Shape::Cow
+                | Shape::Deer
+                | Shape::Goat
+                | Shape::Camel
+                | Shape::Duck
+                | Shape::Heron
+                | Shape::Dog
+                | Shape::Cat
+                | Shape::Snake
+                | Shape::Rat
+                | Shape::Person
+                | Shape::Rabbit
+                | Shape::Frog
+                | Shape::Squirrel
+                | Shape::Chicken
+                | Shape::Dolphin
+                | Shape::Marmot
+        )
+    }
+
     /// A tree, of any kind: what the tree rules plant.
     #[cfg(test)]
     pub fn is_tree(self) -> bool {

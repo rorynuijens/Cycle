@@ -622,6 +622,7 @@ fn connect_gpx(
                         let parent = parent_for_closure.clone();
                         let on_start = Rc::clone(&on_start_route_inner);
                         let (pool, rt) = (pool_gpx_inner.clone(), rt_gpx_inner.clone());
+                        let settings = (pool.clone(), rt.clone());
                         let route_shown = route.clone();
                         save_route_to_library(
                             &path,
@@ -640,6 +641,7 @@ fn connect_gpx(
                                     route_shown,
                                     Scenery::default(),
                                     remember,
+                                    settings,
                                     parent.as_ref(),
                                     on_start,
                                 );

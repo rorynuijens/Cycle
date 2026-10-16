@@ -501,7 +501,7 @@ struct Inner {
     status: gtk::Label,
     route: RefCell<Option<Route>>,
     /// What the world around the route is made of.
-    scenery: Cell<biome::Scenery>,
+    look: Cell<biome::WorldLook>,
     scene: RefCell<Option<CourseScene>>,
     /// Runs the scene's animal encounters as the rider rides.
     director: RefCell<Option<encounters::Director>>,
@@ -556,7 +556,7 @@ impl CourseView {
             status,
             area: area.clone(),
             route: RefCell::new(None),
-            scenery: Cell::new(biome::Scenery::default()),
+            look: Cell::new(biome::WorldLook::default()),
             scene: RefCell::new(None),
             director: RefCell::new(None),
             born_us: glib::monotonic_time(),
@@ -615,9 +615,9 @@ impl CourseView {
         &self.inner.root
     }
 
-    /// Show `route` in `scenery`, with the rider at its start. The world is
+    /// Show `route` looking as `look`, with the rider at its start. The world is
     /// built off the main thread; the view says so until it is up.
-    pub fn set_route(&self, route: &Route, scenery: biome::Scenery) {
+    pub fn set_route(&self, route: &Route, look: biome::WorldLook) {
         let inner = &self.inner;
         inner.generation.set(inner.generation.get() + 1);
         *inner.scene.borrow_mut() = None;
@@ -626,7 +626,7 @@ impl CourseView {
         inner.progress.set(Progress::default());
         inner.drawn_m.set(None);
         *inner.route.borrow_mut() = Some(route.clone());
-        inner.scenery.set(scenery);
+        inner.look.set(look);
         Inner::rebuild(inner);
     }
 
@@ -649,7 +649,7 @@ impl Inner {
             return;
         };
         let generation = this.generation.get();
-        let scenery = this.scenery.get();
+        let scenery = this.look.get().scenery;
         this.update_status();
         let weak = Rc::downgrade(this);
         glib::spawn_future_local(async move {
@@ -662,8 +662,10 @@ impl Inner {
             }
             match built {
                 Ok(scene) => {
+                    // With animals off there are no encounters at all.
                     *inner.director.borrow_mut() = scene
                         .as_ref()
+                        .filter(|_| inner.look.get().animals)
                         .map(|s| encounters::Director::new(s.encounters.clone()));
                     *inner.scene.borrow_mut() = scene;
                     inner.needs_upload.set(true);
@@ -739,7 +741,7 @@ impl Inner {
         if self.needs_upload.get() {
             self.needs_upload.set(false);
             let scene = self.scene.borrow();
-            state.upload(scene.as_ref());
+            state.upload(scene.as_ref(), self.look.get().animals);
         }
 
         let scale = area.scale_factor();
@@ -928,8 +930,19 @@ impl GlState {
     }
 
     /// Replace what is on the GPU with `scene`, or with nothing.
-    fn upload(&mut self, scene: Option<&CourseScene>) {
-        let batches = scene.map(|s| props::batches(&s.props)).unwrap_or_default();
+    /// `animals` false leaves every animal out: herds and birds.
+    fn upload(&mut self, scene: Option<&CourseScene>, animals: bool) {
+        let batches = scene
+            .map(|s| {
+                let kept: Vec<Prop> = s
+                    .props
+                    .iter()
+                    .filter(|p| animals || !p.shape.is_animal())
+                    .copied()
+                    .collect();
+                props::batches(&kept)
+            })
+            .unwrap_or_default();
         for shape in &mut self.props {
             let batch = batches.iter().find(|b| b.shape == shape.shape);
             let data: Vec<u8> = batch
@@ -1731,7 +1744,12 @@ mod offscreen {
             );
 
             let mut state = GlState::new(gl, es).expect("shaders compile");
-            state.upload(Some(&scene));
+            // CYCLE_3D_ANIMALS=0: as with the rider's animals switch off.
+            let animals = std::env::var("CYCLE_3D_ANIMALS").map_or(true, |v| v != "0");
+            if !animals {
+                live.clear();
+            }
+            state.upload(Some(&scene), animals);
             // CYCLE_3D_GTK_STATE=1 leaves the context as GTK's renderer
             // leaves it — depth cleared to 0, depth test on — which once
             // showed the rider nothing but sky.

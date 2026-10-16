@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::data::athlete::AthleteProfile;
-use crate::data::biome::Scenery;
+use crate::data::biome::WorldLook;
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
@@ -939,8 +939,8 @@ impl RoutePlayerPage {
         }
     }
 
-    /// Reset the page for a new route, its 3D world made of `scenery`.
-    pub fn reset_route(&self, route: &Route, scenery: Scenery) {
+    /// Reset the page for a new route, its 3D world looking as `look`.
+    pub fn reset_route(&self, route: &Route, look: WorldLook) {
         self.route_name_label.set_label(&route.name);
         self.mode_label.set_label("");
         self.countdown_banner
@@ -985,7 +985,7 @@ impl RoutePlayerPage {
         let line: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lng)).collect();
         self.route_map.set_route(&line);
         self.route_map.set_lookahead(&[]);
-        self.course_view.set_route(route, scenery);
+        self.course_view.set_route(route, look);
     }
 
     /// Start the 1 Hz ride loop. Calls `on_complete` with the session when the route

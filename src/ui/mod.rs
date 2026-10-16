@@ -213,8 +213,8 @@ pub fn call_reload(holder: &ReloadHolder) {
 /// already gives for reload callbacks.
 pub type StartRouteHolder = std::rc::Rc<std::cell::RefCell<Option<StartRoute>>>;
 
-/// Starts a ride on a route, its 3D world made of the scenery chosen for it.
-pub type StartRoute = std::rc::Rc<dyn Fn(crate::data::route::Route, crate::data::biome::Scenery)>;
+/// Starts a ride on a route, its 3D world looking as chosen for it.
+pub type StartRoute = std::rc::Rc<dyn Fn(crate::data::route::Route, crate::data::biome::WorldLook)>;
 
 /// Banner text for the sensors that have stopped reporting mid-ride, or `None`
 /// while everything is still live.

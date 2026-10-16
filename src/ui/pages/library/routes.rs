@@ -200,6 +200,7 @@ fn build_row(route: &SavedRoute, ctx: &Rc<RouteRows>) -> adw::ActionRow {
         let on_toast = Rc::clone(&on_toast_open);
         let file_name = file_name.clone();
         let pool = pool_open.clone();
+        let (pool_settings, rt_settings) = (pool_open.clone(), rt_open.clone());
         let remember = RememberScenery {
             route_id,
             pool: pool_open.clone(),
@@ -223,6 +224,7 @@ fn build_row(route: &SavedRoute, ctx: &Rc<RouteRows>) -> adw::ActionRow {
                     route,
                     scenery,
                     Some(remember),
+                    (pool_settings.clone(), rt_settings.clone()),
                     parent.as_ref(),
                     Rc::clone(&on_start),
                 ),

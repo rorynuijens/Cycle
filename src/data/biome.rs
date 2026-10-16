@@ -499,6 +499,23 @@ pub enum Scenery {
     Mixed,
 }
 
+/// How the 3D world round a ride looks: the route's scenery, and whether
+/// animals are about — one switch, for every route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorldLook {
+    pub scenery: Scenery,
+    pub animals: bool,
+}
+
+impl Default for WorldLook {
+    fn default() -> Self {
+        Self {
+            scenery: Scenery::default(),
+            animals: true,
+        }
+    }
+}
+
 impl Scenery {
     /// Every choice, in the order the picker lists them.
     pub const CHOICES: [Scenery; 11] = [

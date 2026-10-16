@@ -250,6 +250,7 @@ pub fn show_route_detail(
     route: Route,
     scenery: Scenery,
     remember: Option<RememberScenery>,
+    settings: (SqlitePool, tokio::runtime::Handle),
     parent: Option<&gtk::Window>,
     on_start_route: crate::ui::StartRoute,
 ) {
@@ -431,7 +432,52 @@ pub fn show_route_detail(
         .description("The road, its climbs and its distance stay the same")
         .build();
     scenery_group.add(&scenery_row);
+    // One switch for every route, read as the window opens; it answers only
+    // once the stored value is in, so the read is never saved back.
+    let animals = Rc::new(std::cell::Cell::new(true));
+    let animals_row = adw::SwitchRow::builder()
+        .title("Animals")
+        .subtitle("Herds, birds and animal encounters, on every route")
+        .active(true)
+        .sensitive(false)
+        .build();
+    scenery_group.add(&animals_row);
     inner.append(&scenery_group);
+    {
+        let (pool, rt) = settings;
+        let animals = Rc::clone(&animals);
+        let pool_read = pool.clone();
+        crate::ui::spawn_to_main(
+            &rt.clone(),
+            async move { crate::data::settings::animals_3d(&pool_read).await },
+            glib::clone!(
+                #[weak]
+                animals_row,
+                move |res| {
+                    let on = res
+                        .inspect_err(|e| tracing::warn!("Could not read the animals switch: {e}"))
+                        .unwrap_or(true);
+                    animals.set(on);
+                    animals_row.set_active(on);
+                    animals_row.set_sensitive(true);
+                    animals_row.connect_active_notify(move |row| {
+                        let on = row.is_active();
+                        animals.set(on);
+                        let pool = pool.clone();
+                        crate::ui::spawn_to_main(
+                            &rt,
+                            async move { crate::data::settings::set_animals_3d(&pool, on).await },
+                            |res| {
+                                if let Err(e) = res {
+                                    tracing::error!("Could not save the animals switch: {e}");
+                                }
+                            },
+                        );
+                    });
+                }
+            ),
+        );
+    }
 
     let toast_overlay = adw::ToastOverlay::new();
     {
@@ -485,7 +531,13 @@ pub fn show_route_detail(
         #[weak]
         win,
         move |_| {
-            on_start_route(route_for_ride.clone(), chosen.get());
+            on_start_route(
+                route_for_ride.clone(),
+                crate::data::biome::WorldLook {
+                    scenery: chosen.get(),
+                    animals: animals.get(),
+                },
+            );
             win.close();
         }
     ));

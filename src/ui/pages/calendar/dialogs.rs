@@ -461,18 +461,26 @@ pub fn show_schedule_dialog(
     dialog.present(Some(parent));
 }
 
-/// Read a saved route's GPX from disk, and the scenery chosen for it.
+/// Read a saved route's GPX from disk, and how its 3D world looks: the
+/// scenery chosen for it, and the rider's animals switch.
 async fn load_saved_route(
     pool: &SqlitePool,
     route_id: i64,
-) -> anyhow::Result<(Route, crate::data::biome::Scenery)> {
+) -> anyhow::Result<(Route, crate::data::biome::WorldLook)> {
     let routes = db::load_routes(pool).await?;
     let saved = routes
         .into_iter()
         .find(|r| r.id == route_id)
         .ok_or_else(|| anyhow::anyhow!("route {route_id} is no longer in the library"))?;
     let route = Route::from_gpx_path(&db::routes_dir()?.join(&saved.file_name))?;
-    Ok((route, saved.scenery))
+    let animals = crate::data::settings::animals_3d(pool).await?;
+    Ok((
+        route,
+        crate::data::biome::WorldLook {
+            scenery: saved.scenery,
+            animals,
+        },
+    ))
 }
 
 /// Parse a saved route's GPX and estimate what riding it will cost.
@@ -1255,12 +1263,12 @@ pub fn show_workout_detail_dialog(
                         &rt_rr,
                         async move { load_saved_route(&pool_c, route_id).await },
                         move |res| match res {
-                            Ok((route, scenery)) => {
+                            Ok((route, look)) => {
                                 let cb = start_route.borrow().clone();
                                 match cb {
                                     Some(cb) => {
                                         dialog.close();
-                                        cb(route, scenery);
+                                        cb(route, look);
                                     }
                                     None => tracing::error!(
                                         "no route-start callback registered; cannot ride"

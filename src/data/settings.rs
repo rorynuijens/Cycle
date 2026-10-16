@@ -33,6 +33,8 @@ pub mod keys {
     pub const SIM_MAX_GRADIENT: &str = "training.sim_max_gradient";
     pub const INTERVAL_CUES: &str = "training.interval_cues";
     pub const AUTO_PAUSE: &str = "training.auto_pause";
+    /// Animals in the 3D world: herds, birds and encounters.
+    pub const ANIMALS_3D: &str = "view3d.animals";
 
     pub const INTERVALS_ATHLETE_ID: &str = "intervals.athlete_id";
     pub const INTERVALS_UPLOAD: &str = "intervals.upload";
@@ -143,6 +145,18 @@ pub async fn set_interval_cues(pool: &SqlitePool, on: bool) -> Result<()> {
 
 pub async fn set_auto_pause(pool: &SqlitePool, on: bool) -> Result<()> {
     db::set_setting(pool, keys::AUTO_PAUSE, flag_value(on)).await
+}
+
+// ── The 3D world ─────────────────────────────────────────────────────────────
+
+/// Whether animals are about in the 3D world — herds, birds and the
+/// encounters. On until the rider turns them off.
+pub async fn animals_3d(pool: &SqlitePool) -> Result<bool> {
+    Ok(flag(db::get_setting(pool, keys::ANIMALS_3D).await?, true))
+}
+
+pub async fn set_animals_3d(pool: &SqlitePool, on: bool) -> Result<()> {
+    db::set_setting(pool, keys::ANIMALS_3D, flag_value(on)).await
 }
 
 // ── Intervals.icu ────────────────────────────────────────────────────────────
@@ -413,6 +427,16 @@ mod tests {
         assert_eq!(loaded.sim_max_gradient_pct, 12.5);
         assert!(!loaded.interval_cues);
         assert!(!loaded.auto_pause);
+    }
+
+    #[tokio::test]
+    async fn should_keep_animals_on_until_turned_off_and_remember_either_way() {
+        let pool = test_pool().await;
+        assert!(animals_3d(&pool).await.unwrap(), "on for a new rider");
+        set_animals_3d(&pool, false).await.unwrap();
+        assert!(!animals_3d(&pool).await.unwrap());
+        set_animals_3d(&pool, true).await.unwrap();
+        assert!(animals_3d(&pool).await.unwrap());
     }
 
     #[tokio::test]

@@ -480,10 +480,10 @@ impl CycleGtkWindow {
             let auto_pause = Rc::clone(&auto_pause);
             let finish_for_route = Rc::clone(&finish_session);
             let athlete_for_route = Rc::clone(&athlete_rc);
-            Rc::new(move |route: Route, scenery| {
+            Rc::new(move |route: Route, look| {
                 timer_alive.set(false);
                 timer_started.set(false);
-                route_player.reset_route(&route, scenery);
+                route_player.reset_route(&route, look);
                 stack.set_visible_child_name("route_player");
 
                 if !timer_started.get() {
