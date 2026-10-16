@@ -153,12 +153,6 @@ pub(crate) fn ball(centre: [f32; 3], radius: [f32; 3], colour: [f32; 4]) -> Mesh
 /// Trees are planted only this near the road: past it the haze has them.
 pub const REACH_M: f32 = 1_100.0;
 
-/// Past this far from the road a wood is planted at half the density each
-/// way: from there the eye takes in its outline, not its trees.
-const THIN_FROM_M: f32 = 350.0;
-/// And past this far at a third: a far wood is a dark line in the haze.
-const THINNEST_FROM_M: f32 = 700.0;
-
 /// No tree stands closer than this to the road's edge — a crown over the
 /// track would be in the rider's face, and round a tight bend the camera
 /// swings out a few metres past the edge.
@@ -186,6 +180,8 @@ pub struct Land<'a> {
     /// Rows of poplars and lone trees the world lays out, in scene space.
     pub rows: &'a [Vec<(f32, f32)>],
     pub lone: &'a [(f32, f32)],
+    /// Thin woods out from this far, in place of each biome's own rule.
+    pub thin_from_m: Option<f32>,
 }
 
 /// Every tree along the route.
@@ -221,9 +217,12 @@ pub fn scatter(land: &Land) -> Vec<Prop> {
                     lo + (hi - lo) * biome::unit(biome::seed_at(cx, cz, CELL_M, 0x5_9AC3));
                 let k = (CELL_M / spacing).round().max(1.0) as usize;
                 let from = (land.from_road)(cx, cz).unwrap_or(f32::MAX);
-                let k = if from > THINNEST_FROM_M {
+                let thin = land.thin_from_m.unwrap_or(def.trees.thin_from_m);
+                let k = if from > 4.0 * thin {
+                    k.div_ceil(4)
+                } else if from > 2.0 * thin {
                     k.div_ceil(3)
-                } else if from > THIN_FROM_M {
+                } else if from > thin {
                     k.div_ceil(2)
                 } else {
                     k
@@ -395,6 +394,7 @@ mod tests {
             biome,
             rows,
             lone,
+            thin_from_m: None,
         }
     }
 

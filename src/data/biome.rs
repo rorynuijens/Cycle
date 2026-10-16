@@ -71,6 +71,15 @@ pub struct TreeRules {
     /// The two kinds of tree that grow: a round crown and a conifer in the
     /// countryside, olives and cypresses by the Mediterranean.
     pub kinds: [Shape; 2],
+    /// Woods past this far from the road are planted at half the density
+    /// each way, past twice it at a third, past four times at a quarter:
+    /// a far wood is its outline in the haze, not its trees.
+    #[serde(default = "thin_from")]
+    pub thin_from_m: f32,
+}
+
+fn thin_from() -> f32 {
+    350.0
 }
 
 /// The herd that grazes beside the road, and the birds overhead.

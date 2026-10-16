@@ -1129,8 +1129,24 @@ impl GlState {
 
                 gl.use_program(Some(self.prop_program));
                 u.props.set(gl, &mvp, &camera.eye, &sky, time_s);
+                // Which way the camera looks, flat, and how wide: chunks
+                // wholly behind it or off to a side are not drawn. A little
+                // wider than the view, for the camera's pitch.
+                let tan_half = (FOV_DEG.to_radians() / 2.0).tan() * aspect * 1.15;
+                let forward = {
+                    let (fx, fz) = (
+                        camera.target[0] - camera.eye[0],
+                        camera.target[2] - camera.eye[2],
+                    );
+                    let len = fx.hypot(fz);
+                    if len > 1e-3 {
+                        (fx / len, fz / len)
+                    } else {
+                        (f32::NAN, f32::NAN)
+                    }
+                };
                 for shape in &self.props {
-                    shape.draw(gl, camera.eye);
+                    shape.draw(gl, camera.eye, forward, tan_half);
                     shape.draw_live(gl);
                 }
                 if first {
@@ -1298,7 +1314,7 @@ impl PropShape {
     /// Draw the props of every chunk within reach of the eye. Each chunk's
     /// run is reached by pointing the per-prop attributes at its start: GL
     /// ES 3.0 has no base instance.
-    unsafe fn draw(&self, gl: &glow::Context, eye: [f32; 3]) {
+    unsafe fn draw(&self, gl: &glow::Context, eye: [f32; 3], forward: (f32, f32), tan_half: f32) {
         if self.chunks.is_empty() || self.mesh.index_count == 0 {
             return;
         }
@@ -1306,7 +1322,7 @@ impl PropShape {
         gl.bind_vertex_array(Some(self.mesh.vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
         for chunk in &self.chunks {
-            if !props::in_reach(chunk, eye[0], eye[2], PROP_DRAW_M) {
+            if !props::in_view(chunk, eye, forward, tan_half, PROP_DRAW_M) {
                 continue;
             }
             let base = chunk.start as i32 * stride;

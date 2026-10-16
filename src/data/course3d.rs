@@ -133,6 +133,9 @@ fn bank_band(t: f32) -> f32 {
 pub struct Look {
     pub biomes: BiomeMap,
     pub snow_line_m: f32,
+    /// Woods thin out with distance from this far, whatever their biome
+    /// says: the countryside's are planted as they always were.
+    pub thin_from_m: Option<f32>,
 }
 
 impl Look {
@@ -142,6 +145,7 @@ impl Look {
         Self {
             biomes: BiomeMap::uniform(biome::Biome::Temperate),
             snow_line_m: f32::INFINITY,
+            thin_from_m: None,
         }
     }
 }
@@ -548,6 +552,7 @@ fn look_for(road: &[RoadPoint], lat: f64, world: &World, scenery: Scenery) -> Lo
             return Look {
                 biomes: BiomeMap::uniform(b),
                 snow_line_m,
+                thin_from_m: None,
             }
         }
         Scenery::Mixed => {
@@ -577,8 +582,13 @@ fn look_for(road: &[RoadPoint], lat: f64, world: &World, scenery: Scenery) -> Lo
     Look {
         biomes,
         snow_line_m,
+        thin_from_m: (scenery == Scenery::Countryside).then_some(COUNTRYSIDE_THIN_FROM_M),
     }
 }
+
+/// Where the countryside's woods start to thin out, in metres from the
+/// road — as they have since the rider first saw them.
+const COUNTRYSIDE_THIN_FROM_M: f32 = 350.0;
 
 /// The road surface point at `distance_m`, clamped to the ends of the road.
 /// `None` only for an empty road.
@@ -1067,6 +1077,7 @@ pub fn world_mesh(
             biome: &biome_at,
             rows: &rows,
             lone: &[],
+            thin_from_m: look.thin_from_m,
         });
         props.extend(animals::place(
             road,
@@ -3021,6 +3032,74 @@ mod tests {
             assert!(
                 d >= trees::CLEAR_OF_ROAD_M - 0.01,
                 "{t:?} {d} m from the road"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod load {
+    use super::*;
+    use crate::data::props::{self, Shape};
+
+    /// What the view draws of the props at the busiest point of a route, in
+    /// every scenery: triangles and draw calls.
+    ///
+    /// ```text
+    /// CYCLE_3D_GPX=route.gpx cargo test --release prop_load -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn prop_load() {
+        let gpx = std::env::var("CYCLE_3D_GPX").expect("CYCLE_3D_GPX");
+        let route = Route::from_gpx_path(std::path::Path::new(&gpx)).expect("a GPX");
+        let reach: f32 = std::env::var("CYCLE_3D_REACH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_300.0);
+        let tris: std::collections::HashMap<Shape, usize> = Shape::ALL
+            .iter()
+            .map(|&s| (s, s.mesh().indices.len() / 3))
+            .collect();
+        for scenery in Scenery::CHOICES
+            .iter()
+            .copied()
+            .chain([Scenery::Countryside])
+        {
+            let scene = CourseScene::build(&route, scenery).expect("a scene");
+            let batches = props::batches(&scene.props);
+            let length = scene.road.last().map_or(0.0, |p| p.distance_m);
+            let (mut worst_tris, mut worst_draws, mut worst_at) = (0usize, 0usize, 0.0f32);
+            let mut d = 0.0;
+            while d < length {
+                let eye = position_at(&scene.road, d).expect("a point");
+                let ahead = position_at(&scene.road, d + 10.0).expect("a point");
+                let (fx, fz) = (ahead[0] - eye[0], ahead[2] - eye[2]);
+                let len = fx.hypot(fz).max(1e-3);
+                let forward = (fx / len, fz / len);
+                let (mut t, mut n) = (0usize, 0usize);
+                for b in &batches {
+                    for c in &b.chunks {
+                        // The view's 16:9 at 60° tall, a little wider.
+                        if props::in_view(c, eye, forward, 1.18, reach) {
+                            t += c.count as usize * tris[&b.shape];
+                            n += 1;
+                        }
+                    }
+                }
+                if t > worst_tris {
+                    (worst_tris, worst_draws, worst_at) = (t, n, d);
+                }
+                d += 250.0;
+            }
+            eprintln!(
+                "{:>14}: {:>7} props, world {:>7} tris; worst {:>9} prop tris, {:>4} draws at {:.0} m",
+                scenery.key(),
+                scene.props.len(),
+                scene.mesh.indices.len() / 3,
+                worst_tris,
+                worst_draws,
+                worst_at
             );
         }
     }

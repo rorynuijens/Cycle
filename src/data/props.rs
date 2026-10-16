@@ -289,6 +289,36 @@ pub fn instances<'a>(props: impl IntoIterator<Item = &'a Prop>) -> Vec<f32> {
     out
 }
 
+/// Whether any of `chunk` could be in sight of an eye at `eye` looking
+/// along `forward` (flat, unit length) with a view `tan_half` wide either
+/// side (the tangent of half the horizontal field of view): within
+/// `reach`, and not wholly behind the eye or off to either side of what it
+/// sees.
+pub fn in_view(
+    chunk: &Chunk,
+    eye: [f32; 3],
+    forward: (f32, f32),
+    tan_half: f32,
+    reach: f32,
+) -> bool {
+    if !in_reach(chunk, eye[0], eye[2], reach) {
+        return false;
+    }
+    let (dx, dz) = (chunk.centre.0 - eye[0], chunk.centre.1 - eye[2]);
+    let ahead = dx * forward.0 + dz * forward.1;
+    let side = (dx * forward.1 - dz * forward.0).abs();
+    if !(ahead.is_finite() && side.is_finite() && tan_half.is_finite()) {
+        // No direction to go on: draw it rather than lose it.
+        return true;
+    }
+    // Half the chunk's diagonal: the furthest any of it reaches past its
+    // centre in any direction. Against a side of the view, that reach
+    // counts across the side's slant.
+    let r = CHUNK_M * std::f32::consts::FRAC_1_SQRT_2;
+    let t = tan_half.max(0.0);
+    ahead >= -r && side <= ahead * t + r * (1.0 + t * t).sqrt()
+}
+
 /// Whether any of `chunk` lies within `reach` of the eye at `(x, z)`.
 pub fn in_reach(chunk: &Chunk, x: f32, z: f32, reach: f32) -> bool {
     let half = CHUNK_M / 2.0;
@@ -356,6 +386,31 @@ mod tests {
             &only[0].instances,
             &[0.0, 1.0, 0.0, 9.0, 0.5, 0.1, 0.2, 0.3, 1.0, 2.0]
         );
+    }
+
+    #[test]
+    fn should_skip_only_chunks_wholly_behind_the_eye_or_off_to_a_side() {
+        let at = |x: f32, z: f32| Chunk {
+            centre: (x, z),
+            start: 0,
+            count: 1,
+        };
+        let eye = [0.0, 0.0, 0.0];
+        let north = (0.0, -1.0);
+        // A view 90° wide: tan 45° = 1.
+        let v = |c: &Chunk, f| in_view(c, eye, f, 1.0, 1_300.0);
+        assert!(v(&at(0.0, -600.0), north), "ahead");
+        assert!(v(&at(0.0, 0.0), north), "standing in it");
+        assert!(v(&at(600.0, -600.0), north), "on the edge of the view");
+        // A corner of it reaches level with the eye: kept.
+        assert!(v(&at(0.0, 353.0), north));
+        assert!(!v(&at(0.0, 360.0), north), "wholly behind");
+        assert!(!v(&at(0.0, -2_000.0), north), "out of reach");
+        // Off to the side: even its nearest corner is outside the 45° line.
+        assert!(!v(&at(1_250.0, -200.0), north), "wholly off to the right");
+        assert!(v(&at(900.0, -600.0), north), "partly in view");
+        // No direction to go on: draw it rather than lose it.
+        assert!(v(&at(0.0, 600.0), (f32::NAN, f32::NAN)));
     }
 
     #[test]
