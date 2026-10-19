@@ -15,18 +15,23 @@ pub struct WellnessEntry {
     pub calories: Option<u32>,
 }
 
+/// Store one day's readings, merging into what that day already holds.
+///
+/// A figure that arrives missing keeps the one already stored. Intervals.icu
+/// may stop passing on what a Garmin watch measured, and a day it sends back
+/// empty must not erase the HRV and sleep the brief was reading.
 pub async fn upsert_wellness_entry(pool: &SqlitePool, entry: &WellnessEntry) -> Result<()> {
     sqlx::query(
         "INSERT INTO wellness_entries
              (date, hrv, resting_hr, sleep_secs, sleep_score, steps, calories)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(date) DO UPDATE SET
-             hrv         = excluded.hrv,
-             resting_hr  = excluded.resting_hr,
-             sleep_secs  = excluded.sleep_secs,
-             sleep_score = excluded.sleep_score,
-             steps       = excluded.steps,
-             calories    = excluded.calories",
+             hrv         = COALESCE(excluded.hrv, hrv),
+             resting_hr  = COALESCE(excluded.resting_hr, resting_hr),
+             sleep_secs  = COALESCE(excluded.sleep_secs, sleep_secs),
+             sleep_score = COALESCE(excluded.sleep_score, sleep_score),
+             steps       = COALESCE(excluded.steps, steps),
+             calories    = COALESCE(excluded.calories, calories)",
     )
     .bind(entry.date.format("%Y-%m-%d").to_string())
     .bind(entry.hrv.map(|v| v as f64))
@@ -203,13 +208,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_clear_a_figure_the_watch_no_longer_reports() {
+    async fn should_keep_a_figure_a_later_sync_leaves_out() {
         let pool = test_pool().await;
         upsert_wellness_entry(&pool, &reading(9, 48)).await.unwrap();
         let mut later = reading(9, 48);
         later.hrv = None;
         upsert_wellness_entry(&pool, &later).await.unwrap();
-        assert_eq!(load_wellness_recent(&pool, 1).await.unwrap()[0].hrv, None);
+        assert_eq!(
+            load_wellness_recent(&pool, 1).await.unwrap()[0].hrv,
+            Some(62.5)
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_every_figure_when_an_empty_day_arrives() {
+        let pool = test_pool().await;
+        upsert_wellness_entry(&pool, &reading(9, 48)).await.unwrap();
+        let empty = WellnessEntry {
+            date: day(9),
+            hrv: None,
+            resting_hr: None,
+            sleep_secs: None,
+            sleep_score: None,
+            steps: None,
+            calories: None,
+        };
+        upsert_wellness_entry(&pool, &empty).await.unwrap();
+        let e = &load_wellness_recent(&pool, 1).await.unwrap()[0];
+        assert_eq!(e.hrv, Some(62.5));
+        assert_eq!(e.resting_hr, Some(48));
+        assert_eq!(e.sleep_secs, Some(27_000));
+        assert_eq!(e.sleep_score, Some(81));
+        assert_eq!(e.steps, Some(9_412));
+        assert_eq!(e.calories, Some(2_350));
     }
 
     #[tokio::test]

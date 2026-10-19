@@ -341,10 +341,12 @@ impl CycleGtkWindow {
         // Built before the pages that show it, so each can subscribe as it is
         // constructed. Nothing is requested until `start()` below, once every
         // page exists — otherwise a card built late would miss the result.
+        let toast_overlay_for_brief = self.toast_overlay.clone();
         let brief_store = crate::ui::brief_store::BriefStore::new(
             pool.clone(),
             rt_handle.clone(),
             Rc::clone(&athlete_rc),
+            Rc::new(move |toast| toast_overlay_for_brief.add_toast(toast)),
         );
 
         // ── Calendar page — built after on_library_start so "Load Now" can start workouts ──

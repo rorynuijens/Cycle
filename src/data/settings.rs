@@ -39,6 +39,8 @@ pub mod keys {
     pub const INTERVALS_SYNC: &str = "intervals.sync";
     /// Set once every stream cached by the broken pre-0.12.0 fetch is gone.
     pub const INTERVALS_STREAMS_REFETCHED: &str = "intervals.streams_refetched";
+    /// The newest withheld activity the rider has been told about.
+    pub const INTERVALS_WITHHELD_ANNOUNCED: &str = "intervals.withheld_announced";
 
     pub const WINDOW_WIDTH: &str = "window.width";
     pub const WINDOW_HEIGHT: &str = "window.height";
@@ -197,6 +199,16 @@ pub async fn streams_refetched(pool: &SqlitePool) -> Result<bool> {
 
 pub async fn set_streams_refetched(pool: &SqlitePool) -> Result<()> {
     db::set_setting(pool, keys::INTERVALS_STREAMS_REFETCHED, flag_value(true)).await
+}
+
+/// The id of the newest activity Intervals.icu withheld that the rider has
+/// already been told about, if any.
+pub async fn withheld_announced(pool: &SqlitePool) -> Result<Option<String>> {
+    db::get_setting(pool, keys::INTERVALS_WITHHELD_ANNOUNCED).await
+}
+
+pub async fn set_withheld_announced(pool: &SqlitePool, icu_id: &str) -> Result<()> {
+    db::set_setting(pool, keys::INTERVALS_WITHHELD_ANNOUNCED, icu_id).await
 }
 
 // ── Window geometry ──────────────────────────────────────────────────────────

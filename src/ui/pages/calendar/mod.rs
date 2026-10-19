@@ -650,7 +650,9 @@ impl CalendarPage {
                 let reload_s = Rc::clone(&reload_icu);
                 let on_toast_s = Rc::clone(&on_toast_icu);
                 let btn_s = btn.clone();
-                let (tx, rx) = async_channel::bounded::<Result<usize, String>>(1);
+                let (tx, rx) = async_channel::bounded::<
+                    Result<crate::ai::intervals::StoredActivities, String>,
+                >(1);
 
                 rt_icu.spawn(async move {
                     // The athlete id is read here rather than on the GTK thread:
@@ -686,34 +688,9 @@ impl CalendarPage {
                     .await
                     {
                         Ok(acts) => {
-                            let count = acts.len();
-                            for a in acts {
-                                let _ = crate::data::db::upsert_intervals_activity(
-                                    &pool_s,
-                                    &a.id,
-                                    a.start_date_local,
-                                    &a.name,
-                                    a.icu_training_load,
-                                    a.moving_time,
-                                    a.average_watts,
-                                    a.normalized_watts,
-                                    a.average_hr,
-                                    a.max_hr,
-                                    &a.sport_type,
-                                    a.start_datetime_local,
-                                    a.distance_m,
-                                    a.elevation_gain_m,
-                                    a.average_cadence,
-                                )
-                                .await;
-                            }
-                            // A ride recorded in-app can arrive back here after a round
-                            // trip through Garmin or Strava — link the two so it is shown
-                            // and counted once.
-                            if let Err(e) = crate::data::db::reconcile_icu_links(&pool_s).await {
-                                tracing::error!("reconcile_icu_links: {e}");
-                            }
-                            let _ = tx.send(Ok(count)).await;
+                            let stored =
+                                crate::ai::intervals::store_activities(&pool_s, acts).await;
+                            let _ = tx.send(Ok(stored)).await;
                             // After the toast, not before it: the Fitness page
                             // wants these, the sync result does not.
                             crate::ai::intervals::backfill_streams(&pool_s, &api_key).await;
@@ -726,10 +703,16 @@ impl CalendarPage {
 
                 glib::MainContext::default().spawn_local(async move {
                     match rx.recv().await {
-                        Ok(Ok(count)) => {
+                        Ok(Ok(stored)) => {
                             on_toast_s(
                                 adw::Toast::builder()
-                                    .title(format!("Synced {count} activities from Intervals.icu"))
+                                    .title(format!(
+                                        "Synced {} activities from Intervals.icu{}",
+                                        stored.saved,
+                                        crate::ai::intervals::withheld_suffix(
+                                            stored.withheld.len()
+                                        )
+                                    ))
                                     .timeout(4)
                                     .build(),
                             );

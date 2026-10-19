@@ -47,6 +47,12 @@ pub async fn load_unlinked_intervals_activities_between(
 }
 
 /// Upsert an Intervals.icu activity (keyed on icu_id).
+///
+/// A sync can add to a ride or correct it, never empty it: a figure that
+/// arrives missing, or a blank name or sport, leaves what is cached alone.
+/// Intervals.icu strips activities it may not share down to an id and a date —
+/// Strava's already, Garmin's likely next — and that copy must not wipe the
+/// ride the rider already has.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_intervals_activity(
     pool: &SqlitePool,
@@ -73,18 +79,19 @@ pub async fn upsert_intervals_activity(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(icu_id) DO UPDATE SET
              date                 = excluded.date,
-             name                 = excluded.name,
-             tss                  = excluded.tss,
-             duration_secs        = excluded.duration_secs,
-             average_watts        = excluded.average_watts,
-             normalized_watts     = excluded.normalized_watts,
-             average_hr           = excluded.average_hr,
-             max_hr               = excluded.max_hr,
-             sport_type           = excluded.sport_type,
-             start_datetime_local = excluded.start_datetime_local,
-             distance_m           = excluded.distance_m,
-             elevation_gain_m     = excluded.elevation_gain_m,
-             average_cadence      = excluded.average_cadence",
+             name                 = COALESCE(NULLIF(excluded.name, ''), name),
+             tss                  = COALESCE(excluded.tss, tss),
+             duration_secs        = COALESCE(excluded.duration_secs, duration_secs),
+             average_watts        = COALESCE(excluded.average_watts, average_watts),
+             normalized_watts     = COALESCE(excluded.normalized_watts, normalized_watts),
+             average_hr           = COALESCE(excluded.average_hr, average_hr),
+             max_hr               = COALESCE(excluded.max_hr, max_hr),
+             sport_type           = COALESCE(NULLIF(excluded.sport_type, ''), sport_type),
+             start_datetime_local =
+                 COALESCE(excluded.start_datetime_local, start_datetime_local),
+             distance_m           = COALESCE(excluded.distance_m, distance_m),
+             elevation_gain_m     = COALESCE(excluded.elevation_gain_m, elevation_gain_m),
+             average_cadence      = COALESCE(excluded.average_cadence, average_cadence)",
     )
     .bind(icu_id)
     .bind(date.format("%Y-%m-%d").to_string())
@@ -437,11 +444,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_clear_a_load_figure_the_new_sync_no_longer_has() {
+    async fn should_keep_a_load_figure_a_later_sync_leaves_out() {
         let pool = test_pool().await;
         ride(&pool, "i1", 9, 7, Some(80.0)).await;
         ride(&pool, "i1", 9, 7, None).await;
-        assert_eq!(load_intervals_activities(&pool).await.unwrap()[0].tss, None);
+        assert_eq!(
+            load_intervals_activities(&pool).await.unwrap()[0].tss,
+            Some(80.0)
+        );
+    }
+
+    /// What Intervals.icu sends for an activity it may not share — it already
+    /// does this for Strava rides: the id and the date, every figure gone.
+    #[tokio::test]
+    async fn should_keep_every_figure_when_a_stripped_copy_of_the_ride_arrives() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        upsert_intervals_activity(
+            &pool,
+            "i1",
+            day(9),
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let a = &load_intervals_activities(&pool).await.unwrap()[0];
+        assert_eq!(a.name, "Morning Ride");
+        assert_eq!(a.sport_type, "Ride");
+        assert_eq!(a.tss, Some(80.0));
+        assert_eq!(a.duration_secs, Some(3600));
+        assert_eq!(a.average_watts, Some(180));
+        assert_eq!(a.normalized_watts, Some(195));
+        assert_eq!(a.average_hr, Some(140));
+        assert_eq!(a.max_hr, Some(171));
+        assert_eq!(a.start_datetime_local, day(9).and_hms_opt(7, 0, 0));
+        assert_eq!(a.distance_m, Some(30_000.0));
+        assert_eq!(a.elevation_gain_m, Some(420.0));
+        assert_eq!(a.average_cadence, Some(88.0));
+    }
+
+    #[tokio::test]
+    async fn should_still_take_a_new_name_and_a_new_figure() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        upsert_intervals_activity(
+            &pool,
+            "i1",
+            day(9),
+            "Indoor Cycling",
+            Some(0.0),
+            Some(3600),
+            Some(180),
+            Some(195),
+            Some(140),
+            Some(171),
+            "VirtualRide",
+            day(9).and_hms_opt(7, 0, 0),
+            Some(30_000.0),
+            Some(420.0),
+            Some(88.0),
+        )
+        .await
+        .unwrap();
+
+        let a = &load_intervals_activities(&pool).await.unwrap()[0];
+        assert_eq!(a.name, "Indoor Cycling");
+        assert_eq!(a.sport_type, "VirtualRide");
+        // Zero is a figure, not a gap.
+        assert_eq!(a.tss, Some(0.0));
     }
 
     #[tokio::test]
