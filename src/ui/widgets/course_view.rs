@@ -54,6 +54,28 @@ const BUILDING: &str = "Building the 3D view…";
 /// seconds. A tick is due every second; past that, the ride has paused.
 const MAX_EXTRAPOLATE_S: f32 = 1.0;
 
+/// Outlines thin out from the first distance and are gone by the second, in
+/// metres: past that a line is a broken pixel wide and crawls with every
+/// move of the camera.
+const LINE_FADE_M: (f32, f32) = (350.0, 1_100.0);
+/// The same, for a fold of the land against more land — on the desert's
+/// dunes, row upon row of crests from a hundred metres out.
+const LAND_LINE_FADE_M: (f32, f32) = (120.0, 320.0);
+
+/// How quickly the drawn rider closes on where the ride says they are, in
+/// seconds: the time to make up two thirds of the gap. A report is due every
+/// second, so the gap is made up at about its own size a second — a metre
+/// short adds a metre a second for a moment, not a lurch.
+const GLIDE_S: f32 = 1.0;
+/// How quickly the speed the rider leans by follows the ride's, in seconds.
+/// The ride's speed changes in a step at each report, and in a hairpin the
+/// lean is so sensitive to speed that each step tipped the rider over by
+/// several degrees at once.
+const LEAN_GLIDE_S: f32 = 0.6;
+/// A gap wider than this, in metres, is a jump — a skip along the route —
+/// and is taken in one frame, not glided over.
+const SNAP_M: f32 = 30.0;
+
 /// A camera that moved less than this since the last frame is not redrawn —
 /// unless something in the world is moving.
 const REDRAW_EPSILON_M: f32 = 0.001;
@@ -239,7 +261,8 @@ void main() {
     }
     float k = max(length(v_rel) - u_fog_start, 0.0) * u_fog_density;
     frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), 1.0);
-    frag_normal = vec4(n * 0.5 + 0.5, 1.0);
+    // Alpha marks the land, whose folds the outline pass lets go of sooner.
+    frag_normal = vec4(n * 0.5 + 0.5, material == 1.0 ? 0.0 : 1.0);
 }
 "#;
 
@@ -270,7 +293,11 @@ void main() {
 /// Outlines: dark lines where the depth folds — an object's silhouette
 /// against what is behind it — or where the faces either side turn sharply,
 /// as at a building's corner. Gentle folds in the land are left unlined.
-/// Lines fade into the haze with what they outline.
+/// Lines fade into the haze with what they outline, and thin out with
+/// distance before that: a far line is a pixel wide and broken, and crawls
+/// as the camera moves. A fold of the land against more land goes soonest —
+/// row upon row of dune crests crawled across the desert; the land's edge
+/// against the sky, the road or anything standing on it is kept.
 const OUTLINE_FRAGMENT_SHADER: &str = r#"
 precision highp sampler2D;
 in vec2 v_uv;
@@ -283,6 +310,8 @@ uniform float u_far;
 uniform vec3 u_outline;
 uniform float u_fog_start;
 uniform float u_fog_density;
+uniform vec2 u_line_fade;
+uniform vec2 u_land_line_fade;
 out vec4 frag;
 
 float linear(float z) {
@@ -311,7 +340,12 @@ void main() {
     edge = max(edge, smoothstep(0.75, 0.5, turn));
     float nearest = min(dc, min(min(dl, dr), min(dd, du)));
     float k = max(nearest - u_fog_start, 0.0) * u_fog_density;
-    float clear = exp(-k * k);
+    float not_land = max(
+        max(texture(u_normal, v_uv).a, texture(u_normal, v_uv - dx).a),
+        max(max(texture(u_normal, v_uv + dx).a, texture(u_normal, v_uv - dy).a),
+            texture(u_normal, v_uv + dy).a));
+    vec2 fade = mix(u_land_line_fade, u_line_fade, step(0.5, not_land));
+    float clear = exp(-k * k) * (1.0 - smoothstep(fade.x, fade.y, nearest));
     vec3 c = texture(u_colour, v_uv).rgb;
     frag = vec4(mix(c, u_outline, 0.85 * edge * clear), 1.0);
 }
@@ -351,6 +385,54 @@ impl Progress {
         } else {
             0.0
         }
+    }
+}
+
+/// Where the rider is drawn, gliding onto where the ride says they are.
+///
+/// Between reports the view carries the rider on at the last speed, and the
+/// next report is rarely exactly there: braking into a bend or easing up a
+/// climb, the ride is a metre short of where the view has drawn them. Taken
+/// as it came, every report was a jolt back up the road — in every bend.
+/// So the drawn rider goes on at the ride's speed and makes up the gap
+/// smoothly, and never backwards.
+#[derive(Debug, Clone, Copy, Default)]
+struct Glide {
+    /// The distance drawn last frame, and when — `None` before the first.
+    shown: Option<(f32, i64)>,
+    /// The speed the rider is drawn leaning by, in m/s.
+    lean_speed: f32,
+}
+
+impl Glide {
+    /// Where to draw the rider at `now_us`, with the ride putting them at
+    /// `target_m`, going `speed_ms`.
+    fn follow(&mut self, target_m: f32, speed_ms: f32, now_us: i64) -> f32 {
+        let speed = if speed_ms.is_finite() {
+            speed_ms.max(0.0)
+        } else {
+            0.0
+        };
+        let next = match self.shown {
+            Some((shown, at)) if (target_m - shown).abs() <= SNAP_M => {
+                let dt = ((now_us - at) as f32 / 1e6).max(0.0);
+                self.lean_speed += (speed - self.lean_speed) * (1.0 - (-dt / LEAN_GLIDE_S).exp());
+                let carried = shown + speed * dt;
+                let closed = carried + (target_m - carried) * (1.0 - (-dt / GLIDE_S).exp());
+                closed.max(shown)
+            }
+            _ => {
+                self.lean_speed = speed;
+                target_m
+            }
+        };
+        self.shown = Some((next, now_us));
+        next
+    }
+
+    /// The speed to lean the rider by: the ride's, eased like the distance.
+    fn lean_speed(&self) -> f32 {
+        self.lean_speed
     }
 }
 
@@ -492,6 +574,8 @@ struct Uniforms {
     o_outline: Uniform,
     o_fog_start: Uniform,
     o_fog_density: Uniform,
+    o_line_fade: Uniform,
+    o_land_line_fade: Uniform,
 }
 
 struct Inner {
@@ -511,6 +595,7 @@ struct Inner {
     needs_upload: Cell<bool>,
     gl: RefCell<Option<GlState>>,
     progress: Cell<Progress>,
+    glide: Cell<Glide>,
     /// The distance last drawn, so an unmoving camera is not redrawn.
     drawn_m: Cell<Option<f32>>,
     /// Bumped for every new route, so a build that finishes after the next
@@ -563,6 +648,7 @@ impl CourseView {
             needs_upload: Cell::new(false),
             gl: RefCell::new(None),
             progress: Cell::new(Progress::default()),
+            glide: Cell::new(Glide::default()),
             drawn_m: Cell::new(None),
             generation: Cell::new(0),
         });
@@ -624,6 +710,7 @@ impl CourseView {
         *inner.director.borrow_mut() = None;
         inner.needs_upload.set(true);
         inner.progress.set(Progress::default());
+        inner.glide.set(Glide::default());
         inner.drawn_m.set(None);
         *inner.route.borrow_mut() = Some(route.clone());
         inner.look.set(look);
@@ -748,8 +835,11 @@ impl Inner {
         let (w, h) = (area.width() * scale, area.height() * scale);
         let now = glib::monotonic_time();
         let progress = self.progress.get();
-        let distance = progress.distance_at(now);
         let speed = progress.speed_at(now);
+        let mut glide = self.glide.get();
+        let distance = glide.follow(progress.distance_at(now), speed, now);
+        self.glide.set(glide);
+        let speed = glide.lean_speed();
         let (pose, sky) = match self.scene.borrow().as_ref() {
             Some(s) => (
                 course3d::rider_pose(&s.road, distance, speed)
@@ -908,6 +998,8 @@ impl GlState {
                 o_outline: at(outline_program, "u_outline"),
                 o_fog_start: at(outline_program, "u_fog_start"),
                 o_fog_density: at(outline_program, "u_fog_density"),
+                o_line_fade: at(outline_program, "u_line_fade"),
+                o_land_line_fade: at(outline_program, "u_land_line_fade"),
             };
             Ok(Self {
                 gl,
@@ -1182,6 +1274,12 @@ impl GlState {
             gl.uniform_3_f32_slice(u.o_outline.as_ref(), &outline);
             gl.uniform_1_f32(u.o_fog_start.as_ref(), biome::FOG_START_M);
             gl.uniform_1_f32(u.o_fog_density.as_ref(), sky.fog_density);
+            gl.uniform_2_f32(u.o_line_fade.as_ref(), LINE_FADE_M.0, LINE_FADE_M.1);
+            gl.uniform_2_f32(
+                u.o_land_line_fade.as_ref(),
+                LAND_LINE_FADE_M.0,
+                LAND_LINE_FADE_M.1,
+            );
             gl.bind_vertex_array(Some(self.empty_vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.bind_vertex_array(None);
@@ -1548,6 +1646,133 @@ mod tests {
         };
         assert_eq!(p.distance_at(500_000), 100.0);
         assert_eq!(p.distance_at(1_500_000), 100.0);
+    }
+
+    /// Frames of a ride at `fps`, from `from_us` for `secs`: the distance the
+    /// view draws at each, as the ride reports `reports` (time, distance,
+    /// speed) and the view carries the rider on between them.
+    fn drawn(reports: &[(i64, f32, f32)], from_us: i64, secs: f32, fps: f32) -> Vec<f32> {
+        let mut glide = Glide::default();
+        let frames = (secs * fps) as i64;
+        (0..frames)
+            .map(|k| {
+                let now = from_us + (k as f32 * 1e6 / fps) as i64;
+                let Some(&(at, d, v)) = reports.iter().rev().find(|r| r.0 <= now) else {
+                    return glide.follow(0.0, 0.0, now);
+                };
+                let p = Progress {
+                    distance_m: d,
+                    speed_ms: v,
+                    at_us: Some(at),
+                };
+                glide.follow(p.distance_at(now), p.speed_at(now), now)
+            })
+            .collect()
+    }
+
+    /// Asserts the drawn rider never goes back and never changes speed from
+    /// one frame to the next by much more than the ride itself does, which
+    /// is `ride_dv` m/s at most — at 60 frames a second.
+    fn assert_smooth(d: &[f32], ride_dv: f32) {
+        let steps: Vec<f32> = d.windows(2).map(|w| w[1] - w[0]).collect();
+        for (k, &step) in steps.iter().enumerate() {
+            assert!(step >= 0.0, "frame {k} went back {step} m");
+        }
+        for (k, w) in steps.windows(2).enumerate() {
+            let dv = (w[1] - w[0]).abs() * 60.0;
+            assert!(dv <= ride_dv + 2.0, "frame {k} changed speed by {dv} m/s");
+        }
+    }
+
+    #[test]
+    fn should_not_jolt_the_rider_back_when_they_brake_into_a_bend() {
+        // 9 m/s, then the ride brakes for a bend: a second later the rider is
+        // at 107.5, not the 109 the view carried them to. Taken as it came,
+        // that report put the rider 1.5 m back in one frame.
+        let reports = [
+            (1_000_000, 100.0, 9.0),
+            (2_000_000, 107.5, 6.0),
+            (3_000_000, 113.5, 6.0),
+        ];
+        assert_smooth(&drawn(&reports, 1_000_000, 2.5, 60.0), 3.0);
+    }
+
+    #[test]
+    fn should_not_jump_the_rider_forward_when_they_speed_up() {
+        let reports = [
+            (1_000_000, 100.0, 5.0),
+            (2_000_000, 106.5, 8.0),
+            (3_000_000, 114.5, 8.0),
+        ];
+        assert_smooth(&drawn(&reports, 1_000_000, 2.5, 60.0), 3.0);
+    }
+
+    #[test]
+    fn should_glide_onto_where_the_ride_says() {
+        let reports = [(1_000_000, 100.0, 9.0), (2_000_000, 107.5, 6.0)];
+        let mut more: Vec<(i64, f32, f32)> = reports.to_vec();
+        for k in 1..5 {
+            more.push((2_000_000 + k * 1_000_000, 107.5 + 6.0 * k as f32, 6.0));
+        }
+        let d = drawn(&more, 1_000_000, 6.0, 60.0);
+        // The last frame is at 6.983 s: the ride has it 4.983 s past 107.5.
+        let truth = 107.5 + 6.0 * (359.0 / 60.0 - 1.0);
+        let last = d[d.len() - 1];
+        assert!(
+            (last - truth).abs() < 0.05,
+            "drawn at {last}, ridden at {truth}"
+        );
+    }
+
+    #[test]
+    fn should_follow_a_steady_ride_exactly() {
+        let reports = [(1_000_000, 100.0, 8.0), (2_000_000, 108.0, 8.0)];
+        let d = drawn(&reports, 1_000_000, 1.9, 50.0);
+        for (k, got) in d.iter().enumerate() {
+            let want = 100.0 + 8.0 * k as f32 / 50.0;
+            assert!((got - want).abs() < 1e-3, "frame {k}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn should_ease_the_lean_speed_rather_than_step_it() {
+        // Braking from 9 to 6 m/s at a report: in a hairpin a step that size
+        // tipped the rider several degrees in one frame.
+        let mut glide = Glide::default();
+        let mut now = 0i64;
+        glide.follow(100.0, 9.0, now);
+        let mut last = glide.lean_speed();
+        assert_eq!(last, 9.0);
+        for k in 1..=180 {
+            now += 16_667;
+            let v = if k < 30 { 9.0 } else { 6.0 };
+            glide.follow(100.0 + k as f32 * 0.12, v, now);
+            let step = (glide.lean_speed() - last).abs();
+            assert!(step < 0.1, "frame {k}: lean speed stepped {step} m/s");
+            last = glide.lean_speed();
+        }
+        assert!((last - 6.0).abs() < 0.2, "still leaning as at {last} m/s");
+    }
+
+    #[test]
+    fn should_take_a_skip_along_the_route_at_once() {
+        let mut glide = Glide::default();
+        assert_eq!(glide.follow(100.0, 8.0, 1_000_000), 100.0);
+        assert_eq!(glide.follow(2_000.0, 8.0, 1_016_000), 2_000.0);
+        // And back down the road too: a skip back is no glide.
+        assert_eq!(glide.follow(500.0, 8.0, 1_032_000), 500.0);
+    }
+
+    #[test]
+    fn should_settle_where_a_paused_ride_stopped() {
+        // Paused a metre short of where the view had carried them: the rider
+        // stays put rather than backing up.
+        let mut glide = Glide::default();
+        glide.follow(100.0, 8.0, 0);
+        let shown = glide.follow(108.0, 8.0, 1_000_000);
+        let held = glide.follow(107.0, 0.0, 3_000_000);
+        assert_eq!(held, shown);
+        assert_eq!(glide.follow(107.0, f32::NAN, 4_000_000), shown);
     }
 
     // ── Status and credit ─────────────────────────────────────────────────────
