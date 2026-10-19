@@ -25,6 +25,12 @@ pub const HUB_Y: f32 = 0.78;
 /// A running animal's legs are every vertex below this, in mesh units: the
 /// view's shader swings them.
 pub const LEGS_TOP: f32 = 0.3;
+/// How far a detail on a building's wall — a window, a door panel — stands
+/// out of it, in mesh units. A building is drawn 7–12 m tall, so this is
+/// about 10 cm: the depth buffer tells that apart from the wall out to where
+/// the haze takes the house. At a millimetre or two the wall and the window
+/// took turns in front, and every window in town flickered.
+const STANDS_PROUD: f32 = 0.012;
 
 /// A plain colour from the base palette.
 fn c(rgb: Rgb) -> [f32; 4] {
@@ -335,10 +341,11 @@ pub fn mesh(shape: Shape) -> Mesh {
         Shape::Barn => {
             m.extend(cuboid([-0.6, 0.0, -0.4], [0.6, 0.55, 0.4], OWN));
             m.extend(gable(-0.64, 0.64, -0.47, 0.47, 0.52, 1.0, c(b.roof_c), OWN));
-            m.extend(cuboid([0.6, 0.0, -0.2], [0.612, 0.42, 0.2], c(b.patch)));
+            let frame = 0.6 + STANDS_PROUD;
+            m.extend(cuboid([0.6, 0.0, -0.2], [frame, 0.42, 0.2], c(b.patch)));
             m.extend(cuboid(
-                [0.612, 0.02, -0.16],
-                [0.615, 0.38, 0.16],
+                [frame, 0.02, -0.16],
+                [frame + STANDS_PROUD, 0.38, 0.16],
                 c(b.animal_dark),
             ));
         }
@@ -360,10 +367,11 @@ pub fn mesh(shape: Shape) -> Mesh {
                 c(b.animal_dark),
             ));
             for x in [-0.22, 0.18] {
-                for z in [-0.361, 0.351] {
+                for side in [-1.0f32, 1.0] {
+                    let (wall, out) = (0.36 * side, (0.36 + STANDS_PROUD) * side);
                     m.extend(cuboid(
-                        [x, 0.24, z],
-                        [x + 0.14, 0.38, z + 0.01],
+                        [x, 0.24, wall.min(out)],
+                        [x + 0.14, 0.38, wall.max(out)],
                         c(b.animal_dark),
                     ));
                 }
@@ -773,6 +781,53 @@ pub fn mesh(shape: Shape) -> Mesh {
 mod tests {
     use super::*;
     use crate::data::animals::HEAD_FROM;
+
+    #[test]
+    fn should_stand_house_windows_out_of_the_wall_by_a_depth_step() {
+        // Windows 1 mm proud of the wall flickered in town: the wall and the
+        // window took turns in front of each other.
+        let dark = c(palette::BASE.animal_dark);
+        let m = mesh(Shape::House);
+        let windows: Vec<f32> = m
+            .vertices
+            .iter()
+            .filter(|v| v.colour == dark && (0.24..=0.38).contains(&v.pos[1]))
+            .filter(|v| v.pos[2].abs() > 0.3)
+            .map(|v| v.pos[2])
+            .collect();
+        let front = windows.iter().copied().fold(f32::MAX, f32::min);
+        let back = windows.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            front <= -0.36 - STANDS_PROUD + 1e-6,
+            "front windows out to {front}"
+        );
+        assert!(
+            back >= 0.36 + STANDS_PROUD - 1e-6,
+            "back windows out to {back}"
+        );
+    }
+
+    #[test]
+    fn should_stand_the_barn_door_out_of_its_frame_by_a_depth_step() {
+        let m = mesh(Shape::Barn);
+        let out_to = |colour: [f32; 4]| {
+            m.vertices
+                .iter()
+                .filter(|v| v.colour == colour)
+                .map(|v| v.pos[0])
+                .fold(f32::MIN, f32::max)
+        };
+        let frame = out_to(c(palette::BASE.patch));
+        let door = out_to(c(palette::BASE.animal_dark));
+        assert!(
+            frame >= 0.6 + STANDS_PROUD - 1e-6,
+            "the frame stands out {frame}"
+        );
+        assert!(
+            door >= frame + STANDS_PROUD - 1e-6,
+            "the door stands out {door} from {frame}"
+        );
+    }
 
     #[test]
     fn should_build_a_closed_box_between_any_two_points() {
