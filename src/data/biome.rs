@@ -76,7 +76,15 @@ pub struct TreeRules {
     /// a far wood is its outline in the haze, not its trees.
     #[serde(default = "thin_from")]
     pub thin_from_m: f32,
+    /// No tree grows higher than about this above the road, in metres: the
+    /// tree line, ragged over [`TREE_LINE_SPREAD_M`] either side.
+    #[serde(default)]
+    pub tree_line_m: Option<f32>,
 }
+
+/// How ragged a tree line or the edge of bare ground is, either side, in
+/// metres.
+pub const TREE_LINE_SPREAD_M: f32 = 25.0;
 
 fn thin_from() -> f32 {
     350.0
@@ -183,6 +191,10 @@ pub struct LandRules {
     pub water: WaterKind,
     /// Rows of poplars along the road.
     pub poplar_rows: bool,
+    /// Land higher than about this above the road is bare rock, in metres:
+    /// above the meadows, ragged over [`TREE_LINE_SPREAD_M`] either side.
+    #[serde(default)]
+    pub bare_above_m: Option<f32>,
 }
 
 /// One biome's look, resolved: the base palette with its overrides applied.
@@ -257,6 +269,14 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             && (-1.0..=1.0).contains(&def.land.fields)
             && (0.0..=1.0).contains(&def.land.crops)
             && (0.0..=500.0).contains(&def.land.paving_m)
+            && def
+                .trees
+                .tree_line_m
+                .is_none_or(|m| (0.0..=2_000.0).contains(&m))
+            && def
+                .land
+                .bare_above_m
+                .is_none_or(|m| (0.0..=2_000.0).contains(&m))
             && def.horizon.scale > 0.0
             && def.horizon.scale <= 3.0;
         let a = &def.animals;
@@ -738,7 +758,7 @@ mod tests {
         let defs = parse(include_str!("biomes.json")).expect("the bundled file");
         assert_eq!(
             defs[Biome::Forest as usize].palette.grass_low,
-            palette::hex(0x5FAF48)
+            palette::hex(0x4F9A3F)
         );
         assert_eq!(defs[Biome::Temperate as usize].palette, palette::BASE);
     }

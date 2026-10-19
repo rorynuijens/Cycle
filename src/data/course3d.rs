@@ -413,15 +413,18 @@ impl CourseScene {
         let own = |x: f32, z: f32| Some(world.height(x, z));
         let terrain = terrain.unwrap_or(&own);
         let mut props = Vec::new();
+        // The land and road are drawn on beyond the route's ends; everything
+        // that rides — rider, camera, sky, encounters — keeps to `road`.
+        let drawn = with_leads(&road);
         let mut mesh = world_mesh(
-            &road,
+            &drawn,
             Grid::VIEW,
             Some(terrain),
             Some(&world),
             &look,
             Some(&mut props),
         );
-        mesh.extend(roadway::ridden_mesh(&road));
+        mesh.extend(roadway::ridden_mesh(&drawn));
         let length = road.last().map_or(0.0, |p| p.distance_m);
         let segments = if scenery == Scenery::Mixed {
             biome::mix_segments(world.seed(), length)
@@ -937,7 +940,8 @@ pub fn world_mesh(
         spacing,
         sample,
     );
-    restyle_steep(&mut mesh, &fine, spacing, look, &look_at);
+    let above_road = |x: f32, z: f32, y: f32| world.map(|w| w.above_road(x, z, y));
+    restyle_steep(&mut mesh, &fine, spacing, look, &look_at, &above_road);
 
     // The verge: grass along either side of the road at its own height,
     // sloping out to meet the ground — so the road lies in the land, not on
@@ -982,7 +986,7 @@ pub fn world_mesh(
                 Some((y, ground_colour(look_at(x, z), w.land(x, z), x, z, 30.0)))
             },
         );
-        restyle_steep(&mut mesh, &far, FAR_SPACING_M, look, &look_at);
+        restyle_steep(&mut mesh, &far, FAR_SPACING_M, look, &look_at, &above_road);
     }
 
     let Some(world) = world else {
@@ -1073,6 +1077,7 @@ pub fn world_mesh(
             from_road: &near,
             area: &area_at,
             ground: &ground,
+            above_road: &|x, z, y| world.above_road(x, z, y),
             taken: &taken,
             biome: &biome_at,
             rows: &rows,
@@ -1342,6 +1347,7 @@ fn restyle_steep(
     spacing: f32,
     look: &Look,
     look_at: &dyn Fn(f32, f32) -> &'static BiomeDef,
+    above_road: &dyn Fn(f32, f32, f32) -> Option<f32>,
 ) {
     let GridSlots {
         slot, cols, rows, ..
@@ -1370,10 +1376,18 @@ fn restyle_steep(
                 .flatten()
                 .map(|n| (n - y).abs() / spacing)
                 .fold(0.0f32, f32::max);
-            let p = &look_at(vertex.pos[0], vertex.pos[2]).palette;
+            let (x, z) = (vertex.pos[0], vertex.pos[2]);
+            let def = look_at(x, z);
+            let p = &def.palette;
+            let bare = def.land.bare_above_m.is_some_and(|bare| {
+                let ragged = (biome::unit(biome::seed_at(x, z, 1.0, 0xBA2E)) - 0.5)
+                    * 2.0
+                    * biome::TREE_LINE_SPREAD_M;
+                above_road(x, z, y).is_some_and(|up| up > bare + ragged)
+            });
             if y > look.snow_line_m {
                 restyle.push((v, p.snow));
-            } else if slope > ROCK_SLOPE {
+            } else if slope > ROCK_SLOPE || bare {
                 restyle.push((v, p.rock));
             }
         }
@@ -1443,6 +1457,71 @@ fn resample(road: &[RoadPoint], step: f32) -> Vec<RoadPoint> {
     if let Some(last) = road.last() {
         out.push(*last);
     }
+    out
+}
+
+/// How far the road is drawn on behind the start and past the finish, in
+/// metres: the chase camera starts behind the first point, and the finish
+/// looks ahead past the last, and a road ending there is the edge of the
+/// world square across the view. Past the finish, far enough for the haze.
+const LEAD_IN_M: f32 = 120.0;
+const LEAD_OUT_M: f32 = 400.0;
+const LEAD_STEP_M: f32 = 5.0;
+/// A lead stops this far short of any other part of the route, so it never
+/// runs across the road ridden — a loop, a lollipop, a finish beside the
+/// start.
+const LEAD_CLEAR_M: f32 = SHOULDER_BASE_M + DEFAULT_EXTENT_M;
+/// The road's direction at either end, taken over this much of it.
+const LEAD_AIM_M: f32 = 10.0;
+
+/// `road` with a stretch drawn on straight and level beyond either end, at
+/// distances before 0 and past the last. Scenery only: the rider, camera and
+/// ride all go by the route's own `road`, which this leaves as it is.
+fn with_leads(road: &[RoadPoint]) -> Vec<RoadPoint> {
+    let (Some(&first), Some(&last)) = (road.first(), road.last()) else {
+        return road.to_vec();
+    };
+    if last.distance_m - first.distance_m < 1.0 {
+        return road.to_vec();
+    }
+    let lead = |end: RoadPoint, inward: f32, length: f32| -> Vec<RoadPoint> {
+        let aim = (end.distance_m + inward * LEAD_AIM_M).clamp(first.distance_m, last.distance_m);
+        let Some(inner) = position_at(road, aim) else {
+            return Vec::new();
+        };
+        let Some(dir) = normalise_xz(sub3(end.pos, inner)) else {
+            return Vec::new();
+        };
+        // The route near this end is where the lead starts from; anything
+        // further along it is in the way.
+        let near_end = 2.0 * LEAD_CLEAR_M;
+        let clear = |x: f32, z: f32| {
+            road.iter().all(|q| {
+                (q.distance_m - end.distance_m).abs() < near_end
+                    || (q.pos[0] - x).hypot(q.pos[2] - z) >= LEAD_CLEAR_M
+            })
+        };
+        let mut out = Vec::new();
+        let mut s = LEAD_STEP_M;
+        while s <= length + 1e-3 {
+            let (x, z) = (end.pos[0] + dir[0] * s, end.pos[2] + dir[2] * s);
+            if !clear(x, z) {
+                break;
+            }
+            out.push(RoadPoint {
+                pos: [x, end.pos[1], z],
+                distance_m: end.distance_m - inward * s,
+            });
+            s += LEAD_STEP_M;
+        }
+        out
+    };
+    let mut before = lead(first, 1.0, LEAD_IN_M);
+    before.reverse();
+    let after = lead(last, -1.0, LEAD_OUT_M);
+    let mut out = before;
+    out.extend_from_slice(road);
+    out.extend(after);
     out
 }
 
@@ -1857,6 +1936,141 @@ mod tests {
     #[test]
     fn should_not_build_a_scene_from_a_single_point() {
         assert!(CourseScene::build(&straight_route(1, 10.0, 0.0), Scenery::Countryside).is_none());
+    }
+
+    /// Whether the scene draws road surface within a metre of `(x, z)`, at
+    /// height `y`.
+    fn road_drawn_at(scene: &CourseScene, x: f32, y: f32, z: f32) -> bool {
+        scene.mesh.vertices.iter().any(|v| {
+            v.colour[3] == MATERIAL_ROAD
+                && (v.pos[0] - x).hypot(v.pos[2] - z) < 3.0
+                && (v.pos[1] - y).abs() < 0.05
+        })
+    }
+
+    #[test]
+    fn should_draw_road_before_the_start_and_past_the_finish() {
+        // Seen from the chase camera at the start, a road that began at the
+        // first GPX point was the edge of the world, square across the view.
+        let route = straight_route(31, 10.0, 0.5);
+        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
+        // The made-up road bends, so each end goes on its own way.
+        let (first, last) = (scene.road[0].pos, scene.road[scene.road.len() - 1].pos);
+        let into = position_at(&scene.road, LEAD_AIM_M).expect("a road");
+        let back = position_at(&scene.road, 300.0 - LEAD_AIM_M).expect("a road");
+        let out_of = normalise_xz(sub3(first, into)).expect("a heading");
+        let on = normalise_xz(sub3(last, back)).expect("a heading");
+        let before = [first[0] + out_of[0] * 40.0, first[2] + out_of[2] * 40.0];
+        let past = [last[0] + on[0] * 150.0, last[2] + on[2] * 150.0];
+        assert!(
+            road_drawn_at(&scene, before[0], first[1], before[1]),
+            "no road 40 m before the start"
+        );
+        assert!(
+            road_drawn_at(&scene, past[0], last[1], past[1]),
+            "no road 150 m past the finish"
+        );
+    }
+
+    #[test]
+    fn should_bare_the_mountains_high_ground_to_rock() {
+        let route = straight_route(301, 10.0, 0.0);
+        let scenery = Scenery::Only(biome::Biome::Mountain);
+        let scene = CourseScene::build(&route, scenery).expect("a scene");
+        let world = World::new(&track::lay(&route));
+        let def = biome::Biome::Mountain.def();
+        let bare = def.land.bare_above_m.expect("bare ground");
+        let rock = def.palette.rock;
+        let high: Vec<&Vertex> = scene
+            .mesh
+            .vertices
+            .iter()
+            .filter(|v| v.colour[3] == MATERIAL_GROUND)
+            .filter(|v| {
+                let up = world.above_road(v.pos[0], v.pos[2], v.pos[1]);
+                up > bare + biome::TREE_LINE_SPREAD_M
+            })
+            .collect();
+        assert!(high.len() > 50, "only {} high ground vertices", high.len());
+        for v in high {
+            assert!(
+                v.colour[..3] == rock || v.colour[..3] == def.palette.snow,
+                "high ground at {:?} is {:?}",
+                v.pos,
+                &v.colour[..3]
+            );
+        }
+    }
+
+    #[test]
+    fn should_leave_the_ridden_road_its_own_ends() {
+        // The road drawn on beyond the ends is scenery: the rider, camera and
+        // sky still go by the route's own road, 0 m to its full length.
+        let route = straight_route(31, 10.0, 0.5);
+        let scene = CourseScene::build(&route, Scenery::Countryside).expect("a scene");
+        assert_eq!(scene.road[0].distance_m, 0.0);
+        assert_eq!(scene.road[scene.road.len() - 1].distance_m, 300.0);
+        assert_eq!(scene.road, track::lay(&route));
+    }
+
+    #[test]
+    fn should_stop_the_road_past_the_finish_short_of_the_route_itself() {
+        // North 300 m, east 200, south 150, then west 100: carried on west,
+        // the finish would run across the first leg at x = 0.
+        let mut road = Vec::new();
+        let mut at = |x: f32, z: f32| {
+            let d = road.last().map_or(0.0, |p: &RoadPoint| {
+                p.distance_m + (p.pos[0] - x).hypot(p.pos[2] - z)
+            });
+            road.push(RoadPoint {
+                pos: [x, 10.0, z],
+                distance_m: d,
+            });
+        };
+        for k in 0..=300 {
+            at(0.0, -(k as f32));
+        }
+        for k in 1..=200 {
+            at(k as f32, -300.0);
+        }
+        for k in 1..=150 {
+            at(200.0, -300.0 + k as f32);
+        }
+        for k in 1..=100 {
+            at(200.0 - k as f32, -150.0);
+        }
+        let drawn = with_leads(&road);
+        let added = drawn.iter().filter(|p| p.distance_m > 750.0);
+        let mut any = false;
+        for p in added {
+            any = true;
+            assert!(
+                p.pos[0] >= LEAD_CLEAR_M,
+                "the lead reaches x = {}",
+                p.pos[0]
+            );
+        }
+        assert!(any, "no road drawn past the finish at all");
+        // The road ridden is all still there, unmoved.
+        assert!(drawn.windows(road.len()).any(|w| w == road.as_slice()));
+    }
+
+    #[test]
+    fn should_draw_the_road_on_level_beyond_the_ends() {
+        let road = road_of(&straight_route(11, 10.0, 1.0));
+        let drawn = with_leads(&road);
+        let (first, last) = (road[0], road[road.len() - 1]);
+        assert!(drawn[0].distance_m <= -LEAD_IN_M + LEAD_STEP_M);
+        assert!(drawn[drawn.len() - 1].distance_m >= last.distance_m + LEAD_OUT_M - LEAD_STEP_M);
+        for p in &drawn {
+            if p.distance_m < 0.0 {
+                assert_eq!(p.pos[1], first.pos[1]);
+                assert_eq!(p.pos[0], 0.0);
+                assert!(p.pos[2] > 0.0, "the lead-in is behind the start");
+            } else if p.distance_m > last.distance_m {
+                assert_eq!(p.pos[1], last.pos[1]);
+            }
+        }
     }
 
     // ── The made-up road in the scene ─────────────────────────────────────────

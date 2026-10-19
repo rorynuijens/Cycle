@@ -174,6 +174,8 @@ pub struct Land<'a> {
     pub area: &'a dyn Fn(f32, f32) -> Option<AreaKind>,
     /// The drawn ground's height, where there is ground.
     pub ground: &'a dyn Fn(f32, f32) -> Option<f32>,
+    /// How far a height at `(x, z)` stands above the road's level there.
+    pub above_road: &'a dyn Fn(f32, f32, f32) -> f32,
     /// Taken by something else — a stream, a sheep's patch of grass.
     pub taken: &'a dyn Fn(f32, f32) -> bool,
     pub biome: &'a dyn Fn(f32, f32) -> &'static BiomeDef,
@@ -303,6 +305,12 @@ fn plant(land: &Land, trees: &mut Vec<Prop>, x: f32, z: f32, seed: u64, kind: Op
         return;
     };
     let def = (land.biome)(x, z);
+    if let Some(line) = def.trees.tree_line_m {
+        let ragged = (biome::unit(seed.rotate_left(61)) - 0.5) * 2.0 * biome::TREE_LINE_SPREAD_M;
+        if (land.above_road)(x, z, y) > line + ragged {
+            return;
+        }
+    }
     let kind = kind.unwrap_or_else(|| {
         if biome::unit(seed.rotate_left(7)) < def.trees.cone_share {
             def.trees.kinds[1]
@@ -390,6 +398,7 @@ mod tests {
             from_road: &from_road,
             area: &area,
             ground: &ground,
+            above_road: &|_, _, y| y,
             taken: &taken,
             biome,
             rows,
@@ -433,6 +442,33 @@ mod tests {
         let n = spots.len();
         spots.dedup();
         assert_eq!(spots.len(), n);
+    }
+
+    #[test]
+    fn should_plant_no_tree_above_the_tree_line() {
+        // The land climbs 0.4 m a metre east, to 200 m above the road at the
+        // east edge; the mountains' trees stop near their tree line.
+        fn mountain(_: f32, _: f32) -> &'static BiomeDef {
+            Biome::Mountain.def()
+        }
+        let line = Biome::Mountain
+            .def()
+            .trees
+            .tree_line_m
+            .expect("a tree line");
+        let rise = |x: f32, _: f32, _: f32| x * 0.4;
+        let land = Land {
+            above_road: &rise,
+            ..land_fixture(&[], &[], &mountain)
+        };
+        let trees = scatter(&land);
+        let top = biome::TREE_LINE_SPREAD_M;
+        for t in &trees {
+            let up = t.pos[0] * 0.4;
+            assert!(up <= line + top, "a tree {up} m up, the line is {line}");
+        }
+        let below = trees.iter().filter(|t| t.pos[0] * 0.4 < line - top).count();
+        assert!(below > 100, "only {below} trees below the tree line");
     }
 
     #[test]

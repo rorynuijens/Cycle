@@ -259,6 +259,12 @@ impl World {
         mix(top, bottom, tz)
     }
 
+    /// How far a height `y` at `(x, z)` stands above the road's own level
+    /// carried out over the land, in metres: how high up a hillside it is.
+    pub fn above_road(&self, x: f32, z: f32, y: f32) -> f32 {
+        y - self.base_at(x, z).0
+    }
+
     /// How far along the route, in metres, the road nearest `(x, z)` is —
     /// from the nearest point of the coarse grid, never blended: between two
     /// stretches of a lap, a blend would name a third that is nowhere near.
