@@ -151,6 +151,9 @@ pub struct Palette {
     pub arch: Rgb,
     pub banner: Rgb,
     pub chequer: Rgb,
+    /// The ghost rider: pale all over, with a soft blue for its kit.
+    pub ghost: Rgb,
+    pub ghost_trim: Rgb,
 }
 
 /// The shared base palette: the skill's names (§3, §7.1), tuned to the
@@ -256,6 +259,8 @@ pub const BASE: Palette = Palette {
     arch: hex(0xD63333),
     banner: hex(0xFFFFFF),
     chequer: hex(0x1E2430),
+    ghost: hex(0xDCEBFF),
+    ghost_trim: hex(0x6FA3EC),
 };
 
 /// The fullscreen ride HUD's colours. The HUD is drawn inside the 3D view in
@@ -338,7 +343,7 @@ pub const LIGHT: Light = Light {
 
 /// Names a biome may not override: the track and the rider look the same
 /// everywhere.
-pub const FIXED: [&str; 14] = [
+pub const FIXED: [&str; 16] = [
     "road",
     "road_edge",
     "road_line",
@@ -353,6 +358,8 @@ pub const FIXED: [&str; 14] = [
     "arch",
     "banner",
     "chequer",
+    "ghost",
+    "ghost_trim",
 ];
 
 impl Palette {
@@ -458,6 +465,8 @@ impl Palette {
             "arch" => &mut self.arch,
             "banner" => &mut self.banner,
             "chequer" => &mut self.chequer,
+            "ghost" => &mut self.ghost,
+            "ghost_trim" => &mut self.ghost_trim,
             _ => return None,
         })
     }
@@ -526,7 +535,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 99] = [
+        const NAMES: [&str; 101] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -626,13 +635,15 @@ mod tests {
             "arch",
             "banner",
             "chequer",
+            "ghost",
+            "ghost_trim",
         ];
         assert_eq!(NAMES.len(), size_of::<Palette>() / size_of::<Rgb>());
         let mut p = BASE;
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 99] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 101] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

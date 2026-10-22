@@ -480,6 +480,7 @@ impl CycleGtkWindow {
             let auto_pause = Rc::clone(&auto_pause);
             let finish_for_route = Rc::clone(&finish_session);
             let athlete_for_route = Rc::clone(&athlete_rc);
+            let (pool_for_ghost, rt_for_ghost) = (pool.clone(), rt_handle.clone());
             Rc::new(move |ride: crate::ui::RouteRide| {
                 let crate::ui::RouteRide {
                     route,
@@ -498,6 +499,7 @@ impl CycleGtkWindow {
                     // Cloned out so no borrow is held while start_timer installs
                     // its callbacks — see CLAUDE.md §2.4.
                     let athlete_now = athlete_for_route.borrow().clone();
+                    let length_m = route.total_distance_m;
                     RoutePlayerPage::start_timer(
                         Rc::clone(&route_player),
                         route,
@@ -516,6 +518,24 @@ impl CycleGtkWindow {
                         },
                         Rc::clone(&timer_alive),
                     );
+                    // The ride to race: the fastest this rider has ridden this
+                    // route, loaded off the main thread while the ride gets going.
+                    if let Some(id) = route_id {
+                        let pool = pool_for_ghost.clone();
+                        let player = Rc::clone(&route_player);
+                        crate::ui::spawn_to_main(
+                            &rt_for_ghost,
+                            async move { db::load_route_rides(&pool, id).await },
+                            move |rides| match rides {
+                                Ok(rides) => player.set_ghost(
+                                    id,
+                                    crate::data::ghost::fastest(&rides, id, length_m)
+                                        .map(|(_, g)| g),
+                                ),
+                                Err(e) => tracing::error!("could not load the route's rides: {e}"),
+                            },
+                        );
+                    }
                 }
             })
         };

@@ -12,6 +12,7 @@ pub mod dressing;
 pub mod encounters;
 pub mod finish;
 pub mod fit;
+pub mod ghost;
 pub mod import;
 pub mod keystore;
 pub mod kit;

@@ -64,6 +64,8 @@ pub struct RouteMap {
     lookahead_layer: RefCell<Option<libshumate::PathLayer>>,
     marker_layer: RefCell<Option<libshumate::MarkerLayer>>,
     marker: RefCell<Option<libshumate::Marker>>,
+    /// The ghost being raced, while there is one.
+    ghost: RefCell<Option<libshumate::Marker>>,
     /// When the rider last panned or zoomed; following resumes after that.
     /// Shared with the gesture controllers that record it.
     last_interaction: Rc<Cell<Option<Instant>>>,
@@ -88,6 +90,7 @@ impl RouteMap {
             lookahead_layer: RefCell::new(None),
             marker_layer: RefCell::new(None),
             marker: RefCell::new(None),
+            ghost: RefCell::new(None),
             last_interaction,
         }
     }
@@ -194,14 +197,14 @@ impl RouteMap {
         };
 
         if self.marker.borrow().is_none() {
-            let layer = libshumate::MarkerLayer::new(&viewport);
+            let Some(layer) = self.marker_layer() else {
+                return;
+            };
             let marker = libshumate::Marker::new();
             let dot = rider_dot();
             marker.set_child(Some(&dot));
             marker.update_property(&[gtk::accessible::Property::Label("Your position")]);
             layer.add_marker(&marker);
-            self.map.add_overlay_layer(&layer);
-            *self.marker_layer.borrow_mut() = Some(layer);
             *self.marker.borrow_mut() = Some(marker);
             // The first fix is worth centring on whatever the rider was doing.
             viewport.set_zoom_level(FOLLOW_ZOOM);
@@ -215,6 +218,79 @@ impl RouteMap {
             viewport.set_location(lat, lng);
         }
     }
+
+    /// Where the ghost being raced is, or `None` to take it off the map.
+    pub fn set_ghost_position(&self, at: Option<(f64, f64)>) {
+        let Some((lat, lng)) = at else {
+            if let (Some(layer), Some(ghost)) = (
+                self.marker_layer.borrow().as_ref(),
+                self.ghost.borrow_mut().take(),
+            ) {
+                layer.remove_marker(&ghost);
+            }
+            return;
+        };
+        if self.ghost.borrow().is_none() {
+            let Some(layer) = self.marker_layer() else {
+                return;
+            };
+            let marker = libshumate::Marker::new();
+            marker.set_child(Some(&ghost_dot()));
+            marker.update_property(&[gtk::accessible::Property::Label("Your ghost's position")]);
+            layer.add_marker(&marker);
+            // Under the rider's own marker where the two meet: the layer
+            // draws in the order added, so the rider goes back on top.
+            if let Some(rider) = self.marker.borrow().as_ref() {
+                layer.remove_marker(rider);
+                layer.add_marker(rider);
+            }
+            *self.ghost.borrow_mut() = Some(marker);
+        }
+        if let Some(ghost) = self.ghost.borrow().as_ref() {
+            ghost.set_location(lat, lng);
+        }
+    }
+
+    /// The layer the markers sit in, made on first use.
+    fn marker_layer(&self) -> Option<libshumate::MarkerLayer> {
+        if let Some(layer) = self.marker_layer.borrow().as_ref() {
+            return Some(layer.clone());
+        }
+        let viewport = self.map.viewport()?;
+        let layer = libshumate::MarkerLayer::new(&viewport);
+        self.map.add_overlay_layer(&layer);
+        *self.marker_layer.borrow_mut() = Some(layer.clone());
+        Some(layer)
+    }
+}
+
+/// The ghost on the map: the rider's dot, hollow and faint — there, and not.
+fn ghost_dot() -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder()
+        .content_width(MARKER_SIZE)
+        .content_height(MARKER_SIZE)
+        .css_classes(["accent"])
+        .can_target(false)
+        .opacity(0.7)
+        .build();
+    area.set_draw_func(|widget, cr, width, height| {
+        let accent = widget.color();
+        let (r, g, b) = (
+            accent.red() as f64,
+            accent.green() as f64,
+            accent.blue() as f64,
+        );
+        let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
+        let radius = cx.min(cy);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+        cr.arc(cx, cy, radius * 0.5, 0.0, std::f64::consts::TAU);
+        cr.fill().ok();
+        cr.set_source_rgba(r, g, b, 1.0);
+        cr.set_line_width(radius * 0.16);
+        cr.arc(cx, cy, radius * 0.5, 0.0, std::f64::consts::TAU);
+        cr.stroke().ok();
+    });
+    area
 }
 
 /// The rider's position on the map: a solid accent core inside a white ring

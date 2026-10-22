@@ -62,6 +62,23 @@ impl Default for Avatar {
     }
 }
 
+impl Avatar {
+    /// The ghost rider: the rider's own shape, pale all over, its kit and
+    /// tyres a soft blue so the shape still reads.
+    pub fn ghost() -> Self {
+        let p = &palette::BASE;
+        Self {
+            helmet: p.ghost,
+            hair: p.ghost,
+            skin: p.ghost,
+            jersey: p.ghost,
+            kit: p.ghost_trim,
+            frame: p.ghost,
+            tyre: p.ghost_trim,
+        }
+    }
+}
+
 /// A wheel: a flat many-sided disc standing upright, centred at `x`.
 fn wheel(x: f32, tyre: Rgb) -> Mesh {
     let tyre = rgba(tyre);

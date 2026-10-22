@@ -58,6 +58,10 @@ pub struct HudReadings {
     pub climbed_m: f32,
     /// How far along the route the rider is, 0–1.
     pub progress: f32,
+    /// Racing a ghost: how far behind it the rider is, in seconds (negative
+    /// ahead), and how far along the route it is, 0–1.
+    pub ghost_gap_secs: Option<f32>,
+    pub ghost_progress: Option<f32>,
 }
 
 /// The route's heights at [`PROFILE_SAMPLES`] even steps from start to finish,
@@ -296,6 +300,9 @@ impl RideHud {
             "rpm",
             cad_dim,
         );
+        if let Some(gap) = r.ghost_gap_secs {
+            ghost_tile(&t, right, TOP + 2.0 * (TILE_H + STACK_GAP), gap);
+        }
 
         power_panel(&t, w, r);
         gradient_sign(&t, 60.0, h - 214.0 - 214.0, r.gradient_pct);
@@ -538,6 +545,21 @@ fn tile(
         base,
         HUD.label,
     );
+}
+
+/// The gap to the ghost, on its own sticker under the cadence: green ahead,
+/// red behind.
+fn ghost_tile(t: &Text, x: f64, y: f64, gap_secs: f32) {
+    sticker(t.cr, x, y, TILE_W, TILE_H, 24.0, 5.0, 7.0);
+    t.draw(&t.caption("GHOST"), x + 22.0, y + 14.0, HUD.label);
+    let text = crate::data::ghost::format_gap(gap_secs);
+    let colour = match text.chars().next() {
+        Some('+') => HUD.sign,
+        Some('−') => HUD.ridden,
+        _ => HUD.ink,
+    };
+    let number = t.layout(&text, 68.0, pango::Weight::Bold);
+    t.on_baseline(&number, x + 22.0, y + TILE_H - 20.0, colour);
 }
 
 fn zone_rgb(z: usize) -> Rgb {
@@ -876,6 +898,21 @@ fn profile_band(t: &Text, w: f64, h: f64, r: &HudReadings, profile: &[f32]) {
     }
     let _ = cr.fill();
 
+    // The ghost, under the rider: a pale ball on a pin.
+    if let Some(g) = r.ghost_progress {
+        let gx = x0 + (x1 - x0) * f64::from(g.clamp(0.0, 1.0));
+        let ground = height_at(&points, gx).unwrap_or(floor);
+        set(cr, BASE.ghost_trim);
+        cr.rectangle(gx - 2.5, ground - 24.0, 5.0, 24.0);
+        let _ = cr.fill();
+        cr.arc(gx, ground - 24.0 - 14.0, 14.0, 0.0, std::f64::consts::TAU);
+        set(cr, BASE.ghost);
+        let _ = cr.fill_preserve();
+        set(cr, BASE.ghost_trim);
+        cr.set_line_width(4.0);
+        let _ = cr.stroke();
+    }
+
     // The rider: a ball in their jersey's colour on a pin.
     let ground = height_at(&points, at).unwrap_or(floor);
     set(cr, HUD.ink);
@@ -1156,7 +1193,28 @@ mod tests {
             elapsed_secs: 872,
             climbed_m: 62.0,
             progress: 0.44,
+            ghost_gap_secs: None,
+            ghost_progress: None,
         }
+    }
+
+    #[test]
+    fn should_show_the_ghost_only_while_racing_one() {
+        let hud = RideHud::new();
+        // The ghost tile's face, under the cadence tile on the right.
+        let (x, y) = (
+            1920 - 48 - 236 + 160,
+            (TOP + 2.0 * (TILE_H + STACK_GAP) + 20.0) as i32,
+        );
+        let mut s = hud.render(1920, 1080, &riding(), &[]).expect("a HUD");
+        assert_eq!(pixel(&mut s, x, y)[3], 0, "no ghost, no tile");
+        let racing = HudReadings {
+            ghost_gap_secs: Some(-8.0),
+            ghost_progress: Some(0.4),
+            ..riding()
+        };
+        let mut s = hud.render(1920, 1080, &racing, &[]).expect("a HUD");
+        assert!(close(pixel(&mut s, x, y), rgb8(HUD.panel)));
     }
 
     /// Writes the HUD to a PNG to look at:

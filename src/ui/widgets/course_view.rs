@@ -26,6 +26,7 @@ use std::sync::OnceLock;
 use crate::data::biome;
 use crate::data::course3d::{self, CameraPose, CourseScene, Mat4, Mesh, RiderPose, Sky};
 use crate::data::encounters;
+use crate::data::ghost::Ghost;
 use crate::data::palette;
 use crate::data::props::{self, Prop, Shape};
 use crate::data::rider;
@@ -69,6 +70,9 @@ const LEAN_GLIDE_S: f32 = 0.6;
 /// constant, in seconds: rolling on about as many metres as they rode in
 /// it, past the arch.
 const COAST_S: f32 = 2.5;
+/// How much of the ghost rider shows: enough to read as a rider, little
+/// enough to read as not there.
+const GHOST_ALPHA: f32 = 0.65;
 /// A gap wider than this, in metres, is a jump — a skip along the route —
 /// and is taken in one frame, not glided over.
 const SNAP_M: f32 = 30.0;
@@ -221,6 +225,8 @@ uniform vec3 u_haze;
 uniform vec3 u_patch_cool;
 uniform vec3 u_patch_warm;
 uniform vec3 u_crack;
+// 1 but for the ghost rider, drawn see-through.
+uniform float u_alpha;
 out vec4 frag;
 
 float hash(vec3 p) {
@@ -337,7 +343,7 @@ void main() {
     }
     lit = mix(lit, u_haze, 0.6 * (1.0 - exp(-away / 450.0)));
     float k = max(away - u_fog_start, 0.0) * u_fog_density;
-    frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), 1.0);
+    frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), u_alpha);
 }
 "#;
 
@@ -520,6 +526,9 @@ struct GlState {
     clouds: MeshGl,
     rider_body: MeshGl,
     rider_leg: MeshGl,
+    /// The ghost rider: the rider's shape in the ghost's colours.
+    ghost_body: MeshGl,
+    ghost_leg: MeshGl,
     /// One per prop shape: its mesh, and every prop of that shape.
     props: Vec<PropShape>,
     /// The scene is drawn here first, and the finishing pass draws it into
@@ -584,6 +593,7 @@ struct SceneUniforms {
     patch_cool: Uniform,
     patch_warm: Uniform,
     crack: Uniform,
+    alpha: Uniform,
 }
 
 impl SceneUniforms {
@@ -611,6 +621,7 @@ impl SceneUniforms {
             patch_cool: at("u_patch_cool"),
             patch_warm: at("u_patch_warm"),
             crack: at("u_crack"),
+            alpha: at("u_alpha"),
         }
     }
 
@@ -624,6 +635,7 @@ impl SceneUniforms {
         gl.uniform_3_f32_slice(self.patch_cool.as_ref(), &light.patch_cool);
         gl.uniform_3_f32_slice(self.patch_warm.as_ref(), &light.patch_warm);
         gl.uniform_3_f32_slice(self.crack.as_ref(), &light.crack);
+        gl.uniform_1_f32(self.alpha.as_ref(), 1.0);
         gl.uniform_matrix_4_f32_slice(self.mvp.as_ref(), false, mvp);
         gl.uniform_matrix_4_f32_slice(self.model.as_ref(), false, &course3d::IDENTITY);
         gl.uniform_3_f32_slice(self.eye.as_ref(), eye);
@@ -681,6 +693,10 @@ struct Inner {
     /// what it does — once.
     finish_btn: gtk::Button,
     on_finish: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// The ride being raced, and the ride's clock of riding time — seconds,
+    /// and when they were reported — that moves it.
+    ghost: RefCell<Option<Ghost>>,
+    ride_clock: Cell<Option<(f32, i64)>>,
     /// The distance last drawn, so an unmoving camera is not redrawn.
     drawn_m: Cell<Option<f32>>,
     /// Bumped for every new route, so a build that finishes after the next
@@ -768,6 +784,8 @@ impl CourseView {
             hud: RefCell::new(HudLayer::default()),
             finish_btn: finish_btn.clone(),
             on_finish: RefCell::new(None),
+            ghost: RefCell::new(None),
+            ride_clock: Cell::new(None),
             drawn_m: Cell::new(None),
             generation: Cell::new(0),
         });
@@ -859,7 +877,24 @@ impl CourseView {
         }
         inner.finish_btn.set_visible(false);
         *inner.on_finish.borrow_mut() = None;
+        *inner.ghost.borrow_mut() = None;
+        inner.ride_clock.set(None);
         Inner::rebuild(inner);
+    }
+
+    /// Race `ghost` on this route, or nothing.
+    pub fn set_ghost(&self, ghost: Option<Ghost>) {
+        *self.inner.ghost.borrow_mut() = ghost;
+        self.inner.area.queue_render();
+    }
+
+    /// The ride's riding time, in seconds — what the ghost rides by. Called
+    /// once a tick; between ticks the ghost is carried on for at most a
+    /// second, so a pause stops it with the rider.
+    pub fn set_ride_clock(&self, secs: u32) {
+        self.inner
+            .ride_clock
+            .set(Some((secs as f32, glib::monotonic_time())));
     }
 
     /// The rider is over the line: let them coast to a stop past the arch,
@@ -1069,7 +1104,19 @@ impl Inner {
             (Some(s), Some(d)) => d.update(&s.road, distance, speed, clock_s),
             _ => Vec::new(),
         };
-        state.draw(w, h, pose, sky, time_s, &live);
+        let ghost = match (self.ghost.borrow().as_ref(), self.scene.borrow().as_ref()) {
+            (Some(g), Some(s)) => {
+                // At the start line until the ride's clock starts.
+                let secs = self.ride_clock.get().map_or(0.0, |(secs, at)| {
+                    secs + ((now - at) as f32 / 1e6).clamp(0.0, MAX_EXTRAPOLATE_S)
+                });
+                let d = g.distance_at(secs);
+                let v = g.distance_at(secs + 0.5) - g.distance_at(secs - 0.5);
+                course3d::rider_pose_in_lane(&s.run_out, d, v, course3d::GHOST_OFFSET_M)
+            }
+            _ => None,
+        };
+        state.draw(w, h, pose, ghost, sky, time_s, &live);
         self.drawn_m.set(pose.map(|_| distance));
 
         let mut hud = self.hud.borrow_mut();
@@ -1226,6 +1273,8 @@ impl GlState {
             let clouds = MeshGl::new(&gl, &empty)?;
             let rider_body = MeshGl::new(&gl, &rider::body(&rider::Avatar::default()))?;
             let rider_leg = MeshGl::new(&gl, &rider::leg(&rider::Avatar::default()))?;
+            let ghost_body = MeshGl::new(&gl, &rider::body(&rider::Avatar::ghost()))?;
+            let ghost_leg = MeshGl::new(&gl, &rider::leg(&rider::Avatar::ghost()))?;
             let props = Shape::ALL
                 .iter()
                 .map(|&shape| PropShape::new(&gl, shape))
@@ -1257,6 +1306,8 @@ impl GlState {
                 clouds,
                 rider_body,
                 rider_leg,
+                ghost_body,
+                ghost_leg,
                 props,
                 target: None,
                 u,
@@ -1347,11 +1398,13 @@ impl GlState {
         self.target.as_ref().ok_or_else(|| "no target".to_owned())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         width: i32,
         height: i32,
         pose: Option<(CameraPose, RiderPose)>,
+        ghost: Option<RiderPose>,
         sky: Sky,
         time_s: f32,
         live: &[Prop],
@@ -1448,20 +1501,13 @@ impl GlState {
                 self.world.draw(gl);
 
                 // The rider, and their legs turning with the cranks.
-                let body = course3d::rider_model(&rider_pose);
-                gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &body);
-                self.rider_body.draw(gl);
-                for side in [-1.0f32, 1.0] {
-                    let (swing, lift) = rider::leg_pose(rider_pose.crank, side);
-                    let hip = course3d::translation([
-                        rider::HIP[0],
-                        rider::HIP[1] + lift,
-                        rider::HIP[2] + side * rider::LEG_Z,
-                    ]);
-                    let leg = course3d::mul4(&body, &course3d::mul4(&hip, &course3d::pitch(swing)));
-                    gl.uniform_matrix_4_f32_slice(u.scene.model.as_ref(), false, &leg);
-                    self.rider_leg.draw(gl);
-                }
+                draw_rider(
+                    gl,
+                    &u.scene.model,
+                    &rider_pose,
+                    &self.rider_body,
+                    &self.rider_leg,
+                );
 
                 gl.use_program(Some(self.prop_program));
                 u.props.set(gl, &mvp, &camera.eye, &sky, time_s);
@@ -1496,6 +1542,23 @@ impl GlState {
                         reach.unwrap_or(PROP_DRAW_M),
                     );
                     shape.draw_live(gl);
+                }
+                // The ghost, last and see-through. Its depth goes down first
+                // on its own, so where its legs pass behind its body only the
+                // nearer shows, as on a solid rider seen through glass.
+                if let Some(g) = ghost {
+                    gl.use_program(Some(self.program));
+                    gl.color_mask(false, false, false, false);
+                    draw_rider(gl, &u.scene.model, &g, &self.ghost_body, &self.ghost_leg);
+                    gl.color_mask(true, true, true, true);
+                    gl.depth_mask(false);
+                    gl.enable(glow::BLEND);
+                    gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                    gl.uniform_1_f32(u.scene.alpha.as_ref(), GHOST_ALPHA);
+                    draw_rider(gl, &u.scene.model, &g, &self.ghost_body, &self.ghost_leg);
+                    gl.uniform_1_f32(u.scene.alpha.as_ref(), 1.0);
+                    gl.disable(glow::BLEND);
+                    gl.depth_mask(true);
                 }
                 if first {
                     let err = gl.get_error();
@@ -1664,7 +1727,14 @@ impl GlState {
         if let Some(target) = self.target.take() {
             target.destroy(&self.gl);
         }
-        for mesh in [&self.world, &self.clouds, &self.rider_body, &self.rider_leg] {
+        for mesh in [
+            &self.world,
+            &self.clouds,
+            &self.rider_body,
+            &self.rider_leg,
+            &self.ghost_body,
+            &self.ghost_leg,
+        ] {
             mesh.destroy(&self.gl);
         }
         for horizon in &self.horizons {
@@ -1838,6 +1908,31 @@ impl Target {
             gl.delete_texture(self.colour);
             gl.delete_texture(self.depth);
         }
+    }
+}
+
+/// A rider at `pose` — `body`, and `leg` twice, turning with the cranks — with
+/// the world program in use.
+unsafe fn draw_rider(
+    gl: &glow::Context,
+    model: &Uniform,
+    pose: &RiderPose,
+    body: &MeshGl,
+    leg: &MeshGl,
+) {
+    let at = course3d::rider_model(pose);
+    gl.uniform_matrix_4_f32_slice(model.as_ref(), false, &at);
+    body.draw(gl);
+    for side in [-1.0f32, 1.0] {
+        let (swing, lift) = rider::leg_pose(pose.crank, side);
+        let hip = course3d::translation([
+            rider::HIP[0],
+            rider::HIP[1] + lift,
+            rider::HIP[2] + side * rider::LEG_Z,
+        ]);
+        let m = course3d::mul4(&at, &course3d::mul4(&hip, &course3d::pitch(swing)));
+        gl.uniform_matrix_4_f32_slice(model.as_ref(), false, &m);
+        leg.draw(gl);
     }
 }
 
@@ -2456,6 +2551,21 @@ mod offscreen {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0);
+            // CYCLE_3D_GHOST_GAP=<metres>: the ghost that far ahead of the
+            // rider, or behind for a negative gap.
+            let ghost_gap: Option<f32> = std::env::var("CYCLE_3D_GHOST_GAP")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let ghost_at = |m: f32| {
+                ghost_gap.and_then(|gap| {
+                    course3d::rider_pose_in_lane(
+                        &scene.run_out,
+                        m + gap,
+                        speed,
+                        course3d::GHOST_OFFSET_M,
+                    )
+                })
+            };
             // CYCLE_3D_FRAMES=<n>: ride on at CYCLE_3D_SPEED for n frames at
             // 30 a second, writing each to CYCLE_3D_OUT with {} as its number.
             let frames: usize = std::env::var("CYCLE_3D_FRAMES")
@@ -2470,7 +2580,15 @@ mod offscreen {
                 let rider = course3d::rider_pose(&scene.road, m, speed).expect("a rider");
                 let pose = course3d::chase_camera(&scene.road, &rider);
                 let t = time_s + f as f32 / 30.0;
-                state.draw(W, H, Some((pose, rider)), scene.sky_at(m), t, &live);
+                state.draw(
+                    W,
+                    H,
+                    Some((pose, rider)),
+                    ghost_at(m),
+                    scene.sky_at(m),
+                    t,
+                    &live,
+                );
                 if bench {
                     state.gl.finish();
                 } else {
@@ -2484,7 +2602,15 @@ mod offscreen {
             if frames > 0 {
                 return;
             }
-            state.draw(W, H, Some((pose, rider)), scene.sky_at(at), time_s, &live);
+            state.draw(
+                W,
+                H,
+                Some((pose, rider)),
+                ghost_at(at),
+                scene.sky_at(at),
+                time_s,
+                &live,
+            );
             // CYCLE_3D_HUD=1: the fullscreen HUD over the road, through the
             // same texture and pass the widget uses.
             if std::env::var("CYCLE_3D_HUD").is_ok_and(|v| v == "1") {
@@ -2500,6 +2626,8 @@ mod offscreen {
                     elapsed_secs: 872,
                     climbed_m: 62.0,
                     progress: at / route.total_distance_m.max(1.0),
+                    ghost_gap_secs: None,
+                    ghost_progress: None,
                 };
                 let mut image = RideHud::new()
                     .render(W, H, &readings, &ride_hud::profile(&route))

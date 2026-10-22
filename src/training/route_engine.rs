@@ -567,6 +567,34 @@ mod tests {
     }
 
     #[test]
+    fn should_cover_about_the_distance_its_recorded_speeds_add_up_to() {
+        // The ghost rider is rebuilt from a ride's recorded speed, one value a
+        // second, while the engine moves in smaller steps within each second.
+        // Over a ride with surges, a descent and a stop, the two must agree
+        // closely enough for the ghost to be scaled onto the route's length.
+        let mut engine = RouteEngine::new(straight(2_000.0, 1_500.0, -0.06, 2_000.0), 0.0, 75.0);
+        let mut summed = 0.0f32;
+        for k in 0..900u32 {
+            let watts = match k % 120 {
+                0..=29 => 420,
+                30..=59 => 0,
+                _ => 210,
+            };
+            summed += engine.tick_sim(watts);
+            if engine.is_done() {
+                break;
+            }
+        }
+        let rode = engine.distance_m;
+        assert!(rode > 3_000.0, "rode only {rode} m");
+        let off = (summed - rode).abs() / rode;
+        assert!(
+            off < 0.02,
+            "speeds add up to {summed} m for {rode} m ridden ({off:.3})"
+        );
+    }
+
+    #[test]
     fn should_settle_at_the_steady_state_speed_on_the_flat() {
         // Momentum changes how speed is reached, never where it ends up.
         let mut engine = RouteEngine::new(straight(20_000.0, 0.0, 0.0, 0.0), 0.0, 75.0);

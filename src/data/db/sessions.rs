@@ -487,7 +487,7 @@ pub async fn checkpoint_session(
 /// Rides that were checkpointed but never finished — the app was closed, crashed
 /// or lost power mid-session. Offered back to the rider at startup.
 pub async fn load_unfinished_sessions(pool: &SqlitePool) -> Result<Vec<SessionRecord>> {
-    load_session_records_where(pool, "s.ended_at IS NULL").await
+    load_session_records_where(pool, "s.ended_at IS NULL", None).await
 }
 
 /// Close out a recovered ride, stamping the end time the rider actually stopped at.
@@ -667,17 +667,31 @@ pub async fn session_exists_at(pool: &SqlitePool, started_at: &DateTime<Utc>) ->
 /// are excluded — they must not reach history, the fitness curve or the calendar
 /// until the rider has actually finished or recovered them.
 pub async fn load_session_records(pool: &SqlitePool) -> Result<Vec<SessionRecord>> {
-    load_session_records_where(pool, "s.ended_at IS NOT NULL").await
+    load_session_records_where(pool, "s.ended_at IS NOT NULL", None).await
+}
+
+/// The finished rides of the saved route `route_id` that the rider drove:
+/// the ones a ghost can be made of (`data::ghost::fastest`).
+pub async fn load_route_rides(pool: &SqlitePool, route_id: i64) -> Result<Vec<Session>> {
+    let records = load_session_records_where(
+        pool,
+        "s.ended_at IS NOT NULL AND s.rider_driven = 1 AND s.route_id = ?",
+        Some(route_id),
+    )
+    .await?;
+    Ok(records.into_iter().map(|r| r.session).collect())
 }
 
 /// Shared body of the full-fidelity session loaders. `predicate` is a trusted
 /// literal supplied by this module only — never user input, so it is inlined
 /// rather than bound (there is no way to parameterise a WHERE clause in SQL).
+/// Its one `?`, if it has one, is bound to `value`.
 async fn load_session_records_where(
     pool: &SqlitePool,
     predicate: &'static str,
+    value: Option<i64>,
 ) -> Result<Vec<SessionRecord>> {
-    let rows = sqlx::query(&format!(
+    let sql = format!(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
                 s.integrity_dismissed, s.is_ftp_test, s.route_id, s.rider_driven,
@@ -686,9 +700,12 @@ async fn load_session_records_where(
          LEFT JOIN workouts w ON s.workout_id = w.id
          WHERE {predicate}
          ORDER BY s.started_at DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+    );
+    let mut query = sqlx::query(&sql);
+    if let Some(v) = value {
+        query = query.bind(v);
+    }
+    let rows = query.fetch_all(pool).await?;
 
     let mut records = Vec::new();
     for r in rows {
@@ -1021,6 +1038,35 @@ mod tests {
         assert_eq!(by_id(already).await, (Some(north), 1), "left as it was");
         // Run again: nothing more to link.
         assert_eq!(link_old_route_rides(&pool, &load).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_load_only_the_routes_finished_rides_the_rider_drove() {
+        let pool = test_pool().await;
+        let north = save_route(&pool, "North", "north.gpx", 2_000.0, 0.0)
+            .await
+            .unwrap();
+        let south = save_route(&pool, "South", "south.gpx", 2_000.0, 0.0)
+            .await
+            .unwrap();
+        let ride = |route: i64, driven: bool, done: bool| {
+            let mut s = Session::new(None);
+            s.route_id = Some(route);
+            s.rider_driven = driven;
+            s.ended_at = done.then_some(s.started_at);
+            s
+        };
+        let keep = save_session(&pool, &ride(north, true, true)).await.unwrap();
+        save_session(&pool, &ride(north, false, true))
+            .await
+            .unwrap();
+        checkpoint_session(&pool, None, &ride(north, true, false))
+            .await
+            .unwrap();
+        save_session(&pool, &ride(south, true, true)).await.unwrap();
+
+        let rides = load_route_rides(&pool, north).await.unwrap();
+        assert_eq!(rides.iter().map(|s| s.id).collect::<Vec<_>>(), vec![keep]);
     }
 
     #[tokio::test]

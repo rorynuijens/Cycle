@@ -663,6 +663,21 @@ fn direction_at(road: &[RoadPoint], distance_m: f32) -> Option<[f32; 3]> {
 /// leaning into a bend as far as the speed round it asks — the lean that
 /// balances a bike, `tan θ = v² / (g r)`.
 pub fn rider_pose(road: &[RoadPoint], distance_m: f32, speed_ms: f32) -> Option<RiderPose> {
+    rider_pose_in_lane(road, distance_m, speed_ms, RIDER_OFFSET_M)
+}
+
+/// The ghost's lane: the left-hand one, beside the rider's, so the two can
+/// ride level without one hiding the other.
+pub const GHOST_OFFSET_M: f32 = -RIDER_OFFSET_M;
+
+/// As [`rider_pose`], `offset_m` to the right of the road's line — negative
+/// for the left-hand lane.
+pub fn rider_pose_in_lane(
+    road: &[RoadPoint],
+    distance_m: f32,
+    speed_ms: f32,
+    offset_m: f32,
+) -> Option<RiderPose> {
     let start = road.first()?.distance_m;
     let end = road.last()?.distance_m;
     let d = distance_m.clamp(start, end);
@@ -672,7 +687,7 @@ pub fn rider_pose(road: &[RoadPoint], distance_m: f32, speed_ms: f32) -> Option<
     // its right-hand lane, beside the line, at the line's own distance and
     // height — so the ride's numbers are the line's, only the rider moves
     // over.
-    let (rx, rz) = (-dir[2] * RIDER_OFFSET_M, dir[0] * RIDER_OFFSET_M);
+    let (rx, rz) = (-dir[2] * offset_m, dir[0] * offset_m);
     // Nose up or down with the road under the wheels.
     let span = 3.0;
     let behind = position_at(road, (d - span).max(start))?;
@@ -2261,6 +2276,25 @@ mod tests {
                 distance_m: i as f32 * 10.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn should_ride_the_ghost_in_the_other_lane_level_with_its_distance() {
+        for road in [road_of(&straight_route(50, 10.0, 0.0)), east_line(50)] {
+            for d in [0.0, 200.0, 490.0] {
+                let rider = rider_at(&road, d);
+                let ghost = rider_pose_in_lane(&road, d, 8.0, GHOST_OFFSET_M).expect("a ghost");
+                let on = position_at(&road, d).expect("a road");
+                // Mirrored across the line: as far left as the rider is right.
+                for k in [0, 2] {
+                    assert!(
+                        (ghost.pos[k] - on[k] + (rider.pos[k] - on[k])).abs() < 1e-3,
+                        "at {d}: rider {rider:?}, ghost {ghost:?}"
+                    );
+                }
+                assert!((ghost.yaw - rider.yaw).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]

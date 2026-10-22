@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::data::athlete::AthleteProfile;
 use crate::data::biome::WorldLook;
+use crate::data::ghost::{self, Ghost};
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
@@ -80,6 +81,8 @@ const TICK_SPACING_M: f32 = 500.0;
 const GRADIENT_DIGITS: i32 = 5;
 const SPEED_DIGITS: i32 = 4;
 const CLIMB_DIGITS: i32 = 4;
+/// The gap to the ghost: "−10:00" at the most a rider will see.
+const GAP_DIGITS: i32 = 6;
 
 /// Room left under the look-ahead chart for its distance labels, in pixels.
 const AXIS_HEIGHT: f64 = 14.0;
@@ -208,6 +211,13 @@ pub struct RoutePlayerPage {
     hr_label: gtk::Label,
     cadence_label: gtk::Label,
     climb_label: gtk::Label,
+    /// The gap to the ghost, shown only while racing one.
+    ghost_box: gtk::Box,
+    ghost_label: gtk::Label,
+    /// The ghost being raced on this ride, and the saved route the ride is
+    /// on — a ghost loaded for another route is not taken.
+    ghost: RefCell<Option<Ghost>>,
+    ghost_route: Cell<Option<i64>>,
     gradient_label: gtk::Label,
     speed_label: gtk::Label,
     elapsed_label: gtk::Label,
@@ -496,6 +506,13 @@ impl RoutePlayerPage {
         secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
         secondary_grid.attach(&elapsed_box, 2, 0, 1, 1);
         secondary_grid.attach(&climb_box, 3, 0, 1, 1);
+        let (ghost_box, ghost_label) =
+            metric_column("Ghost", None, "0:00", &["title-2", "numeric"], GAP_DIGITS);
+        ghost_box.set_visible(false);
+        ghost_box.set_tooltip_text(Some(
+            "How far behind your best ride of this route you are (+) or ahead of it (−)",
+        ));
+        secondary_grid.attach(&ghost_box, 4, 0, 1, 1);
         above.append(&secondary_grid);
 
         // ── Map and profiles — the slot the workout screen gives its graph ───
@@ -694,6 +711,10 @@ impl RoutePlayerPage {
             hr_label,
             cadence_label,
             climb_label,
+            ghost_box,
+            ghost_label,
+            ghost: RefCell::new(None),
+            ghost_route: Cell::new(None),
             gradient_label,
             speed_label,
             elapsed_label,
@@ -986,6 +1007,10 @@ impl RoutePlayerPage {
         self.pause_btn.set_tooltip_text(Some("Pause ride"));
         self.pause_btn.set_sensitive(true);
         self.end_btn.set_sensitive(true);
+        *self.ghost.borrow_mut() = None;
+        self.ghost_route.set(None);
+        self.ghost_box.set_visible(false);
+        self.route_map.set_ghost_position(None);
         self.immersion.set_finished(false);
         // The dial is a judgement about today's legs, so each ride starts from
         // the Preferences baseline rather than inheriting the last ride's.
@@ -1007,6 +1032,18 @@ impl RoutePlayerPage {
         self.route_map.set_route(&line);
         self.route_map.set_lookahead(&[]);
         self.course_view.set_route(route, look);
+    }
+
+    /// Race `ghost` on the ride of the saved route `route_id`, if that is the
+    /// ride under way: a ghost that took a while to load for a ride since
+    /// replaced is dropped.
+    pub fn set_ghost(&self, route_id: i64, ghost: Option<Ghost>) {
+        if self.ghost_route.get() != Some(route_id) {
+            return;
+        }
+        self.ghost_box.set_visible(ghost.is_some());
+        self.course_view.set_ghost(ghost.clone());
+        *self.ghost.borrow_mut() = ghost;
     }
 
     /// Start the 1 Hz ride loop. Calls `on_complete` with the session when the route
@@ -1057,6 +1094,7 @@ impl RoutePlayerPage {
         // says otherwise.
         new_session.route_id = route_id;
         new_session.rider_driven = true;
+        page.ghost_route.set(route_id);
         let engine = Rc::new(RefCell::new(RouteEngine::new(route, 6.944, mass_kg)));
         #[cfg(debug_assertions)]
         if fake_rider_watts(std::env::var(FAKE_RIDER_ENV).ok().as_deref()).is_some() {
@@ -1474,6 +1512,26 @@ impl RoutePlayerPage {
                 page.route_map.set_position(lat, lng);
             }
             page.course_view.set_progress(distance_m, speed_ms);
+            page.course_view.set_ride_clock(elapsed);
+            // The ghost: where it is after as much riding, and the gap to it.
+            let ghost_now = page.ghost.borrow().as_ref().map(|g| {
+                let at = g.distance_at(elapsed as f32);
+                (at, g.gap(distance_m, elapsed as f32))
+            });
+            if let Some((ghost_m, gap)) = ghost_now {
+                let text = ghost::format_gap(gap.secs);
+                page.ghost_label.set_label(&text);
+                // Green ahead, amber behind, plain when level.
+                page.ghost_label.remove_css_class("success");
+                page.ghost_label.remove_css_class("warning");
+                match text.chars().next() {
+                    Some('−') => page.ghost_label.add_css_class("success"),
+                    Some('+') => page.ghost_label.add_css_class("warning"),
+                    _ => {}
+                }
+                page.route_map
+                    .set_ghost_position(engine.borrow().position_at(ghost_m));
+            }
             page.course_view.set_hud(HudReadings {
                 route_name: engine.borrow().route.name.clone(),
                 power_watts: readings.power_watts,
@@ -1490,6 +1548,10 @@ impl RoutePlayerPage {
                 } else {
                     0.0
                 },
+                ghost_gap_secs: ghost_now.map(|(_, gap)| gap.secs),
+                ghost_progress: ghost_now
+                    .filter(|_| total_dist > 0.0)
+                    .map(|(m, _)| m / total_dist),
             });
 
             if is_done && !completed_tick.get() {
