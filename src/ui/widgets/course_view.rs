@@ -115,6 +115,9 @@ in vec2 i_motion;
 uniform mat4 u_mvp;
 uniform vec3 u_eye;
 uniform float u_time;
+// Small props shrink away between these distances from the eye, in metres,
+// rather than blinking out where they stop being drawn.
+uniform vec2 u_reach;
 uniform float u_orbit;
 uniform float u_head;
 uniform vec2 u_hub;
@@ -178,7 +181,7 @@ void main() {
     }
     float c = cos(yaw);
     float s = sin(yaw);
-    p *= i_size.x;
+    p *= i_size.x * (1.0 - smoothstep(u_reach.x, u_reach.y, length(base - u_eye)));
     vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
     v_colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
     v_world = world;
@@ -211,6 +214,9 @@ uniform vec3 u_sunlit;
 uniform vec3 u_shade;
 uniform vec3 u_rim;
 uniform vec3 u_haze;
+uniform vec3 u_patch_cool;
+uniform vec3 u_patch_warm;
+uniform vec3 u_crack;
 out vec4 frag;
 
 float hash(vec3 p) {
@@ -229,6 +235,40 @@ float noise2(vec2 p) {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
+// A hash without sine, steady at the scene's thousands of metres.
+float hash13(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+// Stone: the world cut into rounded blocks. Returns how far this point is
+// from the nearest crack between two blocks, and a tone for its block.
+vec2 stone(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    float d1 = 8.0;
+    float d2 = 8.0;
+    float tone = 0.0;
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            for (int z = -1; z <= 1; z++) {
+                vec3 g = vec3(float(x), float(y), float(z));
+                vec3 o = vec3(hash13(i + g), hash13(i + g + 17.0), hash13(i + g + 31.0));
+                float d = length(g + o - f);
+                if (d < d1) {
+                    d2 = d1;
+                    d1 = d;
+                    tone = hash13(i + g + 5.0);
+                } else if (d < d2) {
+                    d2 = d;
+                }
+            }
+        }
+    }
+    return vec2(d2 - d1, tone);
+}
+
 void main() {
     vec3 c = v_colour.rgb;
     float material = floor(v_colour.a + 0.5);
@@ -239,10 +279,29 @@ void main() {
     // the sign of a vertical component that is noise, and the wall comes out
     // speckled light and dark pixel by pixel.
     if (dot(n, v_rel) > 0.0) n = -n;
+    float away = length(v_rel);
     if (material == 1.0) {
         // A hand-made look: each facet of the land a few per cent lighter or
         // darker, seeded by where it is.
         c *= 0.96 + 0.08 * hash(floor(v_anchor));
+        if (n.y > 0.5) {
+            // Painted patches across the grass, cooler and warmer, and up
+            // close long soft brush strokes. The strokes go before they are
+            // small enough to shimmer.
+            vec2 g = v_world.xz;
+            float blotch = 0.6 * noise2(g / 22.0) + 0.4 * noise2(g / 8.0 + 3.1);
+            c *= mix(u_patch_cool, u_patch_warm, smoothstep(0.3, 0.7, blotch));
+            float stroke = noise2(vec2(g.x * 1.4 + g.y * 0.5, g.y * 0.35 - g.x * 0.2));
+            c *= 1.0 + 0.08 * (stroke - 0.5) * (1.0 - smoothstep(25.0, 60.0, away));
+        }
+    } else if (material == 3.0) {
+        // Rock: blocks of their own tone, split by darker cracks. Both go
+        // with distance, before a crack is thinner than a pixel.
+        vec2 st = stone(v_world / 1.7);
+        float near = 1.0 - smoothstep(60.0, 160.0, away);
+        float crack = 1.0 - smoothstep(0.05, 0.05 + 1.5 * fwidth(st.x), st.x);
+        c *= mix(1.0, 0.86 + 0.24 * st.y, near);
+        c *= mix(vec3(1.0), u_crack, crack * near);
     } else if (material == 4.0) {
         // Water lies flat, with lighter stripes drifting along it.
         n = vec3(0.0, 1.0, 0.0);
@@ -272,7 +331,6 @@ void main() {
         frag = vec4(mix(lit, mix(u_horizon, u_haze, 0.6), mix(0.72, 0.32, up)), 1.0);
         return;
     }
-    float away = length(v_rel);
     lit = mix(lit, u_haze, 0.6 * (1.0 - exp(-away / 450.0)));
     float k = max(away - u_fog_start, 0.0) * u_fog_density;
     frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), 1.0);
@@ -505,6 +563,9 @@ struct SceneUniforms {
     shade: Uniform,
     rim: Uniform,
     haze: Uniform,
+    patch_cool: Uniform,
+    patch_warm: Uniform,
+    crack: Uniform,
 }
 
 impl SceneUniforms {
@@ -529,6 +590,9 @@ impl SceneUniforms {
             shade: at("u_shade"),
             rim: at("u_rim"),
             haze: at("u_haze"),
+            patch_cool: at("u_patch_cool"),
+            patch_warm: at("u_patch_warm"),
+            crack: at("u_crack"),
         }
     }
 
@@ -539,6 +603,9 @@ impl SceneUniforms {
         gl.uniform_3_f32_slice(self.shade.as_ref(), &light.shade);
         gl.uniform_3_f32_slice(self.rim.as_ref(), &light.rim);
         gl.uniform_3_f32_slice(self.haze.as_ref(), &light.haze);
+        gl.uniform_3_f32_slice(self.patch_cool.as_ref(), &light.patch_cool);
+        gl.uniform_3_f32_slice(self.patch_warm.as_ref(), &light.patch_warm);
+        gl.uniform_3_f32_slice(self.crack.as_ref(), &light.crack);
         gl.uniform_matrix_4_f32_slice(self.mvp.as_ref(), false, mvp);
         gl.uniform_matrix_4_f32_slice(self.model.as_ref(), false, &course3d::IDENTITY);
         gl.uniform_3_f32_slice(self.eye.as_ref(), eye);
@@ -567,6 +634,7 @@ struct Uniforms {
     sky_horizon: Uniform,
     sky_zenith: Uniform,
     sky_glow: Uniform,
+    p_reach: Uniform,
     finish_colour: Uniform,
     finish_corner: Uniform,
     hud_image: Uniform,
@@ -1046,6 +1114,7 @@ impl GlState {
                 sky_horizon: at(sky_program, "u_horizon"),
                 sky_zenith: at(sky_program, "u_zenith"),
                 sky_glow: at(sky_program, "u_glow"),
+                p_reach: at(prop_program, "u_reach"),
                 finish_colour: at(finish_program, "u_colour"),
                 finish_corner: at(finish_program, "u_corner"),
                 hud_image: at(hud_program, "u_hud"),
@@ -1289,7 +1358,19 @@ impl GlState {
                     }
                 };
                 for shape in &self.props {
-                    shape.draw(gl, camera.eye, forward, tan_half);
+                    let reach = shape.shape.reach_m();
+                    let (gone_from, gone) = match reach {
+                        Some(r) => (0.75 * r, r),
+                        None => (f32::MAX / 2.0, f32::MAX),
+                    };
+                    gl.uniform_2_f32(u.p_reach.as_ref(), gone_from, gone);
+                    shape.draw(
+                        gl,
+                        camera.eye,
+                        forward,
+                        tan_half,
+                        reach.unwrap_or(PROP_DRAW_M),
+                    );
                     shape.draw_live(gl);
                 }
                 if first {
@@ -1534,7 +1615,14 @@ impl PropShape {
     /// Draw the props of every chunk within reach of the eye. Each chunk's
     /// run is reached by pointing the per-prop attributes at its start: GL
     /// ES 3.0 has no base instance.
-    unsafe fn draw(&self, gl: &glow::Context, eye: [f32; 3], forward: (f32, f32), tan_half: f32) {
+    unsafe fn draw(
+        &self,
+        gl: &glow::Context,
+        eye: [f32; 3],
+        forward: (f32, f32),
+        tan_half: f32,
+        reach_m: f32,
+    ) {
         if self.chunks.is_empty() || self.mesh.index_count == 0 {
             return;
         }
@@ -1542,7 +1630,7 @@ impl PropShape {
         gl.bind_vertex_array(Some(self.mesh.vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
         for chunk in &self.chunks {
-            if !props::in_view(chunk, eye, forward, tan_half, PROP_DRAW_M) {
+            if !props::in_view(chunk, eye, forward, tan_half, reach_m) {
                 continue;
             }
             let base = chunk.start as i32 * stride;
@@ -1701,6 +1789,99 @@ fn egl_get_proc_address() -> Option<GetProcAddress> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Words GLSL keeps for itself — in OpenGL ES 3.0, which GTK may hand
+    /// the view, and in desktop GL — that a shader may not name anything.
+    const RESERVED: &[&str] = &[
+        "attribute",
+        "varying",
+        "coherent",
+        "volatile",
+        "restrict",
+        "readonly",
+        "writeonly",
+        "resource",
+        "atomic_uint",
+        "noperspective",
+        "patch",
+        "sample",
+        "subroutine",
+        "common",
+        "partition",
+        "active",
+        "asm",
+        "class",
+        "union",
+        "enum",
+        "typedef",
+        "template",
+        "this",
+        "goto",
+        "inline",
+        "noinline",
+        "public",
+        "static",
+        "extern",
+        "external",
+        "interface",
+        "long",
+        "short",
+        "double",
+        "half",
+        "fixed",
+        "unsigned",
+        "superp",
+        "input",
+        "output",
+        "filter",
+        "sizeof",
+        "cast",
+        "namespace",
+        "using",
+        "texture2D",
+        "buffer",
+        "shared",
+        "precise",
+        "invariant",
+        "centroid",
+        "smooth",
+        "layout",
+    ];
+
+    #[test]
+    fn should_name_nothing_in_a_shader_with_a_word_glsl_keeps_for_itself() {
+        // Mesa's desktop compiler let `float patch` through offscreen; the
+        // context GTK gave the rider refused it, and the view never started.
+        // `layout`, `smooth`, `invariant` and `centroid` are keywords a
+        // shader may use as such, but never as a name.
+        let shaders = [
+            ("VERTEX", VERTEX_SHADER),
+            ("PROP_VERTEX", PROP_VERTEX_SHADER),
+            ("FRAGMENT", FRAGMENT_SHADER),
+            ("FULLSCREEN_VERTEX", FULLSCREEN_VERTEX_SHADER),
+            ("HUD_FRAGMENT", HUD_FRAGMENT_SHADER),
+            ("SKY_FRAGMENT", SKY_FRAGMENT_SHADER),
+            ("FINISH_FRAGMENT", FINISH_FRAGMENT_SHADER),
+        ];
+        for (name, src) in shaders {
+            let code: String = src
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let words = code
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .collect::<Vec<_>>();
+            for (k, w) in words.iter().enumerate() {
+                if !RESERVED.contains(w) {
+                    continue;
+                }
+                // `layout(location = …)` is the one use the shaders make.
+                let used_as_keyword = *w == "layout" && code.contains("layout(location");
+                assert!(used_as_keyword, "{name} names something `{w}` (word {k})");
+            }
+        }
+    }
 
     #[test]
     fn should_stay_put_before_the_first_report() {

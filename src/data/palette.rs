@@ -138,6 +138,14 @@ pub struct Palette {
     pub goose: Rgb,
     pub owl: Rgb,
     pub pigeon: Rgb,
+    /// Tufts of grass along the verge, a shade deeper than the grass round
+    /// them so they read; dry ones where the land is dry.
+    pub verge_grass: Rgb,
+    pub dry_grass: Rgb,
+    /// Wild flowers along the verge.
+    pub flower_a: Rgb,
+    pub flower_b: Rgb,
+    pub flower_c: Rgb,
 }
 
 /// The shared base palette: the skill's names (§3, §7.1), tuned to the
@@ -235,6 +243,11 @@ pub const BASE: Palette = Palette {
     goose: hex(0xE9E6DF),
     owl: hex(0x8C6B4A),
     pigeon: hex(0x8A8F99),
+    verge_grass: hex(0x6FBF4A),
+    dry_grass: hex(0xC9B46A),
+    flower_a: hex(0xF5D547),
+    flower_b: hex(0xF27A9C),
+    flower_c: hex(0xF7F5EE),
 };
 
 /// The fullscreen ride HUD's colours. The HUD is drawn inside the 3D view in
@@ -286,7 +299,8 @@ pub const HUD: HudColours = HudColours {
 /// colour is multiplied by: in full sun, in shade, and along the edge of a
 /// wall or crown with the sun on it. Then the blue the middle distance sinks
 /// into, the near-white the sky brightens to at the horizon, and what the
-/// picture's corners are darkened by.
+/// picture's corners are darkened by; then the grass's patches and the
+/// rock's cracks.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Light {
     pub sunlit: Rgb,
@@ -295,6 +309,11 @@ pub struct Light {
     pub haze: Rgb,
     pub horizon_glow: Rgb,
     pub corner: Rgb,
+    /// The grass's painted patches run between these, and the cracks
+    /// between blocks of rock are darkened by this.
+    pub patch_cool: Rgb,
+    pub patch_warm: Rgb,
+    pub crack: Rgb,
 }
 
 pub const LIGHT: Light = Light {
@@ -304,6 +323,9 @@ pub const LIGHT: Light = Light {
     haze: hex(0x9EC4F0),
     horizon_glow: hex(0xFFFFFF),
     corner: [0.78, 0.82, 0.95],
+    patch_cool: [0.92, 0.96, 1.03],
+    patch_warm: [1.06, 1.04, 0.93],
+    crack: [0.72, 0.72, 0.82],
 };
 
 /// Names a biome may not override: the track and the rider look the same
@@ -417,6 +439,11 @@ impl Palette {
             "goose" => &mut self.goose,
             "owl" => &mut self.owl,
             "pigeon" => &mut self.pigeon,
+            "verge_grass" => &mut self.verge_grass,
+            "dry_grass" => &mut self.dry_grass,
+            "flower_a" => &mut self.flower_a,
+            "flower_b" => &mut self.flower_b,
+            "flower_c" => &mut self.flower_c,
             _ => return None,
         })
     }
@@ -485,7 +512,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 91] = [
+        const NAMES: [&str; 96] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -577,13 +604,18 @@ mod tests {
             "goose",
             "owl",
             "pigeon",
+            "verge_grass",
+            "dry_grass",
+            "flower_a",
+            "flower_b",
+            "flower_c",
         ];
         assert_eq!(NAMES.len(), size_of::<Palette>() / size_of::<Rgb>());
         let mut p = BASE;
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 91] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 96] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

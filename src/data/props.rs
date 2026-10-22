@@ -60,10 +60,14 @@ pub enum Shape {
     Chicken,
     Dolphin,
     Marmot,
+    /// A tuft of grass on the verge.
+    Tuft,
+    /// A clump of wild flowers on the verge.
+    Flowers,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 40] = [
+    pub const ALL: [Shape; 42] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -104,6 +108,8 @@ impl Shape {
         Shape::Chicken,
         Shape::Dolphin,
         Shape::Marmot,
+        Shape::Tuft,
+        Shape::Flowers,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -114,6 +120,13 @@ impl Shape {
             Shape::Sheep | Shape::Bird => crate::data::animals::mesh(self),
             _ => crate::data::kit::mesh(self),
         }
+    }
+
+    /// How far from the eye this shape is drawn, if nearer than every
+    /// other prop: there are thousands of verge plants, and past this each
+    /// is a pixel or two.
+    pub fn reach_m(self) -> Option<f32> {
+        matches!(self, Shape::Tuft | Shape::Flowers).then_some(VERGE_REACH_M)
     }
 
     /// An animal: hidden, with the encounters, when the rider turns animals
@@ -210,6 +223,10 @@ pub struct Prop {
 /// Props are sent to the view in square chunks this wide, so a chunk out of
 /// sight is skipped whole.
 pub const CHUNK_M: f32 = 500.0;
+
+/// Verge plants are drawn this far from the eye, in metres, shrinking away
+/// over the last quarter of it rather than blinking out.
+pub const VERGE_REACH_M: f32 = 200.0;
 
 /// Floats per prop as the view reads them: x, y, z, size, yaw, red, green,
 /// blue, motion, phase.
@@ -427,6 +444,14 @@ mod tests {
         );
         assert!(!in_reach(&c, 1_501.0, 250.0, 1_000.0));
         assert!(!in_reach(&c, 1_300.0, 1_300.0, 1_000.0), "corner just past");
+    }
+
+    #[test]
+    fn should_draw_only_the_verge_plants_near_the_eye() {
+        for shape in Shape::ALL {
+            let small = matches!(shape, Shape::Tuft | Shape::Flowers);
+            assert_eq!(shape.reach_m(), small.then_some(VERGE_REACH_M), "{shape:?}");
+        }
     }
 
     #[test]

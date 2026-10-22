@@ -13,7 +13,7 @@
 //! Pure: no GTK, no GL.
 
 use crate::data::animals::cuboid;
-use crate::data::course3d::{Mesh, Vertex, MATERIAL_GROUND, MATERIAL_PLAIN};
+use crate::data::course3d::{Mesh, Vertex, MATERIAL_GROUND, MATERIAL_PLAIN, MATERIAL_ROCK};
 use crate::data::palette::{self, Rgb};
 use crate::data::props::{Shape, OWN_COLOUR};
 
@@ -39,6 +39,8 @@ fn c(rgb: Rgb) -> [f32; 4] {
 
 /// The prop's own colour, lit plainly.
 const OWN: [f32; 4] = [OWN_COLOUR[0], OWN_COLOUR[1], OWN_COLOUR[2], MATERIAL_PLAIN];
+/// The prop's own colour on rock: blocks and cracks.
+const ROCK: [f32; 4] = [OWN_COLOUR[0], OWN_COLOUR[1], OWN_COLOUR[2], MATERIAL_ROCK];
 /// The prop's own colour on leaves, with the facet-to-facet shimmer the
 /// land and the tree crowns have.
 const LEAF: [f32; 4] = [OWN_COLOUR[0], OWN_COLOUR[1], OWN_COLOUR[2], MATERIAL_GROUND];
@@ -152,6 +154,88 @@ fn beam(a: [f32; 3], b: [f32; 3], w: f32, h: f32, colour: [f32; 4]) -> Mesh {
     }
     quad(&mut m, [ra[3], ra[2], ra[1], ra[0]], colour);
     quad(&mut m, rb, colour);
+    m
+}
+
+/// A blade of grass or a stem: a thin flat leaf from `root` to `tip`, `w`
+/// wide at its foot, turned side-on to the way it leans.
+fn blade(root: [f32; 3], tip: [f32; 3], w: f32, colour: [f32; 4]) -> Mesh {
+    let mut m = Mesh::default();
+    let (dx, dz) = (tip[0] - root[0], tip[2] - root[2]);
+    let lean = dx.hypot(dz);
+    let (px, pz) = if lean > 1e-4 {
+        (-dz / lean * w / 2.0, dx / lean * w / 2.0)
+    } else {
+        (w / 2.0, 0.0)
+    };
+    tri(
+        &mut m,
+        [
+            [root[0] - px, root[1], root[2] - pz],
+            [root[0] + px, root[1], root[2] + pz],
+            tip,
+        ],
+        colour,
+    );
+    m
+}
+
+/// A flower's head: a flat eight-faced gem round `centre`, `r` across and
+/// `h` deep.
+fn gem(centre: [f32; 3], r: f32, h: f32, colour: [f32; 4]) -> Mesh {
+    let mut m = Mesh::default();
+    let [x, y, z] = centre;
+    let rim = [[x + r, y, z], [x, y, z + r], [x - r, y, z], [x, y, z - r]];
+    for k in 0..4 {
+        let (a, b) = (rim[k], rim[(k + 1) % 4]);
+        tri(&mut m, [a, b, [x, y + h, z]], colour);
+        tri(&mut m, [b, a, [x, y - h, z]], colour);
+    }
+    m
+}
+
+/// A rounded lump of rock round `centre`, stretched by `radius`, cut flat
+/// where it meets the ground: more rings and sides than a crown's ball, so
+/// it reads as a worn stone, not a cut gem.
+fn lump(centre: [f32; 3], radius: [f32; 3], colour: [f32; 4]) -> Mesh {
+    const SIDES: usize = 10;
+    const RINGS: [f32; 5] = [-0.8, -0.42, 0.0, 0.42, 0.8];
+    let mut m = Mesh::default();
+    let at = |x: f32, y: f32, z: f32| {
+        [
+            centre[0] + x * radius[0],
+            (centre[1] + y * radius[1]).max(0.0),
+            centre[2] + z * radius[2],
+        ]
+    };
+    let bottom = push(&mut m, at(0.0, -1.0, 0.0), colour);
+    let rings: Vec<Vec<u32>> = RINGS
+        .iter()
+        .enumerate()
+        .map(|(r, &y)| {
+            let w = (1.0 - y * y).sqrt();
+            let turn = r as f32 * 0.5;
+            (0..SIDES)
+                .map(|k| {
+                    let a = (k as f32 + turn) / SIDES as f32 * std::f32::consts::TAU;
+                    push(&mut m, at(w * a.cos(), y, w * a.sin()), colour)
+                })
+                .collect()
+        })
+        .collect();
+    let top = push(&mut m, at(0.0, 1.0, 0.0), colour);
+    for k in 0..SIDES {
+        let j = (k + 1) % SIDES;
+        m.indices
+            .extend_from_slice(&[bottom, rings[0][j], rings[0][k]]);
+        for r in 0..rings.len() - 1 {
+            let (a, b) = (&rings[r], &rings[r + 1]);
+            m.indices
+                .extend_from_slice(&[a[k], a[j], b[k], a[j], b[j], b[k]]);
+        }
+        let last = &rings[rings.len() - 1];
+        m.indices.extend_from_slice(&[last[k], last[j], top]);
+    }
     m
 }
 
@@ -333,7 +417,65 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(ball([0.32, 0.38, 0.2], [0.32, 0.3, 0.32], LEAF));
         }
         Shape::Boulder => {
-            m.extend(ball([0.0, 0.45, 0.0], [0.62, 0.45, 0.5], OWN));
+            // Two or three worn lumps leaning together, sat flat on the
+            // ground, rather than one sharp ball balanced on its point.
+            m.extend(lump([0.0, 0.32, 0.0], [0.62, 0.62, 0.52], ROCK));
+            m.extend(lump([0.42, 0.18, 0.22], [0.36, 0.42, 0.34], ROCK));
+            m.extend(lump([-0.36, 0.12, -0.26], [0.32, 0.34, 0.3], ROCK));
+        }
+        Shape::Tuft => {
+            // Eleven blades fanning out from one root, each its own length:
+            // a clump, not a weed.
+            const BLADES: [(f32, f32, f32); 11] = [
+                (0.0, 0.95, 0.26),
+                (0.57, 0.70, 0.34),
+                (1.14, 0.88, 0.20),
+                (1.71, 1.00, 0.14),
+                (2.28, 0.66, 0.36),
+                (2.85, 0.82, 0.26),
+                (3.42, 0.92, 0.18),
+                (3.99, 0.72, 0.32),
+                (4.56, 0.86, 0.24),
+                (5.13, 0.62, 0.38),
+                (5.70, 0.90, 0.20),
+            ];
+            for (a, h, lean) in BLADES {
+                let (ca, sa) = (a.cos(), a.sin());
+                m.extend(blade(
+                    [0.08 * ca, 0.0, 0.08 * sa],
+                    [lean * ca, h, lean * sa],
+                    0.16,
+                    OWN,
+                ));
+            }
+        }
+        Shape::Flowers => {
+            // A few stems with a head each, and blades of leaf at their feet.
+            const STEMS: [(f32, f32, f32); 5] = [
+                (0.3, 0.90, 0.10),
+                (1.6, 0.72, 0.22),
+                (2.9, 0.84, 0.18),
+                (4.1, 0.62, 0.26),
+                (5.3, 0.78, 0.14),
+            ];
+            let stem = c(b.verge_grass);
+            for (a, h, out) in STEMS {
+                let (ca, sa) = (a.cos(), a.sin());
+                let tip = [out * ca, h, out * sa];
+                m.extend(blade(
+                    [0.4 * out * ca, 0.0, 0.4 * out * sa],
+                    tip,
+                    0.04,
+                    stem,
+                ));
+                m.extend(blade(
+                    [0.05 * ca, 0.0, 0.05 * sa],
+                    [0.5 * out * ca + 0.1 * sa, 0.32, 0.5 * out * sa - 0.1 * ca],
+                    0.08,
+                    stem,
+                ));
+                m.extend(gem(tip, 0.14, 0.07, OWN));
+            }
         }
         Shape::HayBale => {
             m.extend(tube(0.0, 0.0, 0.5, 0.5, 0.0, 0.8, 8, OWN));
@@ -911,6 +1053,29 @@ mod tests {
     }
 
     #[test]
+    fn should_sit_a_boulder_on_a_flat_base_as_rounded_rock() {
+        let m = mesh(Shape::Boulder);
+        let on_ground = m.vertices.iter().filter(|v| v.pos[1].abs() < 1e-5).count();
+        assert!(
+            on_ground >= 8,
+            "only {on_ground} corners on the ground: it rocks on a point"
+        );
+        assert!(
+            m.vertices.iter().all(|v| v.pos[1] >= 0.0),
+            "nothing below the ground"
+        );
+        assert!(
+            m.indices.len() / 3 >= 120,
+            "{} facets is a cut gem, not a rounded rock",
+            m.indices.len() / 3
+        );
+        assert!(
+            m.vertices.iter().all(|v| v.colour[3] == MATERIAL_ROCK),
+            "drawn as rock"
+        );
+    }
+
+    #[test]
     fn should_stand_every_plant_and_building_inside_its_unit() {
         for shape in [
             Shape::Olive,
@@ -921,6 +1086,8 @@ mod tests {
             Shape::Reeds,
             Shape::Bush,
             Shape::Boulder,
+            Shape::Tuft,
+            Shape::Flowers,
             Shape::HayBale,
             Shape::Barn,
             Shape::House,

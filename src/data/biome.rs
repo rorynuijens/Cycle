@@ -753,6 +753,40 @@ impl Blend for Weights {
 mod tests {
     use super::*;
 
+    /// The verge plants a biome sets out along the road: (tufts, flowers).
+    fn verge_rules(b: Biome) -> (Vec<&'static crate::data::dressing::PropRule>, usize) {
+        let props = &b.def().props;
+        let tufts: Vec<_> = props.iter().filter(|r| r.shape == Shape::Tuft).collect();
+        let flowers = props.iter().filter(|r| r.shape == Shape::Flowers).count();
+        (tufts, flowers)
+    }
+
+    #[test]
+    fn should_line_every_biomes_verge_with_tufts_close_to_the_road() {
+        for b in Biome::ALL {
+            let (tufts, _) = verge_rules(b);
+            assert!(!tufts.is_empty(), "{b:?} has a bare verge");
+            for r in tufts {
+                assert!(r.every_m > 0.0, "{b:?}: tufts go along the road");
+                assert!(r.both_sides, "{b:?}: tufts on both sides");
+                assert!(
+                    r.to_m <= 8.0,
+                    "{b:?}: tufts {} m out is not the verge",
+                    r.to_m
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_set_flowers_on_every_verge_but_the_desert_and_the_town() {
+        for b in Biome::ALL {
+            let (_, flowers) = verge_rules(b);
+            let bare = matches!(b, Biome::Desert | Biome::Urban);
+            assert_eq!(flowers == 0, bare, "{b:?}: {flowers} flower rules");
+        }
+    }
+
     #[test]
     fn should_read_the_bundled_biomes() {
         let defs = parse(include_str!("biomes.json")).expect("the bundled file");

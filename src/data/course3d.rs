@@ -106,6 +106,8 @@ pub const MATERIAL_PLAIN: f32 = 0.0;
 pub const MATERIAL_GROUND: f32 = 1.0;
 /// Road surface.
 pub const MATERIAL_ROAD: f32 = 2.0;
+/// Bare rock — cliffs, scree, boulders: drawn as blocks with cracks.
+pub const MATERIAL_ROCK: f32 = 3.0;
 /// Open water: lighter stripes drift across it.
 pub const MATERIAL_WATER: f32 = 4.0;
 /// The far backdrop: mountains on the horizon, half lost in the haze.
@@ -1386,15 +1388,16 @@ fn restyle_steep(
                 above_road(x, z, y).is_some_and(|up| up > bare + ragged)
             });
             if y > look.snow_line_m {
-                restyle.push((v, p.snow));
+                restyle.push((v, p.snow, MATERIAL_GROUND));
             } else if slope > ROCK_SLOPE || bare {
-                restyle.push((v, p.rock));
+                restyle.push((v, p.rock, MATERIAL_ROCK));
             }
         }
     }
-    for (v, rgb) in restyle {
+    for (v, rgb, material) in restyle {
         let c = &mut mesh.vertices[v as usize].colour;
         c[..3].copy_from_slice(&rgb);
+        c[3] = material;
     }
 }
 
@@ -1985,7 +1988,7 @@ mod tests {
             .mesh
             .vertices
             .iter()
-            .filter(|v| v.colour[3] == MATERIAL_GROUND)
+            .filter(|v| v.colour[3] == MATERIAL_GROUND || v.colour[3] == MATERIAL_ROCK)
             .filter(|v| {
                 let up = world.above_road(v.pos[0], v.pos[2], v.pos[1]);
                 up > bare + biome::TREE_LINE_SPREAD_M
@@ -1993,11 +1996,15 @@ mod tests {
             .collect();
         assert!(high.len() > 50, "only {} high ground vertices", high.len());
         for v in high {
+            // Rock is drawn as rock — blocks and cracks — not as grass in
+            // a rock colour.
+            let as_rock = v.colour[..3] == rock && v.colour[3] == MATERIAL_ROCK;
+            let as_snow = v.colour[..3] == def.palette.snow && v.colour[3] == MATERIAL_GROUND;
             assert!(
-                v.colour[..3] == rock || v.colour[..3] == def.palette.snow,
+                as_rock || as_snow,
                 "high ground at {:?} is {:?}",
                 v.pos,
-                &v.colour[..3]
+                &v.colour
             );
         }
     }
@@ -3014,8 +3021,8 @@ mod tests {
     #[test]
     fn should_keep_every_prop_off_the_track_and_every_animal_well_clear() {
         // Rule 5 and the skill's encounters rule: nothing stands on the
-        // asphalt — not a house, not a lamp post — and nothing that moves
-        // comes within the animals' clearance of the edge.
+        // asphalt — not a house, not a lamp post, not a tuft — and nothing
+        // that moves comes within the animals' clearance of the edge.
         let route = straight_route(400, 10.0, 0.0);
         for scenery in Scenery::CHOICES {
             let scene = CourseScene::build(&route, scenery).expect("a scene");
@@ -3026,8 +3033,12 @@ mod tests {
                     continue;
                 };
                 let from_edge = d2.sqrt() - DEFAULT_EXTENT_M;
+                // Tufts and flowers are the verge itself: on the grass at
+                // the edge, never on the asphalt. Everything else keeps back.
+                let verge = p.shape.reach_m().is_some();
+                let clear = if verge { 0.25 } else { 3.0 };
                 assert!(
-                    from_edge >= 3.0,
+                    from_edge >= clear,
                     "{scenery:?}: {p:?} is {from_edge} m from the edge"
                 );
                 let moves = matches!(
