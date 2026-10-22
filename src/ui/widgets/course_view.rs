@@ -55,24 +55,6 @@ const BUILDING: &str = "Building the 3D view…";
 /// seconds. A tick is due every second; past that, the ride has paused.
 const MAX_EXTRAPOLATE_S: f32 = 1.0;
 
-/// Outlines thin out from the first distance and are gone by the second, in
-/// metres: past that a line is a broken pixel wide and crawls with every
-/// move of the camera.
-const LINE_FADE_M: (f32, f32) = (350.0, 1_100.0);
-/// The same, for a fold of the land against more land — on the desert's
-/// dunes, row upon row of crests from a hundred metres out.
-const LAND_LINE_FADE_M: (f32, f32) = (120.0, 320.0);
-
-/// Props, animals and their outlines: each is drawn a second time, a
-/// little larger and inside out, in the outline colour — its hull — so the
-/// line is part of the shape. A line found in the finished frame was a pixel
-/// wide on a far cow or barn, and blinked on and off as the camera moved.
-/// The hull's width on the screen, in pixels…
-const HULL_PX: f32 = 1.6;
-/// …but never more than this share of the prop's size, so a far cow is not
-/// all outline.
-const HULL_MAX_SHARE: f32 = 0.05;
-
 /// How quickly the drawn rider closes on where the ride says they are, in
 /// seconds: the time to make up two thirds of the gap. A report is due every
 /// second, so the gap is made up at about its own size a second — a metre
@@ -105,10 +87,8 @@ out vec3 v_rel;
 // facets, not gradients.
 flat out vec4 v_colour;
 flat out vec3 v_anchor;
-out vec3 v_push;
 void main() {
     vec3 world = (u_model * vec4(a_pos, 1.0)).xyz;
-    v_push = vec3(0.0);
     v_world = world;
     // Relative to the eye, the numbers are small. Interpolated across a pixel
     // at thousands of metres from the scene's origin, the absolute position
@@ -132,16 +112,9 @@ in vec3 i_pos;
 in vec2 i_size;
 in vec3 i_colour;
 in vec2 i_motion;
-in vec3 a_push;
 uniform mat4 u_mvp;
 uniform vec3 u_eye;
 uniform float u_time;
-// Above zero, this draw is the hull: metres of inflation per metre away.
-uniform float u_hull;
-uniform float u_hull_share;
-uniform vec3 u_outline;
-uniform vec2 u_line_fade;
-out vec3 v_push;
 uniform float u_orbit;
 uniform float u_head;
 uniform vec2 u_hub;
@@ -208,14 +181,6 @@ void main() {
     p *= i_size.x;
     vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
     v_colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
-    v_push = vec3(c * a_push.x - s * a_push.z, a_push.y, s * a_push.x + c * a_push.z);
-    if (u_hull > 0.0) {
-        float away = length(world - u_eye);
-        world += v_push * min(u_hull * away, u_hull_share * i_size.x);
-        // Far off, the hull takes the prop's own colour: no line to crawl.
-        float ink = 0.85 * (1.0 - smoothstep(u_line_fade.x, u_line_fade.y, away));
-        v_colour = vec4(mix(v_colour.rgb, u_outline, ink), 7.0);
-    }
     v_world = world;
     v_rel = world - u_eye;
     v_anchor = world;
@@ -223,17 +188,18 @@ void main() {
 }
 "#;
 
-/// Toon shading: three bands of sunlight, a touch of sky on faces that look
-/// up, a rim of haze light on edges turned away, and squared-exponential
-/// haze. The horizon's mountains take a fixed haze of their own, thicker at
-/// their feet; clouds take none. Writes the colour and the face's normal;
-/// the outline pass reads both.
+/// The painted light. No lines: shapes stand apart by light alone — warm in
+/// the sun, turning cool and blue as a face turns away, the sky's blue on
+/// faces that look up, a warm glow along the edges of walls, trunks and
+/// crowns, and the shadows of clouds drifting over everything. Then the
+/// middle distance goes blue in layers, and the haze takes the rest. The
+/// horizon's mountains take a fixed haze of their own, thicker at their
+/// feet; clouds take none.
 const FRAGMENT_SHADER: &str = r#"
 in vec3 v_world;
 in vec3 v_rel;
 flat in vec4 v_colour;
 flat in vec3 v_anchor;
-in vec3 v_push;
 uniform vec3 u_horizon;
 uniform vec3 u_zenith;
 uniform vec3 u_sun;
@@ -241,13 +207,26 @@ uniform vec3 u_foam;
 uniform float u_fog_start;
 uniform float u_fog_density;
 uniform float u_time;
-// 1 for props: the outline pass leaves their lines to the hull.
-uniform float u_prop;
-layout(location = 0) out vec4 frag;
-layout(location = 1) out vec4 frag_normal;
+uniform vec3 u_sunlit;
+uniform vec3 u_shade;
+uniform vec3 u_rim;
+uniform vec3 u_haze;
+out vec4 frag;
 
 float hash(vec3 p) {
     return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+// Smooth noise over the ground plane, for the clouds' shadows.
+float noise2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash(vec3(i, 0.0));
+    float b = hash(vec3(i + vec2(1.0, 0.0), 0.0));
+    float c = hash(vec3(i + vec2(0.0, 1.0), 0.0));
+    float d = hash(vec3(i + vec2(1.0, 1.0), 0.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 void main() {
@@ -260,20 +239,6 @@ void main() {
     // the sign of a vertical component that is noise, and the wall comes out
     // speckled light and dark pixel by pixel.
     if (dot(n, v_rel) > 0.0) n = -n;
-    if (material == 7.0) {
-        // The hull: only its far side shows, round the prop's edge. Which
-        // side of a facet is outward comes from the push, not the winding,
-        // which the kit does not keep; whether it faces the eye comes from
-        // the facet itself, which is flat — the push, blended across it,
-        // let corners of facets that face the eye through as dots.
-        vec3 facet = normalize(cross(dFdx(v_rel), dFdy(v_rel)));
-        if (dot(facet, v_push) < 0.0) facet = -facet;
-        if (dot(facet, v_rel) < 0.0) discard;
-        float kh = max(length(v_rel) - u_fog_start, 0.0) * u_fog_density;
-        frag = vec4(mix(c, u_horizon, 1.0 - exp(-kh * kh)), 1.0);
-        frag_normal = vec4(n * 0.5 + 0.5, 0.5);
-        return;
-    }
     if (material == 1.0) {
         // A hand-made look: each facet of the land a few per cent lighter or
         // darker, seeded by where it is.
@@ -285,33 +250,37 @@ void main() {
             * sin(v_world.z * 0.17 - v_world.x * 0.07 - u_time * 1.1);
         c = mix(c, u_foam, 0.35 * step(0.55, w));
     }
-    vec3 sun = normalize(u_sun);
-    float ndl = dot(n, sun);
-    float band = ndl > 0.5 ? 1.0 : (ndl > 0.1 ? 0.9 : 0.8);
-    vec3 ambient = mix(vec3(1.0), u_zenith * 1.6, 0.12 * (0.5 + 0.5 * n.y));
-    float rim = pow(1.0 - clamp(dot(n, normalize(-v_rel)), 0.0, 1.0), 4.0);
-    vec3 lit = c * (0.9 * band + 0.12) * ambient + u_horizon * rim * 0.1;
-    if (material == 5.0) {
-        // Far mountains: pale with distance, palest at their feet.
-        float up = clamp((v_rel.y + 120.0) / 1100.0, 0.0, 1.0);
-        frag = vec4(mix(lit, u_horizon, mix(0.72, 0.32, up)), 1.0);
-        frag_normal = vec4(0.5, 1.0, 0.5, 1.0);
-        return;
-    }
     if (material == 6.0) {
         // Clouds: white, a little shade underneath, no haze.
         frag = vec4(c * (0.9 + 0.1 * clamp(n.y, 0.0, 1.0)) - 0.06 * clamp(-n.y, 0.0, 1.0), 1.0);
-        frag_normal = vec4(0.5, 1.0, 0.5, 1.0);
         return;
     }
-    float k = max(length(v_rel) - u_fog_start, 0.0) * u_fog_density;
+    float sunward = smoothstep(0.0, 0.45, dot(n, normalize(u_sun)));
+    // Big, soft cloud shadows: smaller ones read as camouflage on a hill.
+    vec2 q = v_world.xz / 420.0 + vec2(u_time * 0.004, u_time * 0.0015);
+    float cloud = smoothstep(0.5, 0.8, 0.7 * noise2(q) + 0.3 * noise2(q * 2.1 + 7.0));
+    sunward *= 1.0 - 0.6 * cloud;
+    vec3 lit = c * mix(u_shade, u_sunlit, sunward);
+    lit += c * u_zenith * 0.10 * max(n.y, 0.0);
+    // The glow is for walls, trunks and crowns, not the ground: at a low
+    // angle every field would glow.
+    float edge_glow = pow(1.0 - clamp(dot(n, normalize(-v_rel)), 0.0, 1.0), 3.0);
+    lit += u_rim * edge_glow * 0.25 * sunward * (1.0 - abs(n.y));
+    if (material == 5.0) {
+        // Far mountains: pale and blue with distance, palest at their feet.
+        float up = clamp((v_rel.y + 120.0) / 1100.0, 0.0, 1.0);
+        frag = vec4(mix(lit, mix(u_horizon, u_haze, 0.6), mix(0.72, 0.32, up)), 1.0);
+        return;
+    }
+    float away = length(v_rel);
+    lit = mix(lit, u_haze, 0.6 * (1.0 - exp(-away / 450.0)));
+    float k = max(away - u_fog_start, 0.0) * u_fog_density;
     frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), 1.0);
-    // Alpha marks the land, whose folds the outline pass lets go of sooner.
-    frag_normal = vec4(n * 0.5 + 0.5, u_prop > 0.5 ? 0.5 : (material == 1.0 ? 0.0 : 1.0));
 }
 "#;
 
-/// One triangle over the whole view, for the sky and the outline pass.
+/// One triangle over the whole view, for the sky, the finishing pass and
+/// the HUD.
 const FULLSCREEN_VERTEX_SHADER: &str = r#"
 out vec2 v_uv;
 void main() {
@@ -334,88 +303,37 @@ void main() {
 }
 "#;
 
-/// The sky: shaded from haze at the horizon to blue overhead. Drawn first,
-/// without depth, under everything.
+/// The sky: a bright band at the horizon, deepening to blue overhead. Drawn
+/// first, without depth, under everything.
 const SKY_FRAGMENT_SHADER: &str = r#"
 in vec2 v_uv;
 uniform vec3 u_horizon;
 uniform vec3 u_zenith;
-layout(location = 0) out vec4 frag;
-layout(location = 1) out vec4 frag_normal;
+uniform vec3 u_glow;
+out vec4 frag;
 void main() {
-    frag = vec4(mix(u_horizon, u_zenith, smoothstep(0.45, 1.0, v_uv.y)), 1.0);
-    frag_normal = vec4(0.5, 1.0, 0.5, 1.0);
+    vec3 low = mix(u_horizon, u_glow, 0.35);
+    float rise = pow(smoothstep(0.45, 1.0, v_uv.y), 0.7);
+    frag = vec4(mix(low, u_zenith, rise), 1.0);
 }
 "#;
 
-/// Outlines: dark lines where the depth folds — an object's silhouette
-/// against what is behind it — or where the faces either side turn sharply,
-/// as at a building's corner. Gentle folds in the land are left unlined, and
-/// props are left to their hulls.
-/// Lines fade into the haze with what they outline, and thin out with
-/// distance before that: a far line is a pixel wide and broken, and crawls
-/// as the camera moves. A fold of the land against more land goes soonest —
-/// row upon row of dune crests crawled across the desert; the land's edge
-/// against the sky, the road or anything standing on it is kept.
-const OUTLINE_FRAGMENT_SHADER: &str = r#"
+/// The finishing pass, from the scene's framebuffer into GTK's: colours a
+/// little richer, and the corners darker and cooler, as a painter frames a
+/// scene.
+const FINISH_FRAGMENT_SHADER: &str = r#"
 precision highp sampler2D;
 in vec2 v_uv;
 uniform sampler2D u_colour;
-uniform sampler2D u_normal;
-uniform sampler2D u_depth;
-uniform vec2 u_texel;
-uniform float u_near;
-uniform float u_far;
-uniform vec3 u_outline;
-uniform float u_fog_start;
-uniform float u_fog_density;
-uniform vec2 u_line_fade;
-uniform vec2 u_land_line_fade;
+uniform vec3 u_corner;
 out vec4 frag;
-
-float linear(float z) {
-    float ndc = z * 2.0 - 1.0;
-    return 2.0 * u_near * u_far / (u_far + u_near - ndc * (u_far - u_near));
-}
-
-// 1 where a sample is a prop's (the fragment shader marks them 0.5).
-float prop_at(vec2 uv) {
-    return 1.0 - step(0.25, abs(texture(u_normal, uv).a - 0.5));
-}
-
 void main() {
-    vec2 dx = vec2(u_texel.x, 0.0);
-    vec2 dy = vec2(0.0, u_texel.y);
-    float dc = linear(texture(u_depth, v_uv).r);
-    float dl = linear(texture(u_depth, v_uv - dx).r);
-    float dr = linear(texture(u_depth, v_uv + dx).r);
-    float dd = linear(texture(u_depth, v_uv - dy).r);
-    float du = linear(texture(u_depth, v_uv + dy).r);
-    // On a flat face the inverse depth changes evenly across the screen, so
-    // its second difference is zero; at a silhouette or a crease it is not.
-    float fold = (abs(1.0 / dl + 1.0 / dr - 2.0 / dc) + abs(1.0 / dd + 1.0 / du - 2.0 / dc)) * dc;
-    float edge = smoothstep(0.03, 0.08, fold);
-    vec3 nc = texture(u_normal, v_uv).xyz * 2.0 - 1.0;
-    float turn = min(
-        min(dot(nc, texture(u_normal, v_uv - dx).xyz * 2.0 - 1.0),
-            dot(nc, texture(u_normal, v_uv + dx).xyz * 2.0 - 1.0)),
-        min(dot(nc, texture(u_normal, v_uv - dy).xyz * 2.0 - 1.0),
-            dot(nc, texture(u_normal, v_uv + dy).xyz * 2.0 - 1.0)));
-    edge = max(edge, smoothstep(0.75, 0.5, turn));
-    // Props, and the land right against them, are outlined by their hulls.
-    float prop = max(max(prop_at(v_uv), prop_at(v_uv - dx)),
-        max(max(prop_at(v_uv + dx), prop_at(v_uv - dy)), prop_at(v_uv + dy)));
-    edge *= 1.0 - prop;
-    float nearest = min(dc, min(min(dl, dr), min(dd, du)));
-    float k = max(nearest - u_fog_start, 0.0) * u_fog_density;
-    float not_land = max(
-        max(texture(u_normal, v_uv).a, texture(u_normal, v_uv - dx).a),
-        max(max(texture(u_normal, v_uv + dx).a, texture(u_normal, v_uv - dy).a),
-            texture(u_normal, v_uv + dy).a));
-    vec2 fade = mix(u_land_line_fade, u_line_fade, step(0.5, not_land));
-    float clear = exp(-k * k) * (1.0 - smoothstep(fade.x, fade.y, nearest));
     vec3 c = texture(u_colour, v_uv).rgb;
-    frag = vec4(mix(c, u_outline, 0.85 * edge * clear), 1.0);
+    float grey = dot(c, vec3(0.299, 0.587, 0.114));
+    c = mix(vec3(grey), c, 1.08);
+    vec2 off = v_uv - vec2(0.5, 0.55);
+    float corner = smoothstep(0.35, 0.85, length(off * vec2(1.0, 1.25)));
+    frag = vec4(c * mix(vec3(1.0), u_corner, corner), 1.0);
 }
 "#;
 
@@ -510,7 +428,7 @@ struct GlState {
     gl: glow::Context,
     program: glow::Program,
     sky_program: glow::Program,
-    outline_program: glow::Program,
+    finish_program: glow::Program,
     prop_program: glow::Program,
     hud_program: glow::Program,
     /// The HUD as last painted, and its size: replaced only when it changes.
@@ -528,8 +446,8 @@ struct GlState {
     rider_leg: MeshGl,
     /// One per prop shape: its mesh, and every prop of that shape.
     props: Vec<PropShape>,
-    /// The scene is drawn here first — colour, normals and depth — and the
-    /// outline pass draws it into GTK's framebuffer.
+    /// The scene is drawn here first, and the finishing pass draws it into
+    /// GTK's framebuffer.
     target: Option<Target>,
     u: Uniforms,
     /// Whether the GL state GTK handed over has been logged — once per
@@ -549,7 +467,6 @@ struct MeshGl {
 struct Target {
     fbo: glow::Framebuffer,
     colour: glow::Texture,
-    normal: glow::Texture,
     depth: glow::Texture,
     size: (i32, i32),
 }
@@ -564,8 +481,6 @@ struct PropShape {
     /// frame.
     live: glow::Buffer,
     live_count: i32,
-    /// Which way each vertex moves for the hull.
-    push: glow::Buffer,
 }
 
 type Uniform = Option<glow::UniformLocation>;
@@ -586,6 +501,10 @@ struct SceneUniforms {
     head: Uniform,
     hub: Uniform,
     legs: Uniform,
+    sunlit: Uniform,
+    shade: Uniform,
+    rim: Uniform,
+    haze: Uniform,
 }
 
 impl SceneUniforms {
@@ -606,11 +525,20 @@ impl SceneUniforms {
             head: at("u_head"),
             hub: at("u_hub"),
             legs: at("u_legs"),
+            sunlit: at("u_sunlit"),
+            shade: at("u_shade"),
+            rim: at("u_rim"),
+            haze: at("u_haze"),
         }
     }
 
     /// Set every one for a frame. The model starts as the identity.
     unsafe fn set(&self, gl: &glow::Context, mvp: &Mat4, eye: &[f32; 3], sky: &Sky, time_s: f32) {
+        let light = &palette::LIGHT;
+        gl.uniform_3_f32_slice(self.sunlit.as_ref(), &light.sunlit);
+        gl.uniform_3_f32_slice(self.shade.as_ref(), &light.shade);
+        gl.uniform_3_f32_slice(self.rim.as_ref(), &light.rim);
+        gl.uniform_3_f32_slice(self.haze.as_ref(), &light.haze);
         gl.uniform_matrix_4_f32_slice(self.mvp.as_ref(), false, mvp);
         gl.uniform_matrix_4_f32_slice(self.model.as_ref(), false, &course3d::IDENTITY);
         gl.uniform_3_f32_slice(self.eye.as_ref(), eye);
@@ -638,23 +566,10 @@ struct Uniforms {
     props: SceneUniforms,
     sky_horizon: Uniform,
     sky_zenith: Uniform,
-    o_colour: Uniform,
-    o_normal: Uniform,
-    o_depth: Uniform,
-    o_texel: Uniform,
-    o_near: Uniform,
-    o_far: Uniform,
-    o_outline: Uniform,
-    o_fog_start: Uniform,
-    o_fog_density: Uniform,
-    o_line_fade: Uniform,
-    o_land_line_fade: Uniform,
+    sky_glow: Uniform,
+    finish_colour: Uniform,
+    finish_corner: Uniform,
     hud_image: Uniform,
-    p_prop: Uniform,
-    p_hull: Uniform,
-    p_hull_share: Uniform,
-    p_outline: Uniform,
-    p_line_fade: Uniform,
 }
 
 struct Inner {
@@ -1082,11 +997,11 @@ impl GlState {
                 SKY_FRAGMENT_SHADER,
                 &[],
             )?;
-            let outline_program = link(
+            let finish_program = link(
                 &gl,
                 header,
                 FULLSCREEN_VERTEX_SHADER,
-                OUTLINE_FRAGMENT_SHADER,
+                FINISH_FRAGMENT_SHADER,
                 &[],
             )?;
             let hud_program = link(
@@ -1104,7 +1019,6 @@ impl GlState {
                 &[
                     (0, "a_pos"),
                     (1, "a_colour"),
-                    (2, "a_push"),
                     (3, "i_pos"),
                     (4, "i_size"),
                     (5, "i_colour"),
@@ -1131,29 +1045,16 @@ impl GlState {
                 props: SceneUniforms::of(&gl, prop_program),
                 sky_horizon: at(sky_program, "u_horizon"),
                 sky_zenith: at(sky_program, "u_zenith"),
-                o_colour: at(outline_program, "u_colour"),
-                o_normal: at(outline_program, "u_normal"),
-                o_depth: at(outline_program, "u_depth"),
-                o_texel: at(outline_program, "u_texel"),
-                o_near: at(outline_program, "u_near"),
-                o_far: at(outline_program, "u_far"),
-                o_outline: at(outline_program, "u_outline"),
-                o_fog_start: at(outline_program, "u_fog_start"),
-                o_fog_density: at(outline_program, "u_fog_density"),
-                o_line_fade: at(outline_program, "u_line_fade"),
-                o_land_line_fade: at(outline_program, "u_land_line_fade"),
+                sky_glow: at(sky_program, "u_glow"),
+                finish_colour: at(finish_program, "u_colour"),
+                finish_corner: at(finish_program, "u_corner"),
                 hud_image: at(hud_program, "u_hud"),
-                p_prop: at(prop_program, "u_prop"),
-                p_hull: at(prop_program, "u_hull"),
-                p_hull_share: at(prop_program, "u_hull_share"),
-                p_outline: at(prop_program, "u_outline"),
-                p_line_fade: at(prop_program, "u_line_fade"),
             };
             Ok(Self {
                 gl,
                 program,
                 sky_program,
-                outline_program,
+                finish_program,
                 prop_program,
                 hud_program,
                 hud: None,
@@ -1275,19 +1176,18 @@ impl GlState {
             std::num::NonZeroU32::new(id as u32).map(glow::NativeFramebuffer)
         };
         let target = match self.target(width, height) {
-            Ok(t) => (t.fbo, t.colour, t.normal, t.depth),
+            Ok(t) => (t.fbo, t.colour),
             Err(e) => {
                 tracing::error!("3D view could not make its framebuffer: {e}");
                 return;
             }
         };
-        let (fbo, colour_tex, normal_tex, depth_tex) = target;
+        let (fbo, colour_tex) = target;
         let gl = &self.gl;
         let u = &self.u;
-        let outline = palette::BASE.outline;
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1]);
+            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
             // GTK renders with the same context and leaves its own state
             // behind. Nothing here may be assumed: set everything the scene
             // relies on, every frame.
@@ -1312,6 +1212,7 @@ impl GlState {
             gl.use_program(Some(self.sky_program));
             gl.uniform_3_f32_slice(u.sky_horizon.as_ref(), &sky.horizon);
             gl.uniform_3_f32_slice(u.sky_zenith.as_ref(), &sky.top);
+            gl.uniform_3_f32_slice(u.sky_glow.as_ref(), &palette::LIGHT.horizon_glow);
             gl.bind_vertex_array(Some(self.empty_vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
 
@@ -1387,24 +1288,10 @@ impl GlState {
                         (f32::NAN, f32::NAN)
                     }
                 };
-                gl.uniform_1_f32(u.p_prop.as_ref(), 1.0);
-                gl.uniform_1_f32(u.p_hull.as_ref(), 0.0);
                 for shape in &self.props {
-                    shape.draw(gl, camera.eye, forward, tan_half, PROP_DRAW_M);
+                    shape.draw(gl, camera.eye, forward, tan_half);
                     shape.draw_live(gl);
                 }
-                // The hulls, out to where their line has faded into the
-                // prop's own colour.
-                let per_m = 2.0 * (FOV_DEG.to_radians() / 2.0).tan() / height.max(1) as f32;
-                gl.uniform_1_f32(u.p_hull.as_ref(), HULL_PX * per_m);
-                gl.uniform_1_f32(u.p_hull_share.as_ref(), HULL_MAX_SHARE);
-                gl.uniform_3_f32_slice(u.p_outline.as_ref(), &outline);
-                gl.uniform_2_f32(u.p_line_fade.as_ref(), LINE_FADE_M.0, LINE_FADE_M.1);
-                for shape in &self.props {
-                    shape.draw(gl, camera.eye, forward, tan_half, LINE_FADE_M.1);
-                    shape.draw_live(gl);
-                }
-                gl.uniform_1_f32(u.p_hull.as_ref(), 0.0);
                 if first {
                     let err = gl.get_error();
                     tracing::info!(
@@ -1415,35 +1302,14 @@ impl GlState {
                 gl.disable(glow::DEPTH_TEST);
             }
 
-            // Into GTK's framebuffer, with the outlines.
+            // Into GTK's framebuffer, finished.
             gl.bind_framebuffer(glow::FRAMEBUFFER, screen);
             gl.viewport(0, 0, width, height);
-            gl.use_program(Some(self.outline_program));
-            for (unit, tex, uniform) in [
-                (0, colour_tex, &u.o_colour),
-                (1, normal_tex, &u.o_normal),
-                (2, depth_tex, &u.o_depth),
-            ] {
-                gl.active_texture(glow::TEXTURE0 + unit);
-                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                gl.uniform_1_i32(uniform.as_ref(), unit as i32);
-            }
-            gl.uniform_2_f32(
-                u.o_texel.as_ref(),
-                1.0 / width.max(1) as f32,
-                1.0 / height.max(1) as f32,
-            );
-            gl.uniform_1_f32(u.o_near.as_ref(), NEAR_M);
-            gl.uniform_1_f32(u.o_far.as_ref(), FAR_M);
-            gl.uniform_3_f32_slice(u.o_outline.as_ref(), &outline);
-            gl.uniform_1_f32(u.o_fog_start.as_ref(), biome::FOG_START_M);
-            gl.uniform_1_f32(u.o_fog_density.as_ref(), sky.fog_density);
-            gl.uniform_2_f32(u.o_line_fade.as_ref(), LINE_FADE_M.0, LINE_FADE_M.1);
-            gl.uniform_2_f32(
-                u.o_land_line_fade.as_ref(),
-                LAND_LINE_FADE_M.0,
-                LAND_LINE_FADE_M.1,
-            );
+            gl.use_program(Some(self.finish_program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(colour_tex));
+            gl.uniform_1_i32(u.finish_colour.as_ref(), 0);
+            gl.uniform_3_f32_slice(u.finish_corner.as_ref(), &palette::LIGHT.corner);
             gl.bind_vertex_array(Some(self.empty_vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.bind_vertex_array(None);
@@ -1604,13 +1470,12 @@ impl GlState {
             unsafe {
                 self.gl.delete_buffer(shape.instances);
                 self.gl.delete_buffer(shape.live);
-                self.gl.delete_buffer(shape.push);
             }
         }
         unsafe {
             self.gl.delete_program(self.program);
             self.gl.delete_program(self.sky_program);
-            self.gl.delete_program(self.outline_program);
+            self.gl.delete_program(self.finish_program);
             self.gl.delete_program(self.prop_program);
             self.gl.delete_program(self.hud_program);
             if let Some((tex, _)) = self.hud.take() {
@@ -1624,22 +1489,10 @@ impl GlState {
 impl PropShape {
     /// The shape's mesh on the GPU, with an empty buffer for its props.
     unsafe fn new(gl: &glow::Context, shape: Shape) -> Result<Self, String> {
-        let source = shape.mesh();
-        let mesh = MeshGl::new(gl, &source)?;
+        let mesh = MeshGl::new(gl, &shape.mesh())?;
         let instances = gl.create_buffer()?;
         let live = gl.create_buffer()?;
-        let push = gl.create_buffer()?;
-        let push_bytes: Vec<u8> = hull_push(&source)
-            .iter()
-            .flatten()
-            .flat_map(|f| f.to_ne_bytes())
-            .collect();
         gl.bind_vertex_array(Some(mesh.vao));
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(push));
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &push_bytes, glow::STATIC_DRAW);
-        gl.enable_vertex_attrib_array(2);
-        gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, 12, 0);
-        gl.bind_buffer(glow::ARRAY_BUFFER, None);
         for slot in [3, 4, 5, 6] {
             gl.enable_vertex_attrib_array(slot);
             gl.vertex_attrib_divisor(slot, 1);
@@ -1652,7 +1505,6 @@ impl PropShape {
             chunks: Vec::new(),
             live,
             live_count: 0,
-            push,
         })
     }
 
@@ -1682,14 +1534,7 @@ impl PropShape {
     /// Draw the props of every chunk within reach of the eye. Each chunk's
     /// run is reached by pointing the per-prop attributes at its start: GL
     /// ES 3.0 has no base instance.
-    unsafe fn draw(
-        &self,
-        gl: &glow::Context,
-        eye: [f32; 3],
-        forward: (f32, f32),
-        tan_half: f32,
-        reach_m: f32,
-    ) {
+    unsafe fn draw(&self, gl: &glow::Context, eye: [f32; 3], forward: (f32, f32), tan_half: f32) {
         if self.chunks.is_empty() || self.mesh.index_count == 0 {
             return;
         }
@@ -1697,7 +1542,7 @@ impl PropShape {
         gl.bind_vertex_array(Some(self.mesh.vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
         for chunk in &self.chunks {
-            if !props::in_view(chunk, eye, forward, tan_half, reach_m) {
+            if !props::in_view(chunk, eye, forward, tan_half, PROP_DRAW_M) {
                 continue;
             }
             let base = chunk.start as i32 * stride;
@@ -1719,8 +1564,8 @@ impl PropShape {
 }
 
 impl Target {
-    /// A framebuffer with a colour and a normal texture and a depth texture,
-    /// all `size`, every one readable by the outline pass.
+    /// A framebuffer with a colour texture, which the finishing pass reads,
+    /// and a depth texture, both `size`.
     unsafe fn new(gl: &glow::Context, size: (i32, i32)) -> Result<Self, String> {
         let texture = |internal: u32, format: u32, kind: u32| -> Result<glow::Texture, String> {
             let t = gl.create_texture()?;
@@ -1747,7 +1592,6 @@ impl Target {
             Ok(t)
         };
         let colour = texture(glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE)?;
-        let normal = texture(glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE)?;
         let depth = texture(
             glow::DEPTH_COMPONENT24,
             glow::DEPTH_COMPONENT,
@@ -1758,7 +1602,6 @@ impl Target {
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         for (attachment, t) in [
             (glow::COLOR_ATTACHMENT0, colour),
-            (glow::COLOR_ATTACHMENT1, normal),
             (glow::DEPTH_ATTACHMENT, depth),
         ] {
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, attachment, glow::TEXTURE_2D, Some(t), 0);
@@ -1767,7 +1610,6 @@ impl Target {
         let target = Self {
             fbo,
             colour,
-            normal,
             depth,
             size,
         };
@@ -1782,7 +1624,6 @@ impl Target {
         unsafe {
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.colour);
-            gl.delete_texture(self.normal);
             gl.delete_texture(self.depth);
         }
     }
@@ -1833,118 +1674,6 @@ fn vertex_bytes(mesh: &Mesh) -> Vec<u8> {
         .collect()
 }
 
-/// Which way each vertex of `mesh` moves to inflate it into its hull: the
-/// faces round that corner, averaged, each turned away from the middle of
-/// its own part. The kit does not keep a winding, so "away from the middle"
-/// is what says which way is out; every part is a box or near enough.
-fn hull_push(mesh: &Mesh) -> Vec<[f32; 3]> {
-    use std::collections::HashMap;
-    let n = mesh.vertices.len();
-    let key = |v: usize| {
-        let p = mesh.vertices[v].pos;
-        [
-            (p[0] * 1e4).round() as i64,
-            (p[1] * 1e4).round() as i64,
-            (p[2] * 1e4).round() as i64,
-        ]
-    };
-    // Parts: vertices joined by a triangle or by standing at one spot.
-    let mut parent: Vec<usize> = (0..n).collect();
-    fn root(parent: &mut [usize], mut v: usize) -> usize {
-        while parent[v] != v {
-            parent[v] = parent[parent[v]];
-            v = parent[v];
-        }
-        v
-    }
-    let join = |parent: &mut Vec<usize>, a: usize, b: usize| {
-        let (ra, rb) = (root(parent, a), root(parent, b));
-        if ra != rb {
-            parent[ra] = rb;
-        }
-    };
-    for t in mesh.indices.chunks_exact(3) {
-        join(&mut parent, t[0] as usize, t[1] as usize);
-        join(&mut parent, t[1] as usize, t[2] as usize);
-    }
-    let mut first_at: HashMap<[i64; 3], usize> = HashMap::new();
-    for v in 0..n {
-        let k = key(v);
-        if let Some(&w) = first_at.get(&k) {
-            join(&mut parent, v, w);
-        } else {
-            first_at.insert(k, v);
-        }
-    }
-    let mut middle: HashMap<usize, ([f32; 3], f32)> = HashMap::new();
-    for v in 0..n {
-        let r = root(&mut parent, v);
-        let e = middle.entry(r).or_insert(([0.0; 3], 0.0));
-        for i in 0..3 {
-            e.0[i] += mesh.vertices[v].pos[i];
-        }
-        e.1 += 1.0;
-    }
-    // Each face counts once at a corner, however many of its triangles
-    // meet there: counted per triangle, a box's corners leaned towards
-    // whichever faces were split through them.
-    let mut faces: HashMap<(usize, [i64; 3]), Vec<[f32; 3]>> = HashMap::new();
-    for t in mesh.indices.chunks_exact(3) {
-        let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
-        let (pa, pb, pc) = (
-            mesh.vertices[a].pos,
-            mesh.vertices[b].pos,
-            mesh.vertices[c].pos,
-        );
-        let u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-        let w = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-        let mut nrm = [
-            u[1] * w[2] - u[2] * w[1],
-            u[2] * w[0] - u[0] * w[2],
-            u[0] * w[1] - u[1] * w[0],
-        ];
-        let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
-        if len < 1e-12 {
-            continue;
-        }
-        let r = root(&mut parent, a);
-        let (m, count) = middle[&r];
-        let out = [
-            (pa[0] + pb[0] + pc[0]) / 3.0 - m[0] / count,
-            (pa[1] + pb[1] + pc[1]) / 3.0 - m[1] / count,
-            (pa[2] + pb[2] + pc[2]) / 3.0 - m[2] / count,
-        ];
-        if nrm[0] * out[0] + nrm[1] * out[1] + nrm[2] * out[2] < 0.0 {
-            nrm = [-nrm[0], -nrm[1], -nrm[2]];
-        }
-        for x in &mut nrm {
-            *x /= len;
-        }
-        for v in [a, b, c] {
-            let seen = faces.entry((r, key(v))).or_default();
-            let same = |f: &[f32; 3]| f[0] * nrm[0] + f[1] * nrm[1] + f[2] * nrm[2] > 0.9999;
-            if !seen.iter().any(same) {
-                seen.push(nrm);
-            }
-        }
-    }
-    (0..n)
-        .map(|v| {
-            let r = root(&mut parent, v);
-            let p = faces.get(&(r, key(v))).map_or([0.0; 3], |fs| {
-                fs.iter()
-                    .fold([0.0; 3], |a, f| [a[0] + f[0], a[1] + f[1], a[2] + f[2]])
-            });
-            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-            if len < 1e-6 {
-                [0.0; 3]
-            } else {
-                [p[0] / len, p[1] / len, p[2] / len]
-            }
-        })
-        .collect()
-}
-
 fn index_bytes(mesh: &Mesh) -> Vec<u8> {
     mesh.indices.iter().flat_map(|i| i.to_ne_bytes()).collect()
 }
@@ -1972,93 +1701,6 @@ fn egl_get_proc_address() -> Option<GetProcAddress> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A box from `lo` to `hi`, every face its own four corners, as the kit
-    /// builds them — with every other face wound the wrong way round.
-    fn mixed_box(mesh: &mut Mesh, lo: [f32; 3], hi: [f32; 3]) {
-        let corner = |i: usize| {
-            [
-                if i & 1 == 0 { lo[0] } else { hi[0] },
-                if i & 2 == 0 { lo[1] } else { hi[1] },
-                if i & 4 == 0 { lo[2] } else { hi[2] },
-            ]
-        };
-        let faces = [
-            [0, 2, 6, 4],
-            [1, 5, 7, 3],
-            [0, 4, 5, 1],
-            [2, 3, 7, 6],
-            [0, 1, 3, 2],
-            [4, 6, 7, 5],
-        ];
-        for (k, f) in faces.iter().enumerate() {
-            let base = mesh.vertices.len() as u32;
-            for &i in f {
-                mesh.vertices.push(course3d::Vertex {
-                    pos: corner(i),
-                    colour: [0.5, 0.5, 0.5, 2.0],
-                });
-            }
-            let tris = if k % 2 == 0 {
-                [0, 1, 2, 0, 2, 3]
-            } else {
-                [0, 2, 1, 0, 3, 2]
-            };
-            mesh.indices.extend(tris.iter().map(|t| base + t));
-        }
-    }
-
-    #[test]
-    fn should_push_every_corner_of_a_box_outward_whatever_its_winding() {
-        let mut mesh = Mesh::default();
-        mixed_box(&mut mesh, [-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]);
-        let push = hull_push(&mesh);
-        for (v, p) in mesh.vertices.iter().zip(&push) {
-            // A corner goes out along its own diagonal, all three ways.
-            let out = [v.pos[0], v.pos[1] - 1.0, v.pos[2]];
-            for i in 0..3 {
-                assert!(
-                    (p[i] - out[i].signum() / 3f32.sqrt()).abs() < 1e-4,
-                    "corner {:?} pushed {:?}",
-                    v.pos,
-                    p
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn should_push_each_part_away_from_its_own_middle() {
-        // A body and a leg under it, touching at no corner: the leg's top
-        // goes up, out of the body, not down towards the body's middle.
-        let mut mesh = Mesh::default();
-        mixed_box(&mut mesh, [-1.0, 1.0, -1.0], [1.0, 2.0, 1.0]);
-        let leg = mesh.vertices.len();
-        mixed_box(&mut mesh, [-0.2, 0.0, -0.2], [0.2, 0.9, 0.2]);
-        let push = hull_push(&mesh);
-        for (v, p) in mesh.vertices[leg..].iter().zip(&push[leg..]) {
-            assert_eq!(
-                p[1] > 0.0,
-                v.pos[1] > 0.5,
-                "leg corner {:?} pushed {:?}",
-                v.pos,
-                p
-            );
-        }
-    }
-
-    #[test]
-    fn should_leave_a_mesh_with_no_area_unpushed() {
-        let mut mesh = Mesh::default();
-        for _ in 0..3 {
-            mesh.vertices.push(course3d::Vertex {
-                pos: [1.0, 1.0, 1.0],
-                colour: [0.0; 4],
-            });
-        }
-        mesh.indices.extend([0, 1, 2]);
-        assert_eq!(hull_push(&mesh), vec![[0.0; 3]; 3]);
-    }
 
     #[test]
     fn should_stay_put_before_the_first_report() {

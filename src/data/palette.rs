@@ -3,8 +3,8 @@
 //! The scene is a bright, low-poly game world (the stylized-route skill, §3):
 //! no mesh builder or shader names a colour of its own, they all come from
 //! here. A biome (`data/biome.rs`) overrides some names with its own values;
-//! the road, its paint and the outline never change, so the route always
-//! reads as the same track.
+//! the road and its paint never change, so the route always reads as the
+//! same track. The world draws no outlines: [`LIGHT`] shapes it.
 //!
 //! Values are the display colours as written in hex: the view draws into an
 //! ordinary 8-bit framebuffer and lights them by multiplying, so `#7BC950`
@@ -62,6 +62,7 @@ pub struct Palette {
     pub sky_top: Rgb,
     /// The sky at the horizon, which is also the colour of the haze.
     pub sky_horizon: Rgb,
+    /// The HUD's ink. The world itself draws no lines.
     pub outline: Rgb,
     /// Squares, car parks and the ground in towns.
     pub paving: Rgb,
@@ -279,6 +280,30 @@ pub const HUD: HudColours = HudColours {
     ridden: hex(0x6CB84C),
     marker: BASE.jersey,
     flag: BASE.road_edge,
+};
+
+/// The light the world is painted by. Each of the first three is what a
+/// colour is multiplied by: in full sun, in shade, and along the edge of a
+/// wall or crown with the sun on it. Then the blue the middle distance sinks
+/// into, the near-white the sky brightens to at the horizon, and what the
+/// picture's corners are darkened by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Light {
+    pub sunlit: Rgb,
+    pub shade: Rgb,
+    pub rim: Rgb,
+    pub haze: Rgb,
+    pub horizon_glow: Rgb,
+    pub corner: Rgb,
+}
+
+pub const LIGHT: Light = Light {
+    sunlit: [1.04, 1.01, 0.94],
+    shade: [0.50, 0.58, 0.86],
+    rim: hex(0xFFE2A8),
+    haze: hex(0x9EC4F0),
+    horizon_glow: hex(0xFFFFFF),
+    corner: [0.78, 0.82, 0.95],
 };
 
 /// Names a biome may not override: the track and the rider look the same
