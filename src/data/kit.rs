@@ -363,7 +363,7 @@ pub fn mesh(shape: Shape) -> Mesh {
             ));
             m.extend(cuboid(
                 [0.42, 0.0, -0.09],
-                [0.43, 0.3, 0.09],
+                [0.42 + STANDS_PROUD, 0.3, 0.09],
                 c(b.animal_dark),
             ));
             for x in [-0.22, 0.18] {
@@ -381,9 +381,10 @@ pub fn mesh(shape: Shape) -> Mesh {
         Shape::Villa => {
             m.extend(cuboid([-0.45, 0.0, -0.45], [0.45, 0.62, 0.45], OWN));
             m.extend(hipped(-0.52, 0.52, -0.52, 0.52, 0.6, 0.86, c(b.roof_a)));
-            m.extend(cuboid([0.45, 0.0, -0.1], [0.46, 0.34, 0.1], c(b.boat_b)));
+            let face = 0.45 + STANDS_PROUD;
+            m.extend(cuboid([0.45, 0.0, -0.1], [face, 0.34, 0.1], c(b.boat_b)));
             for z in [-0.3, 0.15] {
-                m.extend(cuboid([0.45, 0.4, z], [0.46, 0.52, z + 0.15], c(b.boat_b)));
+                m.extend(cuboid([0.45, 0.4, z], [face, 0.52, z + 0.15], c(b.boat_b)));
             }
         }
         Shape::Hut => {
@@ -398,7 +399,11 @@ pub fn mesh(shape: Shape) -> Mesh {
                 c(b.animal_dark),
                 OWN,
             ));
-            m.extend(cuboid([0.4, 0.0, -0.08], [0.41, 0.3, 0.08], c(b.cattail)));
+            m.extend(cuboid(
+                [0.4, 0.0, -0.08],
+                [0.4 + STANDS_PROUD, 0.3, 0.08],
+                c(b.cattail),
+            ));
             m.extend(cuboid([-0.2, 0.6, 0.12], [-0.1, 0.98, 0.22], c(b.rock)));
         }
         Shape::Windmill => {
@@ -406,7 +411,7 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(spike(0.0, 0.0, 0.17, 0.7, 0.86, 8, c(b.roof_c)));
             m.extend(cuboid(
                 [0.1, 0.74, -0.03],
-                [0.24, 0.82, 0.03],
+                [0.23, 0.82, 0.03],
                 c(b.windmill),
             ));
             // Four sails in front of the hub, in the plane the shader turns.
@@ -414,7 +419,9 @@ pub fn mesh(shape: Shape) -> Mesh {
                 let a = k as f32 * std::f32::consts::FRAC_PI_2 + 0.4;
                 let (ca, sa) = (a.cos(), a.sin());
                 let at = |r: f32, w: f32| [0.26, HUB_Y + r * sa + w * ca, r * ca - w * sa];
-                m.extend(beam(at(0.0, 0.0), at(0.5, 0.0), 0.02, 0.02, c(b.trunk)));
+                // Thick enough that its faces stand clear of the sail it
+                // carries, which lies through its middle.
+                m.extend(beam(at(0.0, 0.0), at(0.5, 0.0), 0.03, 0.03, c(b.trunk)));
                 quad(
                     &mut m,
                     [at(0.1, 0.0), at(0.5, 0.0), at(0.5, 0.1), at(0.1, 0.1)],
@@ -432,14 +439,14 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(tube(0.0, 0.0, 0.16, 0.16, 0.81, 0.83, 8, c(b.animal_dark)));
             m.extend(tube(0.0, 0.0, 0.08, 0.08, 0.83, 0.93, 8, c(b.beak)));
             m.extend(spike(0.0, 0.0, 0.11, 0.93, 1.0, 8, c(b.animal_dark)));
-            m.extend(cuboid([0.12, 0.0, -0.12], [0.36, 0.14, 0.12], c(b.patch)));
+            m.extend(cuboid([0.12, 0.0, -0.12], [0.36, 0.16, 0.12], c(b.patch)));
             m.extend(gable(
                 0.1,
                 0.38,
                 -0.15,
                 0.15,
-                0.14,
-                0.22,
+                0.16,
+                0.24,
                 c(b.lighthouse),
                 c(b.patch),
             ));
@@ -479,14 +486,14 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(cuboid([-0.45, 0.38, -0.21], [0.38, 0.8, 0.21], OWN));
             // White patches on the flanks.
             for (x0, x1, y0, y1) in [(-0.35, -0.1, 0.5, 0.74), (0.05, 0.25, 0.45, 0.65)] {
-                for z in [-0.214, 0.21] {
-                    m.extend(cuboid([x0, y0, z], [x1, y1, z + 0.004], c(b.patch)));
+                for (side, flank) in [(-0.21 - STANDS_PROUD, -0.21), (0.21, 0.21 + STANDS_PROUD)] {
+                    m.extend(cuboid([x0, y0, side], [x1, y1, flank], c(b.patch)));
                 }
             }
             m.extend(legs(0.33, 0.14, 0.1, 0.4, c(b.animal_dark)));
             m.extend(cuboid([0.47, 0.52, -0.12], [0.7, 0.8, 0.12], OWN));
             m.extend(cuboid([0.62, 0.52, -0.1], [0.72, 0.64, 0.1], c(b.patch)));
-            for z in [-0.17, 0.11] {
+            for z in [-0.18, 0.12] {
                 m.extend(cuboid([0.5, 0.78, z], [0.55, 0.86, z + 0.06], c(b.patch)));
             }
             m.extend(beam(
@@ -503,7 +510,7 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(beam([0.26, 0.7, 0.0], [0.44, 0.92, 0.0], 0.09, 0.09, OWN));
             m.extend(cuboid([0.47, 0.86, -0.06], [0.64, 0.98, 0.06], OWN));
             m.extend(cuboid(
-                [0.62, 0.87, -0.03],
+                [0.62, 0.86, -0.03],
                 [0.66, 0.92, 0.03],
                 c(b.animal_dark),
             ));
@@ -521,7 +528,7 @@ pub fn mesh(shape: Shape) -> Mesh {
             }
             m.extend(cuboid(
                 [-0.42, 0.62, -0.04],
-                [-0.37, 0.72, 0.04],
+                [-0.38, 0.72, 0.04],
                 c(b.patch),
             ));
         }
@@ -781,6 +788,64 @@ pub fn mesh(shape: Shape) -> Mesh {
 mod tests {
     use super::*;
     use crate::data::animals::HEAD_FROM;
+
+    /// Every flat, axis-aligned face of `shape`'s mesh: which axis it faces
+    /// along, where on it, its colour and its extent across the other two.
+    fn flat_faces(shape: Shape) -> Vec<(usize, f32, [f32; 4], [f32; 4])> {
+        let m = shape.mesh();
+        let mut faces = Vec::new();
+        for t in m.indices.chunks_exact(3) {
+            let v = [0, 1, 2].map(|k| m.vertices[t[k] as usize]);
+            for axis in 0..3 {
+                let c = v[0].pos[axis];
+                if v.iter().any(|p| (p.pos[axis] - c).abs() > 1e-6) {
+                    continue;
+                }
+                let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+                let lo_u = v.iter().map(|p| p.pos[u]).fold(f32::MAX, f32::min);
+                let hi_u = v.iter().map(|p| p.pos[u]).fold(f32::MIN, f32::max);
+                let lo_w = v.iter().map(|p| p.pos[w]).fold(f32::MAX, f32::min);
+                let hi_w = v.iter().map(|p| p.pos[w]).fold(f32::MIN, f32::max);
+                faces.push((axis, c, v[0].colour, [lo_u, hi_u, lo_w, hi_w]));
+            }
+        }
+        faces
+    }
+
+    #[test]
+    fn should_stand_every_detail_a_depth_step_clear_of_the_face_behind_it() {
+        // Two faces of different colours a hair apart and facing the same
+        // way take turns in front with distance: windows on a house, patches
+        // on a cow, all flickered. A detail stands STANDS_PROUD out, or lies
+        // flush and wholly behind (the hidden back of a box).
+        let mut close = Vec::new();
+        for shape in Shape::ALL {
+            let faces = flat_faces(shape);
+            for (i, a) in faces.iter().enumerate() {
+                for b in &faces[i + 1..] {
+                    if a.0 != b.0 || a.2 == b.2 {
+                        continue;
+                    }
+                    let gap = (a.1 - b.1).abs();
+                    let overlap_u = a.3[1].min(b.3[1]) - a.3[0].max(b.3[0]);
+                    let overlap_w = a.3[3].min(b.3[3]) - a.3[2].max(b.3[2]);
+                    if gap > 1e-5
+                        && gap < STANDS_PROUD - 1e-6
+                        && overlap_u > 1e-4
+                        && overlap_w > 1e-4
+                    {
+                        close.push(format!("{shape:?}: {gap} apart at {} on axis {}", a.1, a.0));
+                    }
+                }
+            }
+        }
+        close.dedup();
+        assert!(
+            close.is_empty(),
+            "faces too close to tell apart:\n{}",
+            close.join("\n")
+        );
+    }
 
     #[test]
     fn should_stand_house_windows_out_of_the_wall_by_a_depth_step() {
