@@ -6,5 +6,6 @@ pub mod fitness;
 pub mod library;
 pub mod onboarding;
 pub mod player;
+pub mod route_immersion;
 pub mod route_player;
 pub mod summary;

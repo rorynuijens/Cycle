@@ -17,12 +17,14 @@ use crate::training::engine::{
 };
 use crate::training::route_engine::{self, RouteEngine};
 use crate::ui::overlay::{CourseReadings, RideOverlay};
+use crate::ui::pages::route_immersion::Immersion;
 use crate::ui::widgets::course_view::CourseView;
 use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
+use crate::ui::widgets::ride_hud::HudReadings;
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
 use crate::ui::widgets::zone_meter::ZoneMeter;
-use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
+use crate::ui::WINDOWED_CLAMP;
 
 /// Debug builds only: set this to a power in watts and the route player rides
 /// itself — steady power, a heart rate and a cadence, in SIM mode — so the 3D
@@ -224,10 +226,8 @@ pub struct RoutePlayerPage {
     /// reached — so the labels and CSS classes are only touched when the cue
     /// actually changes rather than every second.
     cue_rendered: Cell<Option<(i32, bool)>>,
-    /// The content clamp and the box inside it, kept so fullscreen can widen
-    /// the one and tighten the other.
-    clamp: adw::Clamp,
-    inner: gtk::Box,
+    /// The windowed, fullscreen and fullscreen-on-the-road layouts.
+    immersion: Rc<Immersion>,
     /// The on-page fullscreen button, which turns into the way back out.
     fullscreen_btn: gtk::Button,
     pause_btn: gtk::Button,
@@ -304,6 +304,16 @@ impl RoutePlayerPage {
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
             .build();
+        // The cockpit above the map slot and below it, each one box, so
+        // fullscreen on the 3D road can put both away whole.
+        let above = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build();
+        let below = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build();
 
         // ── Route name + ride mode ───────────────────────────────────────────
         let name_row = gtk::Box::builder()
@@ -324,7 +334,7 @@ impl RoutePlayerPage {
             .build();
         name_row.append(&route_name_label);
         name_row.append(&mode_label);
-        inner.append(&name_row);
+        above.append(&name_row);
 
         // ── Connected devices ────────────────────────────────────────────────
         // Same chip strip as the workout player, so the rider can see at a glance
@@ -346,7 +356,7 @@ impl RoutePlayerPage {
             .spacing(6)
             .build();
         devices_section.append(&devices_flow);
-        inner.append(&devices_section);
+        above.append(&devices_section);
 
         // ── Gradient profile ──────────────────────────────────────────────────
         let ele_pts_rc: ProfileSamples = Rc::new(RefCell::new(profile_samples(route)));
@@ -410,11 +420,11 @@ impl RoutePlayerPage {
         hero_grid.attach(&gradient_box, 0, 0, 1, 1);
         hero_grid.attach(&power_box, 1, 0, 1, 1);
         hero_grid.attach(&speed_box, 2, 0, 1, 1);
-        inner.append(&hero_grid);
+        above.append(&hero_grid);
 
         // ── Zone ribbon ──────────────────────────────────────────────────────
         let zone_meter = ZoneMeter::new(ftp_watts);
-        inner.append(zone_meter.widget());
+        above.append(zone_meter.widget());
 
         // ── Course cue ───────────────────────────────────────────────────────
         // What the road is about to do, in words, in the same slot and the same
@@ -439,7 +449,7 @@ impl RoutePlayerPage {
             .build();
         cue_box.append(&cue_headline);
         cue_box.append(&cue_detail);
-        inner.append(&cue_box);
+        above.append(&cue_box);
 
         // ── Secondary metrics: HR · cadence · elapsed · remaining ────────────
         let secondary_grid = gtk::Grid::builder()
@@ -478,7 +488,7 @@ impl RoutePlayerPage {
         secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
         secondary_grid.attach(&elapsed_box, 2, 0, 1, 1);
         secondary_grid.attach(&climb_box, 3, 0, 1, 1);
-        inner.append(&secondary_grid);
+        above.append(&secondary_grid);
 
         // ── Map and profiles — the slot the workout screen gives its graph ───
         // All three span the full width and stack in the order the rider reads
@@ -506,10 +516,12 @@ impl RoutePlayerPage {
             .build();
         graph_column.append(&map_stack);
         graph_column.append(&lookahead_chart);
+        inner.append(&above);
         inner.append(&graph_column);
 
-        inner.append(&progress_bar);
-        inner.append(&time_dist_row);
+        below.append(&progress_bar);
+        below.append(&time_dist_row);
+        inner.append(&below);
 
         // ── Controls ─────────────────────────────────────────────────────────
         let controls = gtk::Box::builder()
@@ -604,6 +616,17 @@ impl RoutePlayerPage {
         controls.append(&end_btn);
         inner.append(&controls);
 
+        let immersion = Immersion::new(
+            clamp.clone(),
+            inner.clone(),
+            above,
+            below,
+            lookahead_chart.clone(),
+            controls.clone(),
+            course_view.clone(),
+        );
+        view_3d_btn.connect_toggled(Immersion::road_toggle(&immersion));
+
         clamp.set_child(Some(&inner));
         scroll.set_child(Some(&clamp));
         root.append(&scroll);
@@ -677,8 +700,7 @@ impl RoutePlayerPage {
             cue_headline,
             cue_detail,
             cue_rendered: Cell::new(None),
-            clamp,
-            inner,
+            immersion,
             fullscreen_btn,
             pause_btn,
             end_btn,
@@ -767,22 +789,10 @@ impl RoutePlayerPage {
     /// look-ahead profile grows with it.
     pub fn set_fullscreen(&self, fullscreen: bool) {
         crate::ui::dress_fullscreen_button(&self.fullscreen_btn, fullscreen);
-        self.clamp.set_maximum_size(if fullscreen {
-            FULLSCREEN_CLAMP
-        } else {
-            WINDOWED_CLAMP
-        });
-        let margin = if fullscreen { 12 } else { 24 };
-        self.clamp.set_margin_top(if fullscreen { 12 } else { 20 });
-        self.clamp.set_margin_bottom(margin);
-        self.clamp.set_margin_start(margin);
-        self.clamp.set_margin_end(margin);
-        // Tighter gaps between sections in fullscreen. Every pixel saved here is
-        // a pixel the map gains, and it keeps the page's minimum height well
-        // under a screen so nothing has to scroll.
-        self.inner.set_spacing(if fullscreen { 12 } else { 18 });
-        // The map itself needs no resizing: it carries `vexpand`, so whatever
+        // Wider and tighter on the map; the whole screen on the 3D road. The
+        // map itself needs no resizing: it carries `vexpand`, so whatever
         // height fullscreen frees reaches it on its own.
+        Immersion::set_fullscreen(&self.immersion, fullscreen);
     }
 
     /// Show what the road ahead does, re-rendering only when it changes.
@@ -1433,6 +1443,23 @@ impl RoutePlayerPage {
                 page.route_map.set_position(lat, lng);
             }
             page.course_view.set_progress(distance_m, speed_ms);
+            page.course_view.set_hud(HudReadings {
+                route_name: engine.borrow().route.name.clone(),
+                power_watts: readings.power_watts,
+                ftp_watts: session.borrow().ftp_watts.unwrap_or(0),
+                speed_kmh: speed_ms * 3.6,
+                to_go_m: (total_dist - distance_m).max(0.0),
+                heart_rate_bpm: readings.heart_rate_bpm,
+                cadence_rpm: readings.cadence_rpm,
+                gradient_pct,
+                elapsed_secs: elapsed,
+                climbed_m: session.borrow().elevation_gain_m().unwrap_or(0.0),
+                progress: if total_dist > 0.0 {
+                    distance_m / total_dist
+                } else {
+                    0.0
+                },
+            });
 
             if is_done && !completed_tick.get() {
                 completed_tick.set(true);

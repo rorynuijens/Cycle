@@ -30,6 +30,7 @@ use crate::data::palette;
 use crate::data::props::{self, Prop, Shape};
 use crate::data::rider;
 use crate::data::route::Route;
+use crate::ui::widgets::ride_hud::{self, HudReadings, RideHud};
 
 /// Vertical field of view, in degrees. Wide enough that a bend does not
 /// leave the frame.
@@ -61,6 +62,16 @@ const LINE_FADE_M: (f32, f32) = (350.0, 1_100.0);
 /// The same, for a fold of the land against more land — on the desert's
 /// dunes, row upon row of crests from a hundred metres out.
 const LAND_LINE_FADE_M: (f32, f32) = (120.0, 320.0);
+
+/// Props, animals and their outlines: each is drawn a second time, a
+/// little larger and inside out, in the outline colour — its hull — so the
+/// line is part of the shape. A line found in the finished frame was a pixel
+/// wide on a far cow or barn, and blinked on and off as the camera moved.
+/// The hull's width on the screen, in pixels…
+const HULL_PX: f32 = 1.6;
+/// …but never more than this share of the prop's size, so a far cow is not
+/// all outline.
+const HULL_MAX_SHARE: f32 = 0.05;
 
 /// How quickly the drawn rider closes on where the ride says they are, in
 /// seconds: the time to make up two thirds of the gap. A report is due every
@@ -94,8 +105,10 @@ out vec3 v_rel;
 // facets, not gradients.
 flat out vec4 v_colour;
 flat out vec3 v_anchor;
+out vec3 v_push;
 void main() {
     vec3 world = (u_model * vec4(a_pos, 1.0)).xyz;
+    v_push = vec3(0.0);
     v_world = world;
     // Relative to the eye, the numbers are small. Interpolated across a pixel
     // at thousands of metres from the scene's origin, the absolute position
@@ -119,9 +132,16 @@ in vec3 i_pos;
 in vec2 i_size;
 in vec3 i_colour;
 in vec2 i_motion;
+in vec3 a_push;
 uniform mat4 u_mvp;
 uniform vec3 u_eye;
 uniform float u_time;
+// Above zero, this draw is the hull: metres of inflation per metre away.
+uniform float u_hull;
+uniform float u_hull_share;
+uniform vec3 u_outline;
+uniform vec2 u_line_fade;
+out vec3 v_push;
 uniform float u_orbit;
 uniform float u_head;
 uniform vec2 u_hub;
@@ -187,9 +207,17 @@ void main() {
     float s = sin(yaw);
     p *= i_size.x;
     vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+    v_colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
+    v_push = vec3(c * a_push.x - s * a_push.z, a_push.y, s * a_push.x + c * a_push.z);
+    if (u_hull > 0.0) {
+        float away = length(world - u_eye);
+        world += v_push * min(u_hull * away, u_hull_share * i_size.x);
+        // Far off, the hull takes the prop's own colour: no line to crawl.
+        float ink = 0.85 * (1.0 - smoothstep(u_line_fade.x, u_line_fade.y, away));
+        v_colour = vec4(mix(v_colour.rgb, u_outline, ink), 7.0);
+    }
     v_world = world;
     v_rel = world - u_eye;
-    v_colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
     v_anchor = world;
     gl_Position = u_mvp * vec4(world, 1.0);
 }
@@ -205,6 +233,7 @@ in vec3 v_world;
 in vec3 v_rel;
 flat in vec4 v_colour;
 flat in vec3 v_anchor;
+in vec3 v_push;
 uniform vec3 u_horizon;
 uniform vec3 u_zenith;
 uniform vec3 u_sun;
@@ -212,6 +241,8 @@ uniform vec3 u_foam;
 uniform float u_fog_start;
 uniform float u_fog_density;
 uniform float u_time;
+// 1 for props: the outline pass leaves their lines to the hull.
+uniform float u_prop;
 layout(location = 0) out vec4 frag;
 layout(location = 1) out vec4 frag_normal;
 
@@ -229,6 +260,20 @@ void main() {
     // the sign of a vertical component that is noise, and the wall comes out
     // speckled light and dark pixel by pixel.
     if (dot(n, v_rel) > 0.0) n = -n;
+    if (material == 7.0) {
+        // The hull: only its far side shows, round the prop's edge. Which
+        // side of a facet is outward comes from the push, not the winding,
+        // which the kit does not keep; whether it faces the eye comes from
+        // the facet itself, which is flat — the push, blended across it,
+        // let corners of facets that face the eye through as dots.
+        vec3 facet = normalize(cross(dFdx(v_rel), dFdy(v_rel)));
+        if (dot(facet, v_push) < 0.0) facet = -facet;
+        if (dot(facet, v_rel) < 0.0) discard;
+        float kh = max(length(v_rel) - u_fog_start, 0.0) * u_fog_density;
+        frag = vec4(mix(c, u_horizon, 1.0 - exp(-kh * kh)), 1.0);
+        frag_normal = vec4(n * 0.5 + 0.5, 0.5);
+        return;
+    }
     if (material == 1.0) {
         // A hand-made look: each facet of the land a few per cent lighter or
         // darker, seeded by where it is.
@@ -262,7 +307,7 @@ void main() {
     float k = max(length(v_rel) - u_fog_start, 0.0) * u_fog_density;
     frag = vec4(mix(lit, u_horizon, 1.0 - exp(-k * k)), 1.0);
     // Alpha marks the land, whose folds the outline pass lets go of sooner.
-    frag_normal = vec4(n * 0.5 + 0.5, material == 1.0 ? 0.0 : 1.0);
+    frag_normal = vec4(n * 0.5 + 0.5, u_prop > 0.5 ? 0.5 : (material == 1.0 ? 0.0 : 1.0));
 }
 "#;
 
@@ -273,6 +318,19 @@ void main() {
     vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
     v_uv = p * 0.5 + 0.5;
     gl_Position = vec4(p, 0.0, 1.0);
+}
+"#;
+
+/// The fullscreen ride HUD, painted by Cairo, over everything. Cairo's pixels
+/// lie in memory as B, G, R, A, alpha already multiplied in, and run top to
+/// bottom.
+const HUD_FRAGMENT_SHADER: &str = r#"
+precision highp sampler2D;
+in vec2 v_uv;
+uniform sampler2D u_hud;
+out vec4 frag;
+void main() {
+    frag = texture(u_hud, vec2(v_uv.x, 1.0 - v_uv.y)).bgra;
 }
 "#;
 
@@ -292,7 +350,8 @@ void main() {
 
 /// Outlines: dark lines where the depth folds — an object's silhouette
 /// against what is behind it — or where the faces either side turn sharply,
-/// as at a building's corner. Gentle folds in the land are left unlined.
+/// as at a building's corner. Gentle folds in the land are left unlined, and
+/// props are left to their hulls.
 /// Lines fade into the haze with what they outline, and thin out with
 /// distance before that: a far line is a pixel wide and broken, and crawls
 /// as the camera moves. A fold of the land against more land goes soonest —
@@ -319,6 +378,11 @@ float linear(float z) {
     return 2.0 * u_near * u_far / (u_far + u_near - ndc * (u_far - u_near));
 }
 
+// 1 where a sample is a prop's (the fragment shader marks them 0.5).
+float prop_at(vec2 uv) {
+    return 1.0 - step(0.25, abs(texture(u_normal, uv).a - 0.5));
+}
+
 void main() {
     vec2 dx = vec2(u_texel.x, 0.0);
     vec2 dy = vec2(0.0, u_texel.y);
@@ -338,6 +402,10 @@ void main() {
         min(dot(nc, texture(u_normal, v_uv - dy).xyz * 2.0 - 1.0),
             dot(nc, texture(u_normal, v_uv + dy).xyz * 2.0 - 1.0)));
     edge = max(edge, smoothstep(0.75, 0.5, turn));
+    // Props, and the land right against them, are outlined by their hulls.
+    float prop = max(max(prop_at(v_uv), prop_at(v_uv - dx)),
+        max(max(prop_at(v_uv + dx), prop_at(v_uv - dy)), prop_at(v_uv + dy)));
+    edge *= 1.0 - prop;
     float nearest = min(dc, min(min(dl, dr), min(dd, du)));
     float k = max(nearest - u_fog_start, 0.0) * u_fog_density;
     float not_land = max(
@@ -444,6 +512,9 @@ struct GlState {
     sky_program: glow::Program,
     outline_program: glow::Program,
     prop_program: glow::Program,
+    hud_program: glow::Program,
+    /// The HUD as last painted, and its size: replaced only when it changes.
+    hud: Option<(glow::Texture, (i32, i32))>,
     /// Core profiles draw nothing without a vertex array bound, even for a
     /// triangle made up in the shader.
     empty_vao: glow::VertexArray,
@@ -493,6 +564,8 @@ struct PropShape {
     /// frame.
     live: glow::Buffer,
     live_count: i32,
+    /// Which way each vertex moves for the hull.
+    push: glow::Buffer,
 }
 
 type Uniform = Option<glow::UniformLocation>;
@@ -576,6 +649,12 @@ struct Uniforms {
     o_fog_density: Uniform,
     o_line_fade: Uniform,
     o_land_line_fade: Uniform,
+    hud_image: Uniform,
+    p_prop: Uniform,
+    p_hull: Uniform,
+    p_hull_share: Uniform,
+    p_outline: Uniform,
+    p_line_fade: Uniform,
 }
 
 struct Inner {
@@ -596,11 +675,25 @@ struct Inner {
     gl: RefCell<Option<GlState>>,
     progress: Cell<Progress>,
     glide: Cell<Glide>,
+    hud: RefCell<HudLayer>,
     /// The distance last drawn, so an unmoving camera is not redrawn.
     drawn_m: Cell<Option<f32>>,
     /// Bumped for every new route, so a build that finishes after the next
     /// route has been set is thrown away rather than shown.
     generation: Cell<u64>,
+}
+
+/// The fullscreen ride HUD, while the view carries one.
+#[derive(Default)]
+struct HudLayer {
+    shown: bool,
+    readings: Option<HudReadings>,
+    /// The route's heights, for the profile band.
+    profile: Vec<f32>,
+    /// Made on first use: loading the font is for fullscreen, not every view.
+    painter: Option<RideHud>,
+    /// What the texture on the GPU shows: the readings and the view's size.
+    painted: Option<(HudReadings, (i32, i32))>,
 }
 
 /// The 3D road view. Cheap to clone; clones share one widget.
@@ -649,6 +742,7 @@ impl CourseView {
             gl: RefCell::new(None),
             progress: Cell::new(Progress::default()),
             glide: Cell::new(Glide::default()),
+            hud: RefCell::new(HudLayer::default()),
             drawn_m: Cell::new(None),
             generation: Cell::new(0),
         });
@@ -714,6 +808,12 @@ impl CourseView {
         inner.drawn_m.set(None);
         *inner.route.borrow_mut() = Some(route.clone());
         inner.look.set(look);
+        {
+            let mut hud = inner.hud.borrow_mut();
+            hud.profile = ride_hud::profile(route);
+            hud.readings = None;
+            hud.painted = None;
+        }
         Inner::rebuild(inner);
     }
 
@@ -725,6 +825,18 @@ impl CourseView {
             speed_ms,
             at_us: Some(glib::monotonic_time()),
         });
+    }
+
+    /// Show or hide the fullscreen ride HUD over the road.
+    pub fn set_hud_shown(&self, shown: bool) {
+        self.inner.hud.borrow_mut().shown = shown;
+        self.inner.area.queue_render();
+    }
+
+    /// What the HUD shows. Called once a tick by the ride loop; the HUD is
+    /// painted again only when this changes.
+    pub fn set_hud(&self, readings: HudReadings) {
+        self.inner.hud.borrow_mut().readings = Some(readings);
     }
 }
 
@@ -863,6 +975,28 @@ impl Inner {
         };
         state.draw(w, h, pose, sky, time_s, &live);
         self.drawn_m.set(pose.map(|_| distance));
+
+        let mut hud = self.hud.borrow_mut();
+        let HudLayer {
+            shown,
+            readings,
+            profile,
+            painter,
+            painted,
+        } = &mut *hud;
+        if let (true, Some(readings)) = (*shown, readings.as_ref()) {
+            let fresh = painted
+                .as_ref()
+                .is_some_and(|(r, size)| r == readings && *size == (w, h));
+            if !fresh {
+                let painter = painter.get_or_insert_with(RideHud::new);
+                if let Some(mut image) = painter.render(w, h, readings, profile) {
+                    state.upload_hud(&mut image);
+                    *painted = Some((readings.clone(), (w, h)));
+                }
+            }
+            state.draw_hud(w, h);
+        }
     }
 }
 
@@ -955,6 +1089,13 @@ impl GlState {
                 OUTLINE_FRAGMENT_SHADER,
                 &[],
             )?;
+            let hud_program = link(
+                &gl,
+                header,
+                FULLSCREEN_VERTEX_SHADER,
+                HUD_FRAGMENT_SHADER,
+                &[],
+            )?;
             let prop_program = link(
                 &gl,
                 header,
@@ -963,6 +1104,7 @@ impl GlState {
                 &[
                     (0, "a_pos"),
                     (1, "a_colour"),
+                    (2, "a_push"),
                     (3, "i_pos"),
                     (4, "i_size"),
                     (5, "i_colour"),
@@ -1000,6 +1142,12 @@ impl GlState {
                 o_fog_density: at(outline_program, "u_fog_density"),
                 o_line_fade: at(outline_program, "u_line_fade"),
                 o_land_line_fade: at(outline_program, "u_land_line_fade"),
+                hud_image: at(hud_program, "u_hud"),
+                p_prop: at(prop_program, "u_prop"),
+                p_hull: at(prop_program, "u_hull"),
+                p_hull_share: at(prop_program, "u_hull_share"),
+                p_outline: at(prop_program, "u_outline"),
+                p_line_fade: at(prop_program, "u_line_fade"),
             };
             Ok(Self {
                 gl,
@@ -1007,6 +1155,8 @@ impl GlState {
                 sky_program,
                 outline_program,
                 prop_program,
+                hud_program,
+                hud: None,
                 empty_vao,
                 world,
                 horizons,
@@ -1237,10 +1387,24 @@ impl GlState {
                         (f32::NAN, f32::NAN)
                     }
                 };
+                gl.uniform_1_f32(u.p_prop.as_ref(), 1.0);
+                gl.uniform_1_f32(u.p_hull.as_ref(), 0.0);
                 for shape in &self.props {
-                    shape.draw(gl, camera.eye, forward, tan_half);
+                    shape.draw(gl, camera.eye, forward, tan_half, PROP_DRAW_M);
                     shape.draw_live(gl);
                 }
+                // The hulls, out to where their line has faded into the
+                // prop's own colour.
+                let per_m = 2.0 * (FOV_DEG.to_radians() / 2.0).tan() / height.max(1) as f32;
+                gl.uniform_1_f32(u.p_hull.as_ref(), HULL_PX * per_m);
+                gl.uniform_1_f32(u.p_hull_share.as_ref(), HULL_MAX_SHARE);
+                gl.uniform_3_f32_slice(u.p_outline.as_ref(), &outline);
+                gl.uniform_2_f32(u.p_line_fade.as_ref(), LINE_FADE_M.0, LINE_FADE_M.1);
+                for shape in &self.props {
+                    shape.draw(gl, camera.eye, forward, tan_half, LINE_FADE_M.1);
+                    shape.draw_live(gl);
+                }
+                gl.uniform_1_f32(u.p_hull.as_ref(), 0.0);
                 if first {
                     let err = gl.get_error();
                     tracing::info!(
@@ -1286,6 +1450,94 @@ impl GlState {
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
             gl.use_program(None);
+        }
+    }
+
+    /// Put a freshly painted HUD on the GPU, reusing the texture while the
+    /// view keeps its size.
+    fn upload_hud(&mut self, image: &mut cairo::ImageSurface) {
+        let (w, h, stride) = (image.width(), image.height(), image.stride());
+        let Ok(pixels) = image.data() else {
+            return;
+        };
+        let gl = &self.gl;
+        unsafe {
+            let tex = match self.hud {
+                Some((tex, size)) if size == (w, h) => tex,
+                stale => {
+                    if let Some((old, _)) = stale {
+                        gl.delete_texture(old);
+                    }
+                    let Ok(tex) = gl.create_texture() else {
+                        tracing::error!("3D view could not make the HUD's texture");
+                        self.hud = None;
+                        return;
+                    };
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    for (key, value) in [
+                        (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                        (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+                        (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                        (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+                    ] {
+                        gl.tex_parameter_i32(glow::TEXTURE_2D, key, value as i32);
+                    }
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA8 as i32,
+                        w,
+                        h,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    tex
+                }
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, stride / 4);
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                w,
+                h,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&pixels)),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            self.hud = Some((tex, (w, h)));
+        }
+    }
+
+    /// Lay the HUD over the frame just drawn, in GTK's framebuffer.
+    fn draw_hud(&self, width: i32, height: i32) {
+        let Some((tex, _)) = self.hud else {
+            return;
+        };
+        let gl = &self.gl;
+        unsafe {
+            gl.viewport(0, 0, width, height);
+            gl.disable(glow::DEPTH_TEST);
+            gl.enable(glow::BLEND);
+            // Cairo's alpha is already multiplied in.
+            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+            gl.use_program(Some(self.hud_program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.uniform_1_i32(self.u.hud_image.as_ref(), 0);
+            gl.bind_vertex_array(Some(self.empty_vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.use_program(None);
+            gl.disable(glow::BLEND);
         }
     }
 
@@ -1352,6 +1604,7 @@ impl GlState {
             unsafe {
                 self.gl.delete_buffer(shape.instances);
                 self.gl.delete_buffer(shape.live);
+                self.gl.delete_buffer(shape.push);
             }
         }
         unsafe {
@@ -1359,6 +1612,10 @@ impl GlState {
             self.gl.delete_program(self.sky_program);
             self.gl.delete_program(self.outline_program);
             self.gl.delete_program(self.prop_program);
+            self.gl.delete_program(self.hud_program);
+            if let Some((tex, _)) = self.hud.take() {
+                self.gl.delete_texture(tex);
+            }
             self.gl.delete_vertex_array(self.empty_vao);
         }
     }
@@ -1367,10 +1624,22 @@ impl GlState {
 impl PropShape {
     /// The shape's mesh on the GPU, with an empty buffer for its props.
     unsafe fn new(gl: &glow::Context, shape: Shape) -> Result<Self, String> {
-        let mesh = MeshGl::new(gl, &shape.mesh())?;
+        let source = shape.mesh();
+        let mesh = MeshGl::new(gl, &source)?;
         let instances = gl.create_buffer()?;
         let live = gl.create_buffer()?;
+        let push = gl.create_buffer()?;
+        let push_bytes: Vec<u8> = hull_push(&source)
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_ne_bytes())
+            .collect();
         gl.bind_vertex_array(Some(mesh.vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(push));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &push_bytes, glow::STATIC_DRAW);
+        gl.enable_vertex_attrib_array(2);
+        gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, 12, 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
         for slot in [3, 4, 5, 6] {
             gl.enable_vertex_attrib_array(slot);
             gl.vertex_attrib_divisor(slot, 1);
@@ -1383,6 +1652,7 @@ impl PropShape {
             chunks: Vec::new(),
             live,
             live_count: 0,
+            push,
         })
     }
 
@@ -1412,7 +1682,14 @@ impl PropShape {
     /// Draw the props of every chunk within reach of the eye. Each chunk's
     /// run is reached by pointing the per-prop attributes at its start: GL
     /// ES 3.0 has no base instance.
-    unsafe fn draw(&self, gl: &glow::Context, eye: [f32; 3], forward: (f32, f32), tan_half: f32) {
+    unsafe fn draw(
+        &self,
+        gl: &glow::Context,
+        eye: [f32; 3],
+        forward: (f32, f32),
+        tan_half: f32,
+        reach_m: f32,
+    ) {
         if self.chunks.is_empty() || self.mesh.index_count == 0 {
             return;
         }
@@ -1420,7 +1697,7 @@ impl PropShape {
         gl.bind_vertex_array(Some(self.mesh.vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
         for chunk in &self.chunks {
-            if !props::in_view(chunk, eye, forward, tan_half, PROP_DRAW_M) {
+            if !props::in_view(chunk, eye, forward, tan_half, reach_m) {
                 continue;
             }
             let base = chunk.start as i32 * stride;
@@ -1556,6 +1833,118 @@ fn vertex_bytes(mesh: &Mesh) -> Vec<u8> {
         .collect()
 }
 
+/// Which way each vertex of `mesh` moves to inflate it into its hull: the
+/// faces round that corner, averaged, each turned away from the middle of
+/// its own part. The kit does not keep a winding, so "away from the middle"
+/// is what says which way is out; every part is a box or near enough.
+fn hull_push(mesh: &Mesh) -> Vec<[f32; 3]> {
+    use std::collections::HashMap;
+    let n = mesh.vertices.len();
+    let key = |v: usize| {
+        let p = mesh.vertices[v].pos;
+        [
+            (p[0] * 1e4).round() as i64,
+            (p[1] * 1e4).round() as i64,
+            (p[2] * 1e4).round() as i64,
+        ]
+    };
+    // Parts: vertices joined by a triangle or by standing at one spot.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut v: usize) -> usize {
+        while parent[v] != v {
+            parent[v] = parent[parent[v]];
+            v = parent[v];
+        }
+        v
+    }
+    let join = |parent: &mut Vec<usize>, a: usize, b: usize| {
+        let (ra, rb) = (root(parent, a), root(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    };
+    for t in mesh.indices.chunks_exact(3) {
+        join(&mut parent, t[0] as usize, t[1] as usize);
+        join(&mut parent, t[1] as usize, t[2] as usize);
+    }
+    let mut first_at: HashMap<[i64; 3], usize> = HashMap::new();
+    for v in 0..n {
+        let k = key(v);
+        if let Some(&w) = first_at.get(&k) {
+            join(&mut parent, v, w);
+        } else {
+            first_at.insert(k, v);
+        }
+    }
+    let mut middle: HashMap<usize, ([f32; 3], f32)> = HashMap::new();
+    for v in 0..n {
+        let r = root(&mut parent, v);
+        let e = middle.entry(r).or_insert(([0.0; 3], 0.0));
+        for i in 0..3 {
+            e.0[i] += mesh.vertices[v].pos[i];
+        }
+        e.1 += 1.0;
+    }
+    // Each face counts once at a corner, however many of its triangles
+    // meet there: counted per triangle, a box's corners leaned towards
+    // whichever faces were split through them.
+    let mut faces: HashMap<(usize, [i64; 3]), Vec<[f32; 3]>> = HashMap::new();
+    for t in mesh.indices.chunks_exact(3) {
+        let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
+        let (pa, pb, pc) = (
+            mesh.vertices[a].pos,
+            mesh.vertices[b].pos,
+            mesh.vertices[c].pos,
+        );
+        let u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let w = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+        let mut nrm = [
+            u[1] * w[2] - u[2] * w[1],
+            u[2] * w[0] - u[0] * w[2],
+            u[0] * w[1] - u[1] * w[0],
+        ];
+        let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+        if len < 1e-12 {
+            continue;
+        }
+        let r = root(&mut parent, a);
+        let (m, count) = middle[&r];
+        let out = [
+            (pa[0] + pb[0] + pc[0]) / 3.0 - m[0] / count,
+            (pa[1] + pb[1] + pc[1]) / 3.0 - m[1] / count,
+            (pa[2] + pb[2] + pc[2]) / 3.0 - m[2] / count,
+        ];
+        if nrm[0] * out[0] + nrm[1] * out[1] + nrm[2] * out[2] < 0.0 {
+            nrm = [-nrm[0], -nrm[1], -nrm[2]];
+        }
+        for x in &mut nrm {
+            *x /= len;
+        }
+        for v in [a, b, c] {
+            let seen = faces.entry((r, key(v))).or_default();
+            let same = |f: &[f32; 3]| f[0] * nrm[0] + f[1] * nrm[1] + f[2] * nrm[2] > 0.9999;
+            if !seen.iter().any(same) {
+                seen.push(nrm);
+            }
+        }
+    }
+    (0..n)
+        .map(|v| {
+            let r = root(&mut parent, v);
+            let p = faces.get(&(r, key(v))).map_or([0.0; 3], |fs| {
+                fs.iter()
+                    .fold([0.0; 3], |a, f| [a[0] + f[0], a[1] + f[1], a[2] + f[2]])
+            });
+            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            if len < 1e-6 {
+                [0.0; 3]
+            } else {
+                [p[0] / len, p[1] / len, p[2] / len]
+            }
+        })
+        .collect()
+}
+
 fn index_bytes(mesh: &Mesh) -> Vec<u8> {
     mesh.indices.iter().flat_map(|i| i.to_ne_bytes()).collect()
 }
@@ -1583,6 +1972,93 @@ fn egl_get_proc_address() -> Option<GetProcAddress> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box from `lo` to `hi`, every face its own four corners, as the kit
+    /// builds them — with every other face wound the wrong way round.
+    fn mixed_box(mesh: &mut Mesh, lo: [f32; 3], hi: [f32; 3]) {
+        let corner = |i: usize| {
+            [
+                if i & 1 == 0 { lo[0] } else { hi[0] },
+                if i & 2 == 0 { lo[1] } else { hi[1] },
+                if i & 4 == 0 { lo[2] } else { hi[2] },
+            ]
+        };
+        let faces = [
+            [0, 2, 6, 4],
+            [1, 5, 7, 3],
+            [0, 4, 5, 1],
+            [2, 3, 7, 6],
+            [0, 1, 3, 2],
+            [4, 6, 7, 5],
+        ];
+        for (k, f) in faces.iter().enumerate() {
+            let base = mesh.vertices.len() as u32;
+            for &i in f {
+                mesh.vertices.push(course3d::Vertex {
+                    pos: corner(i),
+                    colour: [0.5, 0.5, 0.5, 2.0],
+                });
+            }
+            let tris = if k % 2 == 0 {
+                [0, 1, 2, 0, 2, 3]
+            } else {
+                [0, 2, 1, 0, 3, 2]
+            };
+            mesh.indices.extend(tris.iter().map(|t| base + t));
+        }
+    }
+
+    #[test]
+    fn should_push_every_corner_of_a_box_outward_whatever_its_winding() {
+        let mut mesh = Mesh::default();
+        mixed_box(&mut mesh, [-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]);
+        let push = hull_push(&mesh);
+        for (v, p) in mesh.vertices.iter().zip(&push) {
+            // A corner goes out along its own diagonal, all three ways.
+            let out = [v.pos[0], v.pos[1] - 1.0, v.pos[2]];
+            for i in 0..3 {
+                assert!(
+                    (p[i] - out[i].signum() / 3f32.sqrt()).abs() < 1e-4,
+                    "corner {:?} pushed {:?}",
+                    v.pos,
+                    p
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_push_each_part_away_from_its_own_middle() {
+        // A body and a leg under it, touching at no corner: the leg's top
+        // goes up, out of the body, not down towards the body's middle.
+        let mut mesh = Mesh::default();
+        mixed_box(&mut mesh, [-1.0, 1.0, -1.0], [1.0, 2.0, 1.0]);
+        let leg = mesh.vertices.len();
+        mixed_box(&mut mesh, [-0.2, 0.0, -0.2], [0.2, 0.9, 0.2]);
+        let push = hull_push(&mesh);
+        for (v, p) in mesh.vertices[leg..].iter().zip(&push[leg..]) {
+            assert_eq!(
+                p[1] > 0.0,
+                v.pos[1] > 0.5,
+                "leg corner {:?} pushed {:?}",
+                v.pos,
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn should_leave_a_mesh_with_no_area_unpushed() {
+        let mut mesh = Mesh::default();
+        for _ in 0..3 {
+            mesh.vertices.push(course3d::Vertex {
+                pos: [1.0, 1.0, 1.0],
+                colour: [0.0; 4],
+            });
+        }
+        mesh.indices.extend([0, 1, 2]);
+        assert_eq!(hull_push(&mesh), vec![[0.0; 3]; 3]);
+    }
 
     #[test]
     fn should_stay_put_before_the_first_report() {
@@ -2004,12 +2480,68 @@ mod offscreen {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0);
+            // CYCLE_3D_FRAMES=<n>: ride on at CYCLE_3D_SPEED for n frames at
+            // 30 a second, writing each to CYCLE_3D_OUT with {} as its number.
+            let frames: usize = std::env::var("CYCLE_3D_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            // CYCLE_3D_BENCH=1: time the frames instead of saving them.
+            let bench = std::env::var("CYCLE_3D_BENCH").is_ok_and(|v| v == "1");
+            let clock = std::time::Instant::now();
+            for f in 0..frames {
+                let m = at + speed * f as f32 / 30.0;
+                let rider = course3d::rider_pose(&scene.road, m, speed).expect("a rider");
+                let pose = course3d::chase_camera(&scene.road, &rider);
+                let t = time_s + f as f32 / 30.0;
+                state.draw(W, H, Some((pose, rider)), scene.sky_at(m), t, &live);
+                if bench {
+                    state.gl.finish();
+                } else {
+                    save(&state.gl, &out.replace("{}", &format!("{f:03}")));
+                }
+            }
+            if bench {
+                let ms = clock.elapsed().as_secs_f64() * 1000.0 / frames.max(1) as f64;
+                eprintln!("{frames} frames at {W}x{H}: {ms:.2} ms a frame");
+            }
+            if frames > 0 {
+                return;
+            }
             state.draw(W, H, Some((pose, rider)), scene.sky_at(at), time_s, &live);
+            // CYCLE_3D_HUD=1: the fullscreen HUD over the road, through the
+            // same texture and pass the widget uses.
+            if std::env::var("CYCLE_3D_HUD").is_ok_and(|v| v == "1") {
+                let readings = HudReadings {
+                    route_name: route.name.clone(),
+                    power_watts: Some(180),
+                    ftp_watts: 211,
+                    speed_kmh: 27.4,
+                    to_go_m: (route.total_distance_m - at).max(0.0),
+                    heart_rate_bpm: Some(142),
+                    cadence_rpm: None,
+                    gradient_pct: route.gradient_at(at) * 100.0,
+                    elapsed_secs: 872,
+                    climbed_m: 62.0,
+                    progress: at / route.total_distance_m.max(1.0),
+                };
+                let mut image = RideHud::new()
+                    .render(W, H, &readings, &ride_hud::profile(&route))
+                    .expect("a HUD");
+                state.upload_hud(&mut image);
+                state.draw_hud(W, H);
+            }
             let err = state.gl.get_error();
             eprintln!("glGetError after draw: 0x{err:X}");
+            save(&state.gl, &out);
+        }
+    }
 
+    /// What is in the framebuffer, to a PNG at `out`.
+    unsafe fn save(gl: &glow::Context, out: &str) {
+        {
             let mut pixels = vec![0u8; (W * H * 4) as usize];
-            state.gl.read_pixels(
+            gl.read_pixels(
                 0,
                 0,
                 W,
@@ -2028,7 +2560,7 @@ mod offscreen {
                 &glib::Bytes::from_owned(flipped),
                 row,
             );
-            texture.save_to_png(&out).expect("saved");
+            texture.save_to_png(out).expect("saved");
             eprintln!("wrote {out}");
         }
     }

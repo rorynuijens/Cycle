@@ -8,6 +8,7 @@ pub mod ftp_result;
 pub mod integrity_notice;
 pub mod metric_column;
 pub mod progression_card;
+pub mod ride_hud;
 pub mod route_map;
 pub mod rpe_dialog;
 pub mod sparkline;

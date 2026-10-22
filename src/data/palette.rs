@@ -236,6 +236,51 @@ pub const BASE: Palette = Palette {
     pigeon: hex(0x8A8F99),
 };
 
+/// The fullscreen ride HUD's colours. The HUD is drawn inside the 3D view in
+/// the world's style — cream stickers with the world's outline — and looks
+/// the same in every biome, so it is not part of [`Palette`], which a biome
+/// may override. Power zones take `ZONE_COLORS`, as everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HudColours {
+    /// A panel's face.
+    pub panel: Rgb,
+    /// Outlines, numbers and the panels' hard shadow: the world's outline.
+    pub ink: Rgb,
+    /// Captions and units.
+    pub label: Rgb,
+    /// A reading with nothing to show.
+    pub dim: Rgb,
+    /// The power zones above the rider's.
+    pub zone_off: Rgb,
+    pub heart: Rgb,
+    /// The gradient sign's red border, its white face and its post.
+    pub sign: Rgb,
+    pub sign_face: Rgb,
+    pub post: Rgb,
+    /// The route's profile, the part already ridden, and the rider on it.
+    pub profile: Rgb,
+    pub ridden: Rgb,
+    pub marker: Rgb,
+    /// The route-name flag.
+    pub flag: Rgb,
+}
+
+pub const HUD: HudColours = HudColours {
+    panel: hex(0xFFF8E7),
+    ink: BASE.outline,
+    label: hex(0x4E5566),
+    dim: hex(0x8A90A0),
+    zone_off: hex(0xE9E3D3),
+    heart: hex(0xFF7A63),
+    sign: hex(0xD63333),
+    sign_face: hex(0xFFFFFF),
+    post: hex(0x9AA0AE),
+    profile: BASE.grass_low,
+    ridden: hex(0x6CB84C),
+    marker: BASE.jersey,
+    flag: BASE.road_edge,
+};
+
 /// Names a biome may not override: the track and the rider look the same
 /// everywhere.
 pub const FIXED: [&str; 11] = [
