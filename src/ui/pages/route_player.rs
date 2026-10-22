@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::data::athlete::AthleteProfile;
 use crate::data::biome::WorldLook;
-use crate::data::ghost::{self, Ghost};
+use crate::data::ghost::{self, Ghost, NewBest};
 use crate::data::route::Route;
 use crate::data::session::{DataPoint, LiveReadings, ReadingsTracker, Session};
 use crate::devices::manager::DeviceCommand;
@@ -218,6 +218,11 @@ pub struct RoutePlayerPage {
     /// on — a ghost loaded for another route is not taken.
     ghost: RefCell<Option<Ghost>>,
     ghost_route: Cell<Option<i64>>,
+    /// Whether the ghost is raced — shown and timed against — or only kept
+    /// to tell whether this ride beats it.
+    racing: Cell<bool>,
+    /// What the last finished ride did to the route's ghost.
+    new_best: Cell<Option<NewBest>>,
     gradient_label: gtk::Label,
     speed_label: gtk::Label,
     elapsed_label: gtk::Label,
@@ -715,6 +720,8 @@ impl RoutePlayerPage {
             ghost_label,
             ghost: RefCell::new(None),
             ghost_route: Cell::new(None),
+            racing: Cell::new(false),
+            new_best: Cell::new(None),
             gradient_label,
             speed_label,
             elapsed_label,
@@ -1009,6 +1016,8 @@ impl RoutePlayerPage {
         self.end_btn.set_sensitive(true);
         *self.ghost.borrow_mut() = None;
         self.ghost_route.set(None);
+        self.racing.set(false);
+        self.new_best.set(None);
         self.ghost_box.set_visible(false);
         self.route_map.set_ghost_position(None);
         self.immersion.set_finished(false);
@@ -1034,16 +1043,24 @@ impl RoutePlayerPage {
         self.course_view.set_route(route, look);
     }
 
-    /// Race `ghost` on the ride of the saved route `route_id`, if that is the
-    /// ride under way: a ghost that took a while to load for a ride since
-    /// replaced is dropped.
-    pub fn set_ghost(&self, route_id: i64, ghost: Option<Ghost>) {
+    /// The ghost of the saved route `route_id`, if that is the ride under
+    /// way — a ghost that took a while to load for a ride since replaced is
+    /// dropped. Raced when `race`; kept either way, to tell whether this
+    /// ride beats it.
+    pub fn set_ghost(&self, route_id: i64, ghost: Option<Ghost>, race: bool) {
         if self.ghost_route.get() != Some(route_id) {
             return;
         }
-        self.ghost_box.set_visible(ghost.is_some());
-        self.course_view.set_ghost(ghost.clone());
+        let shown = race && ghost.is_some();
+        self.racing.set(shown);
+        self.ghost_box.set_visible(shown);
+        self.course_view.set_ghost(ghost.clone().filter(|_| shown));
         *self.ghost.borrow_mut() = ghost;
+    }
+
+    /// What the ride that just finished did to the route's ghost, once.
+    pub fn take_new_best(&self) -> Option<NewBest> {
+        self.new_best.take()
     }
 
     /// Start the 1 Hz ride loop. Calls `on_complete` with the session when the route
@@ -1514,10 +1531,15 @@ impl RoutePlayerPage {
             page.course_view.set_progress(distance_m, speed_ms);
             page.course_view.set_ride_clock(elapsed);
             // The ghost: where it is after as much riding, and the gap to it.
-            let ghost_now = page.ghost.borrow().as_ref().map(|g| {
-                let at = g.distance_at(elapsed as f32);
-                (at, g.gap(distance_m, elapsed as f32))
-            });
+            let ghost_now = page
+                .ghost
+                .borrow()
+                .as_ref()
+                .filter(|_| page.racing.get())
+                .map(|g| {
+                    let at = g.distance_at(elapsed as f32);
+                    (at, g.gap(distance_m, elapsed as f32))
+                });
             if let Some((ghost_m, gap)) = ghost_now {
                 let text = ghost::format_gap(gap.secs);
                 page.ghost_label.set_label(&text);
@@ -1562,6 +1584,10 @@ impl RoutePlayerPage {
                 let mut sess = session.borrow().clone();
                 let now = chrono::Utc::now();
                 sess.ended_at = Some(now - paused_time.borrow().total(now));
+                let best =
+                    ghost::new_best(page.ghost.borrow().as_ref(), elapsed, sess.rider_driven)
+                        .filter(|_| sess.route_id.is_some());
+                page.new_best.set(best);
                 // Nothing left to pause or end.
                 page.pause_btn.set_sensitive(false);
                 page.end_btn.set_sensitive(false);
@@ -1576,6 +1602,7 @@ impl RoutePlayerPage {
                         avg_power_watts: sess.average_power().map(|w| w.round() as u32),
                         climbed_m: sess.elevation_gain_m().unwrap_or(0.0),
                         avg_heart_rate_bpm: sess.average_hr().map(|b| b.round() as u32),
+                        best,
                     };
                     let on_complete = Rc::clone(&on_complete);
                     page.course_view

@@ -1272,6 +1272,7 @@ pub fn show_workout_detail_dialog(
                                             route,
                                             route_id: Some(route_id),
                                             look,
+                                            race: true,
                                         });
                                     }
                                     None => tracing::error!(

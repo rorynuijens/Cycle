@@ -221,6 +221,8 @@ pub struct RouteRide {
     pub route_id: Option<i64>,
     /// How its 3D world looks.
     pub look: crate::data::biome::WorldLook,
+    /// Race the route's ghost, if it has one.
+    pub race: bool,
 }
 
 /// Starts a ride on a route.

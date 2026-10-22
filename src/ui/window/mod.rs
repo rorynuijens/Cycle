@@ -481,11 +481,13 @@ impl CycleGtkWindow {
             let finish_for_route = Rc::clone(&finish_session);
             let athlete_for_route = Rc::clone(&athlete_rc);
             let (pool_for_ghost, rt_for_ghost) = (pool.clone(), rt_handle.clone());
+            let toast_for_best = self.toast_overlay.clone();
             Rc::new(move |ride: crate::ui::RouteRide| {
                 let crate::ui::RouteRide {
                     route,
                     route_id,
                     look,
+                    race,
                 } = ride;
                 timer_alive.set(false);
                 timer_started.set(false);
@@ -510,11 +512,31 @@ impl CycleGtkWindow {
                         Rc::clone(&sim_difficulty),
                         Rc::clone(&sim_max_grade),
                         Rc::clone(&auto_pause),
-                        move |session| {
-                            // A route ride ends the same way a workout does: summary
-                            // page, RPE, save and upload. It has no plan to compare
-                            // against, so it passes no segments.
-                            finish(session, route_name.clone(), None);
+                        {
+                            // Weak: the page keeps this closure while the
+                            // finished card is up (CLAUDE.md §2.4).
+                            let player = Rc::downgrade(&route_player);
+                            let toast = toast_for_best.clone();
+                            move |session| {
+                                // A route ride ends the same way a workout does:
+                                // summary page, RPE, save and upload. It has no
+                                // plan to compare against, so it passes no
+                                // segments.
+                                finish(session, route_name.clone(), None);
+                                // Said on the summary too: with the map showing
+                                // there was no finished card to say it.
+                                let best = player.upgrade().and_then(|p| p.take_new_best());
+                                if let Some(best) = best {
+                                    toast.add_toast(
+                                        adw::Toast::builder()
+                                            .title(crate::ui::widgets::ride_hud::new_best_headline(
+                                                best,
+                                            ))
+                                            .timeout(8)
+                                            .build(),
+                                    );
+                                }
+                            }
                         },
                         Rc::clone(&timer_alive),
                     );
@@ -531,6 +553,7 @@ impl CycleGtkWindow {
                                     id,
                                     crate::data::ghost::fastest(&rides, id, length_m)
                                         .map(|(_, g)| g),
+                                    race,
                                 ),
                                 Err(e) => tracing::error!("could not load the route's rides: {e}"),
                             },

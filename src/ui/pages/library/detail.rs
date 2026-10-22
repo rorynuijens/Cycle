@@ -481,6 +481,63 @@ pub fn show_route_detail(
         );
     }
 
+    // ── Race your best ────────────────────────────────────────────────────
+    // A saved route's fastest finished ride under the rider's own power, as a
+    // ghost to race. Off, and greyed out, until there is one.
+    let race = Rc::new(std::cell::Cell::new(false));
+    let race_row = adw::SwitchRow::builder()
+        .title("Race Your Best")
+        .subtitle("Looking for your best ride of this route…")
+        .active(false)
+        .sensitive(false)
+        .build();
+    let ghost_group = adw::PreferencesGroup::builder()
+        .title("Ghost")
+        .description("Your fastest ride of this route rides beside you in the left lane")
+        .visible(route_id.is_some())
+        .build();
+    ghost_group.add(&race_row);
+    inner.append(&ghost_group);
+    {
+        let race = Rc::clone(&race);
+        race_row.connect_active_notify(move |row| race.set(row.is_active()));
+    }
+    if let (Some(id), Some(remember)) = (route_id, remember.as_ref()) {
+        let pool = remember.pool.clone();
+        let length_m = route.total_distance_m;
+        crate::ui::spawn_to_main(
+            &remember.rt_handle,
+            async move {
+                let rides = db::load_route_rides(&pool, id).await?;
+                anyhow::Ok(
+                    crate::data::ghost::fastest(&rides, id, length_m)
+                        .map(|(ride, g)| (g.finish_secs(), ride.started_at)),
+                )
+            },
+            glib::clone!(
+                #[weak]
+                race_row,
+                move |best| match best {
+                    Ok(Some((secs, when))) => {
+                        let day = when.with_timezone(&chrono::Local).format("%-d %B %Y");
+                        race_row.set_subtitle(&format!(
+                            "Your best: {}, on {day}",
+                            crate::ui::ride_card::format_ride_time(u64::from(secs))
+                        ));
+                        race_row.set_sensitive(true);
+                        race_row.set_active(true);
+                    }
+                    Ok(None) => race_row
+                        .set_subtitle("Finish this route under your own power to set a ghost",),
+                    Err(e) => {
+                        tracing::error!("could not look up the route's best ride: {e}");
+                        race_row.set_subtitle("Your best ride could not be read");
+                    }
+                }
+            ),
+        );
+    }
+
     let toast_overlay = adw::ToastOverlay::new();
     {
         let chosen = Rc::clone(&chosen);
@@ -540,6 +597,7 @@ pub fn show_route_detail(
                     scenery: chosen.get(),
                     animals: animals.get(),
                 },
+                race: race.get(),
             });
             win.close();
         }

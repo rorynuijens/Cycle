@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use pango::prelude::*;
 
 use crate::data::athlete::{power_zone_index, ZONE_COLORS};
+use crate::data::ghost::NewBest;
 use crate::data::palette::{Rgb, BASE, HUD};
 use crate::data::route::Route;
 use crate::ui::ride_card::format_ride_time;
@@ -116,6 +117,8 @@ pub struct FinishedCard {
     pub avg_power_watts: Option<u32>,
     pub climbed_m: f32,
     pub avg_heart_rate_bpm: Option<u32>,
+    /// The ride is the route's new ghost.
+    pub best: Option<NewBest>,
 }
 
 impl FinishedCard {
@@ -145,6 +148,17 @@ impl FinishedCard {
     }
 }
 
+/// How the finish announces a new ghost.
+pub fn new_best_headline(best: NewBest) -> String {
+    match best {
+        NewBest::First => "First finish on this route — you're the ghost now".into(),
+        NewBest::Faster(secs) => format!(
+            "New best on this route — {} faster",
+            format_ride_time(u64::from(secs))
+        ),
+    }
+}
+
 /// The finished card, on the sheet: its size, and where its button row sits
 /// down from the card's top. The button itself is a real one, laid over the
 /// view there.
@@ -154,11 +168,25 @@ const CARD_HEADER: f64 = 56.0;
 const CARD_BUTTON_Y: f64 = 584.0;
 const CARD_TILE_H: f64 = 106.0;
 
+/// The room a "new best" pill takes on the card, on the sheet.
+const CARD_PILL_SPACE: f64 = 64.0;
+
+/// How much taller than its plainest the card is: the pill's room, if it
+/// has one.
+fn card_extra(with_pill: bool) -> f64 {
+    if with_pill {
+        CARD_PILL_SPACE
+    } else {
+        0.0
+    }
+}
+
 /// How far below the view's middle the finished card's button sits, in
-/// pixels, for a view `width` × `height`.
-pub fn finish_button_drop(width: i32, height: i32) -> f64 {
+/// pixels, for a view `width` × `height` — lower on a card with a pill.
+pub fn finish_button_drop(width: i32, height: i32, with_pill: bool) -> f64 {
     let (scale, _, _) = sheet(width, height);
-    (CARD_BUTTON_Y - CARD_H / 2.0) * scale
+    let extra = card_extra(with_pill);
+    (CARD_BUTTON_Y + extra - (CARD_H + extra) / 2.0) * scale
 }
 
 /// The gradient on the sign: a whole per cent, no "-0%" on the flat.
@@ -703,11 +731,13 @@ fn finished_card(t: &Text, w: f64, h: f64, card: &FinishedCard) {
     set(cr, HUD.ink);
     cr.paint_with_alpha(0.38).ok();
 
-    let (x, y) = (w / 2.0 - CARD_W / 2.0, h / 2.0 - CARD_H / 2.0);
-    rounded(cr, x, y + 12.0, CARD_W, CARD_H, 36.0);
+    let extra = card_extra(card.best.is_some());
+    let card_h = CARD_H + extra;
+    let (x, y) = (w / 2.0 - CARD_W / 2.0, h / 2.0 - card_h / 2.0);
+    rounded(cr, x, y + 12.0, CARD_W, card_h, 36.0);
     set(cr, HUD.ink);
     let _ = cr.fill();
-    rounded(cr, x, y, CARD_W, CARD_H, 36.0);
+    rounded(cr, x, y, CARD_W, card_h, 36.0);
     set(cr, HUD.panel);
     let _ = cr.fill_preserve();
     cr.save().ok();
@@ -717,7 +747,7 @@ fn finished_card(t: &Text, w: f64, h: f64, card: &FinishedCard) {
     cr.rectangle(x, y + CARD_HEADER, CARD_W, 6.0);
     let _ = cr.fill();
     cr.restore().ok();
-    rounded(cr, x, y, CARD_W, CARD_H, 36.0);
+    rounded(cr, x, y, CARD_W, card_h, 36.0);
     set(cr, HUD.ink);
     cr.set_line_width(6.0);
     let _ = cr.stroke();
@@ -744,6 +774,10 @@ fn finished_card(t: &Text, w: f64, h: f64, card: &FinishedCard) {
         HUD.label,
     );
 
+    if let Some(best) = card.best {
+        best_pill(t, w / 2.0, y + 270.0, &new_best_headline(best));
+    }
+
     let tiles = card.tiles();
     let (cols, gap) = (3usize, 18.0);
     let tile_w = (CARD_W - 112.0 - gap * (cols as f64 - 1.0)) / cols as f64;
@@ -753,7 +787,7 @@ fn finished_card(t: &Text, w: f64, h: f64, card: &FinishedCard) {
         let in_row = (tiles.len() - row * cols).min(cols) as f64;
         let row_w = in_row * tile_w + (in_row - 1.0) * gap;
         let tx = w / 2.0 - row_w / 2.0 + col as f64 * (tile_w + gap);
-        let ty = y + 262.0 + row as f64 * (CARD_TILE_H + gap);
+        let ty = y + 262.0 + extra + row as f64 * (CARD_TILE_H + gap);
         sticker(cr, tx, ty, tile_w, CARD_TILE_H, 24.0, 5.0, 5.0);
         t.draw(&t.caption(caption), tx + 22.0, ty + 14.0, HUD.label);
         let number = t.layout(value, 56.0, pango::Weight::Bold);
@@ -764,6 +798,36 @@ fn finished_card(t: &Text, w: f64, h: f64, card: &FinishedCard) {
             t.on_baseline(&u, tx + 22.0 + Text::width(&number) + 8.0, base, HUD.label);
         }
     }
+}
+
+/// "New best …" on a yellow pill with a star, tilted a little, centred on
+/// `(cx, cy)`.
+fn best_pill(t: &Text, cx: f64, cy: f64, text: &str) {
+    let cr = t.cr;
+    let words = t.layout(text, 26.0, pango::Weight::Bold);
+    let (hgt, star) = (48.0, 28.0);
+    let pw = 22.0 + star + 12.0 + Text::width(&words) + 22.0;
+    cr.save().ok();
+    cr.translate(cx, cy);
+    cr.rotate(-1.5f64.to_radians());
+    rounded(cr, -pw / 2.0, -hgt / 2.0, pw, hgt, hgt / 2.0);
+    fill_and_outline(cr, HUD.flag, 4.0);
+    // A five-pointed star.
+    let (sx, sy, outer, inner) = (-pw / 2.0 + 22.0 + star / 2.0, 0.0, star / 2.0, star / 5.0);
+    for k in 0..10 {
+        let r = if k % 2 == 0 { outer } else { inner };
+        let a = -std::f64::consts::FRAC_PI_2 + f64::from(k) * std::f64::consts::PI / 5.0;
+        let (px, py) = (sx + r * a.cos(), sy + r * a.sin());
+        if k == 0 {
+            cr.move_to(px, py);
+        } else {
+            cr.line_to(px, py);
+        }
+    }
+    cr.close_path();
+    fill_and_outline(cr, HUD.sign_face, 2.5);
+    t.on_baseline(&words, -pw / 2.0 + 22.0 + star + 12.0, 10.0, HUD.ink);
+    cr.restore().ok();
 }
 
 /// The gradient as a road sign: a red-bordered triangle with the slope drawn
@@ -1005,6 +1069,7 @@ mod tests {
             avg_power_watts: Some(171),
             climbed_m: 142.4,
             avg_heart_rate_bpm: Some(148),
+            best: None,
         }
     }
 
@@ -1037,8 +1102,24 @@ mod tests {
 
     #[test]
     fn should_sit_the_finish_button_on_the_cards_button_row() {
-        assert_eq!(finish_button_drop(1920, 1080), 254.0);
-        assert_eq!(finish_button_drop(3840, 2160), 508.0);
+        assert_eq!(finish_button_drop(1920, 1080, false), 254.0);
+        assert_eq!(finish_button_drop(3840, 2160, false), 508.0);
+        // A card with a pill is 64 taller, its button row 64 lower: the
+        // middle moves down 32, the button 32 further from it.
+        assert_eq!(finish_button_drop(1920, 1080, true), 286.0);
+    }
+
+    #[test]
+    fn should_say_what_kind_of_new_best_it_was() {
+        assert_eq!(
+            new_best_headline(NewBest::Faster(42)),
+            "New best on this route — 0:42 faster"
+        );
+        assert_eq!(
+            new_best_headline(NewBest::Faster(3_725)),
+            "New best on this route — 1:02:05 faster"
+        );
+        assert!(new_best_headline(NewBest::First).contains("you're the ghost now"));
     }
 
     #[test]
@@ -1234,7 +1315,11 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5_600.0);
         let s = if std::env::var("CYCLE_HUD_FINISHED").is_ok_and(|v| v == "1") {
-            hud.render_finished(1920, 1080, &finished())
+            let card = FinishedCard {
+                best: Some(NewBest::Faster(42)),
+                ..finished()
+            };
+            hud.render_finished(1920, 1080, &card)
         } else {
             let r = HudReadings {
                 to_go_m,

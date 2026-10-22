@@ -232,44 +232,48 @@ async fn write_session_metrics(pool: &SqlitePool, id: i64, session: &Session) ->
 
 /// Link the rides recorded before rides knew their route (schema v9) to the
 /// saved route each rode, and say whether the rider's own effort set its
-/// speed. A route ride is named after its route, so only rides named after a
-/// saved route are looked at, and only those whose track rode that route from
-/// start to finish are linked (`route_link::rode`). `load` reads a saved
-/// route's GPX — passed in so a test needs no files. Returns how many rides
-/// were linked.
+/// speed. The ride's title is no guide — it is the name inside the GPX, the
+/// saved route's is the rider's own, and three routes can share one — so a
+/// ride is linked to the saved route its track rode from start to finish
+/// (`route_link::rode`). `load` reads a saved route's GPX — passed in so a
+/// test needs no files. Returns how many rides were linked.
 pub async fn link_old_route_rides(
     pool: &SqlitePool,
     load: &dyn Fn(&super::SavedRoute) -> Option<crate::data::route::Route>,
 ) -> Result<usize> {
     use crate::data::route_link;
-    let routes = super::load_routes(pool).await?;
+    let routes: Vec<(i64, crate::data::route::Route)> = super::load_routes(pool)
+        .await?
+        .iter()
+        .filter_map(|saved| Some((saved.id, load(saved)?)))
+        .collect();
+    if routes.is_empty() {
+        return Ok(0);
+    }
     let rows = sqlx::query(
-        "SELECT id, title, data_points_json FROM sessions
-          WHERE route_id IS NULL AND ended_at IS NOT NULL AND title IS NOT NULL",
+        "SELECT id, data_points_json FROM sessions
+          WHERE route_id IS NULL AND ended_at IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
-    let mut parsed: std::collections::HashMap<i64, Option<crate::data::route::Route>> =
-        std::collections::HashMap::new();
     let mut linked = 0;
     for r in rows {
         let id: i64 = r.get("id");
-        let title: String = r.get("title");
-        let Some(saved) = routes.iter().find(|s| s.name == title) else {
-            continue;
-        };
-        let route = parsed.entry(saved.id).or_insert_with(|| load(saved));
-        let Some(route) = route.as_ref() else {
-            continue;
-        };
         let Ok(points) = serde_json::from_str::<Vec<DataPoint>>(r.get("data_points_json")) else {
             continue;
         };
-        if !route_link::rode(&route_link::track(&points), route) {
+        let track = route_link::track(&points);
+        if track.is_empty() {
             continue;
         }
+        let Some((route_id, _)) = routes
+            .iter()
+            .find(|(_, route)| route_link::rode(&track, route))
+        else {
+            continue;
+        };
         sqlx::query("UPDATE sessions SET route_id = ?, rider_driven = ? WHERE id = ?")
-            .bind(saved.id)
+            .bind(route_id)
             .bind(route_link::rider_driven(&points) as i64)
             .bind(id)
             .execute(pool)
@@ -1000,10 +1004,28 @@ mod tests {
         save_route(&pool, "South", "south.gpx", 2_000.0, 0.0)
             .await
             .unwrap();
-        let own = old_ride(&pool, "North", 2_000.0, |s| 24.0 + (s % 7) as f32).await;
-        let erg = old_ride(&pool, "North", 2_000.0, |_| 25.0).await;
-        let short = old_ride(&pool, "North", 1_000.0, |_| 30.0).await;
-        let other = old_ride(&pool, "South", 2_000.0, |_| 30.0).await;
+        // Titled as the GPX names the road, not as the rider named the route.
+        let own = old_ride(&pool, "Virtual North Road", 2_000.0, |s| {
+            24.0 + (s % 7) as f32
+        })
+        .await;
+        let erg = old_ride(&pool, "North Road", 2_000.0, |_| 25.0).await;
+        let short = old_ride(&pool, "North Road", 1_000.0, |_| 30.0).await;
+        let mut indoors = Session::new(None);
+        indoors.title = Some("North".into());
+        indoors.ended_at = Some(indoors.started_at);
+        indoors.data_points.push(DataPoint {
+            elapsed_secs: 1,
+            power_watts: Some(200),
+            target_watts: None,
+            heart_rate_bpm: None,
+            cadence_rpm: None,
+            speed_kmh: Some(30.0),
+            lat: None,
+            lng: None,
+            altitude_m: None,
+        });
+        let other = save_session(&pool, &indoors).await.unwrap();
         let mut done = Session::new(None);
         done.title = Some("North".into());
         done.ended_at = Some(done.started_at);
@@ -1034,7 +1056,11 @@ mod tests {
             "on the route, but not raceable"
         );
         assert_eq!(by_id(short).await, (None, 0), "given up halfway");
-        assert_eq!(by_id(other).await, (None, 0), "its route would not load");
+        assert_eq!(
+            by_id(other).await,
+            (None, 0),
+            "named for the route, but no track"
+        );
         assert_eq!(by_id(already).await, (Some(north), 1), "left as it was");
         // Run again: nothing more to link.
         assert_eq!(link_old_route_rides(&pool, &load).await.unwrap(), 0);

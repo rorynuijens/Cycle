@@ -910,6 +910,10 @@ impl CourseView {
             at_us: Some(now),
             coast: true,
         });
+        let best = card
+            .best
+            .map(|b| format!("{}. ", ride_hud::new_best_headline(b)))
+            .unwrap_or_default();
         let tiles: Vec<String> = card
             .tiles()
             .iter()
@@ -918,7 +922,7 @@ impl CourseView {
         inner
             .finish_btn
             .update_property(&[gtk::accessible::Property::Description(&format!(
-                "Finished {}: {}",
+                "Finished {}. {best}{}",
                 card.route_name,
                 tiles.join(", ")
             ))]);
@@ -1000,7 +1004,13 @@ impl Inner {
     fn place_finish_button(&self) {
         let scale = self.area.scale_factor().max(1);
         let (w, h) = (self.area.width() * scale, self.area.height() * scale);
-        let drop = ride_hud::finish_button_drop(w, h) / f64::from(scale);
+        let pill = self
+            .hud
+            .borrow()
+            .finished
+            .as_ref()
+            .is_some_and(|c| c.best.is_some());
+        let drop = ride_hud::finish_button_drop(w, h, pill) / f64::from(scale);
         // Centred in what the margin leaves: half the margin moves it down.
         self.finish_btn.set_margin_top((2.0 * drop).round() as i32);
     }

@@ -124,6 +124,32 @@ pub fn format_gap(secs: f32) -> String {
     format!("{sign}{}:{:02}", n / 60, n % 60)
 }
 
+/// What a finished ride did to the route's ghost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewBest {
+    /// The first ride of the route the rider drove to the finish: it is the
+    /// ghost now.
+    First,
+    /// Faster than the ghost by this many seconds: it is the ghost now.
+    Faster(u32),
+}
+
+/// Whether a ride of the route that finished in `ride_secs` of riding is the
+/// new ghost, against `previous`. A ride the rider did not drive never is;
+/// an equal time is not a new best.
+pub fn new_best(previous: Option<&Ghost>, ride_secs: u32, rider_driven: bool) -> Option<NewBest> {
+    if !rider_driven || ride_secs == 0 {
+        return None;
+    }
+    match previous {
+        None => Some(NewBest::First),
+        Some(g) if ride_secs < g.finish_secs() => {
+            Some(NewBest::Faster(g.finish_secs() - ride_secs))
+        }
+        Some(_) => None,
+    }
+}
+
 /// The ride to race on the route `route_id`, `length_m` long: the fastest of
 /// `rides` that rode it to the finish under the rider's own power — not an
 /// FTP test, not moved by ERG emulation. An equal time does not take the
@@ -318,6 +344,23 @@ mod tests {
         assert_eq!(ghost.finish_secs(), 100);
         assert_eq!(ride.started_at, rides[6].started_at);
         assert!(fastest(&rides, 9, 1_000.0).is_none());
+    }
+
+    #[test]
+    fn should_crown_a_new_ghost_only_for_a_faster_ride_the_rider_drove() {
+        let g = Ghost::from_ride(&steady(100), 1_000.0).unwrap();
+        assert_eq!(new_best(Some(&g), 99, true), Some(NewBest::Faster(1)));
+        assert_eq!(new_best(Some(&g), 58, true), Some(NewBest::Faster(42)));
+        assert_eq!(new_best(Some(&g), 100, true), None, "a tie is not a best");
+        assert_eq!(new_best(Some(&g), 101, true), None);
+        assert_eq!(
+            new_best(Some(&g), 50, false),
+            None,
+            "ERG never sets a ghost"
+        );
+        assert_eq!(new_best(None, 300, true), Some(NewBest::First));
+        assert_eq!(new_best(None, 300, false), None);
+        assert_eq!(new_best(None, 0, true), None);
     }
 
     #[test]

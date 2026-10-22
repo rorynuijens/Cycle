@@ -20,6 +20,13 @@ const END_SHARE: f32 = 0.02;
 const NOMINAL_KMH: f32 = 25.0;
 /// Below this, in km/h, the rider is standing still.
 const MOVING_KMH: f32 = 0.5;
+/// A ride of the route starts this close to its start and ends this close
+/// to its finish, in metres: checked first, it rules out almost every
+/// pairing of ride and route before the slow look along the line.
+const ENDS_WITHIN_M: f64 = 300.0;
+/// The look along the line takes at most about this many of a track's
+/// points: plenty to tell how much of it is on the route.
+const SAMPLES: usize = 600;
 
 /// Metres east and north of `origin`: flat enough over a route's length.
 fn local(origin: (f64, f64), lat: f64, lng: f64) -> (f64, f64) {
@@ -40,6 +47,18 @@ pub fn rode(track: &[(f64, f64)], route: &Route) -> bool {
         return false;
     }
     let origin = (first.lat, first.lng);
+    let last = &route.points[route.points.len() - 1];
+    let near = |a: (f64, f64), b: (f64, f64)| {
+        let (p, q) = (local(origin, a.0, a.1), local(origin, b.0, b.1));
+        (p.0 - q.0).hypot(p.1 - q.1) <= ENDS_WITHIN_M
+    };
+    if !near(track[0], (first.lat, first.lng))
+        || !near(track[track.len() - 1], (last.lat, last.lng))
+    {
+        return false;
+    }
+    let step = (track.len() / SAMPLES).max(1);
+    let track: Vec<(f64, f64)> = track.iter().step_by(step).copied().collect();
     let line: Vec<((f64, f64), f32)> = route
         .points
         .iter()
@@ -47,7 +66,7 @@ pub fn rode(track: &[(f64, f64)], route: &Route) -> bool {
         .collect();
     let mut on = 0usize;
     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-    for &(lat, lng) in track {
+    for &(lat, lng) in &track {
         let p = local(origin, lat, lng);
         // The nearest point on the line, and how far along the route it is.
         let mut best = (f64::MAX, 0.0f32);
@@ -155,6 +174,17 @@ mod tests {
         // Exactly at the 2 % allowance either end, it counts.
         assert!(rode(&ride(40.0, 1_960.0, 0.0), &north()));
         assert!(!rode(&ride(45.0, 2_000.0, 0.0), &north()));
+    }
+
+    #[test]
+    fn should_not_take_a_ride_that_started_or_ended_somewhere_else() {
+        // Along the route most of the way, but begun 500 m before its start.
+        let mut track = ride(0.0, 2_000.0, 0.0);
+        let before = ride(0.0, 500.0, 0.0)
+            .into_iter()
+            .map(|(lat, lng)| (lat - 500.0 / 111_320.0, lng));
+        track.splice(0..0, before);
+        assert!(!rode(&track, &north()));
     }
 
     #[test]
