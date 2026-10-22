@@ -146,6 +146,11 @@ pub struct Palette {
     pub flower_a: Rgb,
     pub flower_b: Rgb,
     pub flower_c: Rgb,
+    /// The finish: the arch, its banner, and the chequers on the banner and
+    /// across the road.
+    pub arch: Rgb,
+    pub banner: Rgb,
+    pub chequer: Rgb,
 }
 
 /// The shared base palette: the skill's names (§3, §7.1), tuned to the
@@ -248,6 +253,9 @@ pub const BASE: Palette = Palette {
     flower_a: hex(0xF5D547),
     flower_b: hex(0xF27A9C),
     flower_c: hex(0xF7F5EE),
+    arch: hex(0xD63333),
+    banner: hex(0xFFFFFF),
+    chequer: hex(0x1E2430),
 };
 
 /// The fullscreen ride HUD's colours. The HUD is drawn inside the 3D view in
@@ -330,7 +338,7 @@ pub const LIGHT: Light = Light {
 
 /// Names a biome may not override: the track and the rider look the same
 /// everywhere.
-pub const FIXED: [&str; 11] = [
+pub const FIXED: [&str; 14] = [
     "road",
     "road_edge",
     "road_line",
@@ -342,6 +350,9 @@ pub const FIXED: [&str; 11] = [
     "kit",
     "frame",
     "tyre",
+    "arch",
+    "banner",
+    "chequer",
 ];
 
 impl Palette {
@@ -444,6 +455,9 @@ impl Palette {
             "flower_a" => &mut self.flower_a,
             "flower_b" => &mut self.flower_b,
             "flower_c" => &mut self.flower_c,
+            "arch" => &mut self.arch,
+            "banner" => &mut self.banner,
+            "chequer" => &mut self.chequer,
             _ => return None,
         })
     }
@@ -512,7 +526,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 96] = [
+        const NAMES: [&str; 99] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -609,13 +623,16 @@ mod tests {
             "flower_a",
             "flower_b",
             "flower_c",
+            "arch",
+            "banner",
+            "chequer",
         ];
         assert_eq!(NAMES.len(), size_of::<Palette>() / size_of::<Rgb>());
         let mut p = BASE;
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 96] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 99] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

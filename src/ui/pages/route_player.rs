@@ -20,7 +20,7 @@ use crate::ui::overlay::{CourseReadings, RideOverlay};
 use crate::ui::pages::route_immersion::Immersion;
 use crate::ui::widgets::course_view::CourseView;
 use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
-use crate::ui::widgets::ride_hud::HudReadings;
+use crate::ui::widgets::ride_hud::{FinishedCard, HudReadings};
 use crate::ui::widgets::route_map::RouteMap;
 use crate::ui::widgets::zone_color::gradient_rgb;
 use crate::ui::widgets::zone_meter::ZoneMeter;
@@ -35,6 +35,14 @@ use crate::ui::WINDOWED_CLAMP;
 /// ```
 #[cfg(debug_assertions)]
 const FAKE_RIDER_ENV: &str = "CYCLE_FAKE_RIDER";
+/// Debug builds only, with the pretend rider: start this many metres from
+/// the finish, to watch the finish without riding the whole route.
+///
+/// ```text
+/// CYCLE_FAKE_RIDER=200 CYCLE_FAKE_TO_GO=600 cargo run
+/// ```
+#[cfg(debug_assertions)]
+const FAKE_TO_GO_ENV: &str = "CYCLE_FAKE_TO_GO";
 
 /// The pretend rider's power from the environment variable's value, if it is
 /// a sensible one: a whole number of watts, held to the same 1000 W ceiling the
@@ -976,6 +984,9 @@ impl RoutePlayerPage {
         self.pause_btn
             .set_icon_name("media-playback-pause-symbolic");
         self.pause_btn.set_tooltip_text(Some("Pause ride"));
+        self.pause_btn.set_sensitive(true);
+        self.end_btn.set_sensitive(true);
+        self.immersion.set_finished(false);
         // The dial is a judgement about today's legs, so each ride starts from
         // the Preferences baseline rather than inheriting the last ride's.
         self.intensity_pct.set(100);
@@ -1041,6 +1052,17 @@ impl RoutePlayerPage {
         // no way to tell an unstamped route ride from a pre-phase-1 one.
         new_session.ftp_watts = Some(athlete.ftp_watts);
         let engine = Rc::new(RefCell::new(RouteEngine::new(route, 6.944, mass_kg)));
+        #[cfg(debug_assertions)]
+        if fake_rider_watts(std::env::var(FAKE_RIDER_ENV).ok().as_deref()).is_some() {
+            if let Some(to_go) = std::env::var(FAKE_TO_GO_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|m| m.is_finite() && *m >= 0.0)
+            {
+                let mut e = engine.borrow_mut();
+                e.distance_m = (e.route.total_distance_m - to_go).max(0.0);
+            }
+        }
         let session = Rc::new(RefCell::new(new_session));
         // Publish it so the checkpoint timer can reach this ride. Gated on
         // route_timer_alive there, so a finished ride is never re-written.
@@ -1469,7 +1491,27 @@ impl RoutePlayerPage {
                 let mut sess = session.borrow().clone();
                 let now = chrono::Utc::now();
                 sess.ended_at = Some(now - paused_time.borrow().total(now));
-                on_complete(sess);
+                // Nothing left to pause or end.
+                page.pause_btn.set_sensitive(false);
+                page.end_btn.set_sensitive(false);
+                if page.course_view.is_showing() {
+                    // Watching the road: roll through the arch to the
+                    // finished card, and on to the summary when asked.
+                    page.immersion.set_finished(true);
+                    let card = FinishedCard {
+                        route_name: engine.borrow().route.name.clone(),
+                        elapsed_secs: elapsed,
+                        distance_m: total_dist,
+                        avg_power_watts: sess.average_power().map(|w| w.round() as u32),
+                        climbed_m: sess.elevation_gain_m().unwrap_or(0.0),
+                        avg_heart_rate_bpm: sess.average_hr().map(|b| b.round() as u32),
+                    };
+                    let on_complete = Rc::clone(&on_complete);
+                    page.course_view
+                        .show_finished(card, move || on_complete(sess));
+                } else {
+                    on_complete(sess);
+                }
                 return glib::ControlFlow::Break;
             }
 

@@ -10,6 +10,7 @@ pub mod db;
 pub mod dedupe;
 pub mod dressing;
 pub mod encounters;
+pub mod finish;
 pub mod fit;
 pub mod import;
 pub mod keystore;

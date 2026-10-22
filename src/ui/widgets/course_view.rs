@@ -30,7 +30,7 @@ use crate::data::palette;
 use crate::data::props::{self, Prop, Shape};
 use crate::data::rider;
 use crate::data::route::Route;
-use crate::ui::widgets::ride_hud::{self, HudReadings, RideHud};
+use crate::ui::widgets::ride_hud::{self, FinishedCard, HudReadings, RideHud};
 
 /// Vertical field of view, in degrees. Wide enough that a bend does not
 /// leave the frame.
@@ -65,6 +65,10 @@ const GLIDE_S: f32 = 1.0;
 /// lean is so sensitive to speed that each step tipped the rider over by
 /// several degrees at once.
 const LEAN_GLIDE_S: f32 = 0.6;
+/// Over the finish line the rider coasts to a stop, slowing by this time
+/// constant, in seconds: rolling on about as many metres as they rode in
+/// it, past the arch.
+const COAST_S: f32 = 2.5;
 /// A gap wider than this, in metres, is a jump — a skip along the route —
 /// and is taken in one frame, not glided over.
 const SNAP_M: f32 = 30.0;
@@ -403,6 +407,8 @@ struct Progress {
     /// `glib::monotonic_time()` of the report, in µs — the frame clock's own
     /// time base. `None` before the ride has reported at all.
     at_us: Option<i64>,
+    /// Over the line: no more reports come, and the rider rolls to a stop.
+    coast: bool,
 }
 
 impl Progress {
@@ -412,6 +418,15 @@ impl Progress {
         let Some(at) = self.at_us else {
             return self.distance_m;
         };
+        if self.coast {
+            let t = ((now_us - at) as f32 / 1e6).max(0.0);
+            let v = if self.speed_ms.is_finite() {
+                self.speed_ms.max(0.0)
+            } else {
+                0.0
+            };
+            return self.distance_m + v * COAST_S * (1.0 - (-t / COAST_S).exp());
+        }
         let dt = ((now_us - at) as f32 / 1e6).clamp(0.0, MAX_EXTRAPOLATE_S);
         self.distance_m + self.speed_ms.max(0.0) * dt
     }
@@ -424,6 +439,9 @@ impl Progress {
             return 0.0;
         };
         let dt = (now_us - at) as f32 / 1e6;
+        if self.coast && self.speed_ms.is_finite() {
+            return self.speed_ms.max(0.0) * (-dt.max(0.0) / COAST_S).exp();
+        }
         if dt < MAX_EXTRAPOLATE_S && self.speed_ms.is_finite() {
             self.speed_ms.max(0.0)
         } else {
@@ -659,6 +677,10 @@ struct Inner {
     progress: Cell<Progress>,
     glide: Cell<Glide>,
     hud: RefCell<HudLayer>,
+    /// "See Ride Summary", laid over the finished card's button row, and
+    /// what it does — once.
+    finish_btn: gtk::Button,
+    on_finish: RefCell<Option<Box<dyn FnOnce()>>>,
     /// The distance last drawn, so an unmoving camera is not redrawn.
     drawn_m: Cell<Option<f32>>,
     /// Bumped for every new route, so a build that finishes after the next
@@ -666,17 +688,26 @@ struct Inner {
     generation: Cell<u64>,
 }
 
-/// The fullscreen ride HUD, while the view carries one.
+/// The fullscreen ride HUD, while the view carries one, and the finished
+/// card once the rider is over the line — in any layout.
 #[derive(Default)]
 struct HudLayer {
     shown: bool,
     readings: Option<HudReadings>,
+    finished: Option<FinishedCard>,
     /// The route's heights, for the profile band.
     profile: Vec<f32>,
     /// Made on first use: loading the font is for fullscreen, not every view.
     painter: Option<RideHud>,
-    /// What the texture on the GPU shows: the readings and the view's size.
-    painted: Option<(HudReadings, (i32, i32))>,
+    /// What the texture on the GPU shows, and for what size of view.
+    painted: Option<(Painted, (i32, i32))>,
+}
+
+/// What the HUD texture was last painted with.
+#[derive(Debug, Clone, PartialEq)]
+enum Painted {
+    Readings(HudReadings),
+    Finished(FinishedCard),
 }
 
 /// The 3D road view. Cheap to clone; clones share one widget.
@@ -711,6 +742,15 @@ impl CourseView {
             .build();
         let root = gtk::Overlay::builder().child(&area).build();
         root.add_overlay(&status);
+        let finish_btn = gtk::Button::builder()
+            .label("See Ride Summary")
+            .tooltip_text("Save the ride and see its summary")
+            .css_classes(["pill", "suggested-action"])
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        root.add_overlay(&finish_btn);
 
         let inner = Rc::new(Inner {
             root: root.clone(),
@@ -726,12 +766,31 @@ impl CourseView {
             progress: Cell::new(Progress::default()),
             glide: Cell::new(Glide::default()),
             hud: RefCell::new(HudLayer::default()),
+            finish_btn: finish_btn.clone(),
+            on_finish: RefCell::new(None),
             drawn_m: Cell::new(None),
             generation: Cell::new(0),
         });
 
         // Handlers hold the inner state weakly: the area owns these closures,
         // and a strong capture would keep it alive forever (CLAUDE.md §2.4).
+        let weak = Rc::downgrade(&inner);
+        finish_btn.connect_clicked(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.finish_btn.set_visible(false);
+                // Taken before it runs: it may set a new route on this view.
+                let done = inner.on_finish.borrow_mut().take();
+                if let Some(done) = done {
+                    done();
+                }
+            }
+        });
+        let weak = Rc::downgrade(&inner);
+        area.connect_resize(move |_, _, _| {
+            if let Some(inner) = weak.upgrade() {
+                inner.place_finish_button();
+            }
+        });
         let weak = Rc::downgrade(&inner);
         area.connect_realize(move |area| {
             if let Some(inner) = weak.upgrade() {
@@ -795,9 +854,51 @@ impl CourseView {
             let mut hud = inner.hud.borrow_mut();
             hud.profile = ride_hud::profile(route);
             hud.readings = None;
+            hud.finished = None;
             hud.painted = None;
         }
+        inner.finish_btn.set_visible(false);
+        *inner.on_finish.borrow_mut() = None;
         Inner::rebuild(inner);
+    }
+
+    /// The rider is over the line: let them coast to a stop past the arch,
+    /// lay `card` over the road, and run `then` — once — when they ask for
+    /// the ride's summary.
+    pub fn show_finished(&self, card: FinishedCard, then: impl FnOnce() + 'static) {
+        let inner = &self.inner;
+        let now = glib::monotonic_time();
+        let progress = inner.progress.get();
+        inner.progress.set(Progress {
+            distance_m: progress.distance_at(now),
+            speed_ms: progress.speed_at(now),
+            at_us: Some(now),
+            coast: true,
+        });
+        let tiles: Vec<String> = card
+            .tiles()
+            .iter()
+            .map(|(caption, value, unit)| format!("{} {value} {unit}", caption.to_lowercase()))
+            .collect();
+        inner
+            .finish_btn
+            .update_property(&[gtk::accessible::Property::Description(&format!(
+                "Finished {}: {}",
+                card.route_name,
+                tiles.join(", ")
+            ))]);
+        inner.hud.borrow_mut().finished = Some(card);
+        *inner.on_finish.borrow_mut() = Some(Box::new(then));
+        inner.place_finish_button();
+        inner.finish_btn.set_visible(true);
+        inner.finish_btn.grab_focus();
+        inner.area.queue_render();
+    }
+
+    /// Whether the view is on screen: the finished card is for a rider
+    /// watching the road.
+    pub fn is_showing(&self) -> bool {
+        self.inner.area.is_mapped()
     }
 
     /// Where the ride is: `distance_m` along the route, moving at `speed_ms`.
@@ -807,6 +908,7 @@ impl CourseView {
             distance_m,
             speed_ms,
             at_us: Some(glib::monotonic_time()),
+            coast: false,
         });
     }
 
@@ -857,6 +959,15 @@ impl Inner {
             }
             inner.update_status();
         });
+    }
+
+    /// Lay the finished card's button on the card's button row.
+    fn place_finish_button(&self) {
+        let scale = self.area.scale_factor().max(1);
+        let (w, h) = (self.area.width() * scale, self.area.height() * scale);
+        let drop = ride_hud::finish_button_drop(w, h) / f64::from(scale);
+        // Centred in what the margin leaves: half the margin moves it down.
+        self.finish_btn.set_margin_top((2.0 * drop).round() as i32);
     }
 
     /// Say the world is being built, until it is.
@@ -936,9 +1047,11 @@ impl Inner {
         self.glide.set(glide);
         let speed = glide.lean_speed();
         let (pose, sky) = match self.scene.borrow().as_ref() {
+            // The run-out is the route's own road up to the line, so the
+            // rider rides the same road either way; past it, they coast on.
             Some(s) => (
-                course3d::rider_pose(&s.road, distance, speed)
-                    .map(|r| (course3d::chase_camera(&s.road, &r), r)),
+                course3d::rider_pose(&s.run_out, distance, speed)
+                    .map(|r| (course3d::chase_camera(&s.run_out, &r), r)),
                 s.sky_at(distance),
             ),
             None => (None, Sky::default()),
@@ -963,19 +1076,30 @@ impl Inner {
         let HudLayer {
             shown,
             readings,
+            finished,
             profile,
             painter,
             painted,
         } = &mut *hud;
-        if let (true, Some(readings)) = (*shown, readings.as_ref()) {
+        // The finished card in any layout; else the HUD, when it is shown.
+        let want = match (finished.as_ref(), *shown, readings.as_ref()) {
+            (Some(card), _, _) => Some(Painted::Finished(card.clone())),
+            (None, true, Some(r)) => Some(Painted::Readings(r.clone())),
+            _ => None,
+        };
+        if let Some(want) = want {
             let fresh = painted
                 .as_ref()
-                .is_some_and(|(r, size)| r == readings && *size == (w, h));
+                .is_some_and(|(p, size)| *p == want && *size == (w, h));
             if !fresh {
                 let painter = painter.get_or_insert_with(RideHud::new);
-                if let Some(mut image) = painter.render(w, h, readings, profile) {
+                let image = match &want {
+                    Painted::Readings(r) => painter.render(w, h, r, profile),
+                    Painted::Finished(card) => painter.render_finished(w, h, card),
+                };
+                if let Some(mut image) = image {
                     state.upload_hud(&mut image);
-                    *painted = Some((readings.clone(), (w, h)));
+                    *painted = Some((want, (w, h)));
                 }
             }
             state.draw_hud(w, h);
@@ -1884,6 +2008,30 @@ mod tests {
     }
 
     #[test]
+    fn should_coast_through_the_line_to_a_stop() {
+        // Over the line the ride stops reporting; the rider rolls on,
+        // slowing, and comes to rest — not a second later in a lurch.
+        let p = Progress {
+            distance_m: 1_000.0,
+            speed_ms: 10.0,
+            at_us: Some(0),
+            coast: true,
+        };
+        let after = |s: f32| 1_000.0 + 10.0 * COAST_S * (1.0 - (-s / COAST_S).exp());
+        assert!((p.distance_at(1_000_000) - after(1.0)).abs() < 1e-3);
+        assert!((p.distance_at(3_000_000) - after(3.0)).abs() < 1e-3);
+        // At rest a little over the coasting length on, and staying there.
+        assert!((p.distance_at(120_000_000) - (1_000.0 + 10.0 * COAST_S)).abs() < 1e-2);
+        assert!(p.speed_at(1_000_000) < 10.0 && p.speed_at(1_000_000) > 5.0);
+        assert!(p.speed_at(120_000_000) < 0.01);
+        let back = Progress {
+            speed_ms: -4.0,
+            ..p
+        };
+        assert_eq!(back.distance_at(2_000_000), 1_000.0);
+    }
+
+    #[test]
     fn should_stay_put_before_the_first_report() {
         let p = Progress::default();
         assert_eq!(p.distance_at(5_000_000), 0.0);
@@ -1895,6 +2043,7 @@ mod tests {
             distance_m: 100.0,
             speed_ms: 8.0,
             at_us: Some(1_000_000),
+            coast: false,
         };
         assert_eq!(p.distance_at(1_500_000), 104.0);
     }
@@ -1906,6 +2055,7 @@ mod tests {
             distance_m: 100.0,
             speed_ms: 8.0,
             at_us: Some(1_000_000),
+            coast: false,
         };
         assert_eq!(p.distance_at(2_000_000), 108.0);
         assert_eq!(p.distance_at(60_000_000), 108.0);
@@ -1917,6 +2067,7 @@ mod tests {
             distance_m: 100.0,
             speed_ms: 8.0,
             at_us: Some(1_000_000),
+            coast: false,
         };
         assert_eq!(p.speed_at(1_500_000), 8.0);
         // At the very moment the distance stops moving, so does the lean.
@@ -1942,6 +2093,7 @@ mod tests {
             distance_m: 100.0,
             speed_ms: -5.0,
             at_us: Some(1_000_000),
+            coast: false,
         };
         assert_eq!(p.distance_at(500_000), 100.0);
         assert_eq!(p.distance_at(1_500_000), 100.0);
@@ -1963,6 +2115,7 @@ mod tests {
                     distance_m: d,
                     speed_ms: v,
                     at_us: Some(at),
+                    coast: false,
                 };
                 glide.follow(p.distance_at(now), p.speed_at(now), now)
             })

@@ -20,7 +20,7 @@ use crate::data::props::Prop;
 use crate::data::roadway;
 use crate::data::route::Route;
 use crate::data::world::{splitmix, AreaKind, World};
-use crate::data::{animals, dressing, encounters, rider, sky, track, trees};
+use crate::data::{animals, dressing, encounters, finish, rider, sky, track, trees};
 
 /// The chase camera: this far behind the rider and this high above the road,
 /// aimed at a point this far ahead of the rider and this high.
@@ -379,6 +379,10 @@ pub struct RiderPose {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CourseScene {
     pub road: Vec<RoadPoint>,
+    /// The road on past the finish, the route's own up to it: where the
+    /// rider coasts to a stop once over the line. Everything else keeps to
+    /// `road`.
+    pub run_out: Vec<RoadPoint>,
     pub mesh: Mesh,
     /// Trees and animals, drawn apart from the mesh: many copies of a few
     /// shapes.
@@ -427,6 +431,7 @@ impl CourseScene {
             Some(&mut props),
         );
         mesh.extend(roadway::ridden_mesh(&drawn));
+        mesh.extend(finish::arch(&road));
         let length = road.last().map_or(0.0, |p| p.distance_m);
         let segments = if scenery == Scenery::Mixed {
             biome::mix_segments(world.seed(), length)
@@ -454,8 +459,15 @@ impl CourseScene {
             &|x, z| world.land(x, z) == Some(AreaKind::Water),
             world.seed(),
         );
+        let start = road[0].distance_m;
+        let run_out = drawn
+            .iter()
+            .filter(|p| p.distance_m >= start)
+            .copied()
+            .collect();
         Some(Self {
             road,
+            run_out,
             mesh,
             props,
             horizons,

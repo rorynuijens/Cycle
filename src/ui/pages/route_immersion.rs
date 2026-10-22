@@ -82,6 +82,9 @@ pub struct Immersion {
     on_bar: Cell<bool>,
     /// Where the pointer was last seen over the road.
     pointer: Cell<Option<(f64, f64)>>,
+    /// Over the line: the finished card has the road, and the bar stays down
+    /// — its button row is where the bar would come up.
+    finished: Cell<bool>,
 }
 
 impl Immersion {
@@ -120,6 +123,7 @@ impl Immersion {
             moved: Cell::new(0),
             on_bar: Cell::new(false),
             pointer: Cell::new(None),
+            finished: Cell::new(false),
         });
 
         // Held weakly: the view owns these controllers (CLAUDE.md §2.4).
@@ -168,6 +172,16 @@ impl Immersion {
     pub fn set_road(this: &Rc<Self>, road: bool) {
         this.road.set(road);
         Self::apply(this);
+    }
+
+    /// The ride is over, or a new one is starting: keep the bar down while
+    /// the finished card is up, the pointer showing to press its button.
+    pub fn set_finished(&self, finished: bool) {
+        self.finished.set(finished);
+        if finished {
+            self.bar.set_reveal_child(false);
+            self.course_view.widget().set_cursor(None);
+        }
     }
 
     /// A toggle handler for the 3D button that does not keep the page alive.
@@ -227,6 +241,10 @@ impl Immersion {
             return;
         }
         let view = this.course_view.widget();
+        if this.finished.get() {
+            view.set_cursor(None);
+            return;
+        }
         let scale = f64::from(view.scale_factor().max(1));
         let clear = ride_hud::controls_clearance(
             (f64::from(view.width()) * scale) as i32,
@@ -249,6 +267,7 @@ impl Immersion {
             };
             if this.moved.get() != ticket
                 || this.on_bar.get()
+                || this.finished.get()
                 || this.current.get() != Some(Layout::Road)
             {
                 return;

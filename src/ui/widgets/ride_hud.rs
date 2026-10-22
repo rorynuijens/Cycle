@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use pango::prelude::*;
 
 use crate::data::athlete::{power_zone_index, ZONE_COLORS};
-use crate::data::palette::{Rgb, HUD};
+use crate::data::palette::{Rgb, BASE, HUD};
 use crate::data::route::Route;
 use crate::ui::ride_card::format_ride_time;
 
@@ -87,6 +87,74 @@ pub fn to_go(metres: f32) -> (String, &'static str) {
     } else {
         (format!("{tens:.0}"), "m")
     }
+}
+
+/// "FINISH IN …" over the last stretch: the metres left as the to-go tile
+/// counts them, never "0 m" while there is road left; nothing further out,
+/// or once over the line.
+pub fn finish_in(metres: f32) -> Option<String> {
+    if !(metres.is_finite() && metres > 0.0 && metres <= FINISH_IN_M) {
+        return None;
+    }
+    let (left, _) = to_go(metres.max(5.0));
+    Some(format!("{left} m"))
+}
+
+/// The finish is announced from this far out, in metres.
+pub const FINISH_IN_M: f32 = 500.0;
+
+/// What the card over the road says once the rider is over the line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinishedCard {
+    pub route_name: String,
+    pub elapsed_secs: u32,
+    pub distance_m: f32,
+    pub avg_power_watts: Option<u32>,
+    pub climbed_m: f32,
+    pub avg_heart_rate_bpm: Option<u32>,
+}
+
+impl FinishedCard {
+    /// The numbers on the card, as `(caption, value, unit)`: only those the
+    /// ride has, as on the ride card.
+    pub fn tiles(&self) -> Vec<(&'static str, String, &'static str)> {
+        let mut tiles = vec![
+            ("TIME", format_ride_time(u64::from(self.elapsed_secs)), ""),
+            (
+                "DISTANCE",
+                format!("{:.1}", self.distance_m.max(0.0) / 1_000.0),
+                "km",
+            ),
+        ];
+        if let Some(w) = self.avg_power_watts {
+            tiles.push(("AVG POWER", w.to_string(), "W"));
+        }
+        if self.elapsed_secs > 0 {
+            let kmh = self.distance_m.max(0.0) / self.elapsed_secs as f32 * 3.6;
+            tiles.push(("AVG SPEED", format!("{kmh:.1}"), "km/h"));
+        }
+        tiles.push(("CLIMBED", format!("{:.0}", self.climbed_m.max(0.0)), "m"));
+        if let Some(bpm) = self.avg_heart_rate_bpm {
+            tiles.push(("AVG HEART RATE", bpm.to_string(), "bpm"));
+        }
+        tiles
+    }
+}
+
+/// The finished card, on the sheet: its size, and where its button row sits
+/// down from the card's top. The button itself is a real one, laid over the
+/// view there.
+const CARD_W: f64 = 940.0;
+const CARD_H: f64 = 660.0;
+const CARD_HEADER: f64 = 56.0;
+const CARD_BUTTON_Y: f64 = 584.0;
+const CARD_TILE_H: f64 = 106.0;
+
+/// How far below the view's middle the finished card's button sits, in
+/// pixels, for a view `width` × `height`.
+pub fn finish_button_drop(width: i32, height: i32) -> f64 {
+    let (scale, _, _) = sheet(width, height);
+    (CARD_BUTTON_Y - CARD_H / 2.0) * scale
 }
 
 /// The gradient on the sign: a whole per cent, no "-0%" on the flat.
@@ -232,6 +300,35 @@ impl RideHud {
         power_panel(&t, w, r);
         gradient_sign(&t, 60.0, h - 214.0 - 214.0, r.gradient_pct);
         profile_band(&t, w, h, r, profile);
+        if let Some(left) = finish_in(r.to_go_m) {
+            finish_banner(&t, w, &left);
+        }
+    }
+
+    /// The card over the road once the rider is over the line, the world
+    /// dimmed behind it, for a view `width` × `height`.
+    pub fn render_finished(
+        &self,
+        width: i32,
+        height: i32,
+        card: &FinishedCard,
+    ) -> Option<cairo::ImageSurface> {
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width.max(1), height.max(1)).ok()?;
+        {
+            let cr = cairo::Context::new(&surface).ok()?;
+            let (scale, w, h) = sheet(width, height);
+            cr.scale(scale, scale);
+            let pctx = self.fonts.create_context();
+            pangocairo::functions::update_context(&cr, &pctx);
+            let t = Text {
+                cr: &cr,
+                pctx: &pctx,
+            };
+            finished_card(&t, w, h, card);
+        }
+        surface.flush();
+        Some(surface)
     }
 
     fn route_flag(&self, t: &Text, name: &str) {
@@ -506,6 +603,147 @@ fn power_panel(t: &Text, w: f64, r: &HudReadings) {
     }
 }
 
+/// A row of chequers across `x..x + w`, `square` high, starting dark.
+fn chequers(cr: &cairo::Context, x: f64, y: f64, w: f64, rows: usize, square: f64) {
+    set(cr, HUD.sign_face);
+    cr.rectangle(x, y, w, rows as f64 * square);
+    let _ = cr.fill();
+    set(cr, BASE.chequer);
+    for row in 0..rows {
+        let mut cx = x + (row % 2) as f64 * square;
+        while cx < x + w {
+            cr.rectangle(cx, y + row as f64 * square, square.min(x + w - cx), square);
+            cx += 2.0 * square;
+        }
+    }
+    let _ = cr.fill();
+}
+
+/// "FINISH IN 180 m" on a yellow sticker with chequered ends, tilted a
+/// little, under the power panel.
+fn finish_banner(t: &Text, w: f64, left: &str) {
+    let cr = t.cr;
+    let words = t.layout("FINISH IN", 34.0, pango::Weight::Bold);
+    let attrs = words.attributes().unwrap_or_default();
+    attrs.insert(pango::AttrInt::new_letter_spacing(
+        (0.08 * 34.0 * f64::from(pango::SCALE)) as i32,
+    ));
+    words.set_attributes(Some(&attrs));
+    let number = t.layout(left, 44.0, pango::Weight::Bold);
+    let (end, pad, gap, hgt) = (40.0, 26.0, 14.0, 70.0);
+    let inner = Text::width(&words) + gap + Text::width(&number);
+    let bw = 2.0 * end + 2.0 * pad + inner;
+    let (cx, cy) = (w / 2.0, FINISH_BANNER_Y + hgt / 2.0);
+    cr.save().ok();
+    cr.translate(cx, cy);
+    cr.rotate(-2f64.to_radians());
+    let (x, y) = (-bw / 2.0, -hgt / 2.0);
+    rounded(cr, x, y + 7.0, bw, hgt, 18.0);
+    set(cr, HUD.ink);
+    let _ = cr.fill();
+    rounded(cr, x, y, bw, hgt, 18.0);
+    cr.save().ok();
+    cr.clip_preserve();
+    set(cr, HUD.flag);
+    let _ = cr.fill_preserve();
+    cr.new_path();
+    let square = hgt / 7.0;
+    for ex in [x, x + bw - end] {
+        for row in 0..7 {
+            let k = row % 2;
+            set(cr, if k == 0 { BASE.chequer } else { HUD.sign_face });
+            cr.rectangle(ex, y + row as f64 * square, end / 2.0, square);
+            let _ = cr.fill();
+            set(cr, if k == 0 { HUD.sign_face } else { BASE.chequer });
+            cr.rectangle(ex + end / 2.0, y + row as f64 * square, end / 2.0, square);
+            let _ = cr.fill();
+        }
+    }
+    cr.restore().ok();
+    rounded(cr, x, y, bw, hgt, 18.0);
+    set(cr, HUD.ink);
+    cr.set_line_width(5.0);
+    let _ = cr.stroke();
+    let base = y + hgt / 2.0 + 15.0;
+    let tx = x + end + pad;
+    t.on_baseline(&words, tx, base, HUD.ink);
+    t.on_baseline(&number, tx + Text::width(&words) + gap, base, HUD.ink);
+    cr.restore().ok();
+}
+
+/// The top of the "FINISH IN" sticker, on the sheet: below the power panel.
+const FINISH_BANNER_Y: f64 = 372.0;
+
+/// The card once over the line: the world dimmed, a chequered header,
+/// FINISHED!, the route, and the ride's numbers in tiles.
+fn finished_card(t: &Text, w: f64, h: f64, card: &FinishedCard) {
+    let cr = t.cr;
+    set(cr, HUD.ink);
+    cr.paint_with_alpha(0.38).ok();
+
+    let (x, y) = (w / 2.0 - CARD_W / 2.0, h / 2.0 - CARD_H / 2.0);
+    rounded(cr, x, y + 12.0, CARD_W, CARD_H, 36.0);
+    set(cr, HUD.ink);
+    let _ = cr.fill();
+    rounded(cr, x, y, CARD_W, CARD_H, 36.0);
+    set(cr, HUD.panel);
+    let _ = cr.fill_preserve();
+    cr.save().ok();
+    cr.clip();
+    chequers(cr, x, y, CARD_W, 2, CARD_HEADER / 2.0);
+    set(cr, HUD.ink);
+    cr.rectangle(x, y + CARD_HEADER, CARD_W, 6.0);
+    let _ = cr.fill();
+    cr.restore().ok();
+    rounded(cr, x, y, CARD_W, CARD_H, 36.0);
+    set(cr, HUD.ink);
+    cr.set_line_width(6.0);
+    let _ = cr.stroke();
+
+    let title = t.layout("FINISHED!", 104.0, pango::Weight::Bold);
+    let attrs = title.attributes().unwrap_or_default();
+    attrs.insert(pango::AttrInt::new_letter_spacing(
+        (0.04 * 104.0 * f64::from(pango::SCALE)) as i32,
+    ));
+    title.set_attributes(Some(&attrs));
+    t.on_baseline(
+        &title,
+        w / 2.0 - Text::width(&title) / 2.0,
+        y + 182.0,
+        HUD.ink,
+    );
+    let route = t.layout(&card.route_name, 28.0, pango::Weight::Medium);
+    route.set_width((CARD_W - 112.0) as i32 * pango::SCALE);
+    route.set_ellipsize(pango::EllipsizeMode::End);
+    t.on_baseline(
+        &route,
+        w / 2.0 - Text::width(&route) / 2.0,
+        y + 226.0,
+        HUD.label,
+    );
+
+    let tiles = card.tiles();
+    let (cols, gap) = (3usize, 18.0);
+    let tile_w = (CARD_W - 112.0 - gap * (cols as f64 - 1.0)) / cols as f64;
+    for (k, (caption, value, unit)) in tiles.iter().enumerate() {
+        let (row, col) = (k / cols, k % cols);
+        // A short last row sits in the middle.
+        let in_row = (tiles.len() - row * cols).min(cols) as f64;
+        let row_w = in_row * tile_w + (in_row - 1.0) * gap;
+        let tx = w / 2.0 - row_w / 2.0 + col as f64 * (tile_w + gap);
+        let ty = y + 262.0 + row as f64 * (CARD_TILE_H + gap);
+        sticker(cr, tx, ty, tile_w, CARD_TILE_H, 24.0, 5.0, 5.0);
+        t.draw(&t.caption(caption), tx + 22.0, ty + 14.0, HUD.label);
+        let number = t.layout(value, 56.0, pango::Weight::Bold);
+        let base = ty + CARD_TILE_H - 18.0;
+        t.on_baseline(&number, tx + 22.0, base, HUD.ink);
+        if !unit.is_empty() {
+            let u = t.layout(unit, 24.0, pango::Weight::Semibold);
+            t.on_baseline(&u, tx + 22.0 + Text::width(&number) + 8.0, base, HUD.label);
+        }
+    }
+}
+
 /// The gradient as a road sign: a red-bordered triangle with the slope drawn
 /// in it, falling the other way on a descent.
 fn gradient_sign(t: &Text, x: f64, y: f64, pct: f32) {
@@ -710,6 +948,98 @@ mod tests {
     }
 
     #[test]
+    fn should_announce_the_finish_only_over_the_last_500_m() {
+        assert_eq!(finish_in(500.1), None);
+        assert_eq!(finish_in(500.0), Some("500 m".into()));
+        // The same metres as the to-go tile beside it.
+        assert_eq!(finish_in(184.0), Some(format!("{} m", to_go(184.0).0)));
+        // Never "0 m" with road still to ride; nothing once over the line.
+        assert_eq!(finish_in(2.0), Some("10 m".into()));
+        assert_eq!(finish_in(0.0), None);
+        assert_eq!(finish_in(-3.0), None);
+        assert_eq!(finish_in(f32::NAN), None);
+    }
+
+    fn finished() -> FinishedCard {
+        FinishedCard {
+            route_name: "Hill".into(),
+            elapsed_secs: 1_908,
+            distance_m: 10_120.0,
+            avg_power_watts: Some(171),
+            climbed_m: 142.4,
+            avg_heart_rate_bpm: Some(148),
+        }
+    }
+
+    #[test]
+    fn should_card_every_number_the_ride_has_and_none_it_has_not() {
+        let tiles = finished().tiles();
+        let got: Vec<(&str, &str, &str)> =
+            tiles.iter().map(|(c, v, u)| (*c, v.as_str(), *u)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("TIME", "31:48", ""),
+                ("DISTANCE", "10.1", "km"),
+                ("AVG POWER", "171", "W"),
+                // 10.12 km in 1908 s.
+                ("AVG SPEED", "19.1", "km/h"),
+                ("CLIMBED", "142", "m"),
+                ("AVG HEART RATE", "148", "bpm"),
+            ]
+        );
+        let bare = FinishedCard {
+            avg_power_watts: None,
+            avg_heart_rate_bpm: None,
+            elapsed_secs: 0,
+            ..finished()
+        };
+        let captions: Vec<&str> = bare.tiles().iter().map(|t| t.0).collect();
+        assert_eq!(captions, vec!["TIME", "DISTANCE", "CLIMBED"]);
+    }
+
+    #[test]
+    fn should_sit_the_finish_button_on_the_cards_button_row() {
+        assert_eq!(finish_button_drop(1920, 1080), 254.0);
+        assert_eq!(finish_button_drop(3840, 2160), 508.0);
+    }
+
+    #[test]
+    fn should_dim_the_world_round_the_finished_card() {
+        let hud = RideHud::new();
+        let mut s = hud
+            .render_finished(1920, 1080, &finished())
+            .expect("a card");
+        let corner = pixel(&mut s, 20, 20);
+        assert!(
+            (90..=104).contains(&corner[3]),
+            "the world dimmed by {}",
+            corner[3]
+        );
+        // The card's face, between its first tiles and its edge.
+        assert!(close(pixel(&mut s, 960 - 470 + 30, 540), rgb8(HUD.panel)));
+        // Its chequered header: a dark square at the top left.
+        assert!(close(
+            pixel(&mut s, 960 - 470 + 20, 540 - 330 + 20),
+            rgb8(BASE.chequer)
+        ));
+    }
+
+    #[test]
+    fn should_hang_the_finish_banner_out_only_near_the_finish() {
+        let hud = RideHud::new();
+        let near = HudReadings {
+            to_go_m: 180.0,
+            ..riding()
+        };
+        let mut s = hud.render(1920, 1080, &near, &[]).expect("a HUD");
+        // The sticker's yellow, above its words.
+        assert!(close(pixel(&mut s, 960, 381), rgb8(HUD.flag)));
+        let mut s = hud.render(1920, 1080, &riding(), &[]).expect("a HUD");
+        assert_eq!(pixel(&mut s, 960, 381)[3], 0);
+    }
+
+    #[test]
     fn should_sign_a_gradient_in_whole_per_cents_with_no_minus_zero() {
         assert_eq!(gradient(4.2), "4%");
         assert_eq!(gradient(4.5), "5%");
@@ -839,9 +1169,22 @@ mod tests {
     fn render_hud_png() {
         let out = std::env::var("CYCLE_HUD_OUT").expect("CYCLE_HUD_OUT");
         let hud = RideHud::new();
-        let s = hud
-            .render(1920, 1080, &riding(), &profile(&hill()))
-            .expect("a HUD");
+        // CYCLE_HUD_TO_GO=<metres> for the finish banner; CYCLE_HUD_FINISHED=1
+        // for the card.
+        let to_go_m = std::env::var("CYCLE_HUD_TO_GO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_600.0);
+        let s = if std::env::var("CYCLE_HUD_FINISHED").is_ok_and(|v| v == "1") {
+            hud.render_finished(1920, 1080, &finished())
+        } else {
+            let r = HudReadings {
+                to_go_m,
+                ..riding()
+            };
+            hud.render(1920, 1080, &r, &profile(&hill()))
+        }
+        .expect("a HUD");
         let mut file = std::fs::File::create(out).expect("the PNG file");
         s.write_to_png(&mut file).expect("written");
     }
