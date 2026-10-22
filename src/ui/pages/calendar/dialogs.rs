@@ -1268,7 +1268,11 @@ pub fn show_workout_detail_dialog(
                                 match cb {
                                     Some(cb) => {
                                         dialog.close();
-                                        cb(route, look);
+                                        cb(crate::ui::RouteRide {
+                                            route,
+                                            route_id: Some(route_id),
+                                            look,
+                                        });
                                     }
                                     None => tracing::error!(
                                         "no route-start callback registered; cannot ride"

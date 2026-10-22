@@ -22,6 +22,7 @@ pub mod props;
 pub mod rider;
 pub mod roadway;
 pub mod route;
+pub mod route_link;
 pub mod session;
 pub mod settings;
 pub mod sky;

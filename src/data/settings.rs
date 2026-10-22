@@ -41,6 +41,8 @@ pub mod keys {
     pub const INTERVALS_SYNC: &str = "intervals.sync";
     /// Set once every stream cached by the broken pre-0.12.0 fetch is gone.
     pub const INTERVALS_STREAMS_REFETCHED: &str = "intervals.streams_refetched";
+    /// Set once the rides from before v9 have been linked to their routes.
+    pub const ROUTE_RIDES_LINKED: &str = "sessions.route_rides_linked";
 
     pub const WINDOW_WIDTH: &str = "window.width";
     pub const WINDOW_HEIGHT: &str = "window.height";
@@ -211,6 +213,18 @@ pub async fn streams_refetched(pool: &SqlitePool) -> Result<bool> {
 
 pub async fn set_streams_refetched(pool: &SqlitePool) -> Result<()> {
     db::set_setting(pool, keys::INTERVALS_STREAMS_REFETCHED, flag_value(true)).await
+}
+
+/// Whether the rides from before v9 have been linked to their routes.
+pub async fn route_rides_linked(pool: &SqlitePool) -> Result<bool> {
+    Ok(flag(
+        db::get_setting(pool, keys::ROUTE_RIDES_LINKED).await?,
+        false,
+    ))
+}
+
+pub async fn set_route_rides_linked(pool: &SqlitePool) -> Result<()> {
+    db::set_setting(pool, keys::ROUTE_RIDES_LINKED, flag_value(true)).await
 }
 
 // ── Window geometry ──────────────────────────────────────────────────────────

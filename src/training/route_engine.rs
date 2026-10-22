@@ -230,6 +230,14 @@ impl RouteEngine {
         }
     }
 
+    /// Whether this tick's speed is the rider's own doing: SIM physics turned
+    /// their power into it, a speed sensor measured it, or they are standing
+    /// still. Not when ERG emulation moves them at the nominal pace — a ride
+    /// with any such tick is not a time to race.
+    pub fn rider_sets_speed(sim: bool, power_watts: Option<u32>, speed_kmh: Option<f32>) -> bool {
+        sim || speed_kmh.is_some() || power_watts.unwrap_or(0) == 0
+    }
+
     /// Set the rider's speed (e.g. from a real-time speed sensor or ERG override).
     pub fn set_speed(&mut self, speed_ms: f32) {
         self.speed_ms = speed_ms.max(0.0);
@@ -813,6 +821,20 @@ mod tests {
     fn emulated_speed_runs_at_the_nominal_pace_while_pedalling() {
         let speed = RouteEngine::emulated_speed_ms(Some(150), None);
         assert!((speed - 6.944).abs() < 0.001, "got {speed}");
+    }
+
+    #[test]
+    fn should_say_the_rider_set_the_speed_only_when_they_did() {
+        // SIM: the physics turns the rider's power into speed.
+        assert!(RouteEngine::rider_sets_speed(true, Some(200), None));
+        // A speed sensor: what the wheel did.
+        assert!(RouteEngine::rider_sets_speed(false, Some(200), Some(31.0)));
+        // Standing still sets nothing either way.
+        assert!(RouteEngine::rider_sets_speed(false, None, None));
+        assert!(RouteEngine::rider_sets_speed(false, Some(0), None));
+        // ERG emulation: the clock moved them at the nominal pace.
+        assert!(!RouteEngine::rider_sets_speed(false, Some(1), None));
+        assert!(!RouteEngine::rider_sets_speed(false, Some(400), None));
     }
 
     #[test]

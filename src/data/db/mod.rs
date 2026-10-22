@@ -71,6 +71,21 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     crate::data::migrate::run(pool).await?;
     backfill_session_metrics(pool).await?;
     backfill_session_integrity(pool).await?;
+    // Once: the rides from before rides knew their route. A failure is
+    // logged and tried again next launch — never a reason not to start.
+    if !crate::data::settings::route_rides_linked(pool).await? {
+        let load = |saved: &SavedRoute| {
+            let path = routes_dir().ok()?.join(&saved.file_name);
+            crate::data::route::Route::from_gpx_path(&path).ok()
+        };
+        match link_old_route_rides(pool, &load).await {
+            Ok(n) => {
+                tracing::info!("Linked {n} earlier rides to their routes");
+                crate::data::settings::set_route_rides_linked(pool).await?;
+            }
+            Err(e) => tracing::error!("linking earlier rides to their routes failed: {e}"),
+        }
+    }
     Ok(())
 }
 

@@ -1022,6 +1022,7 @@ impl RoutePlayerPage {
     pub fn start_timer(
         page: Rc<Self>,
         route: Route,
+        route_id: Option<i64>,
         athlete: &AthleteProfile,
         cmd_tx: async_channel::Sender<DeviceCommand>,
         sim_capable: Rc<Cell<bool>>,
@@ -1051,6 +1052,11 @@ impl RoutePlayerPage {
         // route ride scores against whatever the profile says later, and there is
         // no way to tell an unstamped route ride from a pre-phase-1 one.
         new_session.ftp_watts = Some(athlete.ftp_watts);
+        // Filed under the saved route from the start, so a ride recovered after
+        // a crash still knows which route it was. Rider-driven until a tick
+        // says otherwise.
+        new_session.route_id = route_id;
+        new_session.rider_driven = true;
         let engine = Rc::new(RefCell::new(RouteEngine::new(route, 6.944, mass_kg)));
         #[cfg(debug_assertions)]
         if fake_rider_watts(std::env::var(FAKE_RIDER_ENV).ok().as_deref()).is_some() {
@@ -1311,6 +1317,9 @@ impl RoutePlayerPage {
             // The pretend rider rides in SIM, so the course is ridden with the
             // real physics; the grade it sends goes to no trainer.
             let sim = sim_capable.get() || fake.is_some();
+            if !RouteEngine::rider_sets_speed(sim, readings.power_watts, readings.speed_kmh) {
+                session.borrow_mut().rider_driven = false;
+            }
             let speed_ms = if sim {
                 let power = readings.power_watts.unwrap_or(0);
                 let speed_ms = engine.borrow_mut().tick_sim(power);

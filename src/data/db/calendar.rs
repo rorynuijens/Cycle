@@ -94,6 +94,24 @@ pub async fn complete_today_calendar_entry(
     Ok(())
 }
 
+/// Mark the incomplete planned rides of `route_id` on `date` as done — a
+/// route ride's equivalent of [`complete_today_calendar_entry`].
+pub async fn complete_today_route_entry(
+    pool: &SqlitePool,
+    route_id: i64,
+    date: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE calendar_entries SET completed = 1
+         WHERE route_id = ? AND scheduled_date = ? AND completed = 0",
+    )
+    .bind(route_id)
+    .bind(date)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Everything [`row_to_entry`] reads, up to but not including the WHERE clause.
 ///
 /// Shared rather than repeated so the range read and the single-entry read
@@ -760,6 +778,36 @@ mod tests {
 
         assert!(reschedule_entry(&pool, id, "2026-03-12").await.unwrap());
         assert_eq!(entries(&pool).await[0].scheduled_date, "2026-03-12");
+    }
+
+    #[tokio::test]
+    async fn should_close_the_planned_ride_of_the_route_ridden_that_day_only() {
+        // A planned route ride was never closed by riding it: the plan then
+        // counted it as missed and eased the days after.
+        let pool = test_pool().await;
+        let alpe = a_route(&pool, "Alpe").await;
+        let ventoux = a_route(&pool, "Ventoux").await;
+        schedule_route(&pool, alpe, "2026-03-04", 80.0, 3600)
+            .await
+            .unwrap();
+        schedule_route(&pool, alpe, "2026-03-05", 80.0, 3600)
+            .await
+            .unwrap();
+        schedule_route(&pool, ventoux, "2026-03-04", 90.0, 3600)
+            .await
+            .unwrap();
+
+        complete_today_route_entry(&pool, alpe, "2026-03-04")
+            .await
+            .unwrap();
+
+        let done: Vec<(String, String)> = entries(&pool)
+            .await
+            .into_iter()
+            .filter(|e| e.completed)
+            .map(|e| (e.item.name().to_string(), e.scheduled_date))
+            .collect();
+        assert_eq!(done, vec![("Alpe".to_string(), "2026-03-04".to_string())]);
     }
 
     #[tokio::test]

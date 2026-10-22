@@ -49,6 +49,15 @@ pub struct Session {
     /// and a missing one means "ordinary ride", which is what they all were.
     #[serde(default)]
     pub is_ftp_test: bool,
+    /// The saved route this ride was on, if it was on one — what its ghost
+    /// is looked up by.
+    #[serde(default)]
+    pub route_id: Option<i64>,
+    /// Set when the rider's own effort set the ride's speed throughout:
+    /// SIM physics or a speed sensor, never ERG emulation's nominal pace.
+    /// Only such a ride can be raced as a ghost.
+    #[serde(default)]
+    pub rider_driven: bool,
 }
 
 impl Session {
@@ -65,6 +74,8 @@ impl Session {
             icu_id: None,
             integrity_dismissed: false,
             is_ftp_test: false,
+            route_id: None,
+            rider_driven: false,
         }
     }
 

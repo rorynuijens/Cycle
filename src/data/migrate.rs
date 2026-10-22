@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 ///
 /// Bump this when adding to [`MIGRATIONS`]; the test at the bottom of this file
 /// fails if the two disagree.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// Version describing the schema as it stood before versioning existed.
 ///
@@ -215,6 +215,22 @@ const MIGRATIONS: &[Migration] = &[
             // countryside the 3D view has always drawn, so nothing changes
             // for a route until the rider changes it.
             "ALTER TABLE routes ADD COLUMN scenery TEXT",
+        ],
+    },
+    Migration {
+        version: 9,
+        name: "know which route a ride was on, and who set its speed",
+        statements: &[
+            // The saved route a ride was ridden on. The title is the route's
+            // name but can be renamed, and two routes can share a name; the
+            // ghost is looked up by this, and a planned route ride is closed
+            // by it. A deleted route leaves its rides, unlinked.
+            "ALTER TABLE sessions ADD COLUMN route_id INTEGER REFERENCES routes(id) ON DELETE SET NULL",
+            // Set when the rider's own effort set the ride's speed all the way
+            // — SIM physics or a speed sensor — and never the nominal pace ERG
+            // emulation moves a rider at. Only such a ride is a time worth
+            // racing. 0 for every ride before this: nothing says otherwise.
+            "ALTER TABLE sessions ADD COLUMN rider_driven INTEGER NOT NULL DEFAULT 0",
         ],
     },
 ];
@@ -934,6 +950,74 @@ mod tests {
         let routes = crate::data::db::load_routes(&pool).await.unwrap();
         assert_eq!(routes.len(), 1, "the route survived");
         assert_eq!(routes[0].scenery, crate::data::biome::Scenery::Countryside);
+    }
+
+    // ── v9: which route a ride was on ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_leave_a_ride_from_before_v9_on_no_route_and_no_ghost() {
+        // A ride from before v9 knows no route, and nothing says the rider's
+        // own legs set its speed: it must come out as neither, so it can never
+        // be raced as a ghost until something proves otherwise.
+        let pool = empty_pool().await;
+        establish_baseline(&pool).await.unwrap();
+        set_user_version(&pool, 8).await.unwrap();
+        for m in MIGRATIONS.iter().filter(|m| m.version <= 8) {
+            for stmt in m.statements {
+                sqlx::query(stmt).execute(&pool).await.ok();
+            }
+        }
+        sqlx::query(
+            "INSERT INTO sessions (id, started_at, ended_at, data_points_json)
+             VALUES (1, '2026-09-01T09:00:00Z', '2026-09-01T10:00:00Z', '[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run(&pool).await.expect("v9 applies to a v8 database");
+
+        let (route_id, driven): (Option<i64>, i64) =
+            sqlx::query_as("SELECT route_id, rider_driven FROM sessions WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(route_id, None);
+        assert_eq!(driven, 0);
+    }
+
+    #[tokio::test]
+    async fn should_forget_a_deleted_route_on_its_rides_not_the_rides() {
+        let pool = empty_pool().await;
+        run(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO routes (id, name, file_name, distance_m, elevation_gain_m, added_at)
+             VALUES (7, 'Alpe', 'alpe.gpx', 13800, 1071, '2026-09-01T09:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, started_at, ended_at, data_points_json, route_id)
+             VALUES (1, '2026-09-01T09:00:00Z', '2026-09-01T10:00:00Z', '[]', 7)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM routes WHERE id = 7")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let route_id: Option<i64> =
+            sqlx::query_scalar("SELECT route_id FROM sessions WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("the ride is still there");
+        assert_eq!(route_id, None);
     }
 
     #[tokio::test]

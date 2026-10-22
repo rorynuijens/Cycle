@@ -254,6 +254,8 @@ pub fn show_route_detail(
     parent: Option<&gtk::Window>,
     on_start_route: crate::ui::StartRoute,
 ) {
+    // Taken before `remember` moves into the scenery handler below.
+    let route_id = remember.as_ref().map(|r| r.route_id);
     let win = adw::Window::builder()
         .modal(true)
         .title(&route.name)
@@ -531,13 +533,14 @@ pub fn show_route_detail(
         #[weak]
         win,
         move |_| {
-            on_start_route(
-                route_for_ride.clone(),
-                crate::data::biome::WorldLook {
+            on_start_route(crate::ui::RouteRide {
+                route: route_for_ride.clone(),
+                route_id,
+                look: crate::data::biome::WorldLook {
                     scenery: chosen.get(),
                     animals: animals.get(),
                 },
-            );
+            });
             win.close();
         }
     ));

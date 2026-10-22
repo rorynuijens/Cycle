@@ -311,6 +311,7 @@ pub fn finish_session_closure(
 
         let pool = pool_for_complete.clone();
         let workout_id = session.workout_id;
+        let route_id = session.route_id;
 
         // session_id is set by the tokio save task and read by the RPE callback.
         // The session save takes ~10 ms; the RPE dialog requires human interaction
@@ -369,11 +370,16 @@ pub fn finish_session_closure(
                         .lock()
                         .expect("session_id_arc cannot be poisoned") = Some(session_id);
                     tracing::info!("Session saved");
+                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                     if let Some(wid) = workout_id {
-                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                         if let Err(e) = db::complete_today_calendar_entry(&pool, wid, &today).await
                         {
                             tracing::error!("complete_today_calendar_entry failed: {e}");
+                        }
+                    }
+                    if let Some(rid) = route_id {
+                        if let Err(e) = db::complete_today_route_entry(&pool, rid, &today).await {
+                            tracing::error!("complete_today_route_entry failed: {e}");
                         }
                     }
                     // Intervals.icu upload — send the full FIT file so Intervals.icu gets

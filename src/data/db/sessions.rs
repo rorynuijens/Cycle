@@ -230,6 +230,55 @@ async fn write_session_metrics(pool: &SqlitePool, id: i64, session: &Session) ->
     Ok(())
 }
 
+/// Link the rides recorded before rides knew their route (schema v9) to the
+/// saved route each rode, and say whether the rider's own effort set its
+/// speed. A route ride is named after its route, so only rides named after a
+/// saved route are looked at, and only those whose track rode that route from
+/// start to finish are linked (`route_link::rode`). `load` reads a saved
+/// route's GPX — passed in so a test needs no files. Returns how many rides
+/// were linked.
+pub async fn link_old_route_rides(
+    pool: &SqlitePool,
+    load: &dyn Fn(&super::SavedRoute) -> Option<crate::data::route::Route>,
+) -> Result<usize> {
+    use crate::data::route_link;
+    let routes = super::load_routes(pool).await?;
+    let rows = sqlx::query(
+        "SELECT id, title, data_points_json FROM sessions
+          WHERE route_id IS NULL AND ended_at IS NOT NULL AND title IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut parsed: std::collections::HashMap<i64, Option<crate::data::route::Route>> =
+        std::collections::HashMap::new();
+    let mut linked = 0;
+    for r in rows {
+        let id: i64 = r.get("id");
+        let title: String = r.get("title");
+        let Some(saved) = routes.iter().find(|s| s.name == title) else {
+            continue;
+        };
+        let route = parsed.entry(saved.id).or_insert_with(|| load(saved));
+        let Some(route) = route.as_ref() else {
+            continue;
+        };
+        let Ok(points) = serde_json::from_str::<Vec<DataPoint>>(r.get("data_points_json")) else {
+            continue;
+        };
+        if !route_link::rode(&route_link::track(&points), route) {
+            continue;
+        }
+        sqlx::query("UPDATE sessions SET route_id = ?, rider_driven = ? WHERE id = ?")
+            .bind(saved.id)
+            .bind(route_link::rider_driven(&points) as i64)
+            .bind(id)
+            .execute(pool)
+            .await?;
+        linked += 1;
+    }
+    Ok(linked)
+}
+
 /// Judge every finished ride that has never been judged.
 ///
 /// Separate from [`backfill_session_metrics`] because the two look for different
@@ -328,7 +377,8 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             sqlx::query(
                 "UPDATE sessions
                     SET workout_id = ?, started_at = ?, ended_at = ?, data_points_json = ?,
-                        ftp_watts = ?, title = ?, icu_id = ?, is_ftp_test = ?
+                        ftp_watts = ?, title = ?, icu_id = ?, is_ftp_test = ?,
+                        route_id = ?, rider_driven = ?
                   WHERE id = ?",
             )
             .bind(session.workout_id)
@@ -339,6 +389,8 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             .bind(session.title.as_deref())
             .bind(session.icu_id.as_deref())
             .bind(session.is_ftp_test as i64)
+            .bind(session.route_id)
+            .bind(session.rider_driven as i64)
             .bind(existing)
             .execute(pool)
             .await?;
@@ -347,8 +399,9 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
         None => {
             let result = sqlx::query(
                 "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json,
-                                       ftp_watts, title, icu_id, is_ftp_test)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                       ftp_watts, title, icu_id, is_ftp_test,
+                                       route_id, rider_driven)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(session.workout_id)
             .bind(&started_at)
@@ -358,6 +411,8 @@ pub async fn upsert_session(pool: &SqlitePool, id: Option<i64>, session: &Sessio
             .bind(session.title.as_deref())
             .bind(session.icu_id.as_deref())
             .bind(session.is_ftp_test as i64)
+            .bind(session.route_id)
+            .bind(session.rider_driven as i64)
             .execute(pool)
             .await?;
             result.last_insert_rowid()
@@ -391,7 +446,8 @@ pub async fn checkpoint_session(
             sqlx::query(
                 "UPDATE sessions
                     SET workout_id = ?, started_at = ?, data_points_json = ?,
-                        ftp_watts = ?, title = ?, is_ftp_test = ?
+                        ftp_watts = ?, title = ?, is_ftp_test = ?,
+                        route_id = ?, rider_driven = ?
                   WHERE id = ? AND ended_at IS NULL",
             )
             .bind(session.workout_id)
@@ -400,6 +456,8 @@ pub async fn checkpoint_session(
             .bind(session.ftp_watts.map(|v| v as i64))
             .bind(session.title.as_deref())
             .bind(session.is_ftp_test as i64)
+            .bind(session.route_id)
+            .bind(session.rider_driven as i64)
             .bind(existing)
             .execute(pool)
             .await?;
@@ -408,8 +466,8 @@ pub async fn checkpoint_session(
         None => {
             let result = sqlx::query(
                 "INSERT INTO sessions (workout_id, started_at, ended_at, data_points_json,
-                                       ftp_watts, title, is_ftp_test)
-                 VALUES (?, ?, NULL, ?, ?, ?, ?)",
+                                       ftp_watts, title, is_ftp_test, route_id, rider_driven)
+                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             )
             .bind(session.workout_id)
             .bind(&started_at)
@@ -417,6 +475,8 @@ pub async fn checkpoint_session(
             .bind(session.ftp_watts.map(|v| v as i64))
             .bind(session.title.as_deref())
             .bind(session.is_ftp_test as i64)
+            .bind(session.route_id)
+            .bind(session.rider_driven as i64)
             .execute(pool)
             .await?;
             Ok(result.last_insert_rowid())
@@ -620,7 +680,7 @@ async fn load_session_records_where(
     let rows = sqlx::query(&format!(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
-                s.integrity_dismissed, s.is_ftp_test,
+                s.integrity_dismissed, s.is_ftp_test, s.route_id, s.rider_driven,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
@@ -667,6 +727,8 @@ async fn load_session_records_where(
                 icu_id: r.get("icu_id"),
                 integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
                 is_ftp_test: r.get::<i64, _>("is_ftp_test") != 0,
+                route_id: r.get("route_id"),
+                rider_driven: r.get::<i64, _>("rider_driven") != 0,
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -694,7 +756,7 @@ pub async fn load_sessions_between(
     let rows = sqlx::query(
         "SELECT s.id, s.workout_id, s.started_at, s.ended_at, s.data_points_json,
                 s.uploaded_to_icu, s.rpe, s.ftp_watts, s.title, s.icu_id,
-                s.integrity_dismissed, s.is_ftp_test,
+                s.integrity_dismissed, s.is_ftp_test, s.route_id, s.rider_driven,
                 COALESCE(s.title, w.name) AS workout_name
          FROM sessions s
          LEFT JOIN workouts w ON s.workout_id = w.id
@@ -728,6 +790,8 @@ pub async fn load_sessions_between(
                 icu_id: r.get("icu_id"),
                 integrity_dismissed: r.get::<i64, _>("integrity_dismissed") != 0,
                 is_ftp_test: r.get::<i64, _>("is_ftp_test") != 0,
+                route_id: r.get("route_id"),
+                rider_driven: r.get::<i64, _>("rider_driven") != 0,
             },
             workout_name: r.get("workout_name"),
             uploaded_to_icu: r.get::<i64, _>("uploaded_to_icu") != 0,
@@ -861,6 +925,143 @@ mod tests {
         let points: Vec<DataPoint> =
             serde_json::from_str(row.get::<&str, _>("data_points_json")).unwrap();
         assert_eq!(points[0].target_watts, Some(230));
+    }
+
+    /// 2 km due north from 52° N.
+    fn north_route() -> crate::data::route::Route {
+        let deg = 100.0 / 111_320.0;
+        let points = (0..=20)
+            .map(|k| crate::data::route::RoutePoint {
+                lat: 52.0 + k as f64 * deg,
+                lng: 6.0,
+                elevation_m: 10.0,
+                distance_m: k as f32 * 100.0,
+                gradient: 0.0,
+            })
+            .collect();
+        crate::data::route::Route {
+            name: "North".into(),
+            points,
+            total_distance_m: 2_000.0,
+            total_gain_m: 0.0,
+        }
+    }
+
+    /// A finished ride called `title` along `north_route` up to `to_m`, at
+    /// `kmh(second)`.
+    async fn old_ride(pool: &SqlitePool, title: &str, to_m: f32, kmh: fn(u32) -> f32) -> i64 {
+        let deg = 1.0 / 111_320.0;
+        let mut ride = Session::new(None);
+        ride.title = Some(title.into());
+        ride.ended_at = Some(ride.started_at + chrono::Duration::minutes(10));
+        let mut d = 0.0f32;
+        let mut s = 0u32;
+        while d <= to_m {
+            ride.data_points.push(DataPoint {
+                elapsed_secs: s,
+                power_watts: Some(180),
+                target_watts: None,
+                heart_rate_bpm: None,
+                cadence_rpm: None,
+                speed_kmh: Some(kmh(s)),
+                lat: Some(52.0 + f64::from(d) * deg),
+                lng: Some(6.0),
+                altitude_m: None,
+            });
+            d += 5.0;
+            s += 1;
+        }
+        save_session(pool, &ride).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn should_link_only_old_rides_that_rode_a_saved_route_to_the_end() {
+        let pool = test_pool().await;
+        let north = save_route(&pool, "North", "north.gpx", 2_000.0, 0.0)
+            .await
+            .unwrap();
+        save_route(&pool, "South", "south.gpx", 2_000.0, 0.0)
+            .await
+            .unwrap();
+        let own = old_ride(&pool, "North", 2_000.0, |s| 24.0 + (s % 7) as f32).await;
+        let erg = old_ride(&pool, "North", 2_000.0, |_| 25.0).await;
+        let short = old_ride(&pool, "North", 1_000.0, |_| 30.0).await;
+        let other = old_ride(&pool, "South", 2_000.0, |_| 30.0).await;
+        let mut done = Session::new(None);
+        done.title = Some("North".into());
+        done.ended_at = Some(done.started_at);
+        done.route_id = Some(north);
+        done.rider_driven = true;
+        let already = save_session(&pool, &done).await.unwrap();
+
+        let load = |s: &SavedRoute| (s.name == "North").then(north_route);
+        let n = link_old_route_rides(&pool, &load).await.unwrap();
+        assert_eq!(n, 2);
+
+        let by_id = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<i64>, i64)>(
+                    "SELECT route_id, rider_driven FROM sessions WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(by_id(own).await, (Some(north), 1));
+        assert_eq!(
+            by_id(erg).await,
+            (Some(north), 0),
+            "on the route, but not raceable"
+        );
+        assert_eq!(by_id(short).await, (None, 0), "given up halfway");
+        assert_eq!(by_id(other).await, (None, 0), "its route would not load");
+        assert_eq!(by_id(already).await, (Some(north), 1), "left as it was");
+        // Run again: nothing more to link.
+        assert_eq!(link_old_route_rides(&pool, &load).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_remember_the_route_a_ride_was_on_and_who_set_its_speed() {
+        // The ghost is looked up by route and must be the rider's own effort:
+        // both have to come back exactly as written, through a checkpoint as
+        // well as a finish.
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO routes (id, name, file_name, distance_m, elevation_gain_m, added_at)
+             VALUES (7, 'Alpe', 'alpe.gpx', 13800, 1071, '2026-09-01T09:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut ride = Session::new(None);
+        ride.route_id = Some(7);
+        ride.rider_driven = true;
+        let id = checkpoint_session(&pool, None, &ride).await.unwrap();
+        let unfinished = load_unfinished_sessions(&pool).await.unwrap();
+        assert_eq!(unfinished[0].session.route_id, Some(7));
+        assert!(unfinished[0].session.rider_driven);
+
+        ride.ended_at = Some(chrono::Utc::now());
+        ride.rider_driven = false;
+        upsert_session(&pool, Some(id), &ride).await.unwrap();
+        let mut plain = Session::new(None);
+        plain.ended_at = Some(chrono::Utc::now());
+        save_session(&pool, &plain).await.unwrap();
+
+        let loaded = load_session_records(&pool).await.unwrap();
+        let on_route: Vec<_> = loaded
+            .iter()
+            .filter(|r| r.session.route_id == Some(7))
+            .collect();
+        assert_eq!(on_route.len(), 1);
+        assert!(
+            !on_route[0].session.rider_driven,
+            "the finish's word is the last"
+        );
+        assert!(loaded.iter().any(|r| r.session.route_id.is_none()));
     }
 
     #[tokio::test]

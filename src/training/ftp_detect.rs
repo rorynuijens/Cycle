@@ -921,6 +921,8 @@ mod tests {
             icu_id: None,
             integrity_dismissed: false,
             is_ftp_test: false,
+            route_id: None,
+            rider_driven: false,
         }
     }
 
