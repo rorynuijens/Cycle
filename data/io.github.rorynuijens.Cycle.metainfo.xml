@@ -90,6 +90,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.17.0" date="2026-10-23">
+      <description>
+        <p>Cadence, and devices on the radio you choose:</p>
+        <ul>
+          <li>A cadence sensor on the crank now shows its cadence. A trainer that
+              measures no cadence was reporting 0 rpm, and that 0 hid the sensor's
+              reading for the whole ride.</li>
+          <li>Cadence-only ANT+ sensors are now found, and connect on their own,
+              with or without a trainer.</li>
+          <li>The Devices page has a choice of ANT+ or Bluetooth for every device.
+              Devices on the other radio stay listed and say which one they need,
+              and the choice is locked during a ride.</li>
+          <li>The workout chart draws your power at the moment you rode it. Waiting
+              to start, or pausing, no longer pushes it late, and the compact
+              overlay's chart keeps drawing after it opens.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.16.2" date="2026-10-14">
       <description>
         <p>A route ridden indoors is now compared fairly with the same route ridden outdoors.
