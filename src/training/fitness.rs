@@ -93,7 +93,8 @@ fn alpha(time_constant_days: f64) -> f64 {
 }
 
 /// Walk one day at a time from the earliest day with data up to `today`,
-/// advancing both averages, and hand each day to `visit`.
+/// advancing both averages, and hand each day to `visit`. A `today` before
+/// the earliest day visits nothing.
 ///
 /// Days with no riding still get a step — that decay is the whole point of the
 /// model — so this cannot iterate the sparse map directly.
@@ -108,14 +109,14 @@ fn walk_days(
     let (ctl_alpha, atl_alpha) = (alpha(CTL_TIME_CONSTANT_DAYS), alpha(ATL_TIME_CONSTANT_DAYS));
     let (mut ctl, mut atl) = (0.0_f64, 0.0_f64);
     let mut date = earliest;
-    loop {
+    // `<=`, not "until today": a `today` before the first ride — the
+    // dashboard's week-ago figure in a rider's first week — would otherwise
+    // walk on to the end of the calendar.
+    while date <= today {
         let tss = totals.get(&date).copied().unwrap_or(0.0) as f64;
         ctl += ctl_alpha * (tss - ctl);
         atl += atl_alpha * (tss - atl);
         visit(date, ctl, atl);
-        if date == today {
-            break;
-        }
         match date.succ_opt() {
             Some(next) => date = next,
             // Only reachable at the end of the representable calendar.
@@ -304,6 +305,31 @@ mod tests {
         let m = compute_load_metrics(&[], &[], 250, date(2026, 8, 7));
         assert_eq!(m, LoadMetrics::default());
         assert_eq!(m.tsb(), 0.0);
+    }
+
+    // A rider in their first week: the dashboard asks for a week ago, before
+    // the first ride. The walk used to step past `today` and on to the end of
+    // the calendar — minutes on the main thread, the app frozen.
+    #[test]
+    fn should_return_zero_metrics_when_today_is_before_the_first_ride() {
+        let first = date(2026, 10, 23);
+        let rides = [summary_on(first, 100.0)];
+        let m = compute_load_metrics(&rides, &[(first, 80.0)], 250, first - Duration::days(7));
+        assert_eq!(m, LoadMetrics::default());
+        let day_before = compute_load_metrics(&rides, &[], 250, first - Duration::days(1));
+        assert_eq!(day_before, LoadMetrics::default());
+        assert!(compute_pmc_series(&rides, &[], 250, first - Duration::days(1), 42).is_empty());
+    }
+
+    #[test]
+    fn should_count_the_first_ride_on_its_own_day() {
+        let first = date(2026, 10, 23);
+        let rides = [summary_on(first, 100.0)];
+        let m = compute_load_metrics(&rides, &[], 250, first);
+        assert!(
+            m.atl > 0.0 && m.ctl > 0.0,
+            "the boundary day itself is walked"
+        );
     }
 
     #[test]
