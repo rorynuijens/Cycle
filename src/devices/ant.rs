@@ -201,13 +201,15 @@ fn build_track_resistance_page(grade_percent: f32) -> [u8; 8] {
 /// Parse an 8-byte FE-C Specific Trainer Data page (0x19) into readings.
 ///
 /// Instantaneous power is a 12-bit field; 0xFFF marks it invalid. Cadence 0xFF is
-/// invalid. Returns `None` for the wrong page or a short payload.
+/// invalid, and so is 0: a trainer that measures no cadence (the Elite Drivo)
+/// sends 0 at every power, and as a live ANT+ value that 0 outranks a real
+/// cadence sensor on BLE. Returns `None` for the wrong page or a short payload.
 fn parse_specific_trainer(payload: &[u8]) -> Option<LiveReadings> {
     if payload.len() < 8 || payload[0] != PAGE_SPECIFIC_TRAINER {
         return None;
     }
     let cadence = match payload[2] {
-        0xFF => None,
+        0x00 | 0xFF => None,
         rpm => Some((rpm as u32).min(MAX_PLAUSIBLE_CADENCE_RPM)), // CLAUDE.md §5.1
     };
     let inst_power = (payload[5] as u16) | (((payload[6] & 0x0F) as u16) << 8);
@@ -1564,6 +1566,69 @@ mod tests {
         let r = parse_specific_trainer(&payload).unwrap();
         assert_eq!(r.power_watts, None);
         assert_eq!(r.cadence_rpm, None);
+    }
+
+    #[test]
+    fn should_treat_a_trainer_cadence_of_zero_as_no_reading() {
+        // A real page from an Elite Drivo at 68 W (2026-10-23). The Drivo measures
+        // no cadence and sends 0 rather than 0xFF, at every power.
+        let payload = [0x19, 0x55, 0x00, 0xCC, 0x00, 0x44, 0x00, 0x30];
+        let r = parse_specific_trainer(&payload).unwrap();
+        assert_eq!(r.power_watts, Some(68));
+        assert_eq!(r.cadence_rpm, None);
+    }
+
+    #[test]
+    fn should_keep_a_trainer_cadence_of_one_rpm() {
+        // The other side of the zero boundary: 1 rpm is a measurement.
+        let payload = [0x19, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let r = parse_specific_trainer(&payload).unwrap();
+        assert_eq!(r.cadence_rpm, Some(1));
+    }
+
+    #[test]
+    fn should_show_a_bluetooth_cadence_sensor_beside_a_trainer_that_sends_zero() {
+        // Ride #20 recorded 0 rpm for all 2,820 s: the Drivo's 0 arrived over
+        // ANT+ four times a second, and ANT+ outranks a BLE sensor in the merge.
+        use crate::data::session::ReadingsTracker;
+        let mut tracker = ReadingsTracker::default();
+        let now = Instant::now();
+        let drivo = [0x19, 0x55, 0x00, 0xCC, 0x00, 0x44, 0x00, 0x30];
+        tracker.merge(parse_specific_trainer(&drivo).unwrap(), now);
+        tracker.merge(
+            LiveReadings {
+                cadence_rpm: Some(88),
+                source: ReadingSource::Ble,
+                ..Default::default()
+            },
+            now,
+        );
+        tracker.merge(parse_specific_trainer(&drivo).unwrap(), now);
+        assert_eq!(tracker.current(now).cadence_rpm, Some(88));
+    }
+
+    #[test]
+    fn should_label_trainer_pages_as_ant() {
+        // The merge ranks readings by radio, so an unlabelled FE-C page would
+        // be taken for BLE and lose to whatever else is connected.
+        let specific = [0x19, 0x00, 0x5A, 0x00, 0x00, 0xFA, 0x00, 0x00];
+        let general = [0x10, 0x19, 0x00, 0x00, 0x10, 0x27, 0x8C, 0x24];
+        assert_eq!(
+            parse_specific_trainer(&specific).unwrap().source,
+            ReadingSource::Ant
+        );
+        assert_eq!(
+            parse_general_fe(&general).unwrap().source,
+            ReadingSource::Ant
+        );
+    }
+
+    #[test]
+    fn should_convert_general_fe_speed_to_kmh() {
+        // 0x2710 = 10,000 mm/s = 36 km/h.
+        let general = [0x10, 0x19, 0x00, 0x00, 0x10, 0x27, 0x8C, 0x24];
+        let speed = parse_general_fe(&general).unwrap().speed_kmh.unwrap();
+        assert!((speed - 36.0).abs() < 1e-3, "speed {speed}");
     }
 
     #[test]
