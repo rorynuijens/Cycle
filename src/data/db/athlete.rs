@@ -152,7 +152,7 @@ pub async fn update_athlete(pool: &SqlitePool, athlete: &AthleteProfile) -> Resu
 ///
 /// API keys (`anthropic.api_key`, `intervals.api_key`, `intervals.athlete_id`,
 /// `intervals.upload`, `intervals.sync`) and window geometry are always preserved.
-/// Saved BLE devices are always preserved.
+/// Saved devices, and the radio chosen for them, are always preserved.
 pub async fn reset_athlete_data(pool: &SqlitePool, include_training_data: bool) -> Result<()> {
     // Always: remove the athlete row (will be recreated as default on next load)
     sqlx::query("DELETE FROM athletes").execute(pool).await?;
@@ -189,7 +189,8 @@ pub async fn reset_athlete_data(pool: &SqlitePool, include_training_data: bool) 
                 'intervals.upload',
                 'intervals.sync',
                 'window.width',
-                'window.height'
+                'window.height',
+                'devices.radio'
             )",
         )
         .execute(pool)

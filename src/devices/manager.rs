@@ -43,6 +43,9 @@ pub enum DeviceCommand {
     },
     /// Enable or disable ERG mode (automatic resistance control) for the connected trainer.
     SetErgMode(bool),
+    /// Use only this radio: scan and connect over it alone, and drop every
+    /// device on the other.
+    SetRadio(Transport),
 }
 
 /// The GATT profile a device was identified as, either from its advertised
@@ -138,6 +141,13 @@ fn erg_target(watts: u16) -> u16 {
 ///
 /// Each device on the stick comes up and down on its own — dropping one must
 /// not take the rest of the stick with it.
+/// Whether `address` belongs to the radio in use. Every ANT+ address is a
+/// synthetic `ant:` one, so anything else is Bluetooth.
+fn uses_radio(radio: Transport, address: &str) -> bool {
+    let is_ant = crate::devices::ant::classify_address(address).is_some();
+    is_ant == (radio == Transport::AntPlus)
+}
+
 fn ant_command_for(device: AntDevice, connect: bool) -> Option<AntCommand> {
     match (device, connect) {
         (AntDevice::Trainer, true) => Some(AntCommand::ConnectTrainer),
@@ -517,6 +527,10 @@ impl DeviceManager {
         // Tracks whether an ANT trainer is the active ERG target, so the BLE path
         // doesn't log a spurious "no trainer connected" warning every second.
         let mut ant_connected = false;
+        // The one radio in use — see `DeviceCommand::SetRadio`. ANT+ until the
+        // UI says otherwise, which it does before it asks for anything else.
+        let mut radio = Transport::AntPlus;
+        let mut disconnect_now: Vec<String> = Vec::new();
 
         loop {
             tokio::select! {
@@ -530,8 +544,11 @@ impl DeviceManager {
 
                     match cmd {
                         DeviceCommand::StartScan => {
-                            // Scan ANT+ alongside BLE (works even without a BLE adapter).
-                            let _ = ant_tx.send(crate::devices::ant::AntCommand::Scan);
+                            // One radio or the other, never both.
+                            if radio == Transport::AntPlus {
+                                let _ = ant_tx.send(crate::devices::ant::AntCommand::Scan);
+                                continue;
+                            }
                             let Some(ref adapter) = adapter else {
                                 tracing::warn!("StartScan: no BLE adapter available");
                                 continue;
@@ -555,6 +572,18 @@ impl DeviceManager {
                         }
 
                         DeviceCommand::Connect { address } => {
+                            if !uses_radio(radio, &address) {
+                                // The Devices page should never ask, but a row left
+                                // saying "Connecting…" forever would be worse than
+                                // the warning.
+                                tracing::warn!("Connect: {address} is not on the radio in use");
+                                let _ = self.event_tx.send(DeviceEvent::ConnectionChanged {
+                                    address,
+                                    connected: false,
+                                    device_type: None,
+                                }).await;
+                                continue;
+                            }
                             // ANT+ devices are handled by the ANT thread, not btleplug.
                             if let Some(device) = crate::devices::ant::classify_address(&address) {
                                 match ant_command_for(device, true) {
@@ -741,62 +770,35 @@ impl DeviceManager {
                             }).await;
                         }
 
-                        DeviceCommand::Disconnect { address } => {
-                            // Each ANT+ device comes down on its own — dropping one
-                            // must not take the rest of the stick with it.
-                            if let Some(device) = crate::devices::ant::classify_address(&address) {
-                                match ant_command_for(device, false) {
-                                    Some(cmd) => {
-                                        let _ = ant_tx.send(cmd);
-                                    }
-                                    None => {
-                                        tracing::warn!("Disconnect: unknown ANT+ address {address}");
-                                    }
-                                }
-                                if device == AntDevice::Trainer {
-                                    ant_connected = false;
-                                }
+                        DeviceCommand::Disconnect { address } => disconnect_now.push(address),
+
+                        DeviceCommand::SetRadio(chosen) => {
+                            if chosen == radio {
                                 continue;
                             }
-                            if trainer_address.as_deref() == Some(address.as_str()) {
-                                if let Some(ref p) = trainer {
-                                    p.disconnect().await.ok();
+                            radio = chosen;
+                            tracing::info!("Device radio: {}", radio.label());
+                            let _ = ant_tx.send(crate::devices::ant::AntCommand::SetEnabled(
+                                radio == Transport::AntPlus,
+                            ));
+                            // Bluetooth has to let go of its devices itself; the ANT
+                            // thread reports its own on the way down.
+                            if radio == Transport::AntPlus {
+                                if let Some(ref adapter) = adapter {
+                                    adapter.stop_scan().await.ok();
                                 }
-                                trainer = None;
-                                trainer_address = None;
-                                ctrl_char = None;
-                                tracing::info!("Trainer disconnected");
-                            } else if power_meter_address.as_deref() == Some(address.as_str()) {
-                                if let Some(ref p) = power_meter {
-                                    p.disconnect().await.ok();
-                                }
-                                power_meter = None;
-                                power_meter_address = None;
-                                tracing::info!("Power meter disconnected");
-                            } else if hr_monitor_address.as_deref() == Some(address.as_str()) {
-                                if let Some(ref p) = hr_monitor {
-                                    p.disconnect().await.ok();
-                                }
-                                hr_monitor = None;
-                                hr_monitor_address = None;
-                                tracing::info!("HR monitor disconnected");
-                            } else if cadence_sensor_address.as_deref() == Some(address.as_str()) {
-                                if let Some(ref p) = cadence_sensor {
-                                    p.disconnect().await.ok();
-                                }
-                                cadence_sensor = None;
-                                cadence_sensor_address = None;
-                                tracing::info!("Cadence sensor disconnected");
+                                disconnect_now.extend(
+                                    [
+                                        &trainer_address,
+                                        &power_meter_address,
+                                        &hr_monitor_address,
+                                        &cadence_sensor_address,
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned(),
+                                );
                             }
-                            // Unconditional: the reader has to go whether or not the
-                            // address matched one of the roles above, since a device
-                            // that failed to bind to any of them still left one running.
-                            readers.remove(&address);
-                            let _ = self.event_tx.send(DeviceEvent::ConnectionChanged {
-                                address,
-                                connected: false,
-                                device_type: None,
-                            }).await;
                         }
 
                         DeviceCommand::SetTargetPower { watts } => {
@@ -855,12 +857,79 @@ impl DeviceManager {
                             tracing::info!("ERG mode: {}", if enabled { "on" } else { "off" });
                         }
                     }
+
+                    // Disconnects run here, after the match, so a radio switch
+                    // drops each Bluetooth device exactly as the rider dropping
+                    // it would.
+                    for address in std::mem::take(&mut disconnect_now) {
+                        // Each ANT+ device comes down on its own — dropping one
+                        // must not take the rest of the stick with it.
+                        if let Some(device) = crate::devices::ant::classify_address(&address) {
+                            match ant_command_for(device, false) {
+                                Some(cmd) => {
+                                    let _ = ant_tx.send(cmd);
+                                }
+                                None => {
+                                    tracing::warn!("Disconnect: unknown ANT+ address {address}");
+                                }
+                            }
+                            if device == AntDevice::Trainer {
+                                ant_connected = false;
+                            }
+                            continue;
+                        }
+                        if trainer_address.as_deref() == Some(address.as_str()) {
+                            if let Some(ref p) = trainer {
+                                p.disconnect().await.ok();
+                            }
+                            trainer = None;
+                            trainer_address = None;
+                            ctrl_char = None;
+                            tracing::info!("Trainer disconnected");
+                        } else if power_meter_address.as_deref() == Some(address.as_str()) {
+                            if let Some(ref p) = power_meter {
+                                p.disconnect().await.ok();
+                            }
+                            power_meter = None;
+                            power_meter_address = None;
+                            tracing::info!("Power meter disconnected");
+                        } else if hr_monitor_address.as_deref() == Some(address.as_str()) {
+                            if let Some(ref p) = hr_monitor {
+                                p.disconnect().await.ok();
+                            }
+                            hr_monitor = None;
+                            hr_monitor_address = None;
+                            tracing::info!("HR monitor disconnected");
+                        } else if cadence_sensor_address.as_deref() == Some(address.as_str()) {
+                            if let Some(ref p) = cadence_sensor {
+                                p.disconnect().await.ok();
+                            }
+                            cadence_sensor = None;
+                            cadence_sensor_address = None;
+                            tracing::info!("Cadence sensor disconnected");
+                        }
+                        // Unconditional: the reader has to go whether or not the
+                        // address matched one of the roles above, since a device
+                        // that failed to bind to any of them still left one running.
+                        readers.remove(&address);
+                        let _ = self.event_tx.send(DeviceEvent::ConnectionChanged {
+                            address,
+                            connected: false,
+                            device_type: None,
+                        }).await;
+                    }
                 }
 
                 // Forward CentralEvents from the spawned scan task.
                 Some(ble_event) = ble_rx.recv() => {
                     match ble_event {
                         CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => {
+                            // BlueZ reports devices other programs find too, so
+                            // stopping our own scan is not enough to keep
+                            // Bluetooth out of the list.
+                            if radio != Transport::BluetoothLe {
+                                continue;
+                            }
                             let Some(ref adapter) = adapter else { continue; };
                             if let Ok(peripheral) = adapter.peripheral(&id).await {
                                 if let Ok(Some(props)) = peripheral.properties().await {
@@ -916,6 +985,23 @@ mod tests {
     use std::time::Duration;
 
     // ── ERG target ceiling (CLAUDE.md §5.1) ──────────────────────────────────
+
+    #[test]
+    fn should_connect_only_devices_on_the_radio_in_use() {
+        let ble = "hci0/dev_C0_B8_1C_6C_B5_CF";
+        use crate::devices::ant::{ANT_CADENCE_ADDRESS, ANT_FEC_ADDRESS, ANT_HR_ADDRESS};
+        for ant in [
+            ANT_FEC_ADDRESS,
+            ANT_HR_ADDRESS,
+            ANT_CADENCE_ADDRESS,
+            "ant:power",
+        ] {
+            assert!(uses_radio(Transport::AntPlus, ant), "{ant}");
+            assert!(!uses_radio(Transport::BluetoothLe, ant), "{ant}");
+        }
+        assert!(uses_radio(Transport::BluetoothLe, ble));
+        assert!(!uses_radio(Transport::AntPlus, ble));
+    }
 
     #[test]
     fn should_send_each_ant_device_its_own_connect() {

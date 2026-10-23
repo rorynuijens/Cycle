@@ -1118,6 +1118,18 @@ fn screenshots() {
         theme(false);
     }
 
+    // The Devices page with the rider's own four saved devices, on each radio.
+    {
+        theme(false);
+        shoot_devices("29-devices-ant-light", 1100, 900, Radio::Ant);
+        shoot_devices("30-devices-bluetooth-light", 1100, 900, Radio::Switched);
+        shoot_devices("31-devices-riding-light", 900, 900, Radio::Riding);
+        theme(true);
+        shoot_devices("32-devices-ant-dark", 1100, 900, Radio::Ant);
+        shoot_devices("33-devices-bluetooth-dark", 1100, 900, Radio::Switched);
+        theme(false);
+    }
+
     // The window a failed start leaves on screen — the real refusal message a
     // newer database produces, in both themes.
     {
@@ -1232,4 +1244,89 @@ fn screenshots() {
         "05-eased-twice-dark",
         720,
     );
+}
+
+/// Which state of the radio choice a Devices shot shows.
+enum Radio {
+    /// ANT+ in use, its three devices connected.
+    Ant,
+    /// Switched to Bluetooth from that, by the row itself.
+    Switched,
+    /// ANT+ in use with a ride under way, so the choice is locked.
+    Riding,
+}
+
+fn shoot_devices(name: &str, width: i32, height: i32, state: Radio) {
+    use crate::data::db::SavedDevice;
+    use crate::devices::manager::DeviceType;
+    use crate::devices::peripheral::Transport;
+    use crate::ui::pages::devices::DevicesPage;
+
+    let rt = tokio::runtime::Runtime::new().expect("a runtime for the page's writes");
+    let pool = rt
+        .block_on(sqlx::SqlitePool::connect(":memory:"))
+        .expect("an in-memory database");
+    // Kept alive for the shot, so the page's commands have somewhere to go.
+    let (cmd_tx, _cmd_rx) = async_channel::bounded(64);
+    let saved = |address: &str, name: &str, transport: &str, device_type: &str| SavedDevice {
+        address: address.into(),
+        display_name: name.into(),
+        transport: transport.into(),
+        erg_enabled: true,
+        device_type: device_type.into(),
+    };
+    let devices = vec![
+        saved("ant:fec", "Elite Drivo", "ant+", "trainer"),
+        saved("ant:hr", "Xand HR Band", "ant+", "hr"),
+        saved("hci0/dev_C0_B8_1C_6C_B5_CF", "Cadence", "ble", "cadence"),
+        saved("hci0/dev_14_13_0B_0F_9D_08", "Forerunner", "ble", "hr"),
+    ];
+    let mut page = DevicesPage::new(
+        cmd_tx,
+        pool,
+        rt.handle().clone(),
+        devices,
+        Transport::AntPlus,
+    );
+    for (address, kind) in [
+        ("ant:fec", DeviceType::FtmsTrainer),
+        ("ant:hr", DeviceType::HeartRateMonitor),
+    ] {
+        page.on_discovered(
+            address.into(),
+            String::new(),
+            None,
+            Transport::AntPlus,
+            kind,
+        );
+        page.on_connection_changed(address.into(), true, Some(kind));
+    }
+    match state {
+        Radio::Ant => {}
+        Radio::Riding => page.set_riding(true),
+        Radio::Switched => {
+            let row = find_combo(page.widget().upcast_ref()).expect("the radio row");
+            row.set_selected(1);
+            // What the manager reports once ANT+ has let go of its devices.
+            for address in ["ant:fec", "ant:hr"] {
+                page.on_connection_changed(address.into(), false, None);
+            }
+        }
+    }
+    let window = adw::Window::builder().content(page.widget()).build();
+    shoot(&window, width, height, name);
+}
+
+fn find_combo(w: &gtk::Widget) -> Option<adw::ComboRow> {
+    if let Some(row) = w.downcast_ref::<adw::ComboRow>() {
+        return Some(row.clone());
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_combo(&c) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
 }

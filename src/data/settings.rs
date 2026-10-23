@@ -20,6 +20,7 @@ use sqlx::SqlitePool;
 
 use super::db;
 use super::training_profile::TrainingProfile;
+use crate::devices::peripheral::Transport;
 
 /// The settings keys this app reads and writes.
 ///
@@ -49,6 +50,9 @@ pub mod keys {
     pub const OVERLAY_HEIGHT: &str = "overlay.height";
     pub const OVERLAY_OPACITY: &str = "overlay.opacity";
     pub const OVERLAY_HINT_SEEN: &str = "overlay.hint_seen";
+    /// The one radio devices are found and connected over. Kept through a
+    /// data reset, like the saved devices it decides between.
+    pub const DEVICE_RADIO: &str = "devices.radio";
 
     pub const FIRST_USE_COMPLETE: &str = "first_use_complete";
     pub const COACHING_CONTEXT: &str = "coaching.athlete_context";
@@ -340,6 +344,26 @@ pub async fn mark_overlay_hint_seen(pool: &SqlitePool) -> Result<()> {
     db::set_setting(pool, keys::OVERLAY_HINT_SEEN, flag_value(true)).await
 }
 
+// ── Devices ──────────────────────────────────────────────────────────────────
+
+/// The radio the app uses for every device: ANT+ or Bluetooth, never both.
+///
+/// ANT+ unless the rider has chosen otherwise: it is the only radio this
+/// rider's trainer can be controlled over. Anything unreadable falls back to
+/// ANT+ too, rather than to whatever `Transport::from_db_str` defaults to.
+pub async fn device_radio(pool: &SqlitePool) -> Result<Transport> {
+    Ok(
+        match db::get_setting(pool, keys::DEVICE_RADIO).await?.as_deref() {
+            Some("ble") => Transport::BluetoothLe,
+            _ => Transport::AntPlus,
+        },
+    )
+}
+
+pub async fn set_device_radio(pool: &SqlitePool, radio: Transport) -> Result<()> {
+    db::set_setting(pool, keys::DEVICE_RADIO, radio.as_db_str()).await
+}
+
 // ── First run ────────────────────────────────────────────────────────────────
 
 /// Whether the rider has finished onboarding.
@@ -547,6 +571,46 @@ mod tests {
         let loaded = load_window(&pool).await.unwrap();
         assert_eq!(loaded.width, Some(1280));
         assert_eq!(loaded.size(), None);
+    }
+
+    // ── Devices ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_default_the_device_radio_to_ant() {
+        let pool = test_pool().await;
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::AntPlus);
+    }
+
+    #[tokio::test]
+    async fn should_remember_the_device_radio() {
+        let pool = test_pool().await;
+        set_device_radio(&pool, Transport::BluetoothLe)
+            .await
+            .unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::BluetoothLe);
+        set_device_radio(&pool, Transport::AntPlus).await.unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::AntPlus);
+    }
+
+    #[tokio::test]
+    async fn should_read_an_unrecognised_device_radio_as_ant() {
+        // `Transport::from_db_str` reads anything unknown as Bluetooth, which
+        // here would silently take the rider's trainer away.
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::DEVICE_RADIO, "zigbee")
+            .await
+            .unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::AntPlus);
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_device_radio_through_a_full_data_reset() {
+        let pool = test_pool().await;
+        set_device_radio(&pool, Transport::BluetoothLe)
+            .await
+            .unwrap();
+        db::reset_athlete_data(&pool, true).await.unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::BluetoothLe);
     }
 
     // ── First run and coaching context ───────────────────────────────────────

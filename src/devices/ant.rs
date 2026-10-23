@@ -172,6 +172,9 @@ pub enum AntCommand {
     /// SIM mode: set the simulated road gradient in percent.
     SetTrackResistance(f32),
     SetErgMode(bool),
+    /// Whether ANT+ is the radio in use. Off, the stick is released and its
+    /// devices reported gone, and nothing opens it again until this is on.
+    SetEnabled(bool),
     Shutdown,
 }
 
@@ -948,6 +951,8 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     let mut link = AntLink::default();
     let mut channel_open = false;
     let mut erg_enabled = true;
+    // Whether ANT+ is the radio in use — see `AntCommand::SetEnabled`.
+    let mut enabled = true;
     // Set once the Speed & Cadence channel supplies cadence; thereafter FE-C cadence
     // is ignored (some trainers report a bogus 0 there).
     let mut got_ant_cadence = false;
@@ -973,6 +978,9 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
         loop {
             match cmd_rx.try_recv() {
                 Ok(AntCommand::Scan) => {
+                    if !enabled {
+                        continue;
+                    }
                     if stick.is_none() {
                         stick = AntStick::open();
                     }
@@ -988,6 +996,9 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     }
                 }
                 Ok(AntCommand::ConnectTrainer) => {
+                    if !enabled {
+                        continue;
+                    }
                     if stick.is_none() {
                         stick = AntStick::open();
                     }
@@ -1039,9 +1050,34 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                         }
                     }
                 }
-                Ok(AntCommand::SetErgMode(enabled)) => {
-                    erg_enabled = enabled;
-                    tracing::info!("ANT ERG mode: {}", if enabled { "on" } else { "off" });
+                Ok(AntCommand::SetErgMode(on)) => {
+                    erg_enabled = on;
+                    tracing::info!("ANT ERG mode: {}", if on { "on" } else { "off" });
+                }
+                Ok(AntCommand::SetEnabled(on)) => {
+                    if on == enabled {
+                        continue;
+                    }
+                    enabled = on;
+                    if on {
+                        tracing::info!("ANT+ in use — opening the stick");
+                        last_open_attempt = Instant::now();
+                        stick = AntStick::open();
+                        if let Some(s) = &stick {
+                            channel_open = open_all(s, &link);
+                        }
+                    } else {
+                        // Released, not just closed, so the stick is free for
+                        // anything else while Bluetooth is in use.
+                        tracing::info!("ANT+ not in use — releasing the stick");
+                        if let Some(s) = &stick {
+                            s.close_channels();
+                        }
+                        stick = None;
+                        channel_open = false;
+                        let effects = link.stick_lost();
+                        apply(None, &event_tx, effects);
+                    }
                 }
                 Ok(AntCommand::Shutdown) => {
                     if let Some(s) = &stick {
@@ -1062,7 +1098,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
         // stick plugged in later is picked up without restarting the app.
         let Some(s) = &stick else {
             std::thread::sleep(Duration::from_millis(100));
-            if last_open_attempt.elapsed() >= CHANNEL_RETRY_INTERVAL {
+            if enabled && last_open_attempt.elapsed() >= CHANNEL_RETRY_INTERVAL {
                 last_open_attempt = Instant::now();
                 stick = AntStick::open();
                 if stick.is_some() {
