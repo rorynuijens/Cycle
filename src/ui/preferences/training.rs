@@ -7,12 +7,15 @@ use adw::prelude::*;
 use sqlx::SqlitePool;
 use std::rc::Rc;
 
+use crate::data::biome::{Scenery, WorldLook};
 use crate::data::settings::{self, TrainingSettings};
 use crate::ui::spawn_write;
 
 /// Build the Training page.
+#[allow(clippy::too_many_arguments)] // preferences window wiring
 pub fn build(
     settings: &TrainingSettings,
+    workout_look: WorldLook,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
     on_erg_rate_changed: impl Fn(u32) + 'static,
@@ -92,6 +95,65 @@ pub fn build(
     max_grade_row.set_subtitle("Climbs steeper than this are capped (%)");
     sim_group.add(&max_grade_row);
     page.add(&sim_group);
+
+    // Read when each workout opens, so a change here waits for the next one:
+    // the world is built once, as the ride starts.
+    let world_group = adw::PreferencesGroup::builder()
+        .title("3D World")
+        .description(
+            "The road a workout is ridden along in 3D climbs through the hard \
+             intervals. It is only scenery: the trainer still holds the target.",
+        )
+        .build();
+    let labels: Vec<&str> = Scenery::CHOICES.iter().map(|s| s.label()).collect();
+    let scenery_row = adw::ComboRow::builder()
+        .title("Workout Scenery")
+        .subtitle("Routes keep the scenery picked for each of them")
+        .model(&gtk::StringList::new(&labels))
+        .selected(
+            Scenery::CHOICES
+                .iter()
+                .position(|s| *s == workout_look.scenery)
+                .unwrap_or(0) as u32,
+        )
+        .build();
+    world_group.add(&scenery_row);
+    let animals_row = adw::SwitchRow::builder()
+        .title("Animals")
+        .subtitle("Herds, birds and animal encounters, on every route and workout")
+        .active(workout_look.animals)
+        .build();
+    world_group.add(&animals_row);
+    page.add(&world_group);
+
+    {
+        let pool = pool.clone();
+        let rt_handle = rt_handle.clone();
+        scenery_row.connect_selected_notify(move |row| {
+            let Some(&picked) = Scenery::CHOICES.get(row.selected() as usize) else {
+                return;
+            };
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the workout scenery",
+                move |pool| async move { settings::set_workout_scenery(&pool, picked).await },
+            );
+        });
+    }
+    {
+        let pool = pool.clone();
+        let rt_handle = rt_handle.clone();
+        animals_row.connect_active_notify(move |row| {
+            let on = row.is_active();
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the animals setting",
+                move |pool| async move { settings::set_animals_3d(&pool, on).await },
+            );
+        });
+    }
 
     {
         let pool = pool.clone();

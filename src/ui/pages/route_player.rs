@@ -18,7 +18,7 @@ use crate::training::engine::{
 };
 use crate::training::route_engine::{self, RouteEngine};
 use crate::ui::overlay::{CourseReadings, RideOverlay};
-use crate::ui::pages::route_immersion::Immersion;
+use crate::ui::pages::route_immersion::{Immersion, Parts};
 use crate::ui::widgets::course_view::CourseView;
 use crate::ui::widgets::metric_column::{metric_column, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS};
 use crate::ui::widgets::ride_hud::{FinishedCard, HudReadings};
@@ -646,15 +646,18 @@ impl RoutePlayerPage {
         controls.append(&end_btn);
         inner.append(&controls);
 
-        let immersion = Immersion::new(
-            clamp.clone(),
-            inner.clone(),
-            above,
-            below,
-            lookahead_chart.clone(),
-            controls.clone(),
-            course_view.clone(),
-        );
+        let immersion = Immersion::new(Parts {
+            clamp: clamp.clone(),
+            inner: inner.clone(),
+            windowed_top: 20,
+            around: vec![
+                above.upcast(),
+                below.upcast(),
+                lookahead_chart.clone().upcast(),
+            ],
+            controls: controls.clone(),
+            course_view: course_view.clone(),
+        });
         view_3d_btn.connect_toggled(Immersion::road_toggle(&immersion));
 
         clamp.set_child(Some(&inner));

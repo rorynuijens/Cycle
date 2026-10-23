@@ -31,7 +31,7 @@ use crate::data::palette;
 use crate::data::props::{self, Prop, Shape};
 use crate::data::rider;
 use crate::data::route::Route;
-use crate::ui::widgets::ride_hud::{self, FinishedCard, HudReadings, RideHud};
+use crate::ui::widgets::ride_hud::{self, FinishedCard, HudReadings, RideHud, WorkoutHudReadings};
 
 /// Vertical field of view, in degrees. Wide enough that a bend does not
 /// leave the frame.
@@ -710,9 +710,14 @@ struct Inner {
 struct HudLayer {
     shown: bool,
     readings: Option<HudReadings>,
+    /// A workout's readings, on a workout's road: shown in place of the
+    /// route's.
+    workout: Option<WorkoutHudReadings>,
     finished: Option<FinishedCard>,
     /// The route's heights, for the profile band.
     profile: Vec<f32>,
+    /// The workout's blocks, for its profile band.
+    blocks: Vec<ride_hud::Block>,
     /// Made on first use: loading the font is for fullscreen, not every view.
     painter: Option<RideHud>,
     /// What the texture on the GPU shows, and for what size of view.
@@ -723,6 +728,7 @@ struct HudLayer {
 #[derive(Debug, Clone, PartialEq)]
 enum Painted {
     Readings(HudReadings),
+    Workout(WorkoutHudReadings),
     Finished(FinishedCard),
 }
 
@@ -872,6 +878,8 @@ impl CourseView {
             let mut hud = inner.hud.borrow_mut();
             hud.profile = ride_hud::profile(route);
             hud.readings = None;
+            hud.workout = None;
+            hud.blocks = Vec::new();
             hud.finished = None;
             hud.painted = None;
         }
@@ -961,6 +969,18 @@ impl CourseView {
     /// painted again only when this changes.
     pub fn set_hud(&self, readings: HudReadings) {
         self.inner.hud.borrow_mut().readings = Some(readings);
+    }
+
+    /// The workout being ridden along this road, for the HUD's profile band.
+    /// Set after [`CourseView::set_route`], which clears it.
+    pub fn set_workout_profile(&self, blocks: Vec<ride_hud::Block>) {
+        self.inner.hud.borrow_mut().blocks = blocks;
+    }
+
+    /// What the HUD shows over a workout's road. Called once a tick by the
+    /// workout loop; painted again only when it changes.
+    pub fn set_workout_hud(&self, readings: WorkoutHudReadings) {
+        self.inner.hud.borrow_mut().workout = Some(readings);
     }
 }
 
@@ -1133,15 +1153,24 @@ impl Inner {
         let HudLayer {
             shown,
             readings,
+            workout,
             finished,
             profile,
+            blocks,
             painter,
             painted,
         } = &mut *hud;
-        // The finished card in any layout; else the HUD, when it is shown.
-        let want = match (finished.as_ref(), *shown, readings.as_ref()) {
-            (Some(card), _, _) => Some(Painted::Finished(card.clone())),
-            (None, true, Some(r)) => Some(Painted::Readings(r.clone())),
+        // The finished card in any layout; else the HUD, when it is shown —
+        // a workout's if one is being ridden, else the route's.
+        let want = match (
+            finished.as_ref(),
+            *shown,
+            workout.as_ref(),
+            readings.as_ref(),
+        ) {
+            (Some(card), _, _, _) => Some(Painted::Finished(card.clone())),
+            (None, true, Some(r), _) => Some(Painted::Workout(r.clone())),
+            (None, true, None, Some(r)) => Some(Painted::Readings(r.clone())),
             _ => None,
         };
         if let Some(want) = want {
@@ -1152,6 +1181,7 @@ impl Inner {
                 let painter = painter.get_or_insert_with(RideHud::new);
                 let image = match &want {
                     Painted::Readings(r) => painter.render(w, h, r, profile),
+                    Painted::Workout(r) => painter.render_workout(w, h, r, blocks),
                     Painted::Finished(card) => painter.render_finished(w, h, card),
                 };
                 if let Some(mut image) = image {
@@ -2387,13 +2417,46 @@ mod offscreen {
     #[test]
     #[ignore]
     fn render_course_offscreen() {
-        let gpx = std::env::var("CYCLE_3D_GPX").expect("CYCLE_3D_GPX");
         let out = std::env::var("CYCLE_3D_OUT").expect("CYCLE_3D_OUT");
         let mut at: f32 = std::env::var("CYCLE_3D_AT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(200.0);
-        let route = Route::from_gpx_path(std::path::Path::new(&gpx)).expect("a GPX");
+        // CYCLE_3D_WORKOUT=<library workout name> rides that workout's road
+        // instead of a GPX, CYCLE_3D_WORKOUT_AT=<seconds> into it.
+        let workout = std::env::var("CYCLE_3D_WORKOUT").ok().map(|name| {
+            crate::data::workout::Workout::workout_library()
+                .into_iter()
+                .chain([crate::data::workout::Workout::ramp_test()])
+                .find(|w| w.name == name)
+                .expect("a library workout")
+        });
+        let workout_at: f32 = std::env::var("CYCLE_3D_WORKOUT_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let rider_profile = crate::data::athlete::AthleteProfile {
+            ftp_watts: 211,
+            ..Default::default()
+        };
+        let road = workout.as_ref().map(|w| {
+            crate::data::workout_road::WorkoutRoad::build(w, &rider_profile).expect("a road")
+        });
+        let route = match &road {
+            Some(r) => {
+                at = r.distance_at(workout_at);
+                eprintln!(
+                    "workout road {:.1} km, {:.0} m climbed; rider at {at:.0} m",
+                    r.route.total_distance_m / 1000.0,
+                    r.route.total_gain_m
+                );
+                r.route.clone()
+            }
+            None => {
+                let gpx = std::env::var("CYCLE_3D_GPX").expect("CYCLE_3D_GPX");
+                Route::from_gpx_path(std::path::Path::new(&gpx)).expect("a GPX")
+            }
+        };
         let started = std::time::Instant::now();
         // CYCLE_3D_SCENERY=<key>, as stored: desert, mixed, countryside …
         let scenery = std::env::var("CYCLE_3D_SCENERY")
@@ -2623,7 +2686,40 @@ mod offscreen {
             );
             // CYCLE_3D_HUD=1: the fullscreen HUD over the road, through the
             // same texture and pass the widget uses.
-            if std::env::var("CYCLE_3D_HUD").is_ok_and(|v| v == "1") {
+            if let (true, Some(w)) = (
+                std::env::var("CYCLE_3D_HUD").is_ok_and(|v| v == "1"),
+                workout.as_ref(),
+            ) {
+                let t = workout_at as u32;
+                let (mut seg, mut start) = (0usize, 0u32);
+                for (k, s) in w.segments.iter().enumerate() {
+                    if t < start + s.duration_secs {
+                        seg = k;
+                        break;
+                    }
+                    start += s.duration_secs;
+                }
+                let s = &w.segments[seg];
+                let target = s.target_power_at(t - start, rider_profile.ftp_watts);
+                let readings = WorkoutHudReadings {
+                    workout_name: w.name.clone(),
+                    power_watts: Some(target + 4),
+                    target_watts: Some(target),
+                    ftp_watts: rider_profile.ftp_watts,
+                    interval_caption: format!("INTERVAL {}", seg + 1),
+                    interval_left_secs: Some(start + s.duration_secs - t),
+                    heart_rate_bpm: Some(148),
+                    cadence_rpm: Some(88),
+                    elapsed_secs: t,
+                    remaining_secs: Some(w.duration_secs.saturating_sub(t)),
+                    progress: t as f32 / w.duration_secs.max(1) as f32,
+                };
+                let mut image = RideHud::new()
+                    .render_workout(W, H, &readings, &ride_hud::workout_profile(w))
+                    .expect("a HUD");
+                state.upload_hud(&mut image);
+                state.draw_hud(W, H);
+            } else if std::env::var("CYCLE_3D_HUD").is_ok_and(|v| v == "1") {
                 let readings = HudReadings {
                     route_name: route.name.clone(),
                     power_watts: Some(180),

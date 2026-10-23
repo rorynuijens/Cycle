@@ -13,7 +13,9 @@ use std::time::Duration;
 /// cannot be cloned out of the `RefCell` before the call.
 type ButtonCb = crate::ui::ReloadHolder;
 
+use crate::data::biome::WorldLook;
 use crate::data::settings;
+use crate::data::workout_road::WorkoutRoad;
 use crate::data::{
     athlete::AthleteProfile,
     session::{LiveReadings, ReadingsTracker, Session},
@@ -25,12 +27,15 @@ use crate::training::engine::{
     is_pedalling, EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT, PRE_START_SECS,
 };
 use crate::ui::overlay::RideOverlay;
+use crate::ui::pages::route_immersion::{Immersion, Parts};
+use crate::ui::widgets::course_view::CourseView;
 use crate::ui::widgets::metric_column::{
     caption_text, metric_column, metric_column_parts, CLOCK_DIGITS, POWER_DIGITS, RATE_DIGITS,
 };
+use crate::ui::widgets::ride_hud::{self, WorkoutHudReadings};
 use crate::ui::widgets::workout_graph::WorkoutGraph;
 use crate::ui::widgets::zone_meter::ZoneMeter;
-use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
+use crate::ui::WINDOWED_CLAMP;
 
 /// Minimum height for the workout profile strip, in pixels.
 ///
@@ -38,6 +43,10 @@ use crate::ui::{FULLSCREEN_CLAMP, WINDOWED_CLAMP};
 /// is legible at a glance, small enough that it can never be what the page is
 /// mostly made of. Spare height goes to the numbers instead.
 const GRAPH_FLOOR_PX: i32 = 180;
+
+/// Minimum height for the 3D road in the graph's slot, in pixels: the route
+/// page's map floor.
+const ROAD_FLOOR_PX: i32 = 180;
 
 pub struct PlayerPage {
     root: gtk::Box,
@@ -131,12 +140,19 @@ pub struct PlayerPage {
     /// Ladder steps in the test being ridden, for the "of N" in the caption.
     /// Meaningless unless [`Self::test_mode`] is set.
     ladder_steps: Cell<u32>,
-    /// The content clamp and the box inside it, kept so fullscreen can widen
-    /// the one and tighten the other — see [`PlayerPage::set_fullscreen`].
-    clamp: adw::Clamp,
-    inner: gtk::Box,
+    /// The layout for windowed, fullscreen and fullscreen on the road — see
+    /// [`PlayerPage::set_fullscreen`].
+    immersion: Rc<Immersion>,
     /// The on-page fullscreen button, which turns into the way back out.
     fullscreen_btn: gtk::Button,
+    /// ── The 3D road ─────────────────────────────────────────────────────────
+    course_view: CourseView,
+    view_3d_btn: gtk::ToggleButton,
+    /// The road the workout is being ridden along, if it has one.
+    road: RefCell<Option<WorkoutRoad>>,
+    /// Set while [`PlayerPage::set_world`] puts the 3D button where the rider
+    /// left it, so that is not saved back as a choice.
+    restoring_road: Rc<Cell<bool>>,
 }
 
 impl PlayerPage {
@@ -180,6 +196,18 @@ impl PlayerPage {
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
             .build();
+        // The cockpit above and below the graph's slot, each one section, so
+        // the road can have the whole screen in fullscreen — see
+        // `route_immersion`.
+        let above = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .vexpand(true)
+            .build();
+        let below = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build();
 
         // ── Header row: workout name + connected device chips ────────────────
         let header_row = gtk::Box::builder()
@@ -213,7 +241,7 @@ impl PlayerPage {
             .build();
         devices_section.append(&devices_flow);
         header_row.append(&devices_section);
-        inner.append(&header_row);
+        above.append(&header_row);
 
         // ── Hero row: target | live power | interval countdown ───────────────
         // Power is the page's reason to exist — it gets the largest class in the
@@ -283,11 +311,11 @@ impl PlayerPage {
         interval_box.append(&interval_label);
         interval_box.append(&segment_progress);
         hero_grid.attach(&interval_box, 2, 0, 1, 1);
-        inner.append(&hero_grid);
+        above.append(&hero_grid);
 
         // ── Zone ribbon: where the current effort sits across Z1–Z7 ─────────
         let zone_meter = ZoneMeter::new(athlete.ftp_watts);
-        inner.append(zone_meter.widget());
+        above.append(zone_meter.widget());
 
         // ── Interval cue ─────────────────────────────────────────────────────
         // Sits directly under the hero numbers, where the rider is already
@@ -313,7 +341,7 @@ impl PlayerPage {
             .build();
         cue_box.append(&cue_headline);
         cue_box.append(&cue_detail);
-        inner.append(&cue_box);
+        above.append(&cue_box);
 
         // ── Secondary metrics: HR · cadence · elapsed · remaining ────────────
         let secondary_grid = gtk::Grid::builder()
@@ -354,7 +382,7 @@ impl PlayerPage {
         secondary_grid.attach(&cadence_box, 1, 0, 1, 1);
         secondary_grid.attach(&elapsed_box, 2, 0, 1, 1);
         secondary_grid.attach(&remaining_box, 3, 0, 1, 1);
-        inner.append(&secondary_grid);
+        above.append(&secondary_grid);
 
         // ── Workout power profile: a reference strip, not the page ───────────
         // A small floor and no `vexpand` — the inverse of the cockpit rule in
@@ -367,7 +395,22 @@ impl PlayerPage {
         let graph = WorkoutGraph::new(workout, athlete.ftp_watts);
         graph.widget().set_vexpand(false);
         graph.widget().set_size_request(-1, GRAPH_FLOOR_PX);
-        inner.append(graph.widget());
+
+        // The road the workout is ridden along, in the graph's slot when the
+        // rider asks for it. The graph keeps its floor; the road takes a share
+        // of the spare height with the numbers, as the route page's does.
+        let course_view = CourseView::new();
+        course_view.widget().set_size_request(-1, ROAD_FLOOR_PX);
+        let graph_stack = gtk::Stack::builder()
+            .vhomogeneous(false)
+            .interpolate_size(true)
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        graph_stack.add_named(graph.widget(), Some("graph"));
+        graph_stack.add_named(course_view.widget(), Some("3d"));
+        inner.append(&above);
+        inner.append(&graph_stack);
+        inner.append(&below);
 
         // ── Whole-workout progress bar ───────────────────────────────────────
         let workout_progress = gtk::ProgressBar::builder()
@@ -375,7 +418,7 @@ impl PlayerPage {
             .show_text(false)
             .build();
         workout_progress.add_css_class("accent");
-        inner.append(&workout_progress);
+        below.append(&workout_progress);
 
         // ── Session totals strip ─────────────────────────────────────────────
         // Live running totals in one glanceable line; the full breakdown
@@ -413,7 +456,7 @@ impl PlayerPage {
         let if_total = make_total_pair("IF", Some("Intensity factor"));
         let tss_total = make_total_pair("TSS", Some("Training stress score"));
         let kj_total = make_total_pair("Energy", Some("Total work in kilojoules"));
-        inner.append(&totals_row);
+        below.append(&totals_row);
 
         // ── Playback controls ────────────────────────────────────────────────
         // Cancel/Pause/Skip at leading edge; hexpand spacer pushes End Workout to
@@ -480,6 +523,16 @@ impl PlayerPage {
 
         let controls_spacer = gtk::Box::builder().hexpand(true).build();
 
+        // Graph or road: the same slot, either way round. Hidden until a
+        // workout with a road to ride is loaded.
+        let view_3d_btn = gtk::ToggleButton::builder()
+            .label("3D")
+            .tooltip_text("Ride the workout along a road that climbs with the intervals")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+
         // Fullscreen from the page itself. A rider clipped into the pedals is
         // not in a position to go looking for F11, and the menu it also lives in
         // is three widgets away at the top of the window.
@@ -505,10 +558,30 @@ impl PlayerPage {
         controls.append(&skip_btn);
         controls.append(&intensity_box);
         controls.append(&controls_spacer);
+        controls.append(&view_3d_btn);
         controls.append(&overlay_btn);
         controls.append(&fullscreen_btn);
         controls.append(&end_btn);
         inner.append(&controls);
+
+        let immersion = Immersion::new(Parts {
+            clamp: clamp.clone(),
+            inner: inner.clone(),
+            windowed_top: 18,
+            around: vec![above.upcast(), below.upcast()],
+            controls: controls.clone(),
+            course_view: course_view.clone(),
+        });
+        {
+            let graph_stack = graph_stack.clone();
+            view_3d_btn.connect_toggled(move |btn| {
+                let road = btn.is_active();
+                graph_stack.set_visible_child_name(if road { "3d" } else { "graph" });
+                // The graph is a strip; the road shares the spare height.
+                graph_stack.set_vexpand(road);
+            });
+        }
+        view_3d_btn.connect_toggled(Immersion::road_toggle(&immersion));
 
         clamp.set_child(Some(&inner));
         root.append(&clamp);
@@ -613,9 +686,12 @@ impl PlayerPage {
             cue_generation: Cell::new(0),
             test_mode: Cell::new(workout.is_ramp_test()),
             ladder_steps: Cell::new(ladder_steps(workout)),
-            clamp,
-            inner,
+            immersion,
             fullscreen_btn,
+            course_view,
+            view_3d_btn,
+            road: RefCell::new(None),
+            restoring_road: Rc::new(Cell::new(false)),
         }
     }
 
@@ -669,19 +745,44 @@ impl PlayerPage {
 
     pub fn set_fullscreen(&self, fullscreen: bool) {
         crate::ui::dress_fullscreen_button(&self.fullscreen_btn, fullscreen);
-        self.clamp.set_maximum_size(if fullscreen {
-            FULLSCREEN_CLAMP
-        } else {
-            WINDOWED_CLAMP
+        // Wider with tighter gaps on the cockpit, so the graph gains what the
+        // header bar and the margins gave up and it still fits without
+        // scrolling; the whole screen on the 3D road.
+        Immersion::set_fullscreen(&self.immersion, fullscreen);
+    }
+
+    /// Lay out `road` for the workout just loaded, looking as `look`, and put
+    /// the 3D button where the rider last left it (`shown`). With no road the
+    /// button goes and the graph stays.
+    pub fn set_world(
+        &self,
+        workout: &Workout,
+        road: Option<WorkoutRoad>,
+        look: WorldLook,
+        shown: bool,
+    ) {
+        if let Some(r) = &road {
+            self.course_view.set_route(&r.route, look);
+            self.course_view
+                .set_workout_profile(ride_hud::workout_profile(workout));
+        }
+        self.view_3d_btn.set_visible(road.is_some());
+        *self.road.borrow_mut() = road;
+        self.restoring_road.set(true);
+        self.view_3d_btn
+            .set_active(shown && self.view_3d_btn.is_visible());
+        self.restoring_road.set(false);
+    }
+
+    /// Run `save` with the rider's choice whenever they switch between the
+    /// graph and the road — but not when [`PlayerPage::set_world`] restores it.
+    pub fn connect_road_chosen(&self, save: impl Fn(bool) + 'static) {
+        let restoring = Rc::clone(&self.restoring_road);
+        self.view_3d_btn.connect_toggled(move |btn| {
+            if !restoring.get() {
+                save(btn.is_active());
+            }
         });
-        let margin = if fullscreen { 12 } else { 24 };
-        self.clamp.set_margin_top(if fullscreen { 12 } else { 18 });
-        self.clamp.set_margin_bottom(margin);
-        self.clamp.set_margin_start(margin);
-        self.clamp.set_margin_end(margin);
-        // Tighter gaps between sections, so the graph gains what the header bar
-        // and the margins gave up and the cockpit still fits without scrolling.
-        self.inner.set_spacing(if fullscreen { 12 } else { 18 });
     }
 
     /// Bind `+` and `−` (and their keypad twins) to the intensity dial.
@@ -816,6 +917,9 @@ impl PlayerPage {
         self.cue_generation
             .set(self.cue_generation.get().wrapping_add(1));
         self.graph.set_workout(workout);
+        // The last workout's road is not this one's; `load_world` lays the new
+        // one out.
+        *self.road.borrow_mut() = None;
         self.zone_meter.set_power(None);
         self.elapsed_label.set_label("0:00");
         // No step has been reached yet in a test; the warm-up comes first.
@@ -1117,6 +1221,7 @@ impl PlayerPage {
             }
             p.update_session_totals(&session, ftp);
             p.graph.record_live(&snapshot);
+            p.ride_the_road(&snapshot, ftp);
             // The overlay rides this tick rather than one of its own, so the two
             // windows can never show different seconds of the same ride.
             if let Some(overlay) = p.overlay.borrow().as_ref() {
@@ -1233,21 +1338,8 @@ impl PlayerPage {
                 .set_fraction(snap.segment_remaining_secs as f64 / seg_total as f64);
         }
 
-        // Interval caption: numbered while the workout is active.
-        let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
-        if self.test_mode.get() {
-            // The warm-up is not a step, so it is named rather than numbered.
-            self.interval_caption.set_label(
-                &step_number(snap.segment_index, self.ladder_steps.get())
-                    .filter(|_| is_active)
-                    .map_or_else(|| "Warm-up".to_string(), |n| format!("Step {n}")),
-            );
-        } else if is_active {
-            self.interval_caption
-                .set_label(&format!("Interval {}", snap.segment_index + 1));
-        } else {
-            self.interval_caption.set_label("Interval");
-        }
+        self.interval_caption
+            .set_label(&self.interval_caption_text(snap));
 
         self.update_cue(snap);
 
@@ -1255,6 +1347,59 @@ impl PlayerPage {
         let is_idle = snap.state == EngineState::Idle;
         self.countdown_banner.set_revealed(is_idle);
         self.cancel_btn.set_visible(is_idle);
+    }
+
+    /// What the interval clock is captioned: numbered while the workout is
+    /// active, and in a test the step — the warm-up is not a step, so it is
+    /// named rather than numbered.
+    fn interval_caption_text(&self, snap: &EngineSnapshot) -> String {
+        let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
+        if self.test_mode.get() {
+            step_number(snap.segment_index, self.ladder_steps.get())
+                .filter(|_| is_active)
+                .map_or_else(|| "Warm-up".to_string(), |n| format!("Step {n}"))
+        } else if is_active {
+            format!("Interval {}", snap.segment_index + 1)
+        } else {
+            "Interval".to_string()
+        }
+    }
+
+    /// Move the rider along the workout's road to where the clock has got
+    /// to, and give the road's HUD this second's readings. The road follows
+    /// the clock, not the watts — see `data::workout_road` — so it stands
+    /// still while the workout is paused or not yet started.
+    fn ride_the_road(&self, snap: &EngineSnapshot, ftp_watts: u32) {
+        let road = self.road.borrow();
+        let Some(road) = road.as_ref() else {
+            return;
+        };
+        let t = snap.elapsed_secs as f32;
+        let speed = if snap.state == EngineState::Running {
+            road.speed_at(t)
+        } else {
+            0.0
+        };
+        self.course_view.set_progress(road.distance_at(t), speed);
+        let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
+        let total = snap.elapsed_secs + snap.remaining_secs;
+        self.course_view.set_workout_hud(WorkoutHudReadings {
+            workout_name: self.workout_name_label.label().to_string(),
+            power_watts: snap.readings.power_watts,
+            target_watts: is_active.then_some(snap.target_power_watts),
+            ftp_watts,
+            interval_caption: self.interval_caption_text(snap).to_uppercase(),
+            interval_left_secs: is_active.then_some(snap.segment_remaining_secs),
+            heart_rate_bpm: snap.readings.heart_rate_bpm,
+            cadence_rpm: snap.readings.cadence_rpm,
+            elapsed_secs: snap.elapsed_secs,
+            remaining_secs: (!self.test_mode.get()).then_some(snap.remaining_secs),
+            progress: if total > 0 {
+                snap.elapsed_secs as f32 / total as f32
+            } else {
+                0.0
+            },
+        });
     }
 
     /// Show the cue for the segment being ridden.
@@ -1525,6 +1670,40 @@ pub fn load_cues(
             p.cues
                 .replace(crate::training::cues::build_cues(&workout, &priors));
             p.cue_rendered.set(None);
+        },
+    );
+}
+
+/// Lay out the road `workout` is ridden along in 3D, in the scenery chosen in
+/// Preferences, and put the 3D button where the rider left it. The settings
+/// are read off the main thread; like [`load_cues`], a read that lands after
+/// the rider has started something else is dropped.
+pub fn load_world(
+    player: Rc<RefCell<PlayerPage>>,
+    workout: Workout,
+    athlete: &AthleteProfile,
+    pool: sqlx::SqlitePool,
+    rt_handle: &tokio::runtime::Handle,
+) {
+    let generation = player.borrow().cue_generation.get();
+    let road = WorkoutRoad::build(&workout, athlete);
+    crate::ui::spawn_to_main(
+        rt_handle,
+        async move {
+            let look = settings::workout_look(&pool).await?;
+            let shown = settings::workout_road(&pool).await?;
+            anyhow::Ok((look, shown))
+        },
+        move |loaded| {
+            let p = player.borrow();
+            if p.cue_generation.get() != generation {
+                return;
+            }
+            let (look, shown) = loaded.unwrap_or_else(|e| {
+                tracing::warn!("Could not read the 3D world settings: {e}");
+                (WorldLook::default(), false)
+            });
+            p.set_world(&workout, road, look, shown);
         },
     );
 }

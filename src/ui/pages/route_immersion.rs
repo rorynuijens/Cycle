@@ -1,7 +1,8 @@
-//! Fullscreen on the 3D road: the route page gives the whole screen to the 3D
-//! view, which draws every reading itself as a HUD in the world's style
-//! (`ui/widgets/ride_hud.rs`). The page's own controls move into a bar over
-//! the road that slides up when the mouse moves and away again when it rests.
+//! Fullscreen on the 3D road: a ride page — the route's or the workout's —
+//! gives the whole screen to the 3D view, which draws every reading itself as
+//! a HUD in the world's style (`ui/widgets/ride_hud.rs`). The page's own
+//! controls move into a bar over the road that slides up when the mouse moves
+//! and away again when it rests.
 //!
 //! The 3D view is never moved: its GL context, and the world on it, stay put.
 //! Only what is around it hides — whole sections, so a row that shows and
@@ -57,18 +58,22 @@ pub fn layout(fullscreen: bool, road: bool) -> Layout {
     }
 }
 
-/// The parts of the route page that change with the layout.
+/// The parts of a ride page that change with the layout.
 pub struct Immersion {
-    pub clamp: adw::Clamp,
-    pub inner: gtk::Box,
-    /// The cockpit above and below the map slot.
-    pub above: gtk::Box,
-    pub below: gtk::Box,
-    pub lookahead: gtk::DrawingArea,
+    clamp: adw::Clamp,
+    inner: gtk::Box,
+    /// The page's top margin when windowed — the one margin the two ride
+    /// pages do not share.
+    windowed_top: i32,
+    /// The boxes whose gaps tighten in fullscreen.
+    spaced: Vec<gtk::Box>,
+    /// Everything that hides on [`Layout::Road`]: whole sections round the
+    /// 3D view, never a row inside one.
+    around: Vec<gtk::Widget>,
     /// The pause, intensity, view and end controls: in the page normally,
     /// in the bar over the road on [`Layout::Road`].
-    pub controls: gtk::Box,
-    pub course_view: CourseView,
+    controls: gtk::Box,
+    course_view: CourseView,
     /// The bar over the road, and the box in it the controls move into.
     bar: gtk::Revealer,
     bar_box: gtk::Box,
@@ -87,16 +92,36 @@ pub struct Immersion {
     finished: Cell<bool>,
 }
 
+/// The sections of a ride page [`Immersion`] lays out: the clamp and the box
+/// in it, the sections round the 3D view that hide on the road, the controls
+/// that move over it, and the view itself.
+pub struct Parts {
+    pub clamp: adw::Clamp,
+    pub inner: gtk::Box,
+    pub windowed_top: i32,
+    /// Sections of `inner` that hide on the road. A box among them also has
+    /// its gaps tightened in fullscreen.
+    pub around: Vec<gtk::Widget>,
+    pub controls: gtk::Box,
+    pub course_view: CourseView,
+}
+
 impl Immersion {
-    pub fn new(
-        clamp: adw::Clamp,
-        inner: gtk::Box,
-        above: gtk::Box,
-        below: gtk::Box,
-        lookahead: gtk::DrawingArea,
-        controls: gtk::Box,
-        course_view: CourseView,
-    ) -> Rc<Self> {
+    pub fn new(parts: Parts) -> Rc<Self> {
+        let Parts {
+            clamp,
+            inner,
+            windowed_top,
+            around,
+            controls,
+            course_view,
+        } = parts;
+        let mut spaced = vec![inner.clone()];
+        spaced.extend(
+            around
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Box>().cloned()),
+        );
         let bar_box = gtk::Box::builder().css_classes(["toolbar", "osd"]).build();
         let bar = gtk::Revealer::builder()
             .transition_type(gtk::RevealerTransitionType::SlideUp)
@@ -110,9 +135,9 @@ impl Immersion {
         let this = Rc::new(Self {
             clamp,
             inner,
-            above,
-            below,
-            lookahead,
+            windowed_top,
+            spaced,
+            around,
             controls,
             course_view,
             bar,
@@ -202,7 +227,7 @@ impl Immersion {
         s.current.set(Some(want));
 
         let (clamp_max, margin, top, spacing) = match want {
-            Layout::Windowed => (WINDOWED_CLAMP, 24, 20, 18),
+            Layout::Windowed => (WINDOWED_CLAMP, 24, s.windowed_top, 18),
             Layout::Cockpit => (FULLSCREEN_CLAMP, 12, 12, 12),
             Layout::Road => (UNCLAMPED, 0, 0, 0),
         };
@@ -212,12 +237,12 @@ impl Immersion {
         s.clamp.set_margin_bottom(margin);
         s.clamp.set_margin_start(margin);
         s.clamp.set_margin_end(margin);
-        for b in [&s.inner, &s.above, &s.below] {
+        for b in &s.spaced {
             b.set_spacing(spacing);
         }
-        s.above.set_visible(!road);
-        s.below.set_visible(!road);
-        s.lookahead.set_visible(!road);
+        for w in &s.around {
+            w.set_visible(!road);
+        }
         s.course_view.set_hud_shown(road);
 
         if road && !was_road {

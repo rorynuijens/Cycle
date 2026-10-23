@@ -17,6 +17,8 @@ use crate::data::athlete::{power_zone_index, ZONE_COLORS};
 use crate::data::ghost::NewBest;
 use crate::data::palette::{Rgb, BASE, HUD};
 use crate::data::route::Route;
+use crate::data::workout::Workout;
+use crate::training::engine::WorkoutEngine;
 use crate::ui::ride_card::format_ride_time;
 
 /// Fredoka (SIL OFL 1.1, `data/fonts/`), carried in the binary so the HUD
@@ -63,6 +65,63 @@ pub struct HudReadings {
     /// ahead), and how far along the route it is, 0–1.
     pub ghost_gap_secs: Option<f32>,
     pub ghost_progress: Option<f32>,
+}
+
+/// What the HUD shows over a workout's road: the workout cockpit's readings.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WorkoutHudReadings {
+    pub workout_name: String,
+    pub power_watts: Option<u32>,
+    /// What the trainer is being asked for, once the workout is under way.
+    pub target_watts: Option<u32>,
+    pub ftp_watts: u32,
+    /// Over the interval clock: "INTERVAL 3", or "STEP 4" in a ramp test.
+    pub interval_caption: String,
+    /// Time left in this interval, in seconds; `None` before the start.
+    pub interval_left_secs: Option<u32>,
+    pub heart_rate_bpm: Option<u32>,
+    pub cadence_rpm: Option<u32>,
+    pub elapsed_secs: u32,
+    /// Time left in the workout; `None` in a ramp test, which has no end to
+    /// count down to.
+    pub remaining_secs: Option<u32>,
+    /// How far through the workout the rider is, 0–1.
+    pub progress: f32,
+}
+
+/// One stretch of a workout's profile: from `from` to `to` of the way
+/// through it (0–1), its target going from `low_pct` to `high_pct` of FTP.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Block {
+    pub from: f32,
+    pub to: f32,
+    pub low_pct: f32,
+    pub high_pct: f32,
+}
+
+/// A workout's profile for the band: each segment as a block across its
+/// share of the time. Empty for a workout with no time in it.
+pub fn workout_profile(workout: &Workout) -> Vec<Block> {
+    let total: u32 = workout.segments.iter().map(|s| s.duration_secs).sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut at = 0u32;
+    workout
+        .segments
+        .iter()
+        .filter(|s| s.duration_secs > 0)
+        .map(|s| {
+            let from = at as f32 / total as f32;
+            at += s.duration_secs;
+            Block {
+                from,
+                to: at as f32 / total as f32,
+                low_pct: s.power_low_pct,
+                high_pct: s.power_high_pct,
+            }
+        })
+        .collect()
 }
 
 /// The route's heights at [`PROFILE_SAMPLES`] even steps from start to finish,
@@ -332,7 +391,7 @@ impl RideHud {
             ghost_tile(&t, right, TOP + 2.0 * (TILE_H + STACK_GAP), gap);
         }
 
-        power_panel(&t, w, r);
+        power_panel(&t, w, r.power_watts, r.ftp_watts);
         gradient_sign(&t, 60.0, h - 214.0 - 214.0, r.gradient_pct);
         profile_band(&t, w, h, r, profile);
         if let Some(left) = finish_in(r.to_go_m) {
@@ -364,6 +423,87 @@ impl RideHud {
         }
         surface.flush();
         Some(surface)
+    }
+
+    /// The workout HUD for a view `width` × `height` pixels, on a clear image.
+    pub fn render_workout(
+        &self,
+        width: i32,
+        height: i32,
+        r: &WorkoutHudReadings,
+        profile: &[Block],
+    ) -> Option<cairo::ImageSurface> {
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width.max(1), height.max(1)).ok()?;
+        {
+            let cr = cairo::Context::new(&surface).ok()?;
+            self.paint_workout(&cr, width, height, r, profile);
+        }
+        surface.flush();
+        Some(surface)
+    }
+
+    /// The route HUD's layout with a workout's readings in it: the target and
+    /// the interval clock where speed and distance were, and the workout's
+    /// own profile along the bottom.
+    fn paint_workout(
+        &self,
+        cr: &cairo::Context,
+        width: i32,
+        height: i32,
+        r: &WorkoutHudReadings,
+        profile: &[Block],
+    ) {
+        let (scale, w, h) = sheet(width, height);
+        cr.scale(scale, scale);
+        let pctx = self.fonts.create_context();
+        pangocairo::functions::update_context(cr, &pctx);
+        let t = Text { cr, pctx: &pctx };
+
+        self.route_flag(&t, &r.workout_name);
+
+        let (target, target_dim) = reading(r.target_watts);
+        tile(&t, EDGE, 112.0, "TARGET", None, &target, "W", target_dim);
+        let interval = r
+            .interval_left_secs
+            .map_or_else(|| "—".to_string(), WorkoutEngine::format_duration);
+        tile(
+            &t,
+            EDGE,
+            112.0 + TILE_H + STACK_GAP,
+            &r.interval_caption,
+            None,
+            &interval,
+            "",
+            r.interval_left_secs.is_none(),
+        );
+
+        let right = w - EDGE - TILE_W;
+        let (hr, hr_dim) = reading(r.heart_rate_bpm);
+        tile(
+            &t,
+            right,
+            TOP,
+            "HEART RATE",
+            Some(heart),
+            &hr,
+            "bpm",
+            hr_dim,
+        );
+        let (cad, cad_dim) = reading(r.cadence_rpm);
+        tile(
+            &t,
+            right,
+            TOP + TILE_H + STACK_GAP,
+            "CADENCE",
+            None,
+            &cad,
+            "rpm",
+            cad_dim,
+        );
+
+        power_panel(&t, w, r.power_watts, r.ftp_watts);
+        workout_band(&t, w, h, r, profile);
     }
 
     fn route_flag(&self, t: &Text, name: &str) {
@@ -597,10 +737,10 @@ fn zone_rgb(z: usize) -> Rgb {
 
 /// Power, large, at the top in the middle: the zones it has reached lit in
 /// their colours, and its zone named.
-fn power_panel(t: &Text, w: f64, r: &HudReadings) {
+fn power_panel(t: &Text, w: f64, power_watts: Option<u32>, ftp_watts: u32) {
     let cr = t.cr;
     let x = w / 2.0 - POWER_W / 2.0;
-    let zone = zone(r.power_watts, r.ftp_watts);
+    let zone = zone(power_watts, ftp_watts);
     let height = if zone.is_some() { 286.0 } else { 236.0 };
     sticker(cr, x, TOP, POWER_W, height, 32.0, 6.0, 9.0);
     let caption = t.caption("POWER");
@@ -610,7 +750,7 @@ fn power_panel(t: &Text, w: f64, r: &HudReadings) {
         TOP + 16.0,
         HUD.label,
     );
-    let (digits, dim) = reading(r.power_watts);
+    let (digits, dim) = reading(power_watts);
     let number = t.layout(&digits, 132.0, pango::Weight::Bold);
     let unit = t.layout("W", 34.0, pango::Weight::Semibold);
     let span = Text::width(&number) + 10.0 + Text::width(&unit);
@@ -990,6 +1130,106 @@ fn profile_band(t: &Text, w: f64, h: f64, r: &HudReadings, profile: &[f32]) {
         std::f64::consts::TAU,
     );
     set(cr, HUD.ink);
+    let _ = cr.fill();
+    cr.arc(at, ground - 24.0 - 17.0, 17.0, 0.0, std::f64::consts::TAU);
+    fill_and_outline(cr, HUD.marker, 5.0);
+}
+
+/// The band along the bottom for a workout: elapsed and remaining time, and
+/// the workout's blocks in their zones' colours, the part ridden washed over
+/// and the rider's pin where the clock is.
+fn workout_band(t: &Text, w: f64, h: f64, r: &WorkoutHudReadings, profile: &[Block]) {
+    let cr = t.cr;
+    let (x, y) = (EDGE, h - TOP - BAND_H);
+    let bw = w - 2.0 * EDGE;
+    sticker(cr, x, y, bw, BAND_H, 24.0, 5.0, 7.0);
+
+    let sx = x + 24.0;
+    t.draw(&t.caption("ELAPSED"), sx, y + 18.0, HUD.label);
+    let elapsed = t.layout(
+        &format_ride_time(u64::from(r.elapsed_secs)),
+        44.0,
+        pango::Weight::Bold,
+    );
+    t.on_baseline(&elapsed, sx, y + 80.0, HUD.ink);
+    t.draw(&t.caption("REMAINING"), sx, y + 92.0, HUD.label);
+    let (left, dim) = match r.remaining_secs {
+        Some(secs) => (format_ride_time(u64::from(secs)), false),
+        None => ("—".to_string(), true),
+    };
+    let left = t.layout(&left, 44.0, pango::Weight::Bold);
+    t.on_baseline(&left, sx, y + 152.0, if dim { HUD.dim } else { HUD.ink });
+
+    let (x0, x1) = (sx + BAND_STATS_W + 24.0, x + bw - 24.0);
+    let (top, floor) = (y + 30.0, y + BAND_H - 18.0);
+    let peak = profile
+        .iter()
+        .map(|b| b.low_pct.max(b.high_pct))
+        .filter(|p| p.is_finite())
+        .fold(0.0f32, f32::max)
+        .max(1.0);
+    // Anything not a number is drawn as nothing: one NaN handed to Cairo
+    // stops it drawing the rest of the band.
+    let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+    let height = |pct: f32| floor - (floor - top) * f64::from(finite(pct).clamp(0.0, peak) / peak);
+    let across = |f: f32| x0 + (x1 - x0) * f64::from(finite(f).clamp(0.0, 1.0));
+    let progress = finite(r.progress).clamp(0.0, 1.0);
+    let shape = |cr: &cairo::Context, b: &Block| {
+        cr.move_to(across(b.from), floor);
+        cr.line_to(across(b.from), height(b.low_pct));
+        cr.line_to(across(b.to), height(b.high_pct));
+        cr.line_to(across(b.to), floor);
+        cr.close_path();
+    };
+    for b in profile {
+        shape(cr, b);
+        let mid = (finite(b.low_pct) + finite(b.high_pct)) / 2.0;
+        set(
+            cr,
+            zone_rgb(power_zone_index(mid.max(0.0).round() as u32, 100)),
+        );
+        let _ = cr.fill_preserve();
+        set(cr, HUD.ink);
+        cr.set_line_width(3.0);
+        cr.set_line_join(cairo::LineJoin::Round);
+        let _ = cr.stroke();
+    }
+    let at = across(progress);
+    let _ = cr.save();
+    cr.rectangle(x0, top - 40.0, at - x0, floor - top + 40.0);
+    cr.clip();
+    for b in profile {
+        shape(cr, b);
+    }
+    let [ir, ig, ib] = HUD.ink;
+    cr.set_source_rgba(f64::from(ir), f64::from(ig), f64::from(ib), 0.45);
+    let _ = cr.fill();
+    let _ = cr.restore();
+    set(cr, HUD.ink);
+    cr.set_line_width(4.0);
+    cr.move_to(x0, floor);
+    cr.line_to(x1, floor);
+    let _ = cr.stroke();
+
+    // The rider: the route band's ball on a pin, stood on the block it is in.
+    let ground = profile
+        .iter()
+        .find(|b| progress >= b.from && progress <= b.to)
+        .map_or(floor, |b| {
+            let span = (b.to - b.from).max(f32::EPSILON);
+            let k = ((progress - b.from) / span).clamp(0.0, 1.0);
+            height(finite(b.low_pct) + (finite(b.high_pct) - finite(b.low_pct)) * k)
+        });
+    set(cr, HUD.ink);
+    cr.rectangle(at - 2.5, ground - 24.0, 5.0, 24.0);
+    let _ = cr.fill();
+    cr.arc(
+        at,
+        ground + 4.0 - 24.0 - 17.0,
+        17.0,
+        0.0,
+        std::f64::consts::TAU,
+    );
     let _ = cr.fill();
     cr.arc(at, ground - 24.0 - 17.0, 17.0, 0.0, std::f64::consts::TAU);
     fill_and_outline(cr, HUD.marker, 5.0);
@@ -1377,5 +1617,120 @@ mod tests {
         let after = (x0 + (x1 - x0) * 0.8) as i32;
         assert!(close(pixel(&mut s, before, y), rgb8(HUD.ridden)));
         assert!(close(pixel(&mut s, after, y), rgb8(HUD.profile)));
+    }
+
+    // ── A workout's HUD ──────────────────────────────────────────────────────
+
+    use crate::data::workout::{Segment, WorkoutCategory};
+
+    fn workout(segments: Vec<Segment>) -> Workout {
+        Workout::from_segments("Blocks", "", WorkoutCategory::Custom, segments)
+    }
+
+    #[test]
+    fn should_lay_a_workouts_blocks_end_to_end_by_time() {
+        let w = workout(vec![
+            Segment::ramp(300, 40.0, 70.0, "Warm-up"),
+            Segment::steady(0, 300.0, "Nothing"),
+            Segment::steady(600, 105.0, "Hard"),
+            Segment::steady(300, 50.0, "Easy"),
+        ]);
+        let blocks = workout_profile(&w);
+        assert_eq!(
+            blocks,
+            vec![
+                Block {
+                    from: 0.0,
+                    to: 0.25,
+                    low_pct: 40.0,
+                    high_pct: 70.0
+                },
+                Block {
+                    from: 0.25,
+                    to: 0.75,
+                    low_pct: 105.0,
+                    high_pct: 105.0
+                },
+                Block {
+                    from: 0.75,
+                    to: 1.0,
+                    low_pct: 50.0,
+                    high_pct: 50.0
+                },
+            ],
+            "the empty segment takes no room and the last block ends at 1"
+        );
+        assert!(workout_profile(&workout(vec![])).is_empty());
+        assert!(workout_profile(&workout(vec![Segment::steady(0, 90.0, "x")])).is_empty());
+    }
+
+    fn working() -> WorkoutHudReadings {
+        WorkoutHudReadings {
+            workout_name: "Blocks".into(),
+            power_watts: Some(214),
+            target_watts: Some(211),
+            ftp_watts: 211,
+            interval_caption: "INTERVAL 2".into(),
+            interval_left_secs: Some(95),
+            heart_rate_bpm: Some(150),
+            cadence_rpm: Some(90),
+            elapsed_secs: 600,
+            remaining_secs: Some(600),
+            progress: 0.5,
+        }
+    }
+
+    #[test]
+    fn should_wash_over_the_ridden_part_of_the_workout_and_leave_the_rest_in_its_zone() {
+        let hud = RideHud::new();
+        let one = workout(vec![Segment::steady(1200, 100.0, "Threshold")]);
+        let mut s = hud
+            .render_workout(1920, 1080, &working(), &workout_profile(&one))
+            .expect("a HUD");
+        let x0 = EDGE + 24.0 + BAND_STATS_W + 24.0;
+        let x1 = 1920.0 - EDGE - 24.0;
+        let y = (1080.0 - TOP - 18.0 - 10.0) as i32;
+        let before = (x0 + (x1 - x0) * 0.2) as i32;
+        let after = (x0 + (x1 - x0) * 0.8) as i32;
+        let threshold = rgb8(zone_rgb(power_zone_index(100, 100)));
+        assert!(close(pixel(&mut s, after, y), threshold));
+        assert!(!close(pixel(&mut s, before, y), threshold));
+    }
+
+    #[test]
+    fn should_draw_a_workout_hud_with_nothing_to_show_and_a_profile_gone_wrong() {
+        let hud = RideHud::new();
+        let nothing = WorkoutHudReadings::default();
+        assert!(hud.render_workout(1920, 1080, &nothing, &[]).is_some());
+        let wild = WorkoutHudReadings {
+            progress: f32::NAN,
+            ..working()
+        };
+        let broken = [
+            Block {
+                from: 0.0,
+                to: 0.0,
+                low_pct: f32::NAN,
+                high_pct: f32::INFINITY,
+            },
+            Block {
+                from: 0.9,
+                to: 0.1,
+                low_pct: -50.0,
+                high_pct: 1e9,
+            },
+        ];
+        assert!(hud.render_workout(1, 1, &wild, &broken).is_some());
+        assert!(hud.render_workout(0, -5, &wild, &broken).is_some());
+        // Cairo stops drawing at the first NaN, so the rider's pin — drawn
+        // last — is the proof the band was drawn to the end. With progress
+        // read as the start, it stands at the band's left edge.
+        let mut s = hud
+            .render_workout(1920, 1080, &wild, &broken)
+            .expect("a HUD");
+        let x0 = (EDGE + 24.0 + BAND_STATS_W + 24.0) as i32;
+        let floor = 1080.0 - TOP - 18.0;
+        let pin = (floor - 24.0 - 17.0) as i32;
+        assert!(close(pixel(&mut s, x0, pin), rgb8(HUD.marker)));
     }
 }

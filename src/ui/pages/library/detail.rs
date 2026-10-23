@@ -439,7 +439,7 @@ pub fn show_route_detail(
     let animals = Rc::new(std::cell::Cell::new(true));
     let animals_row = adw::SwitchRow::builder()
         .title("Animals")
-        .subtitle("Herds, birds and animal encounters, on every route")
+        .subtitle("Herds, birds and animal encounters, on every route and workout")
         .active(true)
         .sensitive(false)
         .build();

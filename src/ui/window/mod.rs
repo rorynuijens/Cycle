@@ -164,6 +164,18 @@ impl CycleGtkWindow {
             &athlete_rc.borrow(),
         )));
         player_rc.borrow().set_cues_enabled(training.interval_cues);
+        // Graph or road, kept for the next workout.
+        {
+            let (pool, rt_handle) = (pool.clone(), rt_handle.clone());
+            player_rc.borrow().connect_road_chosen(move |on| {
+                crate::ui::spawn_write(
+                    &rt_handle,
+                    &pool,
+                    "the 3D road choice",
+                    move |pool| async move { settings::set_workout_road(&pool, on).await },
+                );
+            });
+        }
         // Read live by both ride loops, so switching it in Preferences applies
         // to a ride already under way.
         let auto_pause = Rc::new(Cell::new(training.auto_pause));
@@ -300,6 +312,14 @@ impl CycleGtkWindow {
                 engine.borrow_mut().reset_with_workout(workout.clone());
                 let ftp = engine.borrow().athlete.borrow().ftp_watts;
                 player.borrow().reset_workout(&workout, ftp);
+                let athlete = engine.borrow().athlete.borrow().clone();
+                crate::ui::pages::player::load_world(
+                    Rc::clone(&player),
+                    workout.clone(),
+                    &athlete,
+                    pool_for_cues.clone(),
+                    &rt_for_cues,
+                );
                 crate::ui::pages::player::load_cues(
                     Rc::clone(&player),
                     workout,
@@ -329,6 +349,14 @@ impl CycleGtkWindow {
                 timer_alive.set(false);
                 let ftp = engine.borrow().athlete.borrow().ftp_watts;
                 player.borrow().reset_workout(&workout, ftp);
+                let athlete = engine.borrow().athlete.borrow().clone();
+                crate::ui::pages::player::load_world(
+                    Rc::clone(&player),
+                    workout.clone(),
+                    &athlete,
+                    pool_for_cues.clone(),
+                    &rt_for_cues,
+                );
                 crate::ui::pages::player::load_cues(
                     Rc::clone(&player),
                     workout.clone(),

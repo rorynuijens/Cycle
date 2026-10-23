@@ -34,4 +34,5 @@ pub mod training_profile;
 pub mod transfer;
 pub mod trees;
 pub mod workout;
+pub mod workout_road;
 pub mod world;

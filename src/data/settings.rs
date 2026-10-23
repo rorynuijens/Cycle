@@ -18,6 +18,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
+use super::biome::{Scenery, WorldLook};
 use super::db;
 use super::training_profile::TrainingProfile;
 use crate::devices::peripheral::Transport;
@@ -37,6 +38,10 @@ pub mod keys {
     pub const AUTO_PAUSE: &str = "training.auto_pause";
     /// Animals in the 3D world: herds, birds and encounters.
     pub const ANIMALS_3D: &str = "view3d.animals";
+    /// The scenery every workout is ridden through in 3D.
+    pub const WORKOUT_SCENERY: &str = "view3d.workout_scenery";
+    /// Whether the workout page last showed the 3D road in place of its graph.
+    pub const WORKOUT_ROAD: &str = "view3d.workout_road";
 
     pub const INTERVALS_ATHLETE_ID: &str = "intervals.athlete_id";
     pub const INTERVALS_UPLOAD: &str = "intervals.upload";
@@ -168,6 +173,43 @@ pub async fn animals_3d(pool: &SqlitePool) -> Result<bool> {
 
 pub async fn set_animals_3d(pool: &SqlitePool, on: bool) -> Result<()> {
     db::set_setting(pool, keys::ANIMALS_3D, flag_value(on)).await
+}
+
+/// The scenery workouts are ridden through: one choice for them all, since a
+/// workout can be started from half a dozen places. The countryside until the
+/// rider picks one, or when what is stored is not a choice there is.
+pub async fn workout_scenery(pool: &SqlitePool) -> Result<Scenery> {
+    Ok(db::get_setting(pool, keys::WORKOUT_SCENERY)
+        .await?
+        .as_deref()
+        .and_then(Scenery::from_key)
+        .unwrap_or_default())
+}
+
+pub async fn set_workout_scenery(pool: &SqlitePool, scenery: Scenery) -> Result<()> {
+    db::set_setting(pool, keys::WORKOUT_SCENERY, scenery.key()).await
+}
+
+/// How a workout's 3D world looks: its scenery, and the animals switch every
+/// 3D ride shares.
+pub async fn workout_look(pool: &SqlitePool) -> Result<WorldLook> {
+    Ok(WorldLook {
+        scenery: workout_scenery(pool).await?,
+        animals: animals_3d(pool).await?,
+    })
+}
+
+/// Whether the workout page opens on the 3D road. Off for a new rider: the
+/// graph is the page they know.
+pub async fn workout_road(pool: &SqlitePool) -> Result<bool> {
+    Ok(flag(
+        db::get_setting(pool, keys::WORKOUT_ROAD).await?,
+        false,
+    ))
+}
+
+pub async fn set_workout_road(pool: &SqlitePool, on: bool) -> Result<()> {
+    db::set_setting(pool, keys::WORKOUT_ROAD, flag_value(on)).await
 }
 
 // ── Intervals.icu ────────────────────────────────────────────────────────────
@@ -504,6 +546,42 @@ mod tests {
         assert!(!animals_3d(&pool).await.unwrap());
         set_animals_3d(&pool, true).await.unwrap();
         assert!(animals_3d(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn should_ride_workouts_through_the_countryside_until_another_scenery_is_picked() {
+        use crate::data::biome::Biome;
+        let pool = test_pool().await;
+        assert_eq!(workout_look(&pool).await.unwrap(), WorldLook::default());
+        let desert = Scenery::Only(Biome::Desert);
+        set_workout_scenery(&pool, desert).await.unwrap();
+        set_animals_3d(&pool, false).await.unwrap();
+        assert_eq!(
+            workout_look(&pool).await.unwrap(),
+            WorldLook {
+                scenery: desert,
+                animals: false
+            }
+        );
+        // A tampered or retired key is read as the countryside, not an error.
+        db::set_setting(&pool, keys::WORKOUT_SCENERY, "atlantis")
+            .await
+            .unwrap();
+        assert_eq!(workout_scenery(&pool).await.unwrap(), Scenery::Countryside);
+        db::set_setting(&pool, keys::WORKOUT_SCENERY, "")
+            .await
+            .unwrap();
+        assert_eq!(workout_scenery(&pool).await.unwrap(), Scenery::Countryside);
+    }
+
+    #[tokio::test]
+    async fn should_open_workouts_on_the_graph_until_the_road_is_chosen() {
+        let pool = test_pool().await;
+        assert!(!workout_road(&pool).await.unwrap(), "graph for a new rider");
+        set_workout_road(&pool, true).await.unwrap();
+        assert!(workout_road(&pool).await.unwrap());
+        set_workout_road(&pool, false).await.unwrap();
+        assert!(!workout_road(&pool).await.unwrap());
     }
 
     #[tokio::test]
