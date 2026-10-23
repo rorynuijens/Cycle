@@ -123,6 +123,12 @@ pub enum DeviceEvent {
         device_type: Option<DeviceType>,
     },
     Readings(LiveReadings),
+    /// A connect the UI asked for did not happen. Without this the Devices page
+    /// waits on "Connecting…" for good, and skips the device on every rescan
+    /// because a connect is still in flight.
+    ConnectFailed {
+        address: String,
+    },
     Error(String),
     /// Non-fatal issue worth surfacing to the user (e.g. a trainer with no ERG control).
     Warning(String),
@@ -577,11 +583,7 @@ impl DeviceManager {
                                 // saying "Connecting…" forever would be worse than
                                 // the warning.
                                 tracing::warn!("Connect: {address} is not on the radio in use");
-                                let _ = self.event_tx.send(DeviceEvent::ConnectionChanged {
-                                    address,
-                                    connected: false,
-                                    device_type: None,
-                                }).await;
+                                let _ = self.event_tx.send(DeviceEvent::ConnectFailed { address }).await;
                                 continue;
                             }
                             // ANT+ devices are handled by the ANT thread, not btleplug.
@@ -614,6 +616,7 @@ impl DeviceManager {
                                 Some(p) => p.clone(),
                                 None => {
                                     tracing::warn!("Connect: unknown address {address}");
+                                    let _ = self.event_tx.send(DeviceEvent::ConnectFailed { address }).await;
                                     continue;
                                 }
                             };
@@ -621,11 +624,15 @@ impl DeviceManager {
                             tracing::info!("Connecting to {address}");
                             if let Err(e) = peripheral.connect().await {
                                 tracing::error!("connect() failed: {e}");
-                                let _ = self.event_tx.send(DeviceEvent::Error(e.to_string())).await;
+                                let _ = self.event_tx.send(DeviceEvent::ConnectFailed { address }).await;
                                 continue;
                             }
                             if let Err(e) = peripheral.discover_services().await {
                                 tracing::error!("discover_services() failed: {e}");
+                                // Connected but unusable: let go, or BlueZ keeps the
+                                // link and the next attempt finds it half-open.
+                                peripheral.disconnect().await.ok();
+                                let _ = self.event_tx.send(DeviceEvent::ConnectFailed { address }).await;
                                 continue;
                             }
 

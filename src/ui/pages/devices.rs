@@ -430,6 +430,30 @@ impl DevicesPage {
         }
     }
 
+    /// A connect did not happen. Clear the in-flight flag so the row stops
+    /// saying "Connecting…" and the next scan may try again, and start that
+    /// scan on the usual back-off if the device is one being hunted for.
+    pub fn on_connect_failed(&mut self, address: &str) {
+        let missing = {
+            let mut entries = self.ctx.entries.borrow_mut();
+            let Some(entry) = entries.get_mut(address) else {
+                return;
+            };
+            entry.connecting = false;
+            is_missing(
+                entry.saved,
+                entry.connected,
+                entry.held_off,
+                entry.transport == self.ctx.radio.get(),
+            )
+        };
+        update_saved_statuses(&self.ctx);
+        refresh_strip(&self.ctx);
+        if missing {
+            schedule_reconnect_scan(&self.ctx);
+        }
+    }
+
     /// Return the human-readable display name for a device address, falling back to the address.
     pub fn display_name_for(&self, address: &str) -> String {
         self.ctx
@@ -942,7 +966,11 @@ fn rebuild_saved_row(ctx: &PageCtx, address: &str) {
 
     let (new_row, status_label) =
         make_saved_row(ctx, address, &display_name, kind, transport, status);
-    ctx.my_devices_group.remove(&old_row);
+    // A device saved just now has its old row in "Add a Device", already
+    // taken out by the caller; removing it from here too is a GTK critical.
+    if old_row.is_ancestor(&ctx.my_devices_group) {
+        ctx.my_devices_group.remove(&old_row);
+    }
     ctx.my_devices_group.add(&new_row);
 
     if let Some(entry) = ctx.entries.borrow_mut().get_mut(address) {

@@ -102,6 +102,9 @@ pub fn start_polling(
                         );
                     }
                 }
+                DeviceEvent::ConnectFailed { address } => {
+                    devices_for_loop.borrow_mut().on_connect_failed(&address);
+                }
                 DeviceEvent::Error(e) => {
                     tracing::error!("Device error: {e}");
                 }
