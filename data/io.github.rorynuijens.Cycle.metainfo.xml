@@ -90,6 +90,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.18.0" date="2026-10-23">
+      <description>
+        <p>An FTP check-in:</p>
+        <ul>
+          <li>The Fitness page now looks at your threshold work over the last
+              four weeks and says whether your FTP should go up, come down, or
+              stay where it is — with the reasons, and a button to accept. Nothing
+              changes until you press it.</li>
+          <li>It only raises FTP once a ride with cadence shows the intervals
+              were held comfortably, and it can always be set aside for two
+              weeks.</li>
+          <li>The suggestion after a ride based on your best 20 minutes is gone.
+              In ERG that number is what the workout asked for.</li>
+          <li>Preferences shows when your FTP last changed, and what changed
+              it.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.17.1" date="2026-10-23">
       <description>
         <p>A security update. The library Tour du Salon uses for its secure
