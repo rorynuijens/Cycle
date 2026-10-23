@@ -99,11 +99,8 @@ pub async fn load_ftp_history(pool: &SqlitePool) -> Result<Vec<(NaiveDate, u32)>
         .collect())
 }
 
-/// Most recent FTP history entry as `(date, ftp_watts, source)`, if any.
-// TODO(ftp-detect): used by the phase-2 check-in card for cooldown decisions.
-// Phase-1 `ftp_history` CRUD from docs/ftp-detection.md §10 — caller-less by
-// design until the detector ships, not an oversight.
-#[allow(dead_code)]
+/// Most recent FTP history entry as `(date, ftp_watts, source)`, if any —
+/// what the Preferences FTP row says under its title.
 pub async fn latest_ftp_entry(pool: &SqlitePool) -> Result<Option<(String, u32, String)>> {
     let row = sqlx::query(
         "SELECT date, ftp_watts, source FROM ftp_history

@@ -23,6 +23,57 @@ const FTP_LOG_DEBOUNCE: Duration = Duration::from_secs(3);
 /// the zone maths divides by the reserve between them.
 const MIN_HR_RESERVE: u32 = 10;
 
+/// What the FTP row says under its title: when the number last changed, and
+/// what changed it. `entry` is the latest FTP history row as `(date, source)`,
+/// with the date as SQLite's `datetime('now')` writes it.
+///
+/// A row that cannot be read falls back to saying what FTP is, rather than
+/// showing a date the history does not support.
+fn ftp_subtitle(entry: Option<(&str, &str)>) -> String {
+    const PLAIN: &str = "Functional Threshold Power (watts)";
+    let Some((date, source)) = entry else {
+        return PLAIN.to_string();
+    };
+    let Some(day) = date
+        .get(..10)
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    else {
+        return PLAIN.to_string();
+    };
+    let when = format!("Last updated {}", day.format("%-d %B %Y"));
+    match source {
+        "manual" => format!("{when} · set by hand"),
+        "ramp_test" => format!("{when} · from a ramp test"),
+        "suggestion" => format!("{when} · from an FTP check-in"),
+        _ => when,
+    }
+}
+
+/// Fill the FTP row's subtitle from the history, off the main thread.
+fn refresh_ftp_subtitle(
+    ftp_row: &adw::SpinRow,
+    pool: &SqlitePool,
+    rt_handle: &tokio::runtime::Handle,
+) {
+    let row = ftp_row.downgrade();
+    let pool = pool.clone();
+    crate::ui::spawn_to_main(
+        rt_handle,
+        async move { db::latest_ftp_entry(&pool).await },
+        move |result| {
+            // The window may have closed while the query ran.
+            let Some(row) = row.upgrade() else { return };
+            match result {
+                Ok(entry) => {
+                    let entry = entry.as_ref().map(|(d, _, s)| (d.as_str(), s.as_str()));
+                    row.set_subtitle(&ftp_subtitle(entry));
+                }
+                Err(e) => tracing::error!("Could not read the FTP history: {e}"),
+            }
+        },
+    );
+}
+
 /// First line of the training context, truncated, for the row subtitle.
 fn context_preview(ctx: &str) -> String {
     let first = ctx.trim().lines().next().unwrap_or("").trim();
@@ -173,6 +224,7 @@ pub fn build(
         row.connect_value_notify(move |_| apply());
     }
     connect_ftp(&ftp_row, apply, athlete.ftp_watts, &pool, &rt_handle);
+    refresh_ftp_subtitle(&ftp_row, &pool, &rt_handle);
 
     connect_context(&context_row, win, &pool, &rt_handle);
     connect_delete(&delete_btn, win, &pool, &rt_handle, on_saved);
@@ -216,11 +268,24 @@ fn connect_ftp(
                 return;
             }
             last_logged.set(ftp);
-            rt_handle.spawn(async move {
-                if let Err(e) = db::log_ftp_change(&pool, ftp, "manual", "").await {
-                    tracing::error!("log_ftp_change failed: {e}");
-                }
-            });
+            let pool_log = pool.clone();
+            let row_weak = row.downgrade();
+            let rt_refresh = rt_handle.clone();
+            crate::ui::spawn_to_main(
+                &rt_handle,
+                async move { db::log_ftp_change(&pool_log, ftp, "manual", "").await },
+                move |result| {
+                    if let Err(e) = result {
+                        tracing::error!("log_ftp_change failed: {e}");
+                        return;
+                    }
+                    // Read back rather than assumed, so the line says what
+                    // the history now holds.
+                    if let Some(row) = row_weak.upgrade() {
+                        refresh_ftp_subtitle(&row, &pool, &rt_refresh);
+                    }
+                },
+            );
         });
     });
 }
@@ -499,6 +564,40 @@ fn show_context_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_say_when_and_how_ftp_last_changed() {
+        let at = "2026-08-11 07:14:45";
+        assert_eq!(
+            ftp_subtitle(Some((at, "manual"))),
+            "Last updated 11 August 2026 · set by hand"
+        );
+        assert_eq!(
+            ftp_subtitle(Some((at, "ramp_test"))),
+            "Last updated 11 August 2026 · from a ramp test"
+        );
+        assert_eq!(
+            ftp_subtitle(Some((at, "suggestion"))),
+            "Last updated 11 August 2026 · from an FTP check-in"
+        );
+    }
+
+    #[test]
+    fn should_give_the_date_alone_for_a_source_it_does_not_know() {
+        assert_eq!(
+            ftp_subtitle(Some(("2026-10-02 06:00:00", "imported"))),
+            "Last updated 2 October 2026"
+        );
+    }
+
+    #[test]
+    fn should_say_what_ftp_is_when_there_is_no_usable_history() {
+        let plain = "Functional Threshold Power (watts)";
+        assert_eq!(ftp_subtitle(None), plain);
+        for bad in ["", "yesterday", "2026-13-40 00:00:00", "2026-08"] {
+            assert_eq!(ftp_subtitle(Some((bad, "manual"))), plain, "{bad:?}");
+        }
+    }
 
     #[test]
     fn should_prompt_for_context_when_none_is_set() {

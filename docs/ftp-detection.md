@@ -1,6 +1,6 @@
 # FTP Detection — "FTP check-in" specification
 
-Status: **specced, not yet built** · Author: 2026-07-23
+Status: **shipped in 0.18.0** (check-in card; the ramp test shipped in 0.11.0) · Author: 2026-07-23
 
 Automatically suggest FTP adjustments by monitoring workout completions,
 in the spirit of TrainerRoad's AI FTP Detection — but deterministic,
@@ -106,18 +106,32 @@ where each evidence string is a human sentence
   (never trust stored data blindly — CLAUDE.md §5.2).
 - Cooldown: no *up* suggestion within 21 days of any `ftp_history` entry;
   *down* allowed after 7 days (overtraining protection beats rhythm).
-- Dismissing a check-in snoozes it 14 days (settings key).
+- Dismissing a check-in snoozes it 14 days (settings key
+  `ftp.check_in_snooze`, cleared by a data reset). **As built, the snooze
+  hides only a verdict pointing the same way**: a snooze set on "looks
+  right" or on a rise never hides a drop, and the card returns at once when
+  the verdict turns. Accepting a change also sets a "looks right" snooze, so
+  the cooldown that follows does not show a card with nothing to say.
+- A move the caps round back to the current FTP (a rider at the 500 W
+  ceiling) is shown as a hold, never as a button that sets FTP to itself.
 - Accept updates the athlete profile, inserts `ftp_history`, shows a
   toast. Nothing is ever changed without the tap.
 
 ## 6. Surfaces
 
-- **Fitness page — "FTP check-in" card**, shown when a suggestion (or
-  monthly "looks right") is due: suggested value, delta, evidence lines,
-  `Accept <N> W` (suggested-action) / `Not now`. Zone colours only where
-  a colour means a zone; otherwise standard Adwaita.
+- **Fitness page — "FTP check-in" card**, under the form chart, shown
+  whenever the window holds ≥ 3 hard sessions and no snooze hides it:
+  suggested value, delta, evidence lines, `Set FTP to <N> W`
+  (suggested-action) / `Not now`, or `Got it` on a hold. Built
+  (0.18.0) in `ui/pages/fitness/ftp_check_in.rs`; the verdict is
+  `ftp_detect::check_in`. Accepting goes through `ui::ftp_change::accept`,
+  shared with the ramp test, and logs source `suggestion`.
+- **The post-ride toast offering 95 % of the best 20 minutes is gone**
+  (0.18.0): in ERG that number is what the workout asked for, and it
+  could contradict the check-in.
 - **Preferences → Athlete**: FTP row subtitle becomes
   "Last updated <date> · <source>"; manual edits log to `ftp_history`.
+  Built in 0.18.0.
 
 ## 7. Ramp test (phase 3) — SHIPPED 0.11.0
 
@@ -190,11 +204,14 @@ Synthetic-session builder (targets + power/cadence/HR traces + RPE), then:
    `sessions.ftp_watts`, `ftp_history` + Preferences logging.
 2. **Detector** — `training/ftp_detect.rs`, built 2026-09-06 with the two
    amendments above; 33 unit tests, no caller yet.
-   **Check-in card** — still to build. It needs ≥ 3 hard sessions of
+   **Check-in card** — shipped in 0.18.0. It needs ≥ 3 hard sessions of
    new-format data before it can say anything: on 2026-09-06 the window
    held exactly one (the 4×4, 16 min at 115 % FTP, compliance 0.99), and
    nothing scheduled before the program expires on 2026-09-27 reaches
-   91 % FTP — the sweet-spot sessions sit at exactly 90 %.
+   91 % FTP — the sweet-spot sessions sit at exactly 90 %. By 2026-10-23
+   the window held three (two 4×4s and a 5×3: 13 of 13 intervals at 99 %,
+   RPE 4.3), and the verdict was a hold only because none recorded cadence;
+   the first cadence sensor reached the app in 0.17.0.
 3. **Ramp test** workout + test mode.
 4. **Polish**: Intervals.icu eFTP cross-check, optional Claude-written
    explanation prose on the check-in card (facts stay deterministic).
