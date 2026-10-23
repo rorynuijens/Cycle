@@ -4,3 +4,7 @@
 /build-dir
 /cargo-home
 /.flatpak-builder
+
+# Deep-research notes and reports: local working material, not part of the app
+/research_notes/
+/reports/
