@@ -90,6 +90,27 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.20.0" date="2026-10-23">
+      <description>
+        <p>Ride your workouts in 3D:</p>
+        <ul>
+          <li>A 3D button on the workout page swaps the profile for a road
+              that climbs during the hard intervals and levels out in the
+              recoveries. The app remembers which you used last.</li>
+          <li>The road follows the workout clock: pausing stops it and
+              skipping an interval jumps ahead. Your trainer still holds the
+              target power; the road is for the eyes only, and its distance
+              is never saved with the ride.</li>
+          <li>Fullscreen on the road shows the target, the interval clock,
+              power, heart rate, cadence and the workout's zone-coloured
+              profile, drawn into the world.</li>
+          <li>Choose the workout scenery under Preferences, Training, 3D
+              World.</li>
+          <li>Fixed: the dashboard could freeze the app in a rider's first
+              week.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.19.0" date="2026-10-23">
       <description>
         <p>Ride your routes in 3D:</p>
