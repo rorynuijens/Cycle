@@ -346,8 +346,7 @@ impl RideOverlay {
             workout_progress.set_fraction(snap.elapsed_secs as f64 / total as f64);
         }
 
-        graph.set_playhead(snap.elapsed_secs);
-        graph.push_power(snap.readings.power_watts);
+        graph.record_live(snap);
 
         self.set_dropouts(stale);
     }

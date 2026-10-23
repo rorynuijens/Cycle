@@ -20,6 +20,8 @@ use sqlx::SqlitePool;
 
 use super::db;
 use super::training_profile::TrainingProfile;
+use crate::devices::peripheral::Transport;
+use crate::training::ftp_detect::Snooze;
 
 /// The settings keys this app reads and writes.
 ///
@@ -43,6 +45,8 @@ pub mod keys {
     pub const INTERVALS_STREAMS_REFETCHED: &str = "intervals.streams_refetched";
     /// Set once the rides from before v9 have been linked to their routes.
     pub const ROUTE_RIDES_LINKED: &str = "sessions.route_rides_linked";
+    /// The newest withheld activity the rider has been told about.
+    pub const INTERVALS_WITHHELD_ANNOUNCED: &str = "intervals.withheld_announced";
 
     pub const WINDOW_WIDTH: &str = "window.width";
     pub const WINDOW_HEIGHT: &str = "window.height";
@@ -51,6 +55,11 @@ pub mod keys {
     pub const OVERLAY_HEIGHT: &str = "overlay.height";
     pub const OVERLAY_OPACITY: &str = "overlay.opacity";
     pub const OVERLAY_HINT_SEEN: &str = "overlay.hint_seen";
+    /// The one radio devices are found and connected over. Kept through a
+    /// data reset, like the saved devices it decides between.
+    pub const DEVICE_RADIO: &str = "devices.radio";
+    /// "Not now" on the FTP check-in: until when, and the verdict set aside.
+    pub const FTP_CHECK_IN_SNOOZE: &str = "ftp.check_in_snooze";
 
     pub const FIRST_USE_COMPLETE: &str = "first_use_complete";
     pub const COACHING_CONTEXT: &str = "coaching.athlete_context";
@@ -227,6 +236,16 @@ pub async fn set_route_rides_linked(pool: &SqlitePool) -> Result<()> {
     db::set_setting(pool, keys::ROUTE_RIDES_LINKED, flag_value(true)).await
 }
 
+/// The id of the newest activity Intervals.icu withheld that the rider has
+/// already been told about, if any.
+pub async fn withheld_announced(pool: &SqlitePool) -> Result<Option<String>> {
+    db::get_setting(pool, keys::INTERVALS_WITHHELD_ANNOUNCED).await
+}
+
+pub async fn set_withheld_announced(pool: &SqlitePool, icu_id: &str) -> Result<()> {
+    db::set_setting(pool, keys::INTERVALS_WITHHELD_ANNOUNCED, icu_id).await
+}
+
 // ── Window geometry ──────────────────────────────────────────────────────────
 
 /// The size the window was last closed at. `None` means never recorded, and the
@@ -354,6 +373,40 @@ pub async fn set_overlay_opacity(pool: &SqlitePool, opacity: OverlayOpacity) -> 
 /// explanation appears on first use and never again.
 pub async fn mark_overlay_hint_seen(pool: &SqlitePool) -> Result<()> {
     db::set_setting(pool, keys::OVERLAY_HINT_SEEN, flag_value(true)).await
+}
+
+// ── Devices ──────────────────────────────────────────────────────────────────
+
+/// The radio the app uses for every device: ANT+ or Bluetooth, never both.
+///
+/// ANT+ unless the rider has chosen otherwise: it is the only radio this
+/// rider's trainer can be controlled over. Anything unreadable falls back to
+/// ANT+ too, rather than to whatever `Transport::from_db_str` defaults to.
+pub async fn device_radio(pool: &SqlitePool) -> Result<Transport> {
+    Ok(
+        match db::get_setting(pool, keys::DEVICE_RADIO).await?.as_deref() {
+            Some("ble") => Transport::BluetoothLe,
+            _ => Transport::AntPlus,
+        },
+    )
+}
+
+pub async fn set_device_radio(pool: &SqlitePool, radio: Transport) -> Result<()> {
+    db::set_setting(pool, keys::DEVICE_RADIO, radio.as_db_str()).await
+}
+
+// ── FTP check-in ─────────────────────────────────────────────────────────────
+
+/// The snooze on the FTP check-in card, if the rider set one aside.
+pub async fn ftp_check_in_snooze(pool: &SqlitePool) -> Result<Option<Snooze>> {
+    Ok(db::get_setting(pool, keys::FTP_CHECK_IN_SNOOZE)
+        .await?
+        .as_deref()
+        .and_then(Snooze::parse))
+}
+
+pub async fn set_ftp_check_in_snooze(pool: &SqlitePool, snooze: &Snooze) -> Result<()> {
+    db::set_setting(pool, keys::FTP_CHECK_IN_SNOOZE, &snooze.to_setting()).await
 }
 
 // ── First run ────────────────────────────────────────────────────────────────
@@ -573,6 +626,82 @@ mod tests {
         let loaded = load_window(&pool).await.unwrap();
         assert_eq!(loaded.width, Some(1280));
         assert_eq!(loaded.size(), None);
+    }
+
+    // ── Devices ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_default_the_device_radio_to_ant() {
+        let pool = test_pool().await;
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::AntPlus);
+    }
+
+    #[tokio::test]
+    async fn should_remember_the_device_radio() {
+        let pool = test_pool().await;
+        set_device_radio(&pool, Transport::BluetoothLe)
+            .await
+            .unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::BluetoothLe);
+        set_device_radio(&pool, Transport::AntPlus).await.unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::AntPlus);
+    }
+
+    #[tokio::test]
+    async fn should_read_an_unrecognised_device_radio_as_ant() {
+        // `Transport::from_db_str` reads anything unknown as Bluetooth, which
+        // here would silently take the rider's trainer away.
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::DEVICE_RADIO, "zigbee")
+            .await
+            .unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::AntPlus);
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_device_radio_through_a_full_data_reset() {
+        let pool = test_pool().await;
+        set_device_radio(&pool, Transport::BluetoothLe)
+            .await
+            .unwrap();
+        db::reset_athlete_data(&pool, true).await.unwrap();
+        assert_eq!(device_radio(&pool).await.unwrap(), Transport::BluetoothLe);
+    }
+
+    // ── FTP check-in ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_remember_a_check_in_snooze() {
+        use crate::training::ftp_detect::Direction;
+        let pool = test_pool().await;
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), None);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 23).expect("valid date");
+        let snooze = Snooze::starting(today, Direction::Hold);
+        set_ftp_check_in_snooze(&pool, &snooze).await.unwrap();
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), Some(snooze));
+    }
+
+    #[tokio::test]
+    async fn should_read_a_damaged_check_in_snooze_as_none() {
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::FTP_CHECK_IN_SNOOZE, "forever")
+            .await
+            .unwrap();
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn should_clear_the_check_in_snooze_with_the_athlete_data() {
+        // A reset starts the rider over; a snooze from the old data must not
+        // hide the new rider's first check-in.
+        use crate::training::ftp_detect::Direction;
+        let pool = test_pool().await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 23).expect("valid date");
+        set_ftp_check_in_snooze(&pool, &Snooze::starting(today, Direction::Up))
+            .await
+            .unwrap();
+        db::reset_athlete_data(&pool, true).await.unwrap();
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), None);
     }
 
     // ── First run and coaching context ───────────────────────────────────────

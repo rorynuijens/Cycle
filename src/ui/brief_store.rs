@@ -83,6 +83,9 @@ pub struct BriefStore {
     pool: SqlitePool,
     rt: tokio::runtime::Handle,
     athlete: Rc<RefCell<AthleteProfile>>,
+    /// For what the sync ahead of a brief finds that the rider should know —
+    /// today, only activities Intervals.icu withheld.
+    on_toast: Rc<dyn Fn(adw::Toast)>,
 }
 
 impl BriefStore {
@@ -90,6 +93,7 @@ impl BriefStore {
         pool: SqlitePool,
         rt: tokio::runtime::Handle,
         athlete: Rc<RefCell<AthleteProfile>>,
+        on_toast: Rc<dyn Fn(adw::Toast)>,
     ) -> Rc<Self> {
         Rc::new(Self {
             state: RefCell::new(BriefState::default()),
@@ -97,6 +101,7 @@ impl BriefStore {
             pool,
             rt,
             athlete,
+            on_toast,
         })
     }
 
@@ -245,6 +250,7 @@ impl BriefStore {
         });
 
         let store = Rc::clone(self);
+        let on_toast = Rc::clone(&self.on_toast);
         let pool = self.pool.clone();
         // Read now rather than at construction: the brief is written against
         // the rider's current FTP and heart-rate range.
@@ -258,7 +264,8 @@ impl BriefStore {
                 // about the rides the rider actually did. This also means the
                 // fingerprint taken inside `generate` covers what just arrived.
                 let (icu_id, icu_key) = intervals_credentials(&pool).await;
-                crate::ai::intervals::sync_recent(&pool, &icu_id, &icu_key, today).await;
+                let report =
+                    crate::ai::intervals::sync_recent(&pool, &icu_id, &icu_key, today).await;
                 // Ride streams are for the Fitness page, not the brief, and can
                 // run to megabytes — fetch them alongside, never in front.
                 tokio::spawn({
@@ -266,21 +273,43 @@ impl BriefStore {
                     async move { crate::ai::intervals::backfill_streams(&pool, &icu_key).await }
                 });
 
-                brief::generate(&pool, &api_key, athlete, today).await
+                (
+                    report,
+                    brief::generate(&pool, &api_key, athlete, today).await,
+                )
             },
-            move |result| match result {
-                Ok(brief) => store.set(BriefState {
-                    brief: Some(brief),
-                    status: BriefStatus::Idle,
-                }),
-                Err(e) => store.set(BriefState {
-                    // Keep whatever was on screen. A failed refresh should not
-                    // cost the rider the brief they already had.
-                    brief: previous,
-                    status: BriefStatus::Failed(e.into()),
-                }),
+            move |(report, result)| {
+                if report.announce {
+                    on_toast(
+                        adw::Toast::builder()
+                            .title(crate::ai::intervals::withheld_notice(report.withheld))
+                            .timeout(8)
+                            .build(),
+                    );
+                }
+                store.settle(previous, result);
             },
         );
+    }
+
+    /// Show what a request produced.
+    fn settle(
+        self: &Rc<Self>,
+        previous: Option<DailyBrief>,
+        result: Result<DailyBrief, brief::BriefError>,
+    ) {
+        match result {
+            Ok(brief) => self.set(BriefState {
+                brief: Some(brief),
+                status: BriefStatus::Idle,
+            }),
+            Err(e) => self.set(BriefState {
+                // Keep whatever was on screen. A failed refresh should not
+                // cost the rider the brief they already had.
+                brief: previous,
+                status: BriefStatus::Failed(e.into()),
+            }),
+        }
     }
 
     /// Replace the state and tell every card.

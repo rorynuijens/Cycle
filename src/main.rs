@@ -94,6 +94,15 @@ fn main() -> glib::ExitCode {
     let saved_devices = rt
         .block_on(data::db::load_saved_devices(&pool))
         .unwrap_or_default();
+    let device_radio = rt
+        .block_on(data::settings::device_radio(&pool))
+        .unwrap_or_else(|e| {
+            tracing::warn!("Could not read the device radio, using ANT+: {e}");
+            devices::peripheral::Transport::AntPlus
+        });
+    // Sent before the window exists, so the manager is on the right radio
+    // before the Devices page asks it to scan.
+    let _ = cmd_tx.try_send(devices::manager::DeviceCommand::SetRadio(device_radio));
 
     let app = adw::Application::builder()
         .application_id(APP_ID)
@@ -115,6 +124,7 @@ fn main() -> glib::ExitCode {
             pool.clone(),
             rt_handle.clone(),
             saved_devices.clone(),
+            device_radio,
             athlete.clone(),
             workout.clone(),
             workouts.clone(),

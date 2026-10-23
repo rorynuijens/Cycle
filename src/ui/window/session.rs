@@ -231,9 +231,6 @@ pub fn finish_session_closure(
         // weight and HR range rather than the values held at startup. The
         // borrow is dropped before the summary page can emit any signal.
         let athlete_now = athlete_for_complete.borrow().clone();
-        // The FTP the ride was actually executed at — the stamped value wins
-        // over the profile, so a bump taken mid-ride is not re-suggested.
-        let ftp = session.ftp_watts.unwrap_or(athlete_now.ftp_watts);
         summary_for_complete.update(&session, &name, &athlete_now, segments.as_deref());
         summary_for_complete.show_progression(
             &session,
@@ -256,58 +253,23 @@ pub fn finish_session_closure(
                 &session,
                 segments.as_deref(),
                 Rc::new(move |new_ftp| {
-                    // One cell, read by every page and by the running engine, so
-                    // writing it is the whole UI side of the change.
-                    let profile = {
-                        let mut a = athlete_ftp.borrow_mut();
-                        a.ftp_watts = new_ftp;
-                        a.clone()
-                    };
-                    toast_ftp.add_toast(
-                        adw::Toast::builder()
-                            .title(format!("FTP set to {new_ftp} W"))
-                            .timeout(5)
-                            .build(),
+                    crate::ui::ftp_change::accept(
+                        &pool_ftp,
+                        &rt_ftp,
+                        &athlete_ftp,
+                        &|toast| toast_ftp.add_toast(toast),
+                        new_ftp,
+                        "ramp_test",
+                        "ramp test",
                     );
-                    let pool = pool_ftp.clone();
-                    rt_ftp.spawn(async move {
-                        if let Err(e) = db::update_athlete(&pool, &profile).await {
-                            tracing::error!("update_athlete failed after a ramp test: {e}");
-                            return;
-                        }
-                        // Logged only once the profile write succeeded, so the
-                        // history never claims a change the profile did not take.
-                        if let Err(e) =
-                            db::log_ftp_change(&pool, new_ftp, "ramp_test", "ramp test").await
-                        {
-                            tracing::error!("log_ftp_change failed after a ramp test: {e}");
-                        }
-                    });
                 }),
             );
         }
 
-        // FTP auto-suggestion based on 20-minute best power. Not for a ramp
-        // test, which has its own card above and whose best 20 minutes are a
-        // warm-up and a ladder rather than an effort.
-        if let Some(peak_20) = session
-            .peak_power_for_duration(1200)
-            .filter(|_| !session.is_ftp_test)
-        {
-            let suggested = (peak_20 as f32 * 0.95) as u32;
-            if suggested > ftp + 5 {
-                toast_overlay_for_complete.add_toast(
-                    adw::Toast::builder()
-                        .title(format!(
-                            "Your 20-min best suggests an FTP of {} W (currently {} W). \
-                         Update in Preferences.",
-                            suggested, ftp
-                        ))
-                        .timeout(10)
-                        .build(),
-                );
-            }
-        }
+        // No FTP guess from this ride's best 20 minutes: in ERG the trainer
+        // holds power at the target, so that number is what the workout asked
+        // for, not what the rider can do. The Fitness page's check-in judges
+        // FTP from four weeks of completions instead (docs/ftp-detection.md).
 
         let pool = pool_for_complete.clone();
         let workout_id = session.workout_id;

@@ -25,6 +25,7 @@ use crate::data::{
     workout::Workout,
 };
 use crate::devices::manager::{DeviceCommand, DeviceEvent};
+use crate::devices::peripheral::Transport;
 use crate::training::engine::WorkoutEngine;
 
 /// Ends a ride: summary page, RPE prompt, save and upload. Takes the finished
@@ -49,6 +50,7 @@ impl CycleGtkWindow {
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
         saved_devices: Vec<SavedDevice>,
+        device_radio: Transport,
         athlete: AthleteProfile,
         workout: Workout,
         workouts: Vec<Workout>,
@@ -77,6 +79,7 @@ impl CycleGtkWindow {
             pool,
             rt_handle,
             saved_devices,
+            device_radio,
             athlete,
             workout,
             workouts,
@@ -97,6 +100,7 @@ impl CycleGtkWindow {
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
         saved_devices: Vec<SavedDevice>,
+        device_radio: Transport,
         athlete: AthleteProfile,
         workout: Workout,
         workouts: Vec<Workout>,
@@ -148,6 +152,7 @@ impl CycleGtkWindow {
             pool.clone(),
             rt_handle.clone(),
             saved_devices,
+            device_radio,
         )));
 
         let mut engine =
@@ -341,10 +346,12 @@ impl CycleGtkWindow {
         // Built before the pages that show it, so each can subscribe as it is
         // constructed. Nothing is requested until `start()` below, once every
         // page exists — otherwise a card built late would miss the result.
+        let toast_overlay_for_brief = self.toast_overlay.clone();
         let brief_store = crate::ui::brief_store::BriefStore::new(
             pool.clone(),
             rt_handle.clone(),
             Rc::clone(&athlete_rc),
+            Rc::new(move |toast| toast_overlay_for_brief.add_toast(toast)),
         );
 
         // ── Calendar page — built after on_library_start so "Load Now" can start workouts ──
@@ -708,6 +715,19 @@ impl CycleGtkWindow {
             Rc::clone(&workout_active),
             Rc::clone(&route_timer_alive),
         );
+
+        // ── Lock the device radio for the whole ride ─────────────────────────
+        // Polled like the screen lock above, for the same reason: the two ride
+        // flags are written from too many places to hook each one.
+        let devices_ride = Rc::clone(&devices_rc);
+        let workout_ride = Rc::clone(&workout_active);
+        let route_ride = Rc::clone(&route_timer_alive);
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            devices_ride
+                .borrow()
+                .set_riding(workout_ride.get() || route_ride.get());
+            glib::ControlFlow::Continue
+        });
 
         self.toast_overlay.set_child(Some(&content_chrome.root));
         self.window.set_content(Some(&self.toast_overlay));

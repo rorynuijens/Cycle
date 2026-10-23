@@ -17,6 +17,7 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 
 use crate::data::db::{self, SavedDevice};
+use crate::data::settings;
 use crate::devices::manager::{DeviceCommand, DeviceType};
 use crate::devices::peripheral::Transport;
 
@@ -80,6 +81,11 @@ struct PageCtx {
     /// Auto-reconnect scans since the last successful connection. Drives the
     /// backoff in [`reconnect_delay`] and is reset whenever anything connects.
     reconnect_attempts: Rc<Cell<u32>>,
+    /// The one radio devices are found and connected over.
+    radio: Rc<Cell<Transport>>,
+    radio_row: adw::ComboRow,
+    /// A ride is under way, so the radio is locked — see [`DevicesPage::set_riding`].
+    riding: Rc<Cell<bool>>,
 }
 
 pub struct DevicesPage {
@@ -93,6 +99,7 @@ impl DevicesPage {
         pool: SqlitePool,
         rt_handle: tokio::runtime::Handle,
         saved_devices: Vec<SavedDevice>,
+        radio: Transport,
     ) -> Self {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -138,6 +145,13 @@ impl DevicesPage {
         // ── Settings ─────────────────────────────────────────────────────────
         let auto_reconnect = Rc::new(Cell::new(true));
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
+        let radio_row = adw::ComboRow::builder()
+            .title("Connect Using")
+            .subtitle(radio_subtitle(radio, false, None))
+            .model(&gtk::StringList::new(&RADIOS.map(radio_name)))
+            .selected(radio_index(radio))
+            .build();
+        settings_group.add(&radio_row);
         let auto_switch = adw::SwitchRow::builder()
             .title("Reconnect automatically")
             .subtitle("Connect to saved devices as soon as a scan finds them")
@@ -167,7 +181,17 @@ impl DevicesPage {
             scan_generation: Rc::new(Cell::new(0)),
             auto_reconnect,
             reconnect_attempts: Rc::new(Cell::new(0)),
+            radio: Rc::new(Cell::new(radio)),
+            radio_row: radio_row.clone(),
+            riding: Rc::new(Cell::new(false)),
         };
+
+        let ctx_radio = ctx.clone();
+        radio_row.connect_selected_notify(move |row| {
+            if let Some(chosen) = radio_at(row.selected()) {
+                switch_radio(&ctx_radio, chosen);
+            }
+        });
 
         let ctx_scan = ctx.clone();
         scan_btn.connect_clicked(move |_| begin_scan(&ctx_scan));
@@ -181,13 +205,14 @@ impl DevicesPage {
             if kind == DeviceType::Unknown && transport == Transport::AntPlus {
                 kind = DeviceType::FtmsTrainer;
             }
+            let status = saved_status(false, false, false, false, transport, radio);
             let (row, status_label) = make_saved_row(
                 &ctx,
                 &saved.address,
                 &saved.display_name,
                 kind,
                 transport,
-                RowStatus::Idle,
+                status,
             );
             ctx.my_devices_group.add(&row);
             ctx.entries.borrow_mut().insert(
@@ -213,7 +238,7 @@ impl DevicesPage {
 
         // Auto-start a scan on launch when saved devices exist so they reconnect
         // without the user having to navigate to the Devices page first.
-        if !saved_devices.is_empty() {
+        if has_missing_saved(&ctx) {
             begin_scan(&ctx);
         }
 
@@ -224,6 +249,16 @@ impl DevicesPage {
         &self.root
     }
 
+    /// Lock the radio while a ride is under way, so a stray tap cannot drop
+    /// the trainer mid-interval. Cheap to call every second.
+    pub fn set_riding(&self, riding: bool) {
+        if self.ctx.riding.replace(riding) == riding {
+            return;
+        }
+        self.ctx.radio_row.set_sensitive(!riding);
+        refresh_radio_subtitle(&self.ctx);
+    }
+
     pub fn on_discovered(
         &mut self,
         address: String,
@@ -232,6 +267,11 @@ impl DevicesPage {
         transport: Transport,
         kind: DeviceType,
     ) {
+        // The manager only reports the radio in use; a straggler from the
+        // moment of a switch must not be listed or connected.
+        if transport != self.ctx.radio.get() {
+            return;
+        }
         let mut auto_connect = false;
         {
             let mut entries = self.ctx.entries.borrow_mut();
@@ -249,6 +289,7 @@ impl DevicesPage {
                         entry.connecting,
                         entry.held_off,
                         self.ctx.auto_reconnect.get(),
+                        true,
                     ) {
                         entry.connecting = true;
                         auto_connect = true;
@@ -373,15 +414,41 @@ impl DevicesPage {
             // fires from `on_discovered`, which needs a scan running, and no
             // scan runs during a ride. Start one so the existing path can work.
             // Not for a device the rider disconnected on purpose.
-            let went_missing = self
-                .ctx
-                .entries
-                .borrow()
-                .get(&address)
-                .is_some_and(|e| is_missing(e.saved, e.connected, e.held_off));
+            let went_missing = self.ctx.entries.borrow().get(&address).is_some_and(|e| {
+                is_missing(
+                    e.saved,
+                    e.connected,
+                    e.held_off,
+                    e.transport == self.ctx.radio.get(),
+                )
+            });
             if went_missing {
                 schedule_reconnect_scan(&self.ctx);
             }
+        }
+    }
+
+    /// A connect did not happen. Clear the in-flight flag so the row stops
+    /// saying "Connecting…" and the next scan may try again, and start that
+    /// scan on the usual back-off if the device is one being hunted for.
+    pub fn on_connect_failed(&mut self, address: &str) {
+        let missing = {
+            let mut entries = self.ctx.entries.borrow_mut();
+            let Some(entry) = entries.get_mut(address) else {
+                return;
+            };
+            entry.connecting = false;
+            is_missing(
+                entry.saved,
+                entry.connected,
+                entry.held_off,
+                entry.transport == self.ctx.radio.get(),
+            )
+        };
+        update_saved_statuses(&self.ctx);
+        refresh_strip(&self.ctx);
+        if missing {
+            schedule_reconnect_scan(&self.ctx);
         }
     }
 
@@ -481,6 +548,9 @@ fn make_slot_card(strip: &gtk::Box, icon_name: &str, role: &str) -> SetupSlot {
 
 /// Recompute all three role cards from the current entries.
 fn refresh_strip(ctx: &PageCtx) {
+    // Runs on load, on every save, forget and radio switch: each can change
+    // whether Bluetooth can control the trainer.
+    refresh_radio_subtitle(ctx);
     let entries = ctx.entries.borrow();
     let scanning = ctx.scanning.get();
 
@@ -506,20 +576,23 @@ fn refresh_strip(ctx: &PageCtx) {
         let connected = entries
             .values()
             .find(|e| e.saved && e.connected && kinds.contains(&e.kind));
+        // A device on the radio in use first: it is the one that can connect.
+        let radio = ctx.radio.get();
         let saved = entries
             .values()
-            .find(|e| e.saved && kinds.contains(&e.kind));
+            .filter(|e| e.saved && kinds.contains(&e.kind))
+            .min_by_key(|e| e.transport != radio);
 
         match (connected, saved) {
             (Some(e), _) => set_slot(slot, &e.display_name, "Connected", true),
             (None, Some(e)) => {
                 let status =
-                    if saved_status(false, false, e.held_off, scanning) == RowStatus::Searching {
-                        "Searching…"
-                    } else {
-                        "Not connected"
+                    match saved_status(false, false, e.held_off, scanning, e.transport, radio) {
+                        RowStatus::Searching => "Searching…".to_string(),
+                        RowStatus::OtherRadio(needs) => format!("Needs {}", radio_name(needs)),
+                        _ => "Not connected".to_string(),
                     };
-                set_slot(slot, &e.display_name, status, false);
+                set_slot(slot, &e.display_name, &status, false);
             }
             (None, None) => set_slot(slot, empty_name, "Scan to add one", false),
         }
@@ -548,20 +621,31 @@ fn should_auto_connect(
     connecting: bool,
     held_off: bool,
     auto_reconnect: bool,
+    on_radio: bool,
 ) -> bool {
-    saved && !connected && !connecting && !held_off && auto_reconnect
+    saved && !connected && !connecting && !held_off && auto_reconnect && on_radio
 }
 
 /// Whether a saved device counts as missing — what the reconnect scans are
-/// looking for, and what keeps them going.
-fn is_missing(saved: bool, connected: bool, held_off: bool) -> bool {
-    saved && !connected && !held_off
+/// looking for, and what keeps them going. A device on the radio not in use
+/// is not missing: no scan could find it.
+fn is_missing(saved: bool, connected: bool, held_off: bool, on_radio: bool) -> bool {
+    saved && !connected && !held_off && on_radio
 }
 
-/// What a saved device's row says.
-fn saved_status(connected: bool, connecting: bool, held_off: bool, scanning: bool) -> RowStatus {
+/// What a saved device's row says, given the radio in use.
+fn saved_status(
+    connected: bool,
+    connecting: bool,
+    held_off: bool,
+    scanning: bool,
+    transport: Transport,
+    radio: Transport,
+) -> RowStatus {
     if connected {
         RowStatus::Connected
+    } else if transport != radio {
+        RowStatus::OtherRadio(transport)
     } else if connecting {
         RowStatus::Connecting
     } else if scanning && !held_off {
@@ -659,46 +743,196 @@ fn finish_scan(ctx: &PageCtx) {
 }
 
 fn has_missing_saved(ctx: &PageCtx) -> bool {
+    let radio = ctx.radio.get();
     ctx.entries
         .borrow()
         .values()
-        .any(|e| is_missing(e.saved, e.connected, e.held_off))
+        .any(|e| is_missing(e.saved, e.connected, e.held_off, e.transport == radio))
 }
 
 /// Refresh status text on every saved-but-not-connected row.
 fn update_saved_statuses(ctx: &PageCtx) {
     let scanning = ctx.scanning.get();
+    let radio = ctx.radio.get();
     let entries = ctx.entries.borrow();
     for entry in entries.values() {
         if !entry.saved || entry.connected {
             continue;
         }
-        let status = saved_status(entry.connected, entry.connecting, entry.held_off, scanning);
+        let status = saved_status(
+            entry.connected,
+            entry.connecting,
+            entry.held_off,
+            scanning,
+            entry.transport,
+            radio,
+        );
         if let Some(label) = &entry.status_label {
             apply_status(label, status);
         }
+        dim_if_unavailable(&entry.row, status);
     }
 }
 
 // ── Row construction ─────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RowStatus {
     Connected,
     Connecting,
     Searching,
     Idle,
+    /// On the radio not in use: it cannot connect until the rider switches.
+    OtherRadio(Transport),
 }
 
 fn apply_status(label: &gtk::Label, status: RowStatus) {
-    let (text, classes): (&str, &[&str]) = match status {
-        RowStatus::Connected => ("Connected", &["caption", "success"]),
-        RowStatus::Connecting => ("Connecting…", &["caption", "dim-label"]),
-        RowStatus::Searching => ("Searching…", &["caption", "dim-label"]),
-        RowStatus::Idle => ("Not connected", &["caption", "dim-label"]),
+    let text = match status {
+        RowStatus::Connected => "Connected".to_string(),
+        RowStatus::Connecting => "Connecting…".to_string(),
+        RowStatus::Searching => "Searching…".to_string(),
+        RowStatus::Idle => "Not connected".to_string(),
+        RowStatus::OtherRadio(needs) => format!("Needs {}", radio_name(needs)),
     };
-    label.set_label(text);
+    let classes: &[&str] = match status {
+        RowStatus::Connected => &["caption", "success"],
+        _ => &["caption", "dim-label"],
+    };
+    label.set_label(&text);
     label.set_css_classes(classes);
+}
+
+/// Dim a saved row that cannot connect on the radio in use. Kept listed, not
+/// hidden: the rider can still see it, rename it or forget it.
+fn dim_if_unavailable(row: &adw::ActionRow, status: RowStatus) {
+    if matches!(status, RowStatus::OtherRadio(_)) {
+        row.add_css_class("dim-label");
+    } else {
+        row.remove_css_class("dim-label");
+    }
+}
+
+// ── Radio ────────────────────────────────────────────────────────────────────
+
+/// The choices, in the order the row lists them.
+const RADIOS: [Transport; 2] = [Transport::AntPlus, Transport::BluetoothLe];
+
+/// What the rider calls each radio. `Transport::label` says "Bluetooth LE",
+/// which belongs in a device's details, not in a choice between two radios.
+fn radio_name(radio: Transport) -> &'static str {
+    match radio {
+        Transport::AntPlus => "ANT+",
+        Transport::BluetoothLe => "Bluetooth",
+    }
+}
+
+fn radio_index(radio: Transport) -> u32 {
+    RADIOS.iter().position(|r| *r == radio).unwrap_or(0) as u32
+}
+
+fn radio_at(index: u32) -> Option<Transport> {
+    RADIOS.get(index as usize).copied()
+}
+
+fn radio_subtitle(radio: Transport, riding: bool, ant_only_trainer: Option<&str>) -> String {
+    if riding {
+        return "Can’t be changed during a ride".to_string();
+    }
+    match (radio, ant_only_trainer) {
+        (Transport::AntPlus, _) => "Through the ANT+ USB stick".to_string(),
+        (Transport::BluetoothLe, None) => "Through this computer’s Bluetooth".to_string(),
+        (Transport::BluetoothLe, Some(trainer)) => format!(
+            "Through this computer’s Bluetooth. {trainer} can’t set resistance over \
+             Bluetooth, so ERG workouts need ANT+"
+        ),
+    }
+}
+
+/// The name of the saved trainer that only ANT+ can control, when the rider
+/// has no trainer saved that Bluetooth can control instead.
+///
+/// The Elite Drivo is the case this exists for: over Bluetooth it shows up as
+/// a power meter and nothing more, so Bluetooth mode quietly drops every ERG
+/// target. A trainer saved over Bluetooth is one Bluetooth found controllable
+/// (power meters are saved as `CyclingPowerMeter`), and then there is no warning.
+fn ant_only_trainer<'a>(
+    saved: impl IntoIterator<Item = (&'a str, Transport, DeviceType)>,
+) -> Option<&'a str> {
+    let mut ant_trainer = None;
+    for (name, transport, kind) in saved {
+        if kind != DeviceType::FtmsTrainer {
+            continue;
+        }
+        match transport {
+            Transport::BluetoothLe => return None,
+            Transport::AntPlus => ant_trainer = ant_trainer.or(Some(name)),
+        }
+    }
+    ant_trainer
+}
+
+/// Set the "Connect Using" subtitle from the radio, the ride, and the saved trainers.
+fn refresh_radio_subtitle(ctx: &PageCtx) {
+    let entries = ctx.entries.borrow();
+    let trainer = ant_only_trainer(
+        entries
+            .values()
+            .filter(|e| e.saved)
+            .map(|e| (e.display_name.as_str(), e.transport, e.kind)),
+    );
+    ctx.radio_row
+        .set_subtitle(&radio_subtitle(ctx.radio.get(), ctx.riding.get(), trainer));
+}
+
+/// Move every device over to `radio`: the manager drops what is on the other
+/// one, and a scan starts for the saved devices on this one.
+fn switch_radio(ctx: &PageCtx, radio: Transport) {
+    if ctx.radio.get() == radio {
+        return;
+    }
+    if ctx.riding.get() {
+        // The row is insensitive during a ride; this is only the belt to that.
+        ctx.radio_row.set_selected(radio_index(ctx.radio.get()));
+        return;
+    }
+    let left = ctx.radio.replace(radio);
+    tracing::info!("Devices now use {}", radio_name(radio));
+    let _ = ctx.cmd_tx.try_send(DeviceCommand::SetRadio(radio));
+
+    let pool = ctx.pool.clone();
+    ctx.rt.spawn(async move {
+        if let Err(e) = settings::set_device_radio(&pool, radio).await {
+            tracing::error!("Could not save the device radio: {e}");
+        }
+    });
+
+    if ctx.scanning.get() {
+        let _ = ctx.cmd_tx.try_send(DeviceCommand::StopScan);
+        finish_scan(ctx);
+    }
+    {
+        let mut entries = ctx.entries.borrow_mut();
+        // Found-but-unsaved devices on the radio just left can no longer be added.
+        entries.retain(|_, e| {
+            let keep = e.saved || e.transport != left;
+            if !keep {
+                ctx.add_group.remove(&e.row);
+            }
+            keep
+        });
+        // The manager no longer knows them, so nothing on that radio is
+        // connectable until a scan on it finds them again.
+        for e in entries.values_mut().filter(|e| e.transport == left) {
+            e.seen = false;
+            e.connecting = false;
+        }
+    }
+    ctx.reconnect_attempts.set(0);
+    update_saved_statuses(ctx);
+    refresh_strip(ctx);
+    if has_missing_saved(ctx) {
+        begin_scan(ctx);
+    }
 }
 
 fn make_saved_row(
@@ -726,6 +960,7 @@ fn make_saved_row(
 
     let status_label = gtk::Label::builder().valign(gtk::Align::Center).build();
     apply_status(&status_label, status);
+    dim_if_unavailable(&row, status);
     row.add_suffix(&status_label);
     row.add_suffix(
         &gtk::Image::builder()
@@ -749,7 +984,14 @@ fn rebuild_saved_row(ctx: &PageCtx, address: &str) {
     let Some((old_row, display_name, kind, transport, status)) = ({
         let entries = ctx.entries.borrow();
         entries.get(address).map(|e| {
-            let status = saved_status(e.connected, e.connecting, e.held_off, ctx.scanning.get());
+            let status = saved_status(
+                e.connected,
+                e.connecting,
+                e.held_off,
+                ctx.scanning.get(),
+                e.transport,
+                ctx.radio.get(),
+            );
             (
                 e.row.clone(),
                 e.display_name.clone(),
@@ -764,7 +1006,11 @@ fn rebuild_saved_row(ctx: &PageCtx, address: &str) {
 
     let (new_row, status_label) =
         make_saved_row(ctx, address, &display_name, kind, transport, status);
-    ctx.my_devices_group.remove(&old_row);
+    // A device saved just now has its old row in "Add a Device", already
+    // taken out by the caller; removing it from here too is a GTK critical.
+    if old_row.is_ancestor(&ctx.my_devices_group) {
+        ctx.my_devices_group.remove(&old_row);
+    }
     ctx.my_devices_group.add(&new_row);
 
     if let Some(entry) = ctx.entries.borrow_mut().get_mut(address) {
@@ -957,6 +1203,16 @@ fn open_device_dialog(ctx: &PageCtx, address: &str, parent: &impl IsA<gtk::Widge
             }
         ));
         actions.append(&disconnect_btn);
+    } else if transport != ctx.radio.get() {
+        let hint = gtk::Label::builder()
+            .label(format!(
+                "Set Connect Using to {} to use this device",
+                radio_name(transport)
+            ))
+            .css_classes(["caption", "dim-label"])
+            .wrap(true)
+            .build();
+        actions.append(&hint);
     } else if seen {
         let connect_btn = gtk::Button::builder()
             .label("Connect")
@@ -1097,6 +1353,9 @@ fn signal_text(rssi: Option<i16>) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    const ANT: Transport = Transport::AntPlus;
+    const BLE: Transport = Transport::BluetoothLe;
+
     // ── A disconnect the rider asked for ────────────────────────────────────
     // Pressing Disconnect on a saved device used to be undone within seconds:
     // the disconnect looked like a dropout, a reconnect scan started, the
@@ -1104,57 +1363,176 @@ mod tests {
 
     #[test]
     fn should_auto_connect_a_saved_device_that_dropped_out() {
-        assert!(should_auto_connect(true, false, false, false, true));
+        assert!(should_auto_connect(true, false, false, false, true, true));
     }
 
     #[test]
     fn should_not_auto_connect_a_device_the_rider_disconnected() {
-        assert!(!should_auto_connect(true, false, false, true, true));
+        assert!(!should_auto_connect(true, false, false, true, true, true));
     }
 
     #[test]
     fn should_not_auto_connect_with_auto_reconnect_off() {
-        assert!(!should_auto_connect(true, false, false, false, false));
+        assert!(!should_auto_connect(true, false, false, false, false, true));
     }
 
     #[test]
     fn should_not_auto_connect_twice_while_a_connect_is_in_flight() {
-        assert!(!should_auto_connect(true, false, true, false, true));
+        assert!(!should_auto_connect(true, false, true, false, true, true));
     }
 
     #[test]
     fn should_not_auto_connect_a_device_that_was_never_saved() {
-        assert!(!should_auto_connect(false, false, false, false, true));
+        assert!(!should_auto_connect(false, false, false, false, true, true));
     }
 
     #[test]
     fn should_count_a_saved_device_that_dropped_out_as_missing() {
-        assert!(is_missing(true, false, false));
+        assert!(is_missing(true, false, false, true));
     }
 
     #[test]
     fn should_not_hunt_for_a_device_the_rider_disconnected() {
-        assert!(!is_missing(true, false, true));
+        assert!(!is_missing(true, false, true, true));
     }
 
     #[test]
     fn should_not_count_a_connected_device_as_missing() {
-        assert!(!is_missing(true, true, false));
+        assert!(!is_missing(true, true, false, true));
     }
 
     #[test]
     fn should_not_say_searching_for_a_device_the_rider_disconnected() {
-        assert!(saved_status(false, false, true, true) == RowStatus::Idle);
+        assert!(saved_status(false, false, true, true, BLE, BLE) == RowStatus::Idle);
     }
 
     #[test]
     fn should_say_searching_for_a_missing_device_during_a_scan() {
-        assert!(saved_status(false, false, false, true) == RowStatus::Searching);
+        assert!(saved_status(false, false, false, true, BLE, BLE) == RowStatus::Searching);
     }
 
     #[test]
     fn should_say_connecting_once_the_rider_presses_connect() {
-        assert!(saved_status(false, true, false, true) == RowStatus::Connecting);
+        assert!(saved_status(false, true, false, true, BLE, BLE) == RowStatus::Connecting);
+    }
+
+    // ── One radio at a time ─────────────────────────────────────────────────
+
+    #[test]
+    fn should_not_auto_connect_a_device_on_the_radio_not_in_use() {
+        assert!(!should_auto_connect(true, false, false, false, true, false));
+    }
+
+    #[test]
+    fn should_not_hunt_for_a_device_on_the_radio_not_in_use() {
+        // Otherwise a saved Bluetooth device keeps reconnect scans going for
+        // as long as ANT+ is in use, and no scan can ever find it.
+        assert!(!is_missing(true, false, false, false));
+    }
+
+    #[test]
+    fn should_say_which_radio_a_device_needs() {
+        assert_eq!(
+            saved_status(false, false, false, true, BLE, ANT),
+            RowStatus::OtherRadio(BLE)
+        );
+        assert_eq!(
+            saved_status(false, true, false, true, ANT, BLE),
+            RowStatus::OtherRadio(ANT)
+        );
+    }
+
+    #[test]
+    fn should_keep_saying_connected_until_the_other_radio_lets_go() {
+        // Between the switch and the manager's disconnect, the truth is
+        // that it is still connected.
+        assert_eq!(
+            saved_status(true, false, false, false, BLE, ANT),
+            RowStatus::Connected
+        );
+    }
+
+    #[test]
+    fn should_list_ant_first_and_map_both_ways() {
+        assert_eq!(radio_at(0), Some(ANT));
+        assert_eq!(radio_at(1), Some(BLE));
+        assert_eq!(radio_at(2), None);
+        for r in RADIOS {
+            assert_eq!(radio_at(radio_index(r)), Some(r));
+        }
+    }
+
+    #[test]
+    fn should_call_bluetooth_bluetooth_in_the_choice() {
+        assert_eq!(radio_name(BLE), "Bluetooth");
+        assert_eq!(radio_name(ANT), "ANT+");
+    }
+
+    #[test]
+    fn should_say_the_radio_is_locked_during_a_ride() {
+        let drivo = Some("Elite Drivo");
+        assert_eq!(
+            radio_subtitle(ANT, true, None),
+            "Can’t be changed during a ride"
+        );
+        assert_eq!(
+            radio_subtitle(BLE, true, drivo),
+            "Can’t be changed during a ride"
+        );
+        assert_ne!(
+            radio_subtitle(ANT, false, None),
+            radio_subtitle(BLE, false, None)
+        );
+    }
+
+    #[test]
+    fn should_name_the_trainer_that_bluetooth_cannot_control() {
+        let drivo = Some("Elite Drivo");
+        assert_eq!(
+            radio_subtitle(BLE, false, drivo),
+            "Through this computer’s Bluetooth. Elite Drivo can’t set resistance over \
+             Bluetooth, so ERG workouts need ANT+"
+        );
+        // On ANT+ the trainer is controlled, so there is nothing to warn about.
+        assert_eq!(
+            radio_subtitle(ANT, false, drivo),
+            "Through the ANT+ USB stick"
+        );
+    }
+
+    #[test]
+    fn should_find_the_ant_only_trainer_among_the_saved_devices() {
+        use DeviceType::*;
+        // The rider's own saved list: the Drivo on ANT+, and the same Drivo
+        // on Bluetooth, where it is only a power meter.
+        let saved = [
+            ("Xand HR Band", ANT, HeartRateMonitor),
+            ("Elite Drivo", ANT, FtmsTrainer),
+            ("Cadence", BLE, CadenceSensor),
+            ("DR", BLE, CyclingPowerMeter),
+        ];
+        assert_eq!(ant_only_trainer(saved), Some("Elite Drivo"));
+    }
+
+    #[test]
+    fn should_not_warn_when_a_bluetooth_trainer_is_saved() {
+        use DeviceType::*;
+        let both = [
+            ("Elite Drivo", ANT, FtmsTrainer),
+            ("Kickr", BLE, FtmsTrainer),
+        ];
+        assert_eq!(ant_only_trainer(both), None);
+        // Order must not matter: the Bluetooth trainer listed first still wins.
+        let reversed = [
+            ("Kickr", BLE, FtmsTrainer),
+            ("Elite Drivo", ANT, FtmsTrainer),
+        ];
+        assert_eq!(ant_only_trainer(reversed), None);
+        assert_eq!(
+            ant_only_trainer([("Xand HR Band", ANT, HeartRateMonitor)]),
+            None
+        );
+        assert_eq!(ant_only_trainer([]), None);
     }
 
     #[test]

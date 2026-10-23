@@ -28,11 +28,6 @@
 //!   recorded cadence. Down and "looks right" still work — a detector that can
 //!   only ease, when it is half blind, errs in the safe direction.
 
-// The check-in card (docs/ftp-detection.md §6) is the caller, and lands next.
-// Everything here is deliberately caller-less until then, in the same way the
-// phase-1 `ftp_history` CRUD was.
-#![allow(dead_code)]
-
 use chrono::{Local, NaiveDate};
 
 use crate::data::session::{DataPoint, Session};
@@ -672,6 +667,110 @@ fn hold(current_ftp: u32, evidence: Vec<String>) -> FtpSuggestion {
     }
 }
 
+// ── The check-in ────────────────────────────────────────────────────────────
+
+/// How long "Not now" keeps the check-in card away, in days (spec §5).
+const SNOOZE_DAYS: i64 = 14;
+
+/// The rider set the check-in aside: until when, and what it was saying then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snooze {
+    /// The first day the card may show again.
+    pub until: NaiveDate,
+    pub direction: Direction,
+}
+
+impl Snooze {
+    /// A snooze set on `today` for a verdict pointing `direction`.
+    pub fn starting(today: NaiveDate, direction: Direction) -> Self {
+        Self {
+            until: today + chrono::Duration::days(SNOOZE_DAYS),
+            direction,
+        }
+    }
+
+    /// Whether this snooze still hides `suggestion` on `today`.
+    ///
+    /// Only a verdict pointing the same way is hidden. One that has changed
+    /// direction since is news — a snooze set on "looks right" must never be
+    /// what keeps an "ease it" from the rider.
+    pub fn hides(&self, suggestion: &FtpSuggestion, today: NaiveDate) -> bool {
+        today < self.until && suggestion.direction == self.direction
+    }
+
+    /// The form kept in the settings table: `"2026-11-06 down"`.
+    pub fn to_setting(self) -> String {
+        format!(
+            "{} {}",
+            self.until.format("%Y-%m-%d"),
+            self.direction.as_str()
+        )
+    }
+
+    /// Read [`Self::to_setting`] back. Anything else is no snooze: a damaged
+    /// row must not hide the card for good.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (date, direction) = raw.split_once(' ')?;
+        Some(Self {
+            until: NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?,
+            direction: Direction::parse(direction)?,
+        })
+    }
+}
+
+impl Direction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+            Direction::Hold => "hold",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "up" => Some(Direction::Up),
+            "down" => Some(Direction::Down),
+            "hold" => Some(Direction::Hold),
+            _ => None,
+        }
+    }
+}
+
+/// What the Fitness page's check-in card should say today, or `None` to leave
+/// it hidden.
+///
+/// Hidden when the window is too thin to judge ([`suggest`]), when the rider
+/// snoozed this same verdict, or when there is no FTP to judge against. A move
+/// the guard rails round back to the current number is shown as a hold: a
+/// button that sets FTP to what it already is offers nothing.
+pub fn check_in(
+    evidence: &[SessionEvidence],
+    current_ftp: u32,
+    last_change: Option<NaiveDate>,
+    today: NaiveDate,
+    snooze: Option<&Snooze>,
+) -> Option<FtpSuggestion> {
+    if current_ftp == 0 {
+        return None;
+    }
+    let mut suggestion = suggest(
+        &summarise(evidence, today),
+        current_ftp,
+        last_change,
+        today,
+        None,
+    )?;
+    if suggestion.new_ftp == current_ftp {
+        suggestion.direction = Direction::Hold;
+        suggestion.delta_pct = 0.0;
+    }
+    if snooze.is_some_and(|z| z.hides(&suggestion, today)) {
+        return None;
+    }
+    Some(suggestion)
+}
+
 // ── Evidence sentences ──────────────────────────────────────────────────────
 
 fn sessions_phrase(summary: &WindowSummary) -> String {
@@ -682,7 +781,7 @@ fn sessions_phrase(summary: &WindowSummary) -> String {
 fn completion_line(summary: &WindowSummary) -> String {
     let completed = summary.total_segments - summary.failed_segments;
     format!(
-        "{completed} of {} threshold intervals completed, averaging {:.0} % of target",
+        "{completed} of {} threshold intervals completed, averaging {:.0}% of target",
         summary.total_segments,
         summary.avg_compliance * 100.0
     )
@@ -1551,5 +1650,109 @@ mod tests {
         assert_eq!(s.direction, Direction::Up);
         assert_eq!(s.new_ftp, 208); // 2 % base + 1 % for RPE 5 + 1 % for drift
         assert!(s.evidence.iter().any(|l| l.contains("drift improved")));
+    }
+
+    // ── The check-in: snoozes and the card's verdict ─────────────────────────
+
+    fn clean_window() -> Vec<SessionEvidence> {
+        vec![
+            clean_session(days_ago(2), 5),
+            clean_session(days_ago(5), 5),
+            clean_session(days_ago(9), 5),
+        ]
+    }
+
+    fn failing_window() -> Vec<SessionEvidence> {
+        vec![
+            failed_session(days_ago(2), 9),
+            failed_session(days_ago(5), 9),
+            failed_session(days_ago(9), 9),
+        ]
+    }
+
+    #[test]
+    fn should_keep_a_snoozed_verdict_away_for_exactly_fourteen_days() {
+        let s = check_in(&clean_window(), FTP, None, today(), None).expect("a check-in");
+        assert_eq!(s.direction, Direction::Up);
+        let snooze = Snooze::starting(days_ago(14), Direction::Up);
+        assert_eq!(snooze.until, today());
+        let day_before = Snooze::starting(days_ago(13), Direction::Up);
+        assert_eq!(
+            check_in(&clean_window(), FTP, None, today(), Some(&day_before)),
+            None
+        );
+        // On the fourteenth day it is back.
+        assert_eq!(
+            check_in(&clean_window(), FTP, None, today(), Some(&snooze)),
+            Some(s)
+        );
+    }
+
+    #[test]
+    fn should_not_let_a_looks_right_snooze_hide_a_drop() {
+        // The rider set aside "FTP looks right" yesterday; today the window
+        // says ease it. That is news, and the snooze must not swallow it.
+        let snooze = Snooze::starting(days_ago(1), Direction::Hold);
+        let s = check_in(&failing_window(), FTP, None, today(), Some(&snooze))
+            .expect("a drop is shown through a hold snooze");
+        assert_eq!(s.direction, Direction::Down);
+    }
+
+    #[test]
+    fn should_show_a_rise_through_a_snoozed_drop() {
+        let snooze = Snooze::starting(days_ago(1), Direction::Down);
+        let s = check_in(&clean_window(), FTP, None, today(), Some(&snooze)).expect("shown");
+        assert_eq!(s.direction, Direction::Up);
+    }
+
+    #[test]
+    fn should_say_nothing_on_fewer_than_three_hard_sessions() {
+        let two = &clean_window()[..2];
+        assert_eq!(check_in(two, FTP, None, today(), None), None);
+        assert_eq!(check_in(&[], FTP, None, today(), None), None);
+    }
+
+    #[test]
+    fn should_hold_when_the_ceiling_leaves_nothing_to_raise() {
+        // At the 500 W ceiling a rise rounds back to 500. A card offering
+        // "Set FTP to 500 W" to a rider on 500 W is a button that does nothing.
+        let s = check_in(&clean_window(), 500, None, today(), None).expect("a check-in");
+        assert_eq!(s.direction, Direction::Hold);
+        assert_eq!(s.new_ftp, 500);
+        assert_eq!(s.delta_pct, 0.0);
+    }
+
+    #[test]
+    fn should_say_nothing_about_an_ftp_of_zero() {
+        assert_eq!(check_in(&clean_window(), 0, None, today(), None), None);
+    }
+
+    #[test]
+    fn should_store_a_snooze_and_read_it_back() {
+        for direction in [Direction::Up, Direction::Down, Direction::Hold] {
+            let snooze = Snooze::starting(today(), direction);
+            assert_eq!(Snooze::parse(&snooze.to_setting()), Some(snooze));
+        }
+        assert_eq!(
+            Snooze::starting(today(), Direction::Down).to_setting(),
+            "2026-09-20 down"
+        );
+    }
+
+    #[test]
+    fn should_read_a_damaged_snooze_as_no_snooze() {
+        // The settings table is not trusted (CLAUDE.md §5.2): a snooze that
+        // cannot be read hides nothing, rather than hiding the card for good.
+        for raw in [
+            "",
+            "2026-09-20",
+            "2026-09-20 sideways",
+            "2026-13-01 up",
+            "up 2026-09-20",
+            "2026-09-20 up extra",
+            " 2026-09-20 up",
+        ] {
+            assert_eq!(Snooze::parse(raw), None, "{raw:?}");
+        }
     }
 }

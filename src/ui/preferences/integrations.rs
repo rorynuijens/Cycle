@@ -30,11 +30,20 @@ fn library_subtitle(count: i64) -> String {
 }
 
 /// What a finished activity sync has to report.
-fn sync_summary(activities: usize, wellness: usize) -> String {
+fn sync_summary(counts: SyncCounts) -> String {
+    let SyncCounts {
+        activities,
+        withheld,
+        wellness,
+    } = counts;
+    let withheld = crate::ai::intervals::withheld_suffix(withheld);
     if wellness > 0 {
-        format!("Synced {activities} activities and {wellness} wellness entries from Intervals.icu")
+        format!(
+            "Synced {activities} activities and {wellness} wellness entries \
+             from Intervals.icu{withheld}"
+        )
     } else {
-        format!("Synced {activities} activities from Intervals.icu")
+        format!("Synced {activities} activities from Intervals.icu{withheld}")
     }
 }
 
@@ -377,7 +386,7 @@ fn connect_activity_sync(
             spinner.set_visible(true);
             spinner.start();
 
-            let (tx, rx) = async_channel::bounded::<Result<(usize, usize), String>>(1);
+            let (tx, rx) = async_channel::bounded::<Result<SyncCounts, String>>(1);
             let pool_task = pool.clone();
             rt_handle.spawn(async move {
                 let _ = tx
@@ -391,8 +400,8 @@ fn connect_activity_sync(
             glib::MainContext::default().spawn_local(async move {
                 if let Ok(result) = rx.recv().await {
                     let toast = match result {
-                        Ok((activities, wellness)) => adw::Toast::builder()
-                            .title(sync_summary(activities, wellness))
+                        Ok(counts) => adw::Toast::builder()
+                            .title(sync_summary(counts))
                             .timeout(4)
                             .build(),
                         Err(e) => adw::Toast::builder()
@@ -410,6 +419,15 @@ fn connect_activity_sync(
     ));
 }
 
+/// How much one manual sync brought in.
+#[derive(Debug, Clone, Copy)]
+struct SyncCounts {
+    activities: usize,
+    /// Activities Intervals.icu sent without their data, and so not stored.
+    withheld: usize,
+    wellness: usize,
+}
+
 /// Pull activities and wellness, returning how many of each were stored.
 ///
 /// A wellness failure is not fatal: the activities are the point, and wellness
@@ -418,7 +436,7 @@ async fn sync_activities(
     pool: &SqlitePool,
     athlete_id: &str,
     api_key: &str,
-) -> Result<(usize, usize), String> {
+) -> Result<SyncCounts, String> {
     let newest = Local::now().date_naive();
 
     let activities = crate::ai::intervals::fetch_activities(
@@ -430,37 +448,7 @@ async fn sync_activities(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut activity_count = 0usize;
-    for a in activities {
-        match db::upsert_intervals_activity(
-            pool,
-            &a.id,
-            a.start_date_local,
-            &a.name,
-            a.icu_training_load,
-            a.moving_time,
-            a.average_watts,
-            a.normalized_watts,
-            a.average_hr,
-            a.max_hr,
-            &a.sport_type,
-            a.start_datetime_local,
-            a.distance_m,
-            a.elevation_gain_m,
-            a.average_cadence,
-        )
-        .await
-        {
-            Ok(_) => activity_count += 1,
-            Err(e) => tracing::error!("upsert intervals activity: {e}"),
-        }
-    }
-
-    // A ride recorded in-app can arrive back here after a round trip through
-    // Garmin or Strava — link the two so it is shown and counted once.
-    if let Err(e) = db::reconcile_icu_links(pool).await {
-        tracing::error!("reconcile_icu_links: {e}");
-    }
+    let stored = crate::ai::intervals::store_activities(pool, activities).await;
 
     let wellness_count = match crate::ai::intervals::fetch_wellness(
         athlete_id,
@@ -470,32 +458,18 @@ async fn sync_activities(
     )
     .await
     {
-        Ok(entries) => {
-            let mut count = 0usize;
-            for e in entries {
-                let entry = db::WellnessEntry {
-                    date: e.date,
-                    hrv: e.hrv,
-                    resting_hr: e.resting_hr,
-                    sleep_secs: e.sleep_secs,
-                    sleep_score: e.sleep_score,
-                    steps: e.steps,
-                    calories: e.calories,
-                };
-                match db::upsert_wellness_entry(pool, &entry).await {
-                    Ok(_) => count += 1,
-                    Err(e) => tracing::error!("upsert wellness entry: {e}"),
-                }
-            }
-            count
-        }
+        Ok(entries) => crate::ai::intervals::store_wellness(pool, entries).await,
         Err(e) => {
             tracing::warn!("Wellness sync failed (non-fatal): {e}");
             0
         }
     };
 
-    Ok((activity_count, wellness_count))
+    Ok(SyncCounts {
+        activities: stored.saved,
+        withheld: stored.withheld.len(),
+        wellness: wellness_count,
+    })
 }
 
 #[cfg(test)]
@@ -514,7 +488,11 @@ mod tests {
 
     #[test]
     fn should_report_both_halves_of_a_sync() {
-        let summary = sync_summary(12, 30);
+        let summary = sync_summary(SyncCounts {
+            activities: 12,
+            withheld: 0,
+            wellness: 30,
+        });
         assert!(summary.contains("12 activities"), "got {summary}");
         assert!(summary.contains("30 wellness"), "got {summary}");
     }
@@ -523,7 +501,11 @@ mod tests {
     fn should_not_mention_wellness_when_none_came_back() {
         // Wellness is optional and its failure is non-fatal, so a zero means
         // "not available" rather than "you had none" — better left unsaid.
-        let summary = sync_summary(12, 0);
+        let summary = sync_summary(SyncCounts {
+            activities: 12,
+            withheld: 0,
+            wellness: 0,
+        });
         assert!(!summary.contains("wellness"), "got {summary}");
         assert!(summary.contains("12 activities"));
     }

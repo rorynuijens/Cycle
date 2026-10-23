@@ -8,6 +8,7 @@ mod bests;
 mod coach;
 mod data;
 mod form_hero;
+pub(crate) mod ftp_check_in;
 mod load_history;
 mod wellness;
 mod zones;
@@ -30,6 +31,7 @@ use bests::BestsSection;
 use coach::CoachCard;
 use data::{load_fitness_data, FitnessData};
 use form_hero::FormHero;
+use ftp_check_in::FtpCheckIn;
 use load_history::{LoadHistory, TSS_WEEKS};
 use wellness::WellnessGrid;
 use zones::ZonesSection;
@@ -39,9 +41,12 @@ const PMC_WINDOW_DAYS: i64 = 90;
 
 /// The page's sections, in the order they appear.
 ///
-/// The page reads: form → wellness → zones → bests → load → coach.
+/// The page reads: form → FTP check-in → wellness → zones → bests → load →
+/// coach. The check-in sits under the form because it is the one section that
+/// asks the rider to decide something.
 struct Sections {
     hero: FormHero,
+    check_in: FtpCheckIn,
     wellness: WellnessGrid,
     zones: ZonesSection,
     bests: BestsSection,
@@ -63,10 +68,23 @@ impl Sections {
             wellness,
             run_streams,
             synced_rides,
+            check_in,
         } = data;
 
         let today = Local::now().date_naive();
         let ftp_watts = athlete.ftp_watts;
+
+        self.check_in.set(
+            crate::training::ftp_detect::check_in(
+                &check_in.evidence,
+                ftp_watts,
+                check_in.last_change,
+                today,
+                check_in.snooze.as_ref(),
+            ),
+            ftp_watts,
+            today,
+        );
         let rides: Vec<_> = records.iter().map(|r| r.summary()).collect();
 
         self.hero.set_synced_count(icu_activities.len());
@@ -151,8 +169,41 @@ impl FitnessPage {
 
         let load = Rc::new(LoadHistory::new());
 
+        let on_accept: Rc<dyn Fn(u32)> = {
+            let pool = pool.clone();
+            let rt = rt_handle.clone();
+            let athlete = Rc::clone(&athlete);
+            let on_toast = Rc::clone(&on_toast);
+            Rc::new(move |new_ftp| {
+                crate::ui::ftp_change::accept(
+                    &pool,
+                    &rt,
+                    &athlete,
+                    &*on_toast,
+                    new_ftp,
+                    "suggestion",
+                    "FTP check-in",
+                );
+            })
+        };
+        let on_snooze: Rc<dyn Fn(crate::training::ftp_detect::Snooze)> = {
+            let pool = pool.clone();
+            let rt = rt_handle.clone();
+            Rc::new(move |snooze| {
+                let pool = pool.clone();
+                rt.spawn(async move {
+                    if let Err(e) =
+                        crate::data::settings::set_ftp_check_in_snooze(&pool, &snooze).await
+                    {
+                        tracing::error!("Could not store the FTP check-in snooze: {e}");
+                    }
+                });
+            })
+        };
+
         let sections = Rc::new(Sections {
             hero: FormHero::new(),
+            check_in: FtpCheckIn::new(on_accept, on_snooze),
             wellness: WellnessGrid::new(),
             zones: ZonesSection::new(),
             bests: BestsSection::new(Rc::clone(&athlete)),
@@ -166,6 +217,7 @@ impl FitnessPage {
         });
 
         inner.append(sections.hero.widget());
+        inner.append(sections.check_in.widget());
         inner.append(sections.wellness.widget());
         inner.append(sections.zones.widget());
         inner.append(sections.bests.widget());
