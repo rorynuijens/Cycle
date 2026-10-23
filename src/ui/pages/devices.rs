@@ -147,7 +147,7 @@ impl DevicesPage {
         let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
         let radio_row = adw::ComboRow::builder()
             .title("Connect Using")
-            .subtitle(radio_subtitle(radio, false))
+            .subtitle(radio_subtitle(radio, false, None))
             .model(&gtk::StringList::new(&RADIOS.map(radio_name)))
             .selected(radio_index(radio))
             .build();
@@ -256,9 +256,7 @@ impl DevicesPage {
             return;
         }
         self.ctx.radio_row.set_sensitive(!riding);
-        self.ctx
-            .radio_row
-            .set_subtitle(&radio_subtitle(self.ctx.radio.get(), riding));
+        refresh_radio_subtitle(&self.ctx);
     }
 
     pub fn on_discovered(
@@ -550,6 +548,9 @@ fn make_slot_card(strip: &gtk::Box, icon_name: &str, role: &str) -> SetupSlot {
 
 /// Recompute all three role cards from the current entries.
 fn refresh_strip(ctx: &PageCtx) {
+    // Runs on load, on every save, forget and radio switch: each can change
+    // whether Bluetooth can control the trainer.
+    refresh_radio_subtitle(ctx);
     let entries = ctx.entries.borrow();
     let scanning = ctx.scanning.get();
 
@@ -833,14 +834,54 @@ fn radio_at(index: u32) -> Option<Transport> {
     RADIOS.get(index as usize).copied()
 }
 
-fn radio_subtitle(radio: Transport, riding: bool) -> String {
+fn radio_subtitle(radio: Transport, riding: bool, ant_only_trainer: Option<&str>) -> String {
     if riding {
         return "Can’t be changed during a ride".to_string();
     }
-    match radio {
-        Transport::AntPlus => "Through the ANT+ USB stick".to_string(),
-        Transport::BluetoothLe => "Through this computer’s Bluetooth".to_string(),
+    match (radio, ant_only_trainer) {
+        (Transport::AntPlus, _) => "Through the ANT+ USB stick".to_string(),
+        (Transport::BluetoothLe, None) => "Through this computer’s Bluetooth".to_string(),
+        (Transport::BluetoothLe, Some(trainer)) => format!(
+            "Through this computer’s Bluetooth. {trainer} can’t set resistance over \
+             Bluetooth, so ERG workouts need ANT+"
+        ),
     }
+}
+
+/// The name of the saved trainer that only ANT+ can control, when the rider
+/// has no trainer saved that Bluetooth can control instead.
+///
+/// The Elite Drivo is the case this exists for: over Bluetooth it shows up as
+/// a power meter and nothing more, so Bluetooth mode quietly drops every ERG
+/// target. A trainer saved over Bluetooth is one Bluetooth found controllable
+/// (power meters are saved as `CyclingPowerMeter`), and then there is no warning.
+fn ant_only_trainer<'a>(
+    saved: impl IntoIterator<Item = (&'a str, Transport, DeviceType)>,
+) -> Option<&'a str> {
+    let mut ant_trainer = None;
+    for (name, transport, kind) in saved {
+        if kind != DeviceType::FtmsTrainer {
+            continue;
+        }
+        match transport {
+            Transport::BluetoothLe => return None,
+            Transport::AntPlus => ant_trainer = ant_trainer.or(Some(name)),
+        }
+    }
+    ant_trainer
+}
+
+/// Set the "Connect Using" subtitle from the radio, the ride, and the saved trainers.
+fn refresh_radio_subtitle(ctx: &PageCtx) {
+    let entries = ctx.entries.borrow();
+    let trainer = ant_only_trainer(
+        entries
+            .values()
+            .filter(|e| e.saved)
+            .map(|e| (e.display_name.as_str(), e.transport, e.kind)),
+    );
+    ctx.radio_row
+        .set_subtitle(&radio_subtitle(ctx.radio.get(), ctx.riding.get(), trainer));
 }
 
 /// Move every device over to `radio`: the manager drops what is on the other
@@ -887,7 +928,6 @@ fn switch_radio(ctx: &PageCtx, radio: Transport) {
         }
     }
     ctx.reconnect_attempts.set(0);
-    ctx.radio_row.set_subtitle(&radio_subtitle(radio, false));
     update_saved_statuses(ctx);
     refresh_strip(ctx);
     if has_missing_saved(ctx) {
@@ -1430,8 +1470,69 @@ mod tests {
 
     #[test]
     fn should_say_the_radio_is_locked_during_a_ride() {
-        assert_eq!(radio_subtitle(ANT, true), radio_subtitle(BLE, true));
-        assert_ne!(radio_subtitle(ANT, false), radio_subtitle(BLE, false));
+        let drivo = Some("Elite Drivo");
+        assert_eq!(
+            radio_subtitle(ANT, true, None),
+            "Can’t be changed during a ride"
+        );
+        assert_eq!(
+            radio_subtitle(BLE, true, drivo),
+            "Can’t be changed during a ride"
+        );
+        assert_ne!(
+            radio_subtitle(ANT, false, None),
+            radio_subtitle(BLE, false, None)
+        );
+    }
+
+    #[test]
+    fn should_name_the_trainer_that_bluetooth_cannot_control() {
+        let drivo = Some("Elite Drivo");
+        assert_eq!(
+            radio_subtitle(BLE, false, drivo),
+            "Through this computer’s Bluetooth. Elite Drivo can’t set resistance over \
+             Bluetooth, so ERG workouts need ANT+"
+        );
+        // On ANT+ the trainer is controlled, so there is nothing to warn about.
+        assert_eq!(
+            radio_subtitle(ANT, false, drivo),
+            "Through the ANT+ USB stick"
+        );
+    }
+
+    #[test]
+    fn should_find_the_ant_only_trainer_among_the_saved_devices() {
+        use DeviceType::*;
+        // The rider's own saved list: the Drivo on ANT+, and the same Drivo
+        // on Bluetooth, where it is only a power meter.
+        let saved = [
+            ("Xand HR Band", ANT, HeartRateMonitor),
+            ("Elite Drivo", ANT, FtmsTrainer),
+            ("Cadence", BLE, CadenceSensor),
+            ("DR", BLE, CyclingPowerMeter),
+        ];
+        assert_eq!(ant_only_trainer(saved), Some("Elite Drivo"));
+    }
+
+    #[test]
+    fn should_not_warn_when_a_bluetooth_trainer_is_saved() {
+        use DeviceType::*;
+        let both = [
+            ("Elite Drivo", ANT, FtmsTrainer),
+            ("Kickr", BLE, FtmsTrainer),
+        ];
+        assert_eq!(ant_only_trainer(both), None);
+        // Order must not matter: the Bluetooth trainer listed first still wins.
+        let reversed = [
+            ("Kickr", BLE, FtmsTrainer),
+            ("Elite Drivo", ANT, FtmsTrainer),
+        ];
+        assert_eq!(ant_only_trainer(reversed), None);
+        assert_eq!(
+            ant_only_trainer([("Xand HR Band", ANT, HeartRateMonitor)]),
+            None
+        );
+        assert_eq!(ant_only_trainer([]), None);
     }
 
     #[test]
