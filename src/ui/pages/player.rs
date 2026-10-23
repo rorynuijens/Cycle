@@ -1116,8 +1116,7 @@ impl PlayerPage {
                 p.countdown_banner.set_button_label(Some("Start Now"));
             }
             p.update_session_totals(&session, ftp);
-            p.graph.set_playhead(snapshot.elapsed_secs);
-            p.graph.push_power(snapshot.readings.power_watts);
+            p.graph.record_live(&snapshot);
             // The overlay rides this tick rather than one of its own, so the two
             // windows can never show different seconds of the same ride.
             if let Some(overlay) = p.overlay.borrow().as_ref() {

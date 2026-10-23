@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use crate::data::athlete::{power_zone_index, ZONE_COLORS};
 use crate::data::workout::Workout;
+use crate::training::engine::{EngineSnapshot, EngineState};
 
 /// Custom Cairo-drawn workout profile graph.
 ///
@@ -81,13 +82,14 @@ impl WorkoutGraph {
         &self.drawing_area
     }
 
-    pub fn set_playhead(&self, elapsed_secs: u32) {
-        *self.playhead_secs.borrow_mut() = elapsed_secs;
-        self.drawing_area.queue_draw();
-    }
-
-    pub fn push_power(&self, watts: Option<u32>) {
-        self.power_trace.borrow_mut().push(watts);
+    /// Draw one tick of a live ride: move the playhead, and plot the power at
+    /// the second the ride is on — never simply after the last sample. Ticks
+    /// the ride does not record (the pre-start wait, a pause) are not plotted.
+    pub fn record_live(&self, snap: &EngineSnapshot) {
+        *self.playhead_secs.borrow_mut() = snap.elapsed_secs;
+        if let Some((second, watts)) = live_sample(snap) {
+            place_sample(&mut self.power_trace.borrow_mut(), second, watts);
+        }
         self.drawing_area.queue_draw();
     }
 
@@ -225,5 +227,116 @@ impl WorkoutGraph {
             cr.line_to(ph_x, h);
             cr.stroke().ok();
         }
+    }
+}
+
+/// The trace slot a live tick fills, and its power, or `None` for a tick the
+/// ride does not record. Mirrors what `WorkoutEngine::tick` saves, so the live
+/// chart and the finished ride's chart are drawn from the same seconds.
+fn live_sample(snap: &EngineSnapshot) -> Option<(usize, Option<u32>)> {
+    (snap.state == EngineState::Running)
+        .then_some((snap.elapsed_secs as usize, snap.readings.power_watts))
+}
+
+/// Put `watts` at `second`, growing the trace with gaps if it is short.
+fn place_sample(trace: &mut Vec<Option<u32>>, second: usize, watts: Option<u32>) {
+    if trace.len() <= second {
+        trace.resize(second + 1, None);
+    }
+    trace[second] = watts;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::session::LiveReadings;
+
+    fn snap(state: EngineState, elapsed_secs: u32, watts: u32) -> EngineSnapshot {
+        EngineSnapshot {
+            state,
+            elapsed_secs,
+            remaining_secs: 0,
+            segment_index: 0,
+            segment_elapsed_secs: 0,
+            segment_remaining_secs: 0,
+            target_power_watts: 0,
+            intensity_pct: 100,
+            readings: LiveReadings {
+                power_watts: Some(watts),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// What the live chart holds after a run of ticks.
+    fn trace_after(ticks: &[EngineSnapshot]) -> Vec<Option<u32>> {
+        let mut trace = Vec::new();
+        for t in ticks {
+            if let Some((second, watts)) = live_sample(t) {
+                place_sample(&mut trace, second, watts);
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn should_start_the_trace_at_zero_however_long_the_wait_to_start() {
+        // Ride #20 (2026-10-23): the page opened 50 s before the rider began
+        // pedalling, and every interval was drawn 50 s late.
+        let mut ticks: Vec<_> = (0..50).map(|_| snap(EngineState::Idle, 0, 0)).collect();
+        ticks.extend((0..10).map(|s| snap(EngineState::Running, s, 200 + s)));
+        let trace = trace_after(&ticks);
+        assert_eq!(trace.len(), 10);
+        assert_eq!(trace[0], Some(200));
+        assert_eq!(trace[9], Some(209));
+    }
+
+    #[test]
+    fn should_not_shift_the_trace_after_a_pause() {
+        let mut ticks: Vec<_> = (0..5).map(|s| snap(EngineState::Running, s, 100)).collect();
+        ticks.extend((0..30).map(|_| snap(EngineState::Paused, 5, 0)));
+        ticks.push(snap(EngineState::Running, 5, 250));
+        let trace = trace_after(&ticks);
+        assert_eq!(trace.len(), 6);
+        assert_eq!(trace[5], Some(250));
+    }
+
+    #[test]
+    fn should_not_plot_a_tick_the_ride_does_not_record() {
+        for state in [
+            EngineState::Idle,
+            EngineState::Paused,
+            EngineState::Completed,
+        ] {
+            assert_eq!(live_sample(&snap(state, 12, 180)), None, "{state:?}");
+        }
+        assert_eq!(
+            live_sample(&snap(EngineState::Running, 12, 180)),
+            Some((12, Some(180)))
+        );
+    }
+
+    #[test]
+    fn should_leave_a_gap_for_seconds_the_chart_never_saw() {
+        let mut trace = vec![Some(100)];
+        place_sample(&mut trace, 3, Some(140));
+        assert_eq!(trace, vec![Some(100), None, None, Some(140)]);
+    }
+
+    #[test]
+    fn should_keep_drawing_into_a_trace_filled_from_the_ride_so_far() {
+        // The overlay opens mid-ride with the whole workout's length already
+        // laid out; a live second must land inside it, not after its end.
+        let mut trace = vec![None; 100];
+        place_sample(&mut trace, 40, Some(230));
+        assert_eq!(trace.len(), 100);
+        assert_eq!(trace[40], Some(230));
+    }
+
+    #[test]
+    fn should_record_a_dropout_as_a_gap_not_a_stale_value() {
+        let mut trace = vec![Some(100), Some(110)];
+        place_sample(&mut trace, 1, None);
+        assert_eq!(trace, vec![Some(100), None]);
     }
 }
