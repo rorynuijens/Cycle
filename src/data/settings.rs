@@ -21,6 +21,7 @@ use sqlx::SqlitePool;
 use super::db;
 use super::training_profile::TrainingProfile;
 use crate::devices::peripheral::Transport;
+use crate::training::ftp_detect::Snooze;
 
 /// The settings keys this app reads and writes.
 ///
@@ -53,6 +54,8 @@ pub mod keys {
     /// The one radio devices are found and connected over. Kept through a
     /// data reset, like the saved devices it decides between.
     pub const DEVICE_RADIO: &str = "devices.radio";
+    /// "Not now" on the FTP check-in: until when, and the verdict set aside.
+    pub const FTP_CHECK_IN_SNOOZE: &str = "ftp.check_in_snooze";
 
     pub const FIRST_USE_COMPLETE: &str = "first_use_complete";
     pub const COACHING_CONTEXT: &str = "coaching.athlete_context";
@@ -364,6 +367,20 @@ pub async fn set_device_radio(pool: &SqlitePool, radio: Transport) -> Result<()>
     db::set_setting(pool, keys::DEVICE_RADIO, radio.as_db_str()).await
 }
 
+// ── FTP check-in ─────────────────────────────────────────────────────────────
+
+/// The snooze on the FTP check-in card, if the rider set one aside.
+pub async fn ftp_check_in_snooze(pool: &SqlitePool) -> Result<Option<Snooze>> {
+    Ok(db::get_setting(pool, keys::FTP_CHECK_IN_SNOOZE)
+        .await?
+        .as_deref()
+        .and_then(Snooze::parse))
+}
+
+pub async fn set_ftp_check_in_snooze(pool: &SqlitePool, snooze: &Snooze) -> Result<()> {
+    db::set_setting(pool, keys::FTP_CHECK_IN_SNOOZE, &snooze.to_setting()).await
+}
+
 // ── First run ────────────────────────────────────────────────────────────────
 
 /// Whether the rider has finished onboarding.
@@ -611,6 +628,42 @@ mod tests {
             .unwrap();
         db::reset_athlete_data(&pool, true).await.unwrap();
         assert_eq!(device_radio(&pool).await.unwrap(), Transport::BluetoothLe);
+    }
+
+    // ── FTP check-in ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_remember_a_check_in_snooze() {
+        use crate::training::ftp_detect::Direction;
+        let pool = test_pool().await;
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), None);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 23).expect("valid date");
+        let snooze = Snooze::starting(today, Direction::Hold);
+        set_ftp_check_in_snooze(&pool, &snooze).await.unwrap();
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), Some(snooze));
+    }
+
+    #[tokio::test]
+    async fn should_read_a_damaged_check_in_snooze_as_none() {
+        let pool = test_pool().await;
+        db::set_setting(&pool, keys::FTP_CHECK_IN_SNOOZE, "forever")
+            .await
+            .unwrap();
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn should_clear_the_check_in_snooze_with_the_athlete_data() {
+        // A reset starts the rider over; a snooze from the old data must not
+        // hide the new rider's first check-in.
+        use crate::training::ftp_detect::Direction;
+        let pool = test_pool().await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 23).expect("valid date");
+        set_ftp_check_in_snooze(&pool, &Snooze::starting(today, Direction::Up))
+            .await
+            .unwrap();
+        db::reset_athlete_data(&pool, true).await.unwrap();
+        assert_eq!(ftp_check_in_snooze(&pool).await.unwrap(), None);
     }
 
     // ── First run and coaching context ───────────────────────────────────────

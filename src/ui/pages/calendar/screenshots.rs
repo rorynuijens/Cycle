@@ -1130,6 +1130,20 @@ fn screenshots() {
         theme(false);
     }
 
+    // The Fitness page's FTP check-in, in each of its three verdicts. The
+    // hold is what the rider's own data says today (2026-10-23).
+    {
+        use crate::training::ftp_detect::Direction;
+        theme(false);
+        shoot_check_in("34-check-in-up-light", Direction::Up);
+        shoot_check_in("35-check-in-down-light", Direction::Down);
+        shoot_check_in("36-check-in-hold-light", Direction::Hold);
+        theme(true);
+        shoot_check_in("37-check-in-up-dark", Direction::Up);
+        shoot_check_in("38-check-in-hold-dark", Direction::Hold);
+        theme(false);
+    }
+
     // The window a failed start leaves on screen — the real refusal message a
     // newer database produces, in both themes.
     {
@@ -1315,6 +1329,56 @@ fn shoot_devices(name: &str, width: i32, height: i32, state: Radio) {
     }
     let window = adw::Window::builder().content(page.widget()).build();
     shoot(&window, width, height, name);
+}
+
+fn shoot_check_in(name: &str, direction: crate::training::ftp_detect::Direction) {
+    use crate::training::ftp_detect::{Direction, FtpSuggestion};
+    use crate::ui::pages::fitness::ftp_check_in::FtpCheckIn;
+
+    let held = "13 of 13 threshold intervals completed, averaging 99% of target";
+    let rpe = "Average RPE 4.3 across 3 threshold sessions";
+    let (new_ftp, delta_pct, evidence) = match direction {
+        Direction::Up => (206, 3.0, vec![held, rpe]),
+        Direction::Down => (
+            191,
+            -4.5,
+            vec![
+                "3 of 12 threshold intervals came apart before the end",
+                "Average RPE 8.7 across 3 threshold sessions",
+            ],
+        ),
+        Direction::Hold => (
+            200,
+            0.0,
+            vec![
+                held,
+                rpe,
+                "No cadence was recorded, so a session coming apart would go unseen — \
+                 holding until a cadence sensor is reporting",
+            ],
+        ),
+    };
+    let card = FtpCheckIn::new(Rc::new(|_| {}), Rc::new(|_| {}));
+    card.set(
+        Some(FtpSuggestion {
+            new_ftp,
+            delta_pct,
+            direction,
+            evidence: evidence.into_iter().map(String::from).collect(),
+        }),
+        200,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 23).expect("valid date"),
+    );
+    let clamp = adw::Clamp::builder()
+        .maximum_size(1200)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .child(card.widget())
+        .build();
+    let window = adw::Window::builder().content(&clamp).build();
+    shoot(&window, 900, 360, name);
 }
 
 fn find_combo(w: &gtk::Widget) -> Option<adw::ComboRow> {
