@@ -146,6 +146,8 @@ fn ant_command_for(device: AntDevice, connect: bool) -> Option<AntCommand> {
         // for a strap the rider disconnected, whose channel has to reopen.
         (AntDevice::HeartRate, true) => Some(AntCommand::ConnectHr),
         (AntDevice::HeartRate, false) => Some(AntCommand::DisconnectHr),
+        (AntDevice::Cadence, true) => Some(AntCommand::ConnectCadence),
+        (AntDevice::Cadence, false) => Some(AntCommand::DisconnectCadence),
         (AntDevice::Unknown, _) => None,
     }
 }
@@ -925,6 +927,10 @@ mod tests {
             ant_command_for(AntDevice::HeartRate, true),
             Some(AntCommand::ConnectHr)
         );
+        assert_eq!(
+            ant_command_for(AntDevice::Cadence, true),
+            Some(AntCommand::ConnectCadence)
+        );
         assert_eq!(ant_command_for(AntDevice::Unknown, true), None);
     }
 
@@ -937,6 +943,10 @@ mod tests {
         assert_eq!(
             ant_command_for(AntDevice::HeartRate, false),
             Some(AntCommand::DisconnectHr)
+        );
+        assert_eq!(
+            ant_command_for(AntDevice::Cadence, false),
+            Some(AntCommand::DisconnectCadence)
         );
         assert_eq!(ant_command_for(AntDevice::Unknown, false), None);
     }

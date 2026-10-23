@@ -37,6 +37,10 @@ pub const ANT_FEC_ADDRESS: &str = "ant:fec";
 /// channel, so it appears in the Devices page like any other sensor.
 pub const ANT_HR_ADDRESS: &str = "ant:hr";
 
+/// Synthetic device address for a cadence-only sensor found on the ANT+ Bike
+/// Cadence channel.
+pub const ANT_CADENCE_ADDRESS: &str = "ant:cadence";
+
 /// Which ANT+ device a synthetic address refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntDevice {
@@ -44,6 +48,8 @@ pub enum AntDevice {
     Trainer,
     /// Heart rate strap: broadcast-only, live whenever it is heard.
     HeartRate,
+    /// Cadence-only sensor: broadcast-only, live whenever it is heard.
+    Cadence,
     /// An `ant:` address this build does not recognise.
     Unknown,
 }
@@ -59,6 +65,7 @@ pub fn classify_address(address: &str) -> Option<AntDevice> {
     match address {
         ANT_FEC_ADDRESS => Some(AntDevice::Trainer),
         ANT_HR_ADDRESS => Some(AntDevice::HeartRate),
+        ANT_CADENCE_ADDRESS => Some(AntDevice::Cadence),
         _ if address.starts_with("ant:") => Some(AntDevice::Unknown),
         _ => None,
     }
@@ -133,6 +140,12 @@ const CADENCE_CHANNEL: u8 = 0x01;
 const SC_DEVICE_TYPE: u8 = 0x79; // 121 = Bike Speed and Cadence (combined)
 const SC_CHANNEL_PERIOD: u16 = 8086; // ANT+ combined Speed & Cadence period
 
+/// Channel 3 — Bike Cadence: a cadence-only sensor on the crank. Such a sensor
+/// is a different device type from Speed & Cadence, so channel 1 never hears it.
+const BC_CHANNEL: u8 = 0x03;
+const BC_DEVICE_TYPE: u8 = 0x7A; // 122 = Bike Cadence
+const BC_CHANNEL_PERIOD: u16 = 8102; // ANT+ Bike Cadence period (~4.04 Hz)
+
 // FE-C data page numbers
 const PAGE_GENERAL_FE: u8 = 0x10; // 16
 const PAGE_SPECIFIC_TRAINER: u8 = 0x19; // 25
@@ -151,6 +164,10 @@ pub enum AntCommand {
     ConnectHr,
     /// Drop the heart rate strap alone, leaving the trainer running.
     DisconnectHr,
+    /// Bring back a cadence sensor the rider disconnected.
+    ConnectCadence,
+    /// Drop the cadence sensor alone.
+    DisconnectCadence,
     SetTargetPower(u16),
     /// SIM mode: set the simulated road gradient in percent.
     SetTrackResistance(f32),
@@ -277,6 +294,18 @@ fn parse_speed_cadence(payload: &[u8]) -> Option<(u16, u16)> {
     }
     let event_time = u16::from_le_bytes([payload[0], payload[1]]);
     let revolutions = u16::from_le_bytes([payload[2], payload[3]]);
+    Some((revolutions, event_time))
+}
+
+/// ANT+ Bike Cadence page (device type 122): every page, whatever its number,
+/// ends with the last crank event time (1/1024 s) and the cumulative crank
+/// revolutions, both little-endian. Returns `(revolutions, event_time)`.
+fn parse_bike_cadence(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() < 8 {
+        return None;
+    }
+    let event_time = u16::from_le_bytes([payload[4], payload[5]]);
+    let revolutions = u16::from_le_bytes([payload[6], payload[7]]);
     Some((revolutions, event_time))
 }
 
@@ -433,8 +462,9 @@ impl AntStick {
         ok &= self.open_channel(FEC_CHANNEL, FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD);
         ok &= self.open_channel(CADENCE_CHANNEL, SC_DEVICE_TYPE, SC_CHANNEL_PERIOD);
         ok &= self.open_channel(HR_CHANNEL, HR_DEVICE_TYPE, HR_CHANNEL_PERIOD);
+        ok &= self.open_channel(BC_CHANNEL, BC_DEVICE_TYPE, BC_CHANNEL_PERIOD);
         if ok {
-            tracing::info!("ANT channels opened (FE-C + Speed/Cadence + HR, searching)");
+            tracing::info!("ANT channels opened (FE-C + Speed/Cadence + HR + Cadence, searching)");
         } else {
             tracing::warn!(
                 "ANT channels could not be configured — the stick did not accept every \
@@ -448,6 +478,7 @@ impl AntStick {
         self.close_channel(FEC_CHANNEL);
         self.close_channel(CADENCE_CHANNEL);
         self.close_channel(HR_CHANNEL);
+        self.close_channel(BC_CHANNEL);
     }
 
     /// Close a single channel, leaving the others searching. Disconnecting one
@@ -508,6 +539,7 @@ fn channel_config(channel: u8) -> Option<(u8, u16)> {
         FEC_CHANNEL => Some((FEC_DEVICE_TYPE, FEC_CHANNEL_PERIOD)),
         CADENCE_CHANNEL => Some((SC_DEVICE_TYPE, SC_CHANNEL_PERIOD)),
         HR_CHANNEL => Some((HR_DEVICE_TYPE, HR_CHANNEL_PERIOD)),
+        BC_CHANNEL => Some((BC_DEVICE_TYPE, BC_CHANNEL_PERIOD)),
         _ => None,
     }
 }
@@ -566,6 +598,13 @@ struct AntLink {
     /// disconnect, which used to undo the disconnect within seconds.
     fec_muted: bool,
     hr_muted: bool,
+    /// The cadence sensor, kept like the strap: announced, live, or shut off.
+    cad_discovered: bool,
+    cad_connected: bool,
+    cad_muted: bool,
+    /// The previous `(revolutions, event_time)` from the cadence sensor. Cleared
+    /// whenever the sensor may have been away, so no rate spans the gap.
+    last_cadence_page: Option<(u16, u16)>,
     /// When the FE-C channel last spoke — see `FEC_SILENCE_TIMEOUT`.
     last_fec_seen: Option<Instant>,
 }
@@ -575,6 +614,14 @@ fn trainer_changed(connected: bool) -> Effect {
         address: ANT_FEC_ADDRESS.to_string(),
         connected,
         device_type: connected.then_some(DeviceType::FtmsTrainer),
+    })
+}
+
+fn cadence_changed(connected: bool) -> Effect {
+    Effect::Emit(DeviceEvent::ConnectionChanged {
+        address: ANT_CADENCE_ADDRESS.to_string(),
+        connected,
+        device_type: connected.then_some(DeviceType::CadenceSensor),
     })
 }
 
@@ -597,6 +644,7 @@ impl AntLink {
         // already paired.
         self.discovered = false;
         self.hr_discovered = false;
+        self.cad_discovered = false;
         if channels_up && !self.connected && !self.fec_muted {
             // Pressing Scan with no trainer found is the rider saying "look
             // again", so re-arm the FE-C search on its own. The other channels
@@ -685,6 +733,12 @@ impl AntLink {
             self.hr_connected = false;
             out.push(strap_changed(false));
         }
+        self.cad_discovered = false;
+        self.last_cadence_page = None;
+        if self.cad_connected {
+            self.cad_connected = false;
+            out.push(cadence_changed(false));
+        }
         out
     }
 
@@ -712,6 +766,7 @@ impl AntLink {
         let muted = match channel {
             FEC_CHANNEL => self.fec_muted,
             HR_CHANNEL => self.hr_muted,
+            BC_CHANNEL => self.cad_muted,
             _ => false,
         };
         if muted || channel_config(channel).is_none() {
@@ -729,6 +784,9 @@ impl AntLink {
         }
         if self.hr_muted {
             out.push(HR_CHANNEL);
+        }
+        if self.cad_muted {
+            out.push(BC_CHANNEL);
         }
         out
     }
@@ -766,6 +824,66 @@ impl AntLink {
             source: ReadingSource::Ant,
             ..Default::default()
         })));
+        out
+    }
+
+    /// A page arrived on the cadence channel, carrying the sensor's crank
+    /// counters. Announced and connected on the first page, as the strap is;
+    /// a cadence follows from the second.
+    fn cadence_page(&mut self, revolutions: u16, event_time: u16) -> Vec<Effect> {
+        if self.cad_muted {
+            return Vec::new(); // rider disconnected it; its channel should be shut
+        }
+        let mut out = Vec::new();
+        if !self.cad_discovered {
+            self.cad_discovered = true;
+            out.push(Effect::Emit(DeviceEvent::PeripheralDiscovered {
+                address: ANT_CADENCE_ADDRESS.to_string(),
+                name: "ANT+ Cadence".to_string(),
+                rssi: None,
+                transport: Transport::AntPlus,
+                kind: DeviceType::CadenceSensor,
+            }));
+        }
+        if !self.cad_connected {
+            self.cad_connected = true;
+            out.push(cadence_changed(true));
+            tracing::info!("ANT+ cadence sensor found");
+        }
+        let rpm = self
+            .last_cadence_page
+            .and_then(|(revs, time)| compute_cadence_rpm(revs, time, revolutions, event_time));
+        self.last_cadence_page = Some((revolutions, event_time));
+        if let Some(rpm) = rpm {
+            out.push(Effect::Emit(DeviceEvent::Readings(LiveReadings {
+                cadence_rpm: Some(rpm),
+                source: ReadingSource::Ant,
+                ..Default::default()
+            })));
+        }
+        out
+    }
+
+    /// The rider asked to connect the cadence sensor. As with the strap, only
+    /// one they disconnected needs anything doing.
+    fn connect_cadence(&mut self) -> Vec<Effect> {
+        if !self.cad_muted {
+            return Vec::new();
+        }
+        self.cad_muted = false;
+        vec![Effect::Open(BC_CHANNEL)]
+    }
+
+    /// The rider disconnected the cadence sensor alone.
+    fn disconnect_cadence(&mut self) -> Vec<Effect> {
+        let mut out = vec![Effect::Close(BC_CHANNEL)];
+        self.cad_muted = true;
+        self.cad_discovered = false;
+        self.last_cadence_page = None;
+        if self.cad_connected {
+            self.cad_connected = false;
+            out.push(cadence_changed(false));
+        }
         out
     }
 
@@ -897,6 +1015,14 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                     let effects = link.disconnect_hr();
                     apply(stick.as_ref(), &event_tx, effects);
                 }
+                Ok(AntCommand::ConnectCadence) => {
+                    let effects = link.connect_cadence();
+                    apply(stick.as_ref(), &event_tx, effects);
+                }
+                Ok(AntCommand::DisconnectCadence) => {
+                    let effects = link.disconnect_cadence();
+                    apply(stick.as_ref(), &event_tx, effects);
+                }
                 Ok(AntCommand::SetTargetPower(watts)) => {
                     if link.connected && erg_enabled {
                         if let Some(s) = &stick {
@@ -1016,6 +1142,16 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
                 return;
             }
 
+            // Cadence-only sensor — like the strap, its own device, reported
+            // whether or not a trainer has been found.
+            if channel == BC_CHANNEL {
+                if let Some((revs, time)) = parse_bike_cadence(payload) {
+                    let effects = link.cadence_page(revs, time);
+                    apply(Some(s), &event_tx, effects);
+                }
+                return;
+            }
+
             // Speed & Cadence channel — used to recover cadence on trainers that
             // omit it from the FE-C trainer page. Cadence is derived from the change
             // in crank revolutions between samples.
@@ -1049,8 +1185,8 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             if let Some(mut readings) =
                 parse_specific_trainer(payload).or_else(|| parse_general_fe(payload))
             {
-                // Once cadence arrives on the Bike Power channel, defer to it.
-                if got_ant_cadence {
+                // Once a sensor on the crank supplies cadence, defer to it.
+                if got_ant_cadence || link.cad_connected {
                     readings.cadence_rpm = None;
                 }
                 let _ = event_tx.send_blocking(DeviceEvent::Readings(readings));
@@ -1376,6 +1512,180 @@ mod tests {
     fn should_not_restart_a_live_strap_when_asked_to_connect_it() {
         let mut link = both_live(Instant::now());
         assert!(link.connect_hr().is_empty());
+    }
+
+    // ── Cadence sensor (device type 122) ────────────────────────────────────
+    // A cadence-only sensor, such as the rider's Decathlon one, is not a
+    // Speed & Cadence sensor (121): the 121 channel never hears it.
+
+    fn cadence_readings(effects: &[Effect]) -> Vec<u32> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Emit(DeviceEvent::Readings(r)) => {
+                    assert_eq!(r.source, ReadingSource::Ant);
+                    r.cadence_rpm
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn should_search_for_cadence_only_sensors_on_their_own_channel() {
+        // ANT+ Bike Cadence profile: device type 122, period 8102.
+        assert_eq!(BC_DEVICE_TYPE, 122);
+        assert_eq!(channel_config(BC_CHANNEL), Some((122, 8102)));
+        let taken = [FEC_CHANNEL, CADENCE_CHANNEL, HR_CHANNEL];
+        assert!(!taken.contains(&BC_CHANNEL));
+    }
+
+    #[test]
+    fn should_read_crank_time_and_revolutions_from_the_back_half_of_a_cadence_page() {
+        // Bytes 4–5 event time (1/1024 s), 6–7 cumulative revolutions. The
+        // front half differs by page, so it must never be read for cadence.
+        let page = [0x00, 0xAA, 0xBB, 0xCC, 0x00, 0x04, 0x64, 0x00];
+        assert_eq!(parse_bike_cadence(&page), Some((100, 0x0400)));
+        // Background pages with the page-change toggle set carry the same data.
+        let battery = [0x84, 0xFF, 0x12, 0x34, 0x00, 0x04, 0x64, 0x00];
+        assert_eq!(parse_bike_cadence(&battery), Some((100, 0x0400)));
+        assert_eq!(parse_bike_cadence(&[0x00; 7]), None);
+    }
+
+    #[test]
+    fn should_announce_a_cadence_sensor_on_its_first_page() {
+        let mut link = AntLink::default();
+        let first = link.cadence_page(10, 0);
+        assert_eq!(discoveries(&first), vec![ANT_CADENCE_ADDRESS]);
+        assert_eq!(
+            connection_changes(&first),
+            vec![(ANT_CADENCE_ADDRESS, true)]
+        );
+        // One page is not a rate: there is nothing to compare it with yet.
+        assert!(cadence_readings(&first).is_empty());
+        let second = link.cadence_page(11, 1024);
+        assert!(connection_changes(&second).is_empty());
+        assert!(discoveries(&second).is_empty());
+    }
+
+    #[test]
+    fn should_derive_cadence_from_successive_cadence_pages() {
+        let mut link = AntLink::default();
+        link.cadence_page(100, 0x0400);
+        // 3 revs in 2048 ticks (2 s) = 90 rpm.
+        assert_eq!(cadence_readings(&link.cadence_page(103, 0x0C00)), vec![90]);
+    }
+
+    #[test]
+    fn should_derive_cadence_across_the_counter_wrap() {
+        let mut link = AntLink::default();
+        link.cadence_page(0xFFFF, 0xFC00);
+        // 1 rev, 1 s later, with both counters wrapping through zero.
+        assert_eq!(
+            cadence_readings(&link.cadence_page(0x0000, 0x0000)),
+            vec![60]
+        );
+    }
+
+    #[test]
+    fn should_report_no_cadence_while_the_cranks_are_still() {
+        // A sensor repeats its last crank event until the next one, so an
+        // unchanged event time is no new information — not 0 rpm.
+        let mut link = AntLink::default();
+        link.cadence_page(50, 0x2000);
+        assert!(cadence_readings(&link.cadence_page(50, 0x2000)).is_empty());
+    }
+
+    #[test]
+    fn should_report_cadence_without_a_trainer() {
+        // A broadcast sensor of its own, like the strap.
+        let mut link = AntLink::default();
+        assert!(!link.connected);
+        link.cadence_page(0, 0);
+        assert_eq!(cadence_readings(&link.cadence_page(1, 1024)), vec![60]);
+    }
+
+    #[test]
+    fn should_leave_the_trainer_and_strap_alone_when_cadence_is_disconnected() {
+        let now = Instant::now();
+        let mut link = both_live(now);
+        link.cadence_page(0, 0);
+        let effects = link.disconnect_cadence();
+        assert_eq!(closed(&effects), vec![BC_CHANNEL]);
+        assert_eq!(
+            connection_changes(&effects),
+            vec![(ANT_CADENCE_ADDRESS, false)]
+        );
+        assert!(link.connected && link.hr_connected);
+    }
+
+    #[test]
+    fn should_keep_a_disconnected_cadence_sensor_quiet_and_shut() {
+        let mut link = AntLink::default();
+        link.cadence_page(0, 0);
+        link.disconnect_cadence();
+        assert!(link.cadence_page(1, 1024).is_empty());
+        assert!(!opened(&link.scan(true)).contains(&BC_CHANNEL));
+        assert!(link.muted_channels().contains(&BC_CHANNEL));
+        assert!(link.channel_dead(BC_CHANNEL).is_empty());
+    }
+
+    #[test]
+    fn should_bring_a_disconnected_cadence_sensor_back_without_a_stale_rate() {
+        let mut link = AntLink::default();
+        link.cadence_page(0, 0);
+        link.disconnect_cadence();
+        assert_eq!(opened(&link.connect_cadence()), vec![BC_CHANNEL]);
+        // The first page back pairs with nothing from before the disconnect:
+        // 500 revs across the gap is not a cadence.
+        let back = link.cadence_page(500, 2048);
+        assert_eq!(connection_changes(&back), vec![(ANT_CADENCE_ADDRESS, true)]);
+        assert!(cadence_readings(&back).is_empty());
+    }
+
+    #[test]
+    fn should_not_restart_a_live_cadence_sensor_when_asked_to_connect_it() {
+        let mut link = AntLink::default();
+        link.cadence_page(0, 0);
+        assert!(link.connect_cadence().is_empty());
+    }
+
+    #[test]
+    fn should_reopen_a_cadence_channel_that_stopped_listening() {
+        let link = AntLink::default();
+        assert_eq!(opened(&link.channel_dead(BC_CHANNEL)), vec![BC_CHANNEL]);
+    }
+
+    #[test]
+    fn should_report_the_cadence_sensor_gone_with_the_stick() {
+        let mut link = AntLink::default();
+        link.cadence_page(0, 0);
+        let effects = link.stick_lost();
+        assert_eq!(
+            connection_changes(&effects),
+            vec![(ANT_CADENCE_ADDRESS, false)]
+        );
+        // And no rate across the gap when it returns.
+        assert!(cadence_readings(&link.cadence_page(400, 4096)).is_empty());
+        assert_eq!(cadence_readings(&link.cadence_page(401, 5120)), vec![60]);
+    }
+
+    #[test]
+    fn should_relist_a_live_cadence_sensor_after_a_scan_without_reconnecting_it() {
+        let mut link = AntLink::default();
+        link.cadence_page(0, 0);
+        link.scan(true);
+        let heard = link.cadence_page(1, 1024);
+        assert_eq!(discoveries(&heard), vec![ANT_CADENCE_ADDRESS]);
+        assert!(connection_changes(&heard).is_empty());
+    }
+
+    #[test]
+    fn should_classify_the_cadence_address_as_its_own_sensor() {
+        assert_eq!(
+            classify_address(ANT_CADENCE_ADDRESS),
+            Some(AntDevice::Cadence)
+        );
     }
 
     #[test]
@@ -1787,6 +2097,7 @@ mod property_tests {
             let _ = parse_general_fe(&page);
             let _ = parse_ant_heart_rate(&page);
             let _ = parse_speed_cadence(&page);
+            let _ = parse_bike_cadence(&page);
             let _ = dead_channel_event(&page);
         }
 
