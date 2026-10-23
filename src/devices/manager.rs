@@ -562,7 +562,19 @@ impl DeviceManager {
                             // The CentralEvent forwarder is already running — see
                             // where it is spawned above.
                             match adapter.start_scan(ScanFilter::default()).await {
-                                Ok(_) => tracing::info!("BLE scan started"),
+                                Ok(_) => {
+                                    tracing::info!("BLE scan started");
+                                    // A sensor this computer is already connected to
+                                    // has stopped advertising, so the scan alone never
+                                    // finds it — a link left behind by a failed
+                                    // connect, or by another app.
+                                    for p in adapter.peripherals().await.unwrap_or_default() {
+                                        if p.is_connected().await.unwrap_or(false) {
+                                            report_if_cycling(p, &mut discovered, &self.event_tx)
+                                                .await;
+                                        }
+                                    }
+                                }
                                 Err(e) => {
                                     tracing::error!("start_scan failed: {e}");
                                     let _ = self.event_tx.send(DeviceEvent::Error(e.to_string())).await;
@@ -622,8 +634,22 @@ impl DeviceManager {
                             };
 
                             tracing::info!("Connecting to {address}");
-                            if let Err(e) = peripheral.connect().await {
+                            let mut attempt = 1;
+                            let mut result = peripheral.connect().await;
+                            while let Err(e) = &result {
+                                let link_up = peripheral.is_connected().await.unwrap_or(false);
+                                if !retry_connect(attempt, link_up) {
+                                    break;
+                                }
+                                tracing::info!("connect() attempt {attempt}: {e} — link is up, waiting again");
+                                attempt += 1;
+                                result = peripheral.connect().await;
+                            }
+                            if let Err(e) = result {
                                 tracing::error!("connect() failed: {e}");
+                                // A link BlueZ kept stops the sensor advertising,
+                                // so no later scan would find it.
+                                peripheral.disconnect().await.ok();
                                 let _ = self.event_tx.send(DeviceEvent::ConnectFailed { address }).await;
                                 continue;
                             }
@@ -939,41 +965,8 @@ impl DeviceManager {
                             }
                             let Some(ref adapter) = adapter else { continue; };
                             if let Ok(peripheral) = adapter.peripheral(&id).await {
-                                if let Ok(Some(props)) = peripheral.properties().await {
-                                    // Only surface devices that advertise a cycling-relevant
-                                    // GATT service, and classify them by role so the UI can
-                                    // say "Heart rate monitor" instead of a raw device name.
-                                    // FTMS wins over CPS/CSC: trainers often advertise all
-                                    // three. Devices that haven't included service UUIDs in
-                                    // their advertisement packet are also skipped; they will
-                                    // reappear via a DeviceUpdated event once the data arrives.
-                                    let has_svc = |uuid: &str| {
-                                        props.services.iter().any(|svc| svc.to_string() == uuid)
-                                    };
-                                    let kind = if has_svc(FTMS_SERVICE_UUID) {
-                                        DeviceType::FtmsTrainer
-                                    } else if has_svc(CYCLING_POWER_SERVICE_UUID) {
-                                        DeviceType::CyclingPowerMeter
-                                    } else if has_svc(HR_SERVICE_UUID) {
-                                        DeviceType::HeartRateMonitor
-                                    } else if has_svc(CSC_SERVICE_UUID) {
-                                        DeviceType::CadenceSensor
-                                    } else {
-                                        continue;
-                                    };
-
-                                    let name = props.local_name.unwrap_or_else(|| "Unknown".into());
-                                    let rssi = props.rssi;
-                                    let addr = id.to_string();
-                                    discovered.insert(addr.clone(), peripheral);
-                                    let _ = self.event_tx.send(DeviceEvent::PeripheralDiscovered {
-                                        address: addr,
-                                        name,
-                                        rssi,
-                                        transport: Transport::BluetoothLe,
-                                        kind,
-                                    }).await;
-                                }
+                                report_if_cycling(peripheral, &mut discovered, &self.event_tx)
+                                    .await;
                             }
                         }
                         _ => {}
@@ -986,10 +979,151 @@ impl DeviceManager {
     }
 }
 
+/// How many times `connect()` is called before a device is given up on.
+const CONNECT_ATTEMPTS: u32 = 4;
+
+/// Whether to call `connect()` again after attempt number `attempt` failed.
+///
+/// bluez-async gives a new link 5 s to list its services, and the Decathlon
+/// cadence sensor takes longer. The link stays up through that timeout, so
+/// asking again simply waits another 5 s. A link that is down means the
+/// device is gone, and waiting would not help.
+fn retry_connect(attempt: u32, link_up: bool) -> bool {
+    link_up && attempt < CONNECT_ATTEMPTS
+}
+
+/// The role a Bluetooth device plays, from the GATT services it lists, or
+/// `None` when it offers nothing a ride uses.
+///
+/// FTMS wins over power and cadence because trainers often list all three.
+fn classify_services<'a>(services: impl IntoIterator<Item = &'a str>) -> Option<DeviceType> {
+    let services: Vec<&str> = services.into_iter().collect();
+    let has = |uuid: &str| services.iter().any(|s| s.eq_ignore_ascii_case(uuid));
+    if has(FTMS_SERVICE_UUID) {
+        Some(DeviceType::FtmsTrainer)
+    } else if has(CYCLING_POWER_SERVICE_UUID) {
+        Some(DeviceType::CyclingPowerMeter)
+    } else if has(HR_SERVICE_UUID) {
+        Some(DeviceType::HeartRateMonitor)
+    } else if has(CSC_SERVICE_UUID) {
+        Some(DeviceType::CadenceSensor)
+    } else {
+        None
+    }
+}
+
+/// Tell the UI about `peripheral` if it is a cycling device, and remember it
+/// so a later Connect can find it.
+///
+/// A device whose advertisement has not carried its services yet is skipped;
+/// it comes back as a DeviceUpdated once they arrive.
+async fn report_if_cycling(
+    peripheral: Peripheral,
+    discovered: &mut HashMap<String, Peripheral>,
+    event_tx: &Sender<DeviceEvent>,
+) {
+    let Ok(Some(props)) = peripheral.properties().await else {
+        return;
+    };
+    let services: Vec<String> = props.services.iter().map(|s| s.to_string()).collect();
+    let Some(kind) = classify_services(services.iter().map(String::as_str)) else {
+        return;
+    };
+    let address = peripheral.id().to_string();
+    discovered.insert(address.clone(), peripheral);
+    let _ = event_tx
+        .send(DeviceEvent::PeripheralDiscovered {
+            address,
+            name: props.local_name.unwrap_or_else(|| "Unknown".into()),
+            rssi: props.rssi,
+            transport: Transport::BluetoothLe,
+            kind,
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── Bluetooth roles ──────────────────────────────────────────────────────
+
+    #[test]
+    fn should_wait_again_only_while_the_link_is_up() {
+        assert!(retry_connect(1, true));
+        assert!(!retry_connect(1, false));
+    }
+
+    #[test]
+    fn should_stop_after_the_fourth_attempt() {
+        // Four calls of 5 s each: 20 s before the row says it failed.
+        assert!(retry_connect(3, true));
+        assert!(!retry_connect(4, true));
+        assert!(!retry_connect(u32::MAX, true));
+    }
+
+    #[test]
+    fn should_classify_the_decathlon_sensor_as_cadence() {
+        // The services the Decathlon dual-band sensor lists, read from BlueZ.
+        let services = [
+            "00001800-0000-1000-8000-00805f9b34fb",
+            "00001801-0000-1000-8000-00805f9b34fb",
+            "0000180a-0000-1000-8000-00805f9b34fb",
+            "0000180f-0000-1000-8000-00805f9b34fb",
+            "00001816-0000-1000-8000-00805f9b34fb",
+            "8ce5cc01-0a4d-11e9-ab14-d663bd873d93",
+        ];
+        assert_eq!(classify_services(services), Some(DeviceType::CadenceSensor));
+    }
+
+    #[test]
+    fn should_rank_trainer_over_power_over_hr_over_cadence() {
+        use crate::devices::ftms::*;
+        let all = [
+            CSC_SERVICE_UUID,
+            HR_SERVICE_UUID,
+            CYCLING_POWER_SERVICE_UUID,
+        ];
+        assert_eq!(classify_services(all), Some(DeviceType::CyclingPowerMeter));
+        let with_ftms = [
+            CSC_SERVICE_UUID,
+            FTMS_SERVICE_UUID,
+            CYCLING_POWER_SERVICE_UUID,
+        ];
+        assert_eq!(classify_services(with_ftms), Some(DeviceType::FtmsTrainer));
+        let hr_and_csc = [CSC_SERVICE_UUID, HR_SERVICE_UUID];
+        assert_eq!(
+            classify_services(hr_and_csc),
+            Some(DeviceType::HeartRateMonitor)
+        );
+    }
+
+    #[test]
+    fn should_ignore_devices_with_no_ride_service() {
+        // A mouse: generic access, device info, battery, HID.
+        let mouse = [
+            "00001800-0000-1000-8000-00805f9b34fb",
+            "0000180a-0000-1000-8000-00805f9b34fb",
+            "0000180f-0000-1000-8000-00805f9b34fb",
+            "00001812-0000-1000-8000-00805f9b34fb",
+        ];
+        assert_eq!(classify_services(mouse), None);
+        assert_eq!(classify_services([]), None);
+        // One digit off the cadence service is not the cadence service.
+        assert_eq!(
+            classify_services(["00001817-0000-1000-8000-00805f9b34fb"]),
+            None
+        );
+    }
+
+    #[test]
+    fn should_match_service_ids_in_upper_case() {
+        assert_eq!(
+            classify_services(["00001816-0000-1000-8000-00805F9B34FB"]),
+            Some(DeviceType::CadenceSensor)
+        );
+    }
 
     // ── ERG target ceiling (CLAUDE.md §5.1) ──────────────────────────────────
 
