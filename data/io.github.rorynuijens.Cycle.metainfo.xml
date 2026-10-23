@@ -90,6 +90,15 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.17.1" date="2026-10-23">
+      <description>
+        <p>A security update. The library Tour du Salon uses for its secure
+           connections to Intervals.icu and to the AI Coach had several flaws,
+           and its list of trusted certificates still trusted some that have
+           since been withdrawn. All are fixed here. Nothing else has
+           changed.</p>
+      </description>
+    </release>
     <release version="0.17.0" date="2026-10-23">
       <description>
         <p>Cadence, and devices on the radio you choose:</p>
