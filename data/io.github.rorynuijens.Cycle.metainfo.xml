@@ -90,6 +90,32 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.19.0" date="2026-10-23">
+      <description>
+        <p>Ride your routes in 3D:</p>
+        <ul>
+          <li>A route can now be ridden from behind your rider in a painted,
+              low-poly world grown from the route itself. The heights, distance
+              and bends come from your GPX file, so a bend you feel is a bend
+              you see. The map stays one click away.</li>
+          <li>Pick each route's scenery where you choose the route:
+              countryside, one of nine landscapes from polder to mountains, or
+              a mix that changes along the way. Animals cross the road now and
+              then; a switch turns them off.</li>
+          <li>Fullscreen gives the whole screen to the road, with power,
+              gradient, distance to go and the climb ahead drawn into the
+              world.</li>
+          <li>Every route ends under a finish arch, with a card showing the
+              ride's time, distance, power, climb and heart rate.</li>
+          <li>Race your best: a ghost of your fastest ride of a route rides
+              beside you, with the gap shown in seconds. Beat it and the app
+              tells you by how much.</li>
+          <li>The 3D world needs no network and downloads nothing.</li>
+        </ul>
+        <p>Your rides are upgraded to a new format on first start, and a
+           backup is kept. Earlier versions cannot open them afterwards.</p>
+      </description>
+    </release>
     <release version="0.18.0" date="2026-10-23">
       <description>
         <p>An FTP check-in:</p>
