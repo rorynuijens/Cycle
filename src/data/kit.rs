@@ -936,8 +936,8 @@ mod tests {
     fn flat_faces(shape: Shape) -> Vec<(usize, f32, [f32; 4], [f32; 4])> {
         let m = shape.mesh();
         let mut faces = Vec::new();
-        for t in m.indices.chunks_exact(3) {
-            let v = [0, 1, 2].map(|k| m.vertices[t[k] as usize]);
+        for t in m.indices.as_chunks::<3>().0 {
+            let v = t.map(|i| m.vertices[i as usize]);
             for axis in 0..3 {
                 let c = v[0].pos[axis];
                 if v.iter().any(|p| (p.pos[axis] - c).abs() > 1e-6) {

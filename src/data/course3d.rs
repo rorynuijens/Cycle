@@ -2031,7 +2031,7 @@ mod tests {
                 as_rock || as_snow,
                 "high ground at {:?} is {:?}",
                 v.pos,
-                &v.colour
+                v.colour
             );
         }
     }
