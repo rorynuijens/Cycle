@@ -183,8 +183,8 @@ pub fn decode_terrarium(
     let mut out = Vec::with_capacity((TILE_PX * TILE_PX) as usize);
     for y in 0..TILE_PX as usize {
         let line = &rgb[y * stride..y * stride + row];
-        for px in line.chunks_exact(3) {
-            let h = terrarium_height(px[0], px[1], px[2]);
+        for &[r, g, b] in line.as_chunks::<3>().0 {
+            let h = terrarium_height(r, g, b);
             if !(LOWEST_M..=HIGHEST_M).contains(&h) {
                 return Err(TileError::Implausible(h));
             }
