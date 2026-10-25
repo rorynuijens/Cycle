@@ -53,6 +53,13 @@ pub mod keys {
     /// The newest withheld activity the rider has been told about.
     pub const INTERVALS_WITHHELD_ANNOUNCED: &str = "intervals.withheld_announced";
 
+    /// The day the Garmin personal API key stops working, as the rider typed
+    /// it from Garmin Connect. Kept through a data reset, like the key.
+    pub const GARMIN_KEY_EXPIRES: &str = "garmin.key_expires";
+    /// Lactate-threshold heart rate, which a synced activity without power is
+    /// scored against. Unset means derived from max heart rate.
+    pub const ATHLETE_LTHR: &str = "athlete.lthr";
+
     pub const WINDOW_WIDTH: &str = "window.width";
     pub const WINDOW_HEIGHT: &str = "window.height";
 
@@ -288,6 +295,54 @@ pub async fn set_withheld_announced(pool: &SqlitePool, icu_id: &str) -> Result<(
     db::set_setting(pool, keys::INTERVALS_WITHHELD_ANNOUNCED, icu_id).await
 }
 
+// ── Garmin Connect ───────────────────────────────────────────────────────────
+
+/// When the Garmin key expires. `None` when the rider has not said, or what is
+/// stored is not a date.
+pub async fn garmin_key_expires(pool: &SqlitePool) -> Result<Option<chrono::NaiveDate>> {
+    Ok(db::get_setting(pool, keys::GARMIN_KEY_EXPIRES)
+        .await?
+        .and_then(|v| chrono::NaiveDate::parse_from_str(v.trim(), "%Y-%m-%d").ok()))
+}
+
+/// Record when the Garmin key expires; `None` forgets it.
+pub async fn set_garmin_key_expires(
+    pool: &SqlitePool,
+    expires: Option<chrono::NaiveDate>,
+) -> Result<()> {
+    let value = expires.map(|d| d.format("%Y-%m-%d").to_string());
+    db::set_setting(
+        pool,
+        keys::GARMIN_KEY_EXPIRES,
+        value.as_deref().unwrap_or(""),
+    )
+    .await
+}
+
+// ── Heart-rate threshold ─────────────────────────────────────────────────────
+
+/// The LTHR used when the rider has not set one: 90 % of max heart rate, the
+/// usual rule of thumb (an hour's effort sits at about that share of max).
+pub fn default_lthr(max_hr: u32) -> u32 {
+    (max_hr as f32 * 0.9).round() as u32
+}
+
+/// The rider's LTHR, or `None` when it has never been set.
+///
+/// A stored value that is not a plausible heart rate reads as unset rather
+/// than being used: a load scored against a threshold of 0 or 4000 is not a
+/// load at all.
+pub async fn lthr(pool: &SqlitePool) -> Result<Option<u32>> {
+    Ok(db::get_setting(pool, keys::ATHLETE_LTHR)
+        .await?
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| (60..=240).contains(v)))
+}
+
+pub async fn set_lthr(pool: &SqlitePool, bpm: u32) -> Result<()> {
+    db::set_setting(pool, keys::ATHLETE_LTHR, &bpm.to_string()).await
+}
+
 // ── Window geometry ──────────────────────────────────────────────────────────
 
 /// The size the window was last closed at. `None` means never recorded, and the
@@ -508,6 +563,54 @@ mod tests {
             .await
             .expect("migration should succeed");
         pool
+    }
+
+    #[tokio::test]
+    async fn should_read_an_unset_or_implausible_lthr_as_unset() {
+        let pool = test_pool().await;
+        assert_eq!(lthr(&pool).await.unwrap(), None);
+        for (raw, read) in [
+            ("165", Some(165)),
+            (" 172 ", Some(172)),
+            ("60", Some(60)),
+            ("240", Some(240)),
+            ("59", None),
+            ("241", None),
+            ("0", None),
+            ("-150", None),
+            ("abc", None),
+            ("", None),
+        ] {
+            db::set_setting(&pool, keys::ATHLETE_LTHR, raw)
+                .await
+                .unwrap();
+            assert_eq!(lthr(&pool).await.unwrap(), read, "{raw:?}");
+        }
+        set_lthr(&pool, 168).await.unwrap();
+        assert_eq!(lthr(&pool).await.unwrap(), Some(168));
+    }
+
+    #[test]
+    fn should_default_lthr_to_ninety_percent_of_max_rounded() {
+        assert_eq!(default_lthr(190), 171);
+        // 0.9 × 185 = 166.5, which rounds up.
+        assert_eq!(default_lthr(185), 167);
+        assert_eq!(default_lthr(0), 0);
+    }
+
+    #[tokio::test]
+    async fn should_round_trip_and_forget_the_garmin_key_expiry() {
+        let pool = test_pool().await;
+        assert_eq!(garmin_key_expires(&pool).await.unwrap(), None);
+        let day = chrono::NaiveDate::from_ymd_opt(2027, 1, 31).expect("hardcoded valid date");
+        set_garmin_key_expires(&pool, Some(day)).await.unwrap();
+        assert_eq!(garmin_key_expires(&pool).await.unwrap(), Some(day));
+        set_garmin_key_expires(&pool, None).await.unwrap();
+        assert_eq!(garmin_key_expires(&pool).await.unwrap(), None);
+        db::set_setting(&pool, keys::GARMIN_KEY_EXPIRES, "31/01/2027")
+            .await
+            .unwrap();
+        assert_eq!(garmin_key_expires(&pool).await.unwrap(), None);
     }
 
     // ── Training ─────────────────────────────────────────────────────────────

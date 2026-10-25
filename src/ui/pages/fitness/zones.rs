@@ -96,8 +96,8 @@ impl ZonesSection {
 
         let power = LabelledZoneBar::new(
             "Power",
-            "Time spent in each power zone, across rides recorded here and rides \
-             synced from Intervals.icu. Endurance athletes typically aim for \
+            "Time spent in each power zone, across rides recorded here and synced \
+             rides. Endurance athletes typically aim for \
              70–80% in Z1–Z2 (polarised) or Z2–Z3 (pyramidal)",
             "Power zone distribution bar: proportional time in zones Z1 through Z7",
             &POWER_ZONE_LABELS,
@@ -107,7 +107,7 @@ impl ZonesSection {
         let heart_rate = LabelledZoneBar::new(
             "Heart rate",
             "Time in each HR zone based on your recorded max HR, across rides \
-             recorded here and rides synced from Intervals.icu",
+             recorded here and synced rides",
             "Heart rate zone distribution bar: proportional time in HR zones Z1 through Z5",
             &HR_ZONE_LABELS,
         );

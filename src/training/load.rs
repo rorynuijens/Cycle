@@ -101,16 +101,19 @@ pub(crate) fn sample_secs(points: &[crate::data::session::DataPoint], i: usize) 
 /// reported a single fixed value all ride would otherwise produce a confident
 /// and completely wrong load.
 fn hr_is_usable(session: &Session) -> bool {
-    let hrs: Vec<u32> = session
-        .data_points
+    hr_points_usable(&session.data_points)
+}
+
+fn hr_points_usable(points: &[crate::data::session::DataPoint]) -> bool {
+    let hrs: Vec<u32> = points
         .iter()
         .filter_map(|p| p.heart_rate_bpm)
         .filter(|&h| h > 0)
         .collect();
-    if session.data_points.is_empty() || hrs.is_empty() {
+    if points.is_empty() || hrs.is_empty() {
         return false;
     }
-    let coverage = hrs.len() as f32 / session.data_points.len() as f32;
+    let coverage = hrs.len() as f32 / points.len() as f32;
     // Both ends exist: the vector is non-empty.
     let spread = hrs.iter().max().copied().unwrap_or(0) - hrs.iter().min().copied().unwrap_or(0);
     coverage >= MIN_HR_COVERAGE && spread >= MIN_HR_SPREAD_BPM
@@ -189,6 +192,51 @@ pub fn estimate(session: &Session, athlete: &AthleteProfile) -> Option<TrainingL
         anaerobic_te: anaerobic_te(session, ftp),
         source,
     })
+}
+
+/// The heart rates an [`hrss`] is scored against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HrThresholds {
+    pub resting: u32,
+    /// Lactate-threshold heart rate: the rate one hour at threshold is held at.
+    pub lthr: u32,
+    pub max: u32,
+}
+
+/// Heart-rate training load on the Intervals.icu "HRSS" scale: the activity's
+/// Banister TRIMP divided by the TRIMP of one hour at threshold heart rate, so
+/// an hour at LTHR scores 100 — the same as an hour at FTP on the power scale.
+///
+/// `None` when the trace cannot carry an estimate (sparse or flat, as for
+/// [`estimate`]) or the thresholds are not in order: resting < LTHR ≤ max.
+pub fn hrss(points: &[crate::data::session::DataPoint], t: HrThresholds) -> Option<f32> {
+    if !(t.resting < t.lthr && t.lthr <= t.max && hr_points_usable(points)) {
+        return None;
+    }
+    let span = (t.max - t.resting) as f32;
+    let reserve = |hr: u32| (hr as f32 - t.resting as f32) / span;
+    let total: f32 = points
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            Some(trimp_increment(
+                reserve(p.heart_rate_bpm?),
+                sample_secs(points, i),
+            ))
+        })
+        .sum();
+    let hour_at_threshold = trimp_increment(reserve(t.lthr), 3600.0);
+    Some(total / hour_at_threshold * 100.0)
+}
+
+/// Power training load (TSS): `moving_secs` at normalised power `np` against
+/// `ftp`, so an hour at FTP scores 100. `None` without an FTP to score against.
+pub fn power_load(np: f32, moving_secs: u32, ftp: u32) -> Option<f32> {
+    if ftp == 0 || !np.is_finite() || np < 0.0 {
+        return None;
+    }
+    let intensity = np / ftp as f32;
+    Some(intensity * intensity * moving_secs as f32 / 3600.0 * 100.0)
 }
 
 #[cfg(test)]
@@ -539,5 +587,98 @@ mod tests {
         // 299 gaps of two seconds, and a last sample standing for one.
         let proxy = excess * excess * (299.0 * 2.0 + 1.0);
         assert_close(est.anaerobic_te, 0.506 * proxy.ln() - 0.40);
+    }
+
+    fn hr_trace(bpm: &[(u32, u32)]) -> Vec<DataPoint> {
+        // (seconds, bpm) runs, one sample per second.
+        let mut t = 0;
+        let mut out = Vec::new();
+        for &(secs, hr) in bpm {
+            for _ in 0..secs {
+                out.push(DataPoint {
+                    elapsed_secs: t,
+                    power_watts: None,
+                    target_watts: None,
+                    heart_rate_bpm: Some(hr),
+                    cadence_rpm: None,
+                    speed_kmh: None,
+                    lat: None,
+                    lng: None,
+                    altitude_m: None,
+                });
+                t += 1;
+            }
+        }
+        out
+    }
+
+    const HR: HrThresholds = HrThresholds {
+        resting: 50,
+        lthr: 165,
+        max: 185,
+    };
+
+    #[test]
+    fn should_score_an_hour_at_threshold_heart_rate_as_exactly_100() {
+        // The spread check needs some variation: one minute of warm-up below.
+        let mut trace = hr_trace(&[(3600, 165)]);
+        trace[0].heart_rate_bpm = Some(150);
+        let score = hrss(&trace, HR).unwrap();
+        assert!((score - 100.0).abs() < 0.2, "{score}");
+    }
+
+    #[test]
+    fn should_weight_hard_minutes_more_than_easy_ones() {
+        let easy = hrss(&hr_trace(&[(1800, 120), (1800, 130)]), HR).unwrap();
+        let hard = hrss(&hr_trace(&[(1800, 165), (1800, 175)]), HR).unwrap();
+        // Half the reserve, far less than half the load: the weighting is exponential.
+        assert!(hard > easy * 2.5, "easy {easy}, hard {hard}");
+    }
+
+    #[test]
+    fn should_score_a_heart_rate_above_max_as_max_and_below_resting_as_nothing() {
+        let over = hrss(&hr_trace(&[(1800, 185), (1800, 220)]), HR).unwrap();
+        let at = hrss(&hr_trace(&[(1800, 185), (1800, 195)]), HR).unwrap();
+        assert!((over - at).abs() < 0.01);
+        let under = hrss(&hr_trace(&[(1800, 30), (1800, 45)]), HR).unwrap();
+        assert_eq!(under, 0.0);
+    }
+
+    #[test]
+    fn should_refuse_thresholds_out_of_order() {
+        let trace = hr_trace(&[(600, 120), (600, 140)]);
+        for t in [
+            HrThresholds {
+                resting: 50,
+                lthr: 190,
+                max: 185,
+            },
+            HrThresholds {
+                resting: 165,
+                lthr: 165,
+                max: 185,
+            },
+            HrThresholds {
+                resting: 0,
+                lthr: 0,
+                max: 0,
+            },
+        ] {
+            assert_eq!(hrss(&trace, t), None, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn should_refuse_a_flat_heart_rate_trace() {
+        assert_eq!(hrss(&hr_trace(&[(3600, 140)]), HR), None);
+    }
+
+    #[test]
+    fn should_score_an_hour_at_ftp_as_100_and_scale_with_intensity_squared() {
+        assert_eq!(power_load(250.0, 3600, 250), Some(100.0));
+        assert_eq!(power_load(125.0, 3600, 250), Some(25.0));
+        assert_eq!(power_load(250.0, 1800, 250), Some(50.0));
+        assert_eq!(power_load(250.0, 3600, 0), None);
+        assert_eq!(power_load(f32::NAN, 3600, 250), None);
     }
 }

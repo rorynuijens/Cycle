@@ -62,7 +62,10 @@ pub fn show_intervals_detail(
 
     let refresh_btn = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
-        .tooltip_text("Refresh detailed activity data from Intervals.icu")
+        .tooltip_text(format!(
+            "Refresh detailed activity data from {}",
+            source_name(&act.icu_id)
+        ))
         .css_classes(["flat", "circular"])
         .build();
     header.pack_end(&refresh_btn);
@@ -348,7 +351,7 @@ pub fn show_intervals_detail(
 
     inner.append(
         &gtk::Label::builder()
-            .label("Data synced from Intervals.icu")
+            .label(format!("Data synced from {}", source_name(&act.icu_id)))
             .css_classes(["caption", "dim-label"])
             .halign(gtk::Align::Center)
             .wrap(true)
@@ -433,11 +436,24 @@ pub fn show_intervals_detail(
         let spinner = spinner.clone();
         let status_label = status_label.clone();
         Rc::new(move || {
-            let api_key = match keystore::get_secret(keystore::KEY_INTERVALS_API).unwrap_or(None) {
-                Some(s) if !s.is_empty() => s,
+            // A Garmin activity's data is its file, fetched from Garmin; any
+            // other came from Intervals.icu and is fetched from there.
+            let from_garmin = crate::data::dedupe::is_garmin_id(&icu_id);
+            let (key_name, missing) = if from_garmin {
+                (
+                    keystore::KEY_GARMIN_API,
+                    "Garmin API key not set — configure in Preferences",
+                )
+            } else {
+                (
+                    keystore::KEY_INTERVALS_API,
+                    "Intervals.icu credentials not set — configure in Preferences",
+                )
+            };
+            let api_key = match keystore::get_secret(key_name).unwrap_or(None) {
+                Some(s) if !s.trim().is_empty() => s,
                 _ => {
-                    status_label
-                        .set_label("Intervals.icu credentials not set — configure in Preferences");
+                    status_label.set_label(missing);
                     status_label.set_visible(true);
                     return;
                 }
@@ -453,8 +469,11 @@ pub fn show_intervals_detail(
                 let api_key = api_key.clone();
                 let icu_id = icu_id.clone();
                 async move {
-                    let r =
-                        crate::ai::intervals::fetch_combined_activity_data(&api_key, &icu_id).await;
+                    let r = if from_garmin {
+                        crate::ai::garmin::sync::fetch_streams_json(&api_key, &icu_id).await
+                    } else {
+                        crate::ai::intervals::fetch_combined_activity_data(&api_key, &icu_id).await
+                    };
                     tx.send(r).await.ok();
                 }
             });
@@ -467,7 +486,7 @@ pub fn show_intervals_detail(
             let status_label = status_label.clone();
             glib::timeout_add_local(Duration::from_millis(200), move || match rx.try_recv() {
                 Ok(Ok(json)) => {
-                    tracing::debug!("Intervals.icu streams loaded for {icu_id}");
+                    tracing::debug!("Activity streams loaded for {icu_id}");
                     // Cache the streams in the background — this is a write of a
                     // potentially large blob and must not block the GLib loop.
                     rt.spawn({
@@ -487,7 +506,7 @@ pub fn show_intervals_detail(
                                 altitude_pts = s.altitude_m.len(),
                                 hr_pts = s.heartrate.len(),
                                 watts_pts = s.watts.len(),
-                                "Intervals.icu streams parsed"
+                                "Activity streams parsed"
                             );
                             populate(s);
                         }
@@ -501,7 +520,7 @@ pub fn show_intervals_detail(
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!("Intervals.icu streams fetch failed: {e}");
+                    tracing::warn!("Activity streams fetch failed: {e:#}");
                     spinner.set_spinning(false);
                     spinner.set_visible(false);
                     status_label.set_label(&format!("Failed to load: {e}"));
@@ -896,9 +915,10 @@ pub fn show_session_detail(
     // Shown only when this ride was matched to an Intervals.icu activity, so a
     // ride that quietly vanished from the calendar is explainable — and undoable.
     if let Some(icu_id) = session.icu_id.clone() {
+        let source = source_name(&icu_id);
         let link_row = adw::ActionRow::builder()
-            .title("Synced with Intervals.icu")
-            .subtitle("Shown once — the copy from Intervals.icu is hidden")
+            .title(format!("Synced with {source}"))
+            .subtitle(format!("Shown once — the copy from {source} is hidden"))
             .build();
         link_row.add_prefix(&gtk::Image::from_icon_name("emblem-synchronizing-symbolic"));
 
@@ -1551,6 +1571,15 @@ fn show_schedule_past_ride_dialog(
     });
 
     dialog.present(Some(parent));
+}
+
+/// The service a synced activity came from, by its id.
+fn source_name(id: &str) -> &'static str {
+    if crate::data::dedupe::is_garmin_id(id) {
+        "Garmin Connect"
+    } else {
+        "Intervals.icu"
+    }
 }
 
 /// Show a date picker to schedule an Intervals.icu activity as a future workout.

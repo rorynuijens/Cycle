@@ -56,13 +56,17 @@ pub async fn load_run_activity_streams(pool: &SqlitePool) -> Result<Vec<(NaiveDa
 ///
 /// Activities linked to a ride recorded in this app are skipped: that ride
 /// already has its samples locally, and the synced copy is hidden everywhere.
-/// Other sports are skipped because nothing reads their streams.
+/// Other sports are skipped because nothing reads their streams. So are the
+/// Garmin sync's rows (`g…`): Intervals.icu has never heard of those ids, and
+/// the `[]` it would cache for one would stop its file ever being fetched —
+/// see [`garmin_activities_missing_files`].
 pub async fn activities_missing_streams(pool: &SqlitePool, limit: usize) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT a.icu_id, a.sport_type
          FROM intervals_activities a
          WHERE NOT EXISTS (SELECT 1 FROM activity_streams s WHERE s.icu_id = a.icu_id)
            AND NOT EXISTS (SELECT 1 FROM sessions x WHERE x.icu_id = a.icu_id)
+           AND a.icu_id NOT LIKE 'g%'
          ORDER BY a.date DESC, a.icu_id DESC",
     )
     .fetch_all(pool)
@@ -75,6 +79,65 @@ pub async fn activities_missing_streams(pool: &SqlitePool, limit: usize) -> Resu
         })
         .map(|r| r.get::<String, _>("icu_id"))
         .take(limit)
+        .collect())
+}
+
+/// A Garmin activity whose file has not been fetched yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingFile {
+    /// The stored id, `g` and Garmin's own id.
+    pub id: String,
+    pub date: NaiveDate,
+    /// Whether the activity already has a load. One without is waiting on its
+    /// heart-rate trace, which only the file carries.
+    pub has_load: bool,
+}
+
+/// Garmin activities with no file cached, newest first, at most `limit` (all
+/// of them when `None`).
+///
+/// Every sport, not only rides and runs as for Intervals.icu: the file is
+/// where a load comes from for an activity without power. Rides and runs go
+/// first within a day, then anything still without a load. Activities linked
+/// to a ride recorded here are skipped — that ride has its own samples.
+pub async fn garmin_activities_missing_files(
+    pool: &SqlitePool,
+    limit: Option<usize>,
+) -> Result<Vec<MissingFile>> {
+    let rows = sqlx::query(
+        "SELECT a.icu_id, a.date, a.sport_type, a.tss IS NOT NULL AS has_load
+         FROM intervals_activities a
+         WHERE a.icu_id LIKE 'g%'
+           AND NOT EXISTS (SELECT 1 FROM activity_streams s WHERE s.icu_id = a.icu_id)
+           AND NOT EXISTS (SELECT 1 FROM sessions x WHERE x.icu_id = a.icu_id)
+         ORDER BY a.date DESC, a.icu_id DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<(bool, MissingFile)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let date = NaiveDate::parse_from_str(r.get("date"), "%Y-%m-%d").ok()?;
+            let sport: String = r.get("sport_type");
+            let file = MissingFile {
+                id: r.get("icu_id"),
+                date,
+                has_load: r.get::<i64, _>("has_load") != 0,
+            };
+            Some((is_cycling(&sport) || is_run(&sport), file))
+        })
+        .collect();
+    // Stable, so the newest-first order holds within each day.
+    out.sort_by(|(a_curve, a), (b_curve, b)| {
+        b.date
+            .cmp(&a.date)
+            .then(b_curve.cmp(a_curve))
+            .then(a.has_load.cmp(&b.has_load))
+    });
+    Ok(out
+        .into_iter()
+        .map(|(_, f)| f)
+        .take(limit.unwrap_or(usize::MAX))
         .collect())
 }
 

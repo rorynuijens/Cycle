@@ -263,29 +263,15 @@ impl BriefStore {
                 // Freshen the local copy first — the brief should be written
                 // about the rides the rider actually did. This also means the
                 // fingerprint taken inside `generate` covers what just arrived.
-                let (icu_id, icu_key) = intervals_credentials(&pool).await;
-                let report =
-                    crate::ai::intervals::sync_recent(&pool, &icu_id, &icu_key, today).await;
-                // Ride streams are for the Fitness page, not the brief, and can
-                // run to megabytes — fetch them alongside, never in front.
-                tokio::spawn({
-                    let pool = pool.clone();
-                    async move { crate::ai::intervals::backfill_streams(&pool, &icu_key).await }
-                });
-
+                let notice = sync_activities(&pool, today).await;
                 (
-                    report,
+                    notice,
                     brief::generate(&pool, &api_key, athlete, today).await,
                 )
             },
-            move |(report, result)| {
-                if report.announce {
-                    on_toast(
-                        adw::Toast::builder()
-                            .title(crate::ai::intervals::withheld_notice(report.withheld))
-                            .timeout(8)
-                            .build(),
-                    );
+            move |(notice, result)| {
+                if let Some(title) = notice {
+                    on_toast(adw::Toast::builder().title(title).timeout(8).build());
                 }
                 store.settle(previous, result);
             },
@@ -340,6 +326,30 @@ fn api_key() -> Option<String> {
 /// worker: called directly it would park that worker for the whole exchange, and
 /// for as long as the unlock prompt sits there if the keyring is locked. Handing
 /// it to `spawn_blocking` keeps it off the async threads.
+/// Pull recent activities and wellness from Garmin Connect when a key is set,
+/// else from Intervals.icu, leaving their files or streams downloading behind.
+/// Returns what the rider should be told, if anything.
+async fn sync_activities(pool: &SqlitePool, today: chrono::NaiveDate) -> Option<String> {
+    let garmin_key = tokio::task::spawn_blocking(crate::ai::garmin::sync::api_key)
+        .await
+        .unwrap_or(None);
+    if let Some(key) = garmin_key {
+        return crate::ai::garmin::sync::routine(pool, &key, today).await;
+    }
+
+    let (icu_id, icu_key) = intervals_credentials(pool).await;
+    let report = crate::ai::intervals::sync_recent(pool, &icu_id, &icu_key, today).await;
+    // Ride streams are for the Fitness page, not the brief, and can run to
+    // megabytes — fetch them alongside, never in front.
+    tokio::spawn({
+        let pool = pool.clone();
+        async move { crate::ai::intervals::backfill_streams(&pool, &icu_key).await }
+    });
+    report
+        .announce
+        .then(|| crate::ai::intervals::withheld_notice(report.withheld))
+}
+
 async fn intervals_credentials(pool: &SqlitePool) -> (String, String) {
     let id = crate::data::settings::load_intervals(pool)
         .await

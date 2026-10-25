@@ -541,11 +541,22 @@ pub async fn unlink_session_from_icu(pool: &SqlitePool, session_id: i64) -> Resu
 /// would be wasted work, and a ride old enough to have fallen out of this window has
 /// long since been matched or will never match.
 pub async fn reconcile_icu_links(pool: &SqlitePool) -> Result<usize> {
+    const RECONCILE_WINDOW_DAYS: i64 = 60;
+    reconcile_icu_links_within(pool, Some(RECONCILE_WINDOW_DAYS)).await
+}
+
+/// [`reconcile_icu_links`] over the last `window_days`, or every session when
+/// `None` — what a Garmin history import needs, since it brings in years of
+/// activities at once, each of which may be a ride recorded here.
+pub async fn reconcile_icu_links_within(
+    pool: &SqlitePool,
+    window_days: Option<i64>,
+) -> Result<usize> {
     use crate::data::dedupe;
 
-    const RECONCILE_WINDOW_DAYS: i64 = 60;
-
-    let cutoff = (Utc::now() - chrono::Duration::days(RECONCILE_WINDOW_DAYS)).to_rfc3339();
+    let cutoff = window_days
+        .map(|days| (Utc::now() - chrono::Duration::days(days)).to_rfc3339())
+        .unwrap_or_default();
 
     // Rides the rider has explicitly unlinked must not be paired up again.
     let rejected: std::collections::HashSet<i64> =

@@ -35,45 +35,185 @@ const MIN_DURATION_SLACK_SECS: f64 = 120.0;
 /// Fractional distance difference allowed when both records report one.
 const MAX_DISTANCE_DIFF_FRACTION: f32 = 0.10;
 
+/// Whole-hour clock errors a match may carry, nearest first.
+///
+/// Rides the app recorded before 0.12.2 were exported with their local time
+/// three hours out, and a file reaches Garmin with whatever time it carries.
+/// A start that misses by exactly whole hours is taken as that error, but only
+/// when the durations agree to [`MAX_OFFSET_DURATION_FRACTION`]: an hour's gap
+/// alone is also what two separate rides look like.
+const HOUR_OFFSETS: [i64; 6] = [1, -1, 2, -2, 3, -3];
+
+/// How closely durations must agree for a match across a whole-hour offset.
+const MAX_OFFSET_DURATION_FRACTION: f64 = 0.02;
+
+/// How far apart the Intervals.icu and Garmin rows of one activity may claim
+/// to have started. Both describe the same file, so they agree closely.
+const MAX_TWIN_START_DIFF_SECS: i64 = 120;
+
 /// Do `session` and `activity` describe the same ride?
 ///
 /// Requires the activity to be a ride, to have started at essentially the same
 /// moment, and to have lasted about as long. Distance is checked only when both
 /// sides report it — an indoor ride without a speed sensor has none.
+///
+/// Test-only: the app matches through [`find_match`], which applies this rule
+/// first and the whole-hour fallback after it.
+#[cfg(test)]
 pub fn is_same_activity(session: &Session, activity: &IntervalsActivity) -> bool {
+    matches_shifted(session, activity, 0)
+}
+
+/// [`is_same_activity`], with the activity's clock taken to be `hours` out.
+fn matches_shifted(session: &Session, activity: &IntervalsActivity, hours: i64) -> bool {
     if !is_ride(&activity.sport_type) {
         return false;
     }
-    let Some(activity_start) = activity_start_utc(activity) else {
+    let Some(gap) = start_gap_secs(session, activity, hours) else {
         // Without a start time there is nothing precise enough to match on; the
         // date alone would pair any two rides on the same day.
         return false;
     };
-    if (session.started_at - activity_start).num_seconds().abs() > MAX_START_DIFF_SECS {
+    if gap > MAX_START_DIFF_SECS {
         return false;
     }
-    if !durations_agree(session, activity) {
-        return false;
-    }
-    distances_agree(session, activity)
+    let durations = if hours == 0 {
+        durations_agree(session, activity)
+    } else {
+        durations_close(
+            u32::try_from(session.duration_secs()).ok(),
+            activity.duration_secs,
+        )
+    };
+    durations && distances_agree(session, activity)
+}
+
+/// Seconds between the session's start and the activity's, once the activity's
+/// clock is moved by `hours`.
+fn start_gap_secs(session: &Session, activity: &IntervalsActivity, hours: i64) -> Option<i64> {
+    let start = activity_start_utc(activity)? + chrono::Duration::hours(hours);
+    Some((session.started_at - start).num_seconds().abs())
 }
 
 /// Find the activity that is the same ride as `session`, if any.
 ///
 /// When several match — which the thresholds make very unlikely — the one starting
-/// closest to the session wins.
+/// closest to the session wins. Only when nothing matches on the clock as it
+/// stands are whole-hour errors tried, nearest first ([`HOUR_OFFSETS`]).
 pub fn find_match<'a>(
     session: &Session,
     activities: impl IntoIterator<Item = &'a IntervalsActivity>,
 ) -> Option<&'a IntervalsActivity> {
+    let activities: Vec<&IntervalsActivity> = activities.into_iter().collect();
+    std::iter::once(0).chain(HOUR_OFFSETS).find_map(|hours| {
+        activities
+            .iter()
+            .copied()
+            .filter(|a| matches_shifted(session, a, hours))
+            .min_by_key(|a| start_gap_secs(session, a, hours).unwrap_or(i64::MAX))
+    })
+}
+
+/// Whether an activity id is one the Garmin sync wrote. Intervals.icu ids
+/// start with `i`, so the two can never collide.
+pub fn is_garmin_id(id: &str) -> bool {
+    id.starts_with('g')
+}
+
+/// Pairs of `(intervals_id, garmin_id)` that are one activity held twice: once
+/// as Intervals.icu synced it before Garmin became the source, once from Garmin.
+///
+/// Twins are the same sport and started within [`MAX_TWIN_START_DIFF_SECS`] of
+/// each other — or of a whole-hour clock error ([`HOUR_OFFSETS`]) when their
+/// moving times also agree to [`MAX_OFFSET_DURATION_FRACTION`]. Each
+/// Intervals.icu row pairs with at most one Garmin row, the nearest, preferring
+/// no offset over any; several Intervals.icu rows may pair with one Garmin row,
+/// since a ride uploaded there twice is still one file at Garmin.
+pub fn find_twins(activities: &[IntervalsActivity]) -> Vec<(String, String)> {
+    let garmin: Vec<&IntervalsActivity> = activities
+        .iter()
+        .filter(|a| is_garmin_id(&a.icu_id))
+        .collect();
     activities
-        .into_iter()
-        .filter(|a| is_same_activity(session, a))
-        .min_by_key(|a| {
-            activity_start_utc(a)
-                .map(|s| (session.started_at - s).num_seconds().abs())
-                .unwrap_or(i64::MAX)
+        .iter()
+        .filter(|a| !is_garmin_id(&a.icu_id))
+        .filter_map(|icu| {
+            let (_, twin) = garmin
+                .iter()
+                .filter_map(|g| Some((twin_rank(icu, g)?, *g)))
+                .min_by_key(|(rank, _)| *rank)?;
+            Some((icu.icu_id.clone(), twin.icu_id.clone()))
         })
+        .collect()
+}
+
+/// Twins found through a ride recorded here, as `(intervals_id, garmin_id)`:
+/// an Intervals.icu row a session is linked to, and an unclaimed Garmin row
+/// that [`find_match`] takes for the same ride as that session.
+///
+/// This catches what [`find_twins`] cannot. Intervals.icu may keep the moving
+/// time where Garmin keeps the whole ride, and a whole-hour clock error then
+/// leaves the two rows too far apart to trust each other — but the session is
+/// a third clock and a third duration, and the Garmin row can agree with it.
+pub fn find_session_twins(
+    sessions: &[&Session],
+    activities: &[IntervalsActivity],
+) -> Vec<(String, String)> {
+    let claimed: std::collections::HashSet<&str> = sessions
+        .iter()
+        .filter_map(|s| s.icu_id.as_deref())
+        .collect();
+    let mut taken = std::collections::HashSet::new();
+    let mut pairs = Vec::new();
+    for session in sessions {
+        let Some(icu) = session.icu_id.as_deref().filter(|id| !is_garmin_id(id)) else {
+            continue;
+        };
+        let candidates = activities.iter().filter(|a| {
+            is_garmin_id(&a.icu_id)
+                && !claimed.contains(a.icu_id.as_str())
+                && !taken.contains(&a.icu_id)
+        });
+        if let Some(g) = find_match(session, candidates) {
+            taken.insert(g.icu_id.clone());
+            pairs.push((icu.to_string(), g.icu_id.clone()));
+        }
+    }
+    pairs
+}
+
+/// How near a twin `g` is to `icu` as (hours of clock error, seconds left
+/// over), or `None` when it is not a twin at all.
+fn twin_rank(icu: &IntervalsActivity, g: &IntervalsActivity) -> Option<(i64, i64)> {
+    let class = |a: &IntervalsActivity| crate::data::sport::normalize_sport_type(&a.sport_type);
+    if class(icu).to_lowercase() != class(g).to_lowercase() {
+        return None;
+    }
+    let gap = (g.start_datetime_local? - icu.start_datetime_local?).num_seconds();
+    if gap.abs() <= MAX_TWIN_START_DIFF_SECS {
+        return Some((0, gap.abs()));
+    }
+    let hours = HOUR_OFFSETS
+        .into_iter()
+        .find(|h| (gap - h * 3600).abs() <= MAX_TWIN_START_DIFF_SECS)?;
+    if !durations_close(icu.duration_secs, g.duration_secs) {
+        return None;
+    }
+    Some((hours.abs(), (gap - hours * 3600).abs()))
+}
+
+/// Whether two durations agree to [`MAX_OFFSET_DURATION_FRACTION`]. Unknown
+/// or zero on either side is not agreement: it is the one check standing
+/// between a clock error and two different rides.
+fn durations_close(a: Option<u32>, b: Option<u32>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    if a == 0 || b == 0 {
+        return false;
+    }
+    let (a, b) = (f64::from(a), f64::from(b));
+    (a - b).abs() <= a.max(b) * MAX_OFFSET_DURATION_FRACTION
 }
 
 /// What makes two Intervals.icu rows the same upload: same sport, started at the
@@ -336,7 +476,9 @@ mod tests {
     fn should_find_nothing_when_no_activity_matches() {
         let session = ride();
         let mut activity = activity_for(&session, "i1");
-        shift_start(&mut activity, 7200);
+        // Not a whole number of hours out: no clock error explains it. (Exactly
+        // two hours, with the durations agreeing, is one — see below.)
+        shift_start(&mut activity, 7200 + 600);
         assert!(find_match(&session, [&activity]).is_none());
     }
 
@@ -449,5 +591,204 @@ mod tests {
             third,
         ];
         assert_eq!(collapse(jumbled), vec!["i1", "i2", "i3"]);
+    }
+
+    // ── Whole-hour clock errors ──
+
+    #[test]
+    fn should_match_a_ride_whose_clock_is_three_hours_out_when_durations_agree() {
+        let session = ride();
+        let mut activity = activity_for(&session, "g1");
+        shift_start(&mut activity, -3 * 3600 + 60);
+        // 2 % of an hour is 72 s.
+        activity.duration_secs = Some(3600 - 72);
+        assert!(!is_same_activity(&session, &activity));
+        assert_eq!(
+            find_match(&session, [&activity]).map(|a| a.icu_id.as_str()),
+            Some("g1")
+        );
+    }
+
+    #[test]
+    fn should_not_match_across_an_hour_when_durations_differ_by_more_than_two_percent() {
+        let session = ride();
+        let mut activity = activity_for(&session, "g1");
+        shift_start(&mut activity, 3600);
+        // Inside the ±10 % an exact-clock match allows, outside the 2 % here.
+        activity.duration_secs = Some(3600 - 73);
+        assert!(find_match(&session, [&activity]).is_none());
+        // And never with no duration to compare at all.
+        activity.duration_secs = None;
+        assert!(find_match(&session, [&activity]).is_none());
+    }
+
+    #[test]
+    fn should_not_match_four_hours_out() {
+        let session = ride();
+        let mut activity = activity_for(&session, "g1");
+        shift_start(&mut activity, 4 * 3600);
+        assert!(find_match(&session, [&activity]).is_none());
+    }
+
+    #[test]
+    fn should_prefer_the_ride_on_time_over_one_an_hour_out() {
+        let session = ride();
+        let mut early = activity_for(&session, "g-hour");
+        shift_start(&mut early, -3600);
+        let mut on_time = activity_for(&session, "g-late");
+        // Late by the full allowance, still preferred to an exact hour's error.
+        shift_start(&mut on_time, MAX_START_DIFF_SECS);
+        assert_eq!(
+            find_match(&session, [&early, &on_time]).map(|a| a.icu_id.as_str()),
+            Some("g-late")
+        );
+    }
+
+    // ── Twins ──
+
+    fn twin(id: &str, sport: &str, start: NaiveDateTime, secs: u32) -> IntervalsActivity {
+        IntervalsActivity {
+            icu_id: id.into(),
+            date: start.date(),
+            name: String::new(),
+            tss: None,
+            duration_secs: Some(secs),
+            average_watts: None,
+            normalized_watts: None,
+            average_hr: None,
+            max_hr: None,
+            sport_type: sport.into(),
+            start_datetime_local: Some(start),
+            distance_m: None,
+            elevation_gain_m: None,
+            average_cadence: None,
+        }
+    }
+
+    fn at(h: u32, m: u32, sec: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 14)
+            .and_then(|d| d.and_hms_opt(h, m, sec))
+            .expect("hardcoded valid time")
+    }
+
+    #[test]
+    fn should_pair_an_icu_row_with_the_garmin_row_of_the_same_file() {
+        let rows = [
+            twin("i1", "Ride", at(8, 0, 0), 3600),
+            twin("g1", "Ride", at(8, 2, 0), 3000),
+        ];
+        // 120 s apart pairs whatever the durations say; the clocks agree.
+        assert_eq!(find_twins(&rows), [("i1".into(), "g1".into())]);
+    }
+
+    #[test]
+    fn should_not_pair_rows_121_seconds_apart() {
+        let rows = [
+            twin("i1", "Ride", at(8, 0, 0), 3600),
+            twin("g1", "Ride", at(8, 2, 1), 3600),
+        ];
+        assert!(find_twins(&rows).is_empty());
+    }
+
+    #[test]
+    fn should_pair_across_a_whole_hour_only_when_moving_times_agree() {
+        let icu = twin("i1", "VirtualRide", at(8, 0, 0), 3600);
+        let close = twin("g1", "VirtualRide", at(11, 2, 0), 3600 - 72);
+        assert_eq!(
+            find_twins(&[icu.clone(), close]),
+            [("i1".into(), "g1".into())]
+        );
+        let far = twin("g1", "VirtualRide", at(11, 0, 0), 3600 - 73);
+        assert!(find_twins(&[icu.clone(), far]).is_empty());
+        let late = twin("g1", "VirtualRide", at(11, 2, 1), 3600);
+        assert!(find_twins(&[icu.clone(), late]).is_empty());
+        let four = twin("g1", "VirtualRide", at(12, 0, 0), 3600);
+        assert!(find_twins(&[icu, four]).is_empty());
+    }
+
+    #[test]
+    fn should_pair_only_within_one_sport_class_however_the_services_spell_it() {
+        // Intervals.icu files a gravel ride as a ride; Garmin as gravel.
+        let rows = [
+            twin("i1", "Ride", at(8, 0, 0), 3600),
+            twin("g1", "GravelRide", at(8, 0, 30), 3600),
+            twin("i2", "Run", at(18, 0, 0), 1800),
+            twin("g2", "Walk", at(18, 0, 0), 1800),
+        ];
+        assert_eq!(find_twins(&rows), [("i1".into(), "g1".into())]);
+    }
+
+    #[test]
+    fn should_pair_each_icu_copy_of_one_upload_with_the_one_garmin_row() {
+        let rows = [
+            twin("i1", "Ride", at(8, 0, 0), 3600),
+            twin("i2", "Ride", at(8, 0, 0), 3600),
+            twin("g1", "Ride", at(8, 0, 5), 3600),
+        ];
+        assert_eq!(
+            find_twins(&rows),
+            [("i1".into(), "g1".into()), ("i2".into(), "g1".into())]
+        );
+    }
+
+    #[test]
+    fn should_pick_the_nearest_garmin_row_and_never_pair_garmin_with_garmin() {
+        let rows = [
+            twin("g-far", "Ride", at(8, 1, 30), 3600),
+            twin("i1", "Ride", at(8, 0, 0), 3600),
+            twin("g-near", "Ride", at(7, 59, 50), 3600),
+        ];
+        assert_eq!(find_twins(&rows), [("i1".into(), "g-near".into())]);
+    }
+
+    #[test]
+    fn should_leave_a_row_with_no_start_time_unpaired() {
+        let mut icu = twin("i1", "Ride", at(8, 0, 0), 3600);
+        icu.start_datetime_local = None;
+        assert!(find_twins(&[icu, twin("g1", "Ride", at(8, 0, 0), 3600)]).is_empty());
+    }
+
+    #[test]
+    fn should_never_take_a_garmin_row_another_session_already_claims() {
+        let mut linked_to_icu = ride();
+        linked_to_icu.icu_id = Some("i1".into());
+        let mut linked_to_garmin = ride();
+        linked_to_garmin.icu_id = Some("g1".into());
+        let g = activity_for(&linked_to_icu, "g1");
+        assert!(find_session_twins(&[&linked_to_icu, &linked_to_garmin], &[g]).is_empty());
+    }
+
+    #[test]
+    fn should_fold_one_garmin_row_into_one_icu_row_only() {
+        // Two sessions on one ride, each linked to its own icu copy.
+        let mut a = ride();
+        a.icu_id = Some("i1".into());
+        let mut b = a.clone();
+        b.icu_id = Some("i2".into());
+        let g = activity_for(&a, "g1");
+        assert_eq!(
+            find_session_twins(&[&a, &b], &[g]),
+            [("i1".to_string(), "g1".to_string())]
+        );
+    }
+
+    #[test]
+    fn should_ignore_sessions_unlinked_or_already_linked_to_garmin() {
+        let unlinked = ride();
+        let g = activity_for(&unlinked, "g1");
+        assert!(find_session_twins(&[&unlinked], std::slice::from_ref(&g)).is_empty());
+        let mut on_garmin = ride();
+        on_garmin.icu_id = Some("g9".into());
+        assert!(find_session_twins(&[&on_garmin], &[g]).is_empty());
+    }
+
+    #[test]
+    fn should_pick_the_nearer_twin_across_a_negative_whole_hour_offset() {
+        let rows = [
+            twin("i1", "Ride", at(11, 0, 0), 3600),
+            twin("g-far", "Ride", at(8, 1, 40), 3600),
+            twin("g-near", "Ride", at(7, 59, 50), 3600),
+        ];
+        assert_eq!(find_twins(&rows), [("i1".into(), "g-near".into())]);
     }
 }

@@ -165,6 +165,125 @@ pub async fn delete_intervals_activity(pool: &SqlitePool, icu_id: &str) -> Resul
     Ok(())
 }
 
+/// Record the load worked out for a synced activity, replacing any it had.
+pub async fn set_activity_tss(pool: &SqlitePool, icu_id: &str, tss: f32) -> Result<()> {
+    sqlx::query("UPDATE intervals_activities SET tss = ? WHERE icu_id = ?")
+        .bind(f64::from(tss))
+        .bind(icu_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Fold each activity held twice — once from Intervals.icu, once from Garmin —
+/// into its Garmin row. Returns how many Intervals.icu rows were folded away.
+///
+/// Before Garmin became the source, its rides reached the app through
+/// Intervals.icu; the first Garmin sync brings each one in again under a `g`
+/// id. For every pair [`dedupe::find_twins`](crate::data::dedupe::find_twins)
+/// or [`dedupe::find_session_twins`](crate::data::dedupe::find_session_twins)
+/// finds, in one transaction:
+///
+/// 1. a session linked to the Intervals.icu row is linked to the Garmin row;
+/// 2. one set of streams is kept — Garmin's if it has any, else Intervals.icu's,
+///    moved across (a cached `[]` is not a set and is dropped);
+/// 3. the Garmin row keeps its own load, or takes the Intervals.icu one if it
+///    has none yet;
+/// 4. the Intervals.icu row is deleted.
+///
+/// A pair where *both* rows are linked, to two different sessions, is left as
+/// it is: that is two recorded rides claiming one activity, and folding the
+/// rows would hide one of them. The database is snapshotted before the first
+/// change, and nothing is changed if the snapshot cannot be taken.
+pub async fn merge_twins(pool: &SqlitePool) -> Result<usize> {
+    let activities = load_intervals_activities(pool).await?;
+    let mut pairs = crate::data::dedupe::find_twins(&activities);
+    let records = super::load_session_records(pool).await?;
+    let sessions: Vec<&crate::data::session::Session> =
+        records.iter().map(|r| &r.session).collect();
+    for (icu, g) in crate::data::dedupe::find_session_twins(&sessions, &activities) {
+        if !pairs.iter().any(|(i, _)| *i == icu) {
+            pairs.push((icu, g));
+        }
+    }
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    crate::data::backup::snapshot(pool, "garmin-merge").await?;
+
+    let claim = |id: String| {
+        sqlx::query_scalar::<_, i64>("SELECT id FROM sessions WHERE icu_id = ?").bind(id)
+    };
+    let streams = |id: String| {
+        sqlx::query_scalar::<_, String>(
+            "SELECT streams_json FROM activity_streams WHERE icu_id = ? AND streams_json <> '[]'",
+        )
+        .bind(id)
+    };
+
+    let mut merged = 0;
+    for (icu, g) in pairs {
+        let mut tx = pool.begin().await?;
+        let icu_claim = claim(icu.clone()).fetch_optional(&mut *tx).await?;
+        let g_claim = claim(g.clone()).fetch_optional(&mut *tx).await?;
+        if icu_claim.is_some() && g_claim.is_some() {
+            tracing::warn!("Activity {g} is claimed by two sessions; left unmerged");
+            continue;
+        }
+        if icu_claim.is_some() {
+            sqlx::query("UPDATE sessions SET icu_id = ? WHERE icu_id = ?")
+                .bind(&g)
+                .bind(&icu)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if streams(g.clone()).fetch_optional(&mut *tx).await?.is_some() {
+            sqlx::query("DELETE FROM activity_streams WHERE icu_id = ?")
+                .bind(&icu)
+                .execute(&mut *tx)
+                .await?;
+        } else if streams(icu.clone())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some()
+        {
+            sqlx::query("DELETE FROM activity_streams WHERE icu_id = ?")
+                .bind(&g)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE activity_streams SET icu_id = ? WHERE icu_id = ?")
+                .bind(&g)
+                .bind(&icu)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM activity_streams WHERE icu_id = ?")
+                .bind(&icu)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "UPDATE intervals_activities
+             SET tss = (SELECT tss FROM intervals_activities WHERE icu_id = ?)
+             WHERE icu_id = ? AND tss IS NULL",
+        )
+        .bind(&icu)
+        .bind(&g)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM intervals_activities WHERE icu_id = ?")
+            .bind(&icu)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        merged += 1;
+    }
+    if merged > 0 {
+        tracing::info!("Folded {merged} Intervals.icu activities into their Garmin copies");
+    }
+    Ok(merged)
+}
+
 /// Load all Intervals.icu activities, newest first.
 pub async fn load_intervals_activities(pool: &SqlitePool) -> Result<Vec<IntervalsActivity>> {
     let rows = sqlx::query(
@@ -746,5 +865,263 @@ mod tests {
         clear_intervals_workouts(&pool).await.unwrap();
         assert_eq!(count_intervals_workouts(&pool).await.unwrap(), 0);
         assert!(load_intervals_workouts(&pool).await.unwrap().is_empty());
+    }
+
+    // ── Garmin twins ─────────────────────────────────────────────────────────
+
+    use crate::data::db::{get_activity_streams, linked_icu_ids, save_activity_streams};
+
+    async fn tss_of(pool: &SqlitePool, id: &str) -> Option<Option<f32>> {
+        load_intervals_activities(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.icu_id == id)
+            .map(|a| a.tss)
+    }
+
+    #[tokio::test]
+    async fn should_fold_an_icu_row_into_its_garmin_twin_link_streams_and_load_included() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        ride(&pool, "g1", 9, 7, None).await;
+        link(&pool, "i1").await;
+        save_activity_streams(&pool, "i1", r#"[{"type":"time","data":[0]}]"#)
+            .await
+            .unwrap();
+
+        assert_eq!(merge_twins(&pool).await.unwrap(), 1);
+
+        let left = load_intervals_activities(&pool).await.unwrap();
+        assert_eq!(ids(&left), ["g1"]);
+        let linked = linked_icu_ids(&pool).await.unwrap();
+        assert!(
+            linked.contains("g1") && !linked.contains("i1"),
+            "{linked:?}"
+        );
+        assert_eq!(
+            get_activity_streams(&pool, "g1").await.unwrap().as_deref(),
+            Some(r#"[{"type":"time","data":[0]}]"#)
+        );
+        assert_eq!(get_activity_streams(&pool, "i1").await.unwrap(), None);
+        // The Garmin row had no load yet; the Intervals.icu one stands in.
+        assert_eq!(tss_of(&pool, "g1").await, Some(Some(80.0)));
+        // And a second pass finds nothing left to fold.
+        assert_eq!(merge_twins(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_keep_garmins_own_streams_and_load_over_the_icu_ones() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        ride(&pool, "g1", 9, 7, Some(77.5)).await;
+        save_activity_streams(&pool, "i1", r#"[{"type":"time","data":[1]}]"#)
+            .await
+            .unwrap();
+        save_activity_streams(&pool, "g1", r#"[{"type":"time","data":[2]}]"#)
+            .await
+            .unwrap();
+
+        assert_eq!(merge_twins(&pool).await.unwrap(), 1);
+
+        assert_eq!(
+            get_activity_streams(&pool, "g1").await.unwrap().as_deref(),
+            Some(r#"[{"type":"time","data":[2]}]"#)
+        );
+        assert_eq!(get_activity_streams(&pool, "i1").await.unwrap(), None);
+        assert_eq!(tss_of(&pool, "g1").await, Some(Some(77.5)));
+    }
+
+    #[tokio::test]
+    async fn should_drop_an_empty_icu_stream_rather_than_hand_it_to_garmin() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        ride(&pool, "g1", 9, 7, None).await;
+        save_activity_streams(&pool, "i1", "[]").await.unwrap();
+        save_activity_streams(&pool, "g1", "[]").await.unwrap();
+
+        assert_eq!(merge_twins(&pool).await.unwrap(), 1);
+
+        // Neither `[]` is data: the Garmin row keeps its own, and the
+        // Intervals.icu one is gone with its row.
+        assert_eq!(
+            get_activity_streams(&pool, "g1").await.unwrap().as_deref(),
+            Some("[]")
+        );
+        assert_eq!(get_activity_streams(&pool, "i1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn should_leave_twins_alone_when_two_sessions_claim_them() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        ride(&pool, "g1", 9, 7, None).await;
+        link(&pool, "i1").await;
+        link(&pool, "g1").await;
+
+        assert_eq!(merge_twins(&pool).await.unwrap(), 0);
+        let mut left = ids(&load_intervals_activities(&pool).await.unwrap())
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(left, ["g1", "i1"]);
+    }
+
+    #[tokio::test]
+    async fn should_fold_nothing_that_is_not_a_twin() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        // Same day, a different ride: five hours later.
+        ride(&pool, "g1", 9, 12, None).await;
+        // Garmin with Garmin is never a pair, however alike.
+        ride(&pool, "g2", 10, 7, None).await;
+        ride(&pool, "g3", 10, 7, None).await;
+        assert_eq!(merge_twins(&pool).await.unwrap(), 0);
+        assert_eq!(load_intervals_activities(&pool).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn should_queue_garmin_files_apart_from_icu_streams() {
+        let pool = test_pool().await;
+        ride(&pool, "i1", 9, 7, Some(80.0)).await;
+        ride(&pool, "g1", 9, 8, None).await;
+        ride(&pool, "g2", 10, 8, Some(50.0)).await;
+        ride(&pool, "g3", 11, 8, None).await;
+        save_activity_streams(&pool, "g3", "[]").await.unwrap();
+        ride(&pool, "g4", 12, 8, None).await;
+        link(&pool, "g4").await;
+
+        // Intervals.icu is asked only about its own rows.
+        assert_eq!(
+            crate::data::db::activities_missing_streams(&pool, 10)
+                .await
+                .unwrap(),
+            ["i1"]
+        );
+        // Garmin: newest first; cached (even as `[]`) and linked ones skipped.
+        let files = crate::data::db::garmin_activities_missing_files(&pool, None)
+            .await
+            .unwrap();
+        let got: Vec<_> = files.iter().map(|f| (f.id.as_str(), f.has_load)).collect();
+        assert_eq!(got, [("g2", true), ("g1", false)]);
+        let one = crate::data::db::garmin_activities_missing_files(&pool, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, "g2");
+    }
+
+    #[tokio::test]
+    async fn should_queue_rides_before_other_sports_and_loadless_first_within_a_day() {
+        let pool = test_pool().await;
+        let add = |id: &'static str, hour: u32, sport: &'static str, tss: Option<f32>| {
+            let pool = pool.clone();
+            async move {
+                upsert_intervals_activity(
+                    &pool,
+                    id,
+                    day(9),
+                    "",
+                    tss,
+                    Some(1800),
+                    None,
+                    None,
+                    None,
+                    None,
+                    sport,
+                    day(9).and_hms_opt(hour, 0, 0),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        };
+        add("g-a", 6, "WeightTraining", None).await;
+        add("g-b", 7, "Ride", Some(40.0)).await;
+        add("g-c", 8, "Run", None).await;
+        let files = crate::data::db::garmin_activities_missing_files(&pool, None)
+            .await
+            .unwrap();
+        let got: Vec<_> = files.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(got, ["g-c", "g-b", "g-a"]);
+    }
+
+    /// A finished hour-long ride recorded here, starting at `hour` local on
+    /// day `d`, linked to `icu_id`.
+    async fn recorded(pool: &SqlitePool, d: u32, hour: u32, icu_id: &str) -> i64 {
+        use chrono::{Local, Utc};
+        let mut session = Session::new(None);
+        session.started_at = day(d)
+            .and_hms_opt(hour, 0, 0)
+            .and_then(|t| t.and_local_timezone(Local).earliest())
+            .expect("hardcoded valid local time")
+            .with_timezone(&Utc);
+        session.ended_at = Some(session.started_at + chrono::Duration::hours(1));
+        let id = crate::data::db::save_session(pool, &session).await.unwrap();
+        crate::data::db::set_session_icu_id(pool, id, Some(icu_id))
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn row(pool: &SqlitePool, id: &str, d: u32, hour: u32, secs: u32) {
+        upsert_intervals_activity(
+            pool,
+            id,
+            day(d),
+            "",
+            Some(10.0),
+            Some(secs),
+            None,
+            None,
+            None,
+            None,
+            "VirtualRide",
+            day(d).and_hms_opt(hour, 0, 0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_fold_a_garmin_row_that_matches_the_session_its_icu_twin_is_linked_to() {
+        let pool = test_pool().await;
+        // Intervals.icu kept moving time, 17 % short of the ride; Garmin kept
+        // the whole ride but on a clock three hours out. Neither agrees with
+        // the other closely enough to be twins; both are the session.
+        let session = recorded(&pool, 9, 19, "i1").await;
+        row(&pool, "i1", 9, 19, 3000).await;
+        row(&pool, "g1", 9, 16, 3600).await;
+
+        assert_eq!(merge_twins(&pool).await.unwrap(), 1);
+        assert_eq!(
+            ids(&load_intervals_activities(&pool).await.unwrap()),
+            ["g1"]
+        );
+        let linked: Vec<_> =
+            sqlx::query_scalar::<_, String>("SELECT icu_id FROM sessions WHERE id = ?")
+                .bind(session)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, ["g1"]);
+    }
+
+    #[tokio::test]
+    async fn should_not_fold_a_garmin_row_that_does_not_match_the_linked_session() {
+        let pool = test_pool().await;
+        recorded(&pool, 9, 19, "i1").await;
+        row(&pool, "i1", 9, 19, 3000).await;
+        // Three hours out, and a length agreeing with neither the session nor
+        // the Intervals.icu row: another ride.
+        row(&pool, "g1", 9, 16, 2400).await;
+        assert_eq!(merge_twins(&pool).await.unwrap(), 0);
+        assert_eq!(load_intervals_activities(&pool).await.unwrap().len(), 2);
     }
 }

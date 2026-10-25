@@ -126,6 +126,7 @@ fn build_and_present(
     ));
     win.add(&integrations::build(
         &win,
+        parent,
         &intervals_settings,
         pool.clone(),
         rt_handle.clone(),

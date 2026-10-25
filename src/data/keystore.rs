@@ -10,6 +10,7 @@ const SERVICE: &str = "io.github.rorynuijens.Cycle";
 
 pub const KEY_ANTHROPIC: &str = "anthropic.api_key";
 pub const KEY_INTERVALS_API: &str = "intervals.api_key";
+pub const KEY_GARMIN_API: &str = "garmin.api_key";
 
 /// Retrieve a secret. Returns `Ok(None)` when the key does not exist in the keyring.
 pub fn get_secret(key: &str) -> Result<Option<String>> {

@@ -28,7 +28,7 @@ pub fn normalize_sport_type(raw: &str) -> String {
         "rowing" | "indoorrowing" => "Rowing",
         "elliptical" => "Elliptical",
         "nordicski" | "backcountryski" => "Ski",
-        "workout" | "crossfit" | "hiit" => "Cross Training",
+        "workout" | "crossfit" | "hiit" | "highintensityintervaltraining" => "Cross Training",
         _ => return raw.to_string(),
     }
     .to_string()
@@ -64,6 +64,13 @@ pub fn is_run(raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_class_intervals_icus_hiit_with_the_other_spellings() {
+        for raw in ["HighIntensityIntervalTraining", "HIIT", "hiit", "Workout"] {
+            assert_eq!(normalize_sport_type(raw), "Cross Training", "{raw}");
+        }
+    }
 
     #[test]
     fn should_treat_an_empty_sport_as_cycling() {

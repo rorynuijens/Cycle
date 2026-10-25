@@ -739,7 +739,15 @@ pub fn build_week_view(
                             .css_classes(["flat"])
                             .halign(gtk::Align::Start)
                             .hexpand(true)
-                            .tooltip_text(format!("{} · Intervals.icu", dur_str))
+                            .tooltip_text(format!(
+                                "{} · {}",
+                                dur_str,
+                                if crate::data::dedupe::is_garmin_id(&activity.icu_id) {
+                                    "Garmin Connect"
+                                } else {
+                                    "Intervals.icu"
+                                }
+                            ))
                             .build();
                         btn.set_child(Some(
                             &gtk::Label::builder()

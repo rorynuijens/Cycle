@@ -235,9 +235,149 @@ fn json_latlng_vec(val: &Value) -> Vec<(f64, f64)> {
         .unwrap_or_default()
 }
 
+/// The longest gap between two samples of an indoor ride that is still riding;
+/// anything longer is a stop.
+const MAX_STEP_SECS: u32 = 10;
+
+/// One activity's per-second record, written in the streams format
+/// [`ActivityStreams::from_json`] reads (`[{"type": "watts", "data": [...]}, ...]`)
+/// — the shape the cache holds for an activity whatever service it came from.
+///
+/// Missing samples are `null`, which the reader takes as 0 — the same as
+/// Intervals.icu's zero padding — so every stream stays aligned with `time`.
+/// GPS points are pairs, present only where both halves are.
+///
+/// A FIT file's distance field is not one the importer keeps, so distance is
+/// worked out here: along the GPS track when there is one, since older Edge
+/// units record "smart" samples up to a dozen seconds apart, which speed alone
+/// cannot integrate without cutting corners or counting stops; from speed
+/// otherwise, with any gap longer than [`MAX_STEP_SECS`] counted as a stop.
+pub fn streams_json_from_points(points: &[crate::data::session::DataPoint]) -> String {
+    use serde_json::json;
+
+    let opt_u = |v: Option<u32>| v.map(Value::from).unwrap_or(Value::Null);
+    let has_gps = points.iter().any(|p| p.lat.is_some() && p.lng.is_some());
+    let mut distance = 0.0f64;
+    let mut last_t = None;
+    let mut last_fix: Option<(f64, f64)> = None;
+    let mut dist = Vec::with_capacity(points.len());
+    for p in points {
+        if has_gps {
+            if let (Some(lat), Some(lng)) = (p.lat, p.lng) {
+                if let Some((la, ln)) = last_fix {
+                    distance += f64::from(crate::data::route::haversine(la, ln, lat, lng));
+                }
+                last_fix = Some((lat, lng));
+            }
+        } else {
+            // Indoors, a gap longer than any recording interval is a pause:
+            // the speed at the restart must not fill it.
+            let dt = last_t
+                .map(|t| p.elapsed_secs.saturating_sub(t))
+                .unwrap_or(0)
+                .min(MAX_STEP_SECS);
+            let ms = p.speed_kmh.map(|v| f64::from(v) / 3.6).unwrap_or(0.0);
+            distance += ms * f64::from(dt);
+        }
+        dist.push(json!((distance * 10.0).round() / 10.0));
+        last_t = Some(p.elapsed_secs);
+    }
+    let column = |f: &dyn Fn(&crate::data::session::DataPoint) -> Value| {
+        points.iter().map(f).collect::<Vec<_>>()
+    };
+    let mut streams = vec![
+        json!({"type": "time", "data": column(&|p| p.elapsed_secs.into())}),
+        json!({"type": "watts", "data": column(&|p| opt_u(p.power_watts))}),
+        json!({"type": "heartrate", "data": column(&|p| opt_u(p.heart_rate_bpm))}),
+        json!({"type": "cadence", "data": column(&|p| opt_u(p.cadence_rpm))}),
+        json!({
+            "type": "velocity_smooth",
+            "data": column(&|p| json!(p.speed_kmh.map(|v| f64::from(v) / 3.6))),
+        }),
+        json!({"type": "distance", "data": dist}),
+    ];
+    if points.iter().any(|p| p.altitude_m.is_some()) {
+        streams.push(json!({"type": "altitude", "data": column(&|p| json!(p.altitude_m))}));
+    }
+    let gps: Vec<_> = points
+        .iter()
+        .filter_map(|p| Some(json!([p.lat?, p.lng?])))
+        .collect();
+    if !gps.is_empty() {
+        streams.push(json!({"type": "latlng", "data": gps}));
+    }
+    Value::Array(streams).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_write_streams_the_app_reads_back_sample_for_sample() {
+        use crate::data::session::DataPoint;
+        let p = |t, w, hr, kmh, gps: Option<(f64, f64)>| DataPoint {
+            elapsed_secs: t,
+            power_watts: w,
+            target_watts: None,
+            heart_rate_bpm: hr,
+            cadence_rpm: None,
+            speed_kmh: kmh,
+            lat: gps.map(|g| g.0),
+            lng: gps.map(|g| g.1),
+            altitude_m: Some(10.0),
+        };
+        let points = [
+            p(0, Some(200), Some(140), Some(36.0), Some((40.0, 29.0))),
+            p(1, None, Some(141), Some(36.0), None),
+            p(3, Some(250), None, None, Some((40.1, 29.1))),
+        ];
+        let s = ActivityStreams::from_json(&streams_json_from_points(&points)).unwrap();
+        assert_eq!(s.time_s, [0, 1, 3]);
+        // A gap is a zero, not a dropped sample: power stays aligned with time.
+        assert_eq!(s.watts, [200, 0, 250]);
+        assert_eq!(s.heartrate, [140, 141, 0]);
+        // With a track, distance follows it: nothing until the second fix, which
+        // is about 14 km north-east of the first.
+        assert_eq!(s.distance_m[..2], [0.0, 0.0]);
+        let expected = crate::data::route::haversine(40.0, 29.0, 40.1, 29.1);
+        assert!(
+            (s.distance_m[2] - expected).abs() < 0.1,
+            "{:?}",
+            s.distance_m
+        );
+        assert_eq!(s.latlng, [(40.0, 29.0), (40.1, 29.1)]);
+        assert!(s.has_altitude());
+    }
+
+    #[test]
+    fn should_not_count_a_cafe_stop_as_distance() {
+        use crate::data::session::DataPoint;
+        let p = |t| DataPoint {
+            elapsed_secs: t,
+            power_watts: None,
+            target_watts: None,
+            heart_rate_bpm: None,
+            cadence_rpm: None,
+            speed_kmh: Some(36.0),
+            lat: None,
+            lng: None,
+            altitude_m: None,
+        };
+        // Ten seconds riding at 10 m/s, a 30-minute stop, one second more.
+        let points: Vec<_> = (0..=10).chain([1810, 1811]).map(p).collect();
+        let s = ActivityStreams::from_json(&streams_json_from_points(&points)).unwrap();
+        // 100 m before the stop, at most one 10 s step across it, 10 m after.
+        assert_eq!(s.distance_m.last().copied(), Some(210.0));
+    }
+
+    #[test]
+    fn should_write_no_altitude_or_track_for_an_activity_without_them() {
+        let s = ActivityStreams::from_json(&streams_json_from_points(&[])).unwrap();
+        assert!(s.time_s.is_empty());
+        assert!(!s.has_gps());
+        assert!(!s.has_altitude());
+    }
 
     #[test]
     fn should_parse_time_and_latlng_streams() {

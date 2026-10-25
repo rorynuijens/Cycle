@@ -45,6 +45,112 @@ fn reload_fn(holder: &Rc<RefCell<Option<ReloadFn>>>) -> Rc<dyn Fn()> {
     Rc::new(move || crate::ui::call_reload(&holder))
 }
 
+/// Where the calendar's sync button pulls activities from, with its key.
+enum SyncSource {
+    Garmin(String),
+    Intervals(String),
+}
+
+/// How far back the calendar's sync button reaches.
+const CALENDAR_SYNC_DAYS: i64 = 60;
+
+/// Sync the last [`CALENDAR_SYNC_DAYS`] from Garmin Connect, send the toast,
+/// then fetch the new activities' files. Runs on tokio.
+async fn sync_from_garmin(
+    pool: &SqlitePool,
+    api_key: &str,
+    tx: &async_channel::Sender<Result<String, String>>,
+) {
+    use crate::ai::garmin::sync;
+
+    let failed = |e: anyhow::Error| {
+        if sync::is_unauthorized(&e) {
+            sync::UNAUTHORIZED_NOTICE.to_string()
+        } else {
+            format!("{e:#}")
+        }
+    };
+    let source = match sync::Live::connect(api_key).await {
+        Ok(source) => source,
+        Err(e) => {
+            let _ = tx.send(Err(failed(e))).await;
+            return;
+        }
+    };
+    let today = Local::now().date_naive();
+    match sync::sync(pool, &source, today, CALENDAR_SYNC_DAYS, 7).await {
+        Ok(report) => {
+            let _ = tx
+                .send(Ok(format!(
+                    "Synced {} activities from Garmin Connect{}",
+                    report.activities,
+                    sync::merged_suffix(report.merged)
+                )))
+                .await;
+        }
+        Err(e) => {
+            let _ = tx.send(Err(failed(e))).await;
+            return;
+        }
+    }
+    // After the toast, not before it: the Fitness page wants these, the sync
+    // result does not.
+    if let Err(e) = sync::fetch_recent_files(pool, &source).await {
+        tracing::error!("Garmin file pass failed: {e:#}");
+    }
+}
+
+/// Sync the last [`CALENDAR_SYNC_DAYS`] from Intervals.icu, send the toast,
+/// then fetch streams. Runs on tokio.
+async fn sync_from_intervals(
+    pool: &SqlitePool,
+    api_key: &str,
+    tx: &async_channel::Sender<Result<String, String>>,
+) {
+    // The athlete id is read here rather than on the GTK thread: a block_on
+    // against SQLite stalls the GLib loop if the database is busy, which it is
+    // every 30 s during a ride.
+    let athlete_id = match crate::data::settings::load_intervals(pool).await {
+        Ok(s) if !s.athlete_id.trim().is_empty() => s.athlete_id,
+        Ok(_) => {
+            let _ = tx
+                .send(Err(
+                    "No Intervals.icu athlete ID configured — add it in Preferences".to_string(),
+                ))
+                .await;
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Could not read the Intervals.icu athlete ID: {e}");
+            let _ = tx
+                .send(Err("Could not read your Intervals.icu settings".to_string()))
+                .await;
+            return;
+        }
+    };
+
+    let today = Local::now().date_naive();
+    let oldest = today - Duration::days(CALENDAR_SYNC_DAYS);
+    match crate::ai::intervals::fetch_activities(&athlete_id, api_key, oldest, today).await {
+        Ok(acts) => {
+            let stored = crate::ai::intervals::store_activities(pool, acts).await;
+            let _ = tx
+                .send(Ok(format!(
+                    "Synced {} activities from Intervals.icu{}",
+                    stored.saved,
+                    crate::ai::intervals::withheld_suffix(stored.withheld.len())
+                )))
+                .await;
+            // After the toast, not before it: the Fitness page wants these,
+            // the sync result does not.
+            crate::ai::intervals::backfill_streams(pool, api_key).await;
+        }
+        Err(e) => {
+            let _ = tx.send(Err(e.to_string())).await;
+        }
+    }
+}
+
 /// Everything the calendar draws for one visible range.
 struct CalendarData {
     /// Scheduled workouts still ahead, anywhere on the calendar — drives the
@@ -234,8 +340,8 @@ impl CalendarPage {
         );
         let icu_sync_btn = menu_item(
             "view-refresh-symbolic",
-            "Sync Intervals.icu",
-            "Sync activities from Intervals.icu",
+            "Sync Activities",
+            "Sync activities from Garmin Connect, or from Intervals.icu without a Garmin key",
         );
 
         let menu_box = gtk::Box::builder()
@@ -620,7 +726,7 @@ impl CalendarPage {
             Rc::clone(&reload),
         );
 
-        // ── Intervals.icu sync button ─────────────────────────────────────────
+        // ── Activity sync button ──────────────────────────────────────────────
         {
             let pool_icu = pool.clone();
             let rt_icu = rt_handle.clone();
@@ -628,15 +734,23 @@ impl CalendarPage {
             let on_toast_icu = Rc::clone(&on_toast);
 
             icu_sync_btn.connect_clicked(move |btn| {
-                let api_key = match crate::data::keystore::get_secret(
-                    crate::data::keystore::KEY_INTERVALS_API,
-                ) {
-                    Ok(Some(k)) if !k.trim().is_empty() => k,
-                    _ => {
+                // Garmin Connect is the source once a key is set; Intervals.icu
+                // otherwise.
+                let garmin_key = crate::ai::garmin::sync::api_key();
+                let icu_key =
+                    crate::data::keystore::get_secret(crate::data::keystore::KEY_INTERVALS_API)
+                        .ok()
+                        .flatten()
+                        .filter(|k| !k.trim().is_empty());
+                let source = match (garmin_key, icu_key) {
+                    (Some(key), _) => SyncSource::Garmin(key),
+                    (None, Some(key)) => SyncSource::Intervals(key),
+                    (None, None) => {
                         on_toast_icu(
                             adw::Toast::builder()
                                 .title(
-                                    "No Intervals.icu API key configured — add it in Preferences",
+                                    "No Garmin or Intervals.icu API key configured — \
+                                     add one in Preferences",
                                 )
                                 .timeout(5)
                                 .build(),
@@ -650,76 +764,23 @@ impl CalendarPage {
                 let reload_s = Rc::clone(&reload_icu);
                 let on_toast_s = Rc::clone(&on_toast_icu);
                 let btn_s = btn.clone();
-                let (tx, rx) = async_channel::bounded::<
-                    Result<crate::ai::intervals::StoredActivities, String>,
-                >(1);
+                let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
 
                 rt_icu.spawn(async move {
-                    // The athlete id is read here rather than on the GTK thread:
-                    // a block_on against SQLite stalls the GLib loop if the
-                    // database is busy, which it is every 30 s during a ride.
-                    let athlete_id = match crate::data::settings::load_intervals(&pool_s).await {
-                        Ok(s) if !s.athlete_id.trim().is_empty() => s.athlete_id,
-                        Ok(_) => {
-                            let _ = tx
-                                .send(Err("No Intervals.icu athlete ID configured — \
-                                           add it in Preferences"
-                                    .to_string()))
-                                .await;
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::error!("Could not read the Intervals.icu athlete ID: {e}");
-                            let _ = tx
-                                .send(Err("Could not read your Intervals.icu settings".to_string()))
-                                .await;
-                            return;
-                        }
-                    };
-
-                    let today = chrono::Local::now().date_naive();
-                    let oldest = today - chrono::Duration::days(60);
-                    match crate::ai::intervals::fetch_activities(
-                        &athlete_id,
-                        &api_key,
-                        oldest,
-                        today,
-                    )
-                    .await
-                    {
-                        Ok(acts) => {
-                            let stored =
-                                crate::ai::intervals::store_activities(&pool_s, acts).await;
-                            let _ = tx.send(Ok(stored)).await;
-                            // After the toast, not before it: the Fitness page
-                            // wants these, the sync result does not.
-                            crate::ai::intervals::backfill_streams(&pool_s, &api_key).await;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e.to_string())).await;
-                        }
+                    match source {
+                        SyncSource::Garmin(key) => sync_from_garmin(&pool_s, &key, &tx).await,
+                        SyncSource::Intervals(key) => sync_from_intervals(&pool_s, &key, &tx).await,
                     }
                 });
 
                 glib::MainContext::default().spawn_local(async move {
                     match rx.recv().await {
-                        Ok(Ok(stored)) => {
-                            on_toast_s(
-                                adw::Toast::builder()
-                                    .title(format!(
-                                        "Synced {} activities from Intervals.icu{}",
-                                        stored.saved,
-                                        crate::ai::intervals::withheld_suffix(
-                                            stored.withheld.len()
-                                        )
-                                    ))
-                                    .timeout(4)
-                                    .build(),
-                            );
+                        Ok(Ok(title)) => {
+                            on_toast_s(adw::Toast::builder().title(title).timeout(4).build());
                             reload_s();
                         }
                         Ok(Err(e)) => {
-                            tracing::error!("Intervals.icu calendar sync failed: {e}");
+                            tracing::error!("Calendar activity sync failed: {e}");
                             on_toast_s(
                                 adw::Toast::builder()
                                     .title(format!("Sync failed: {e}"))

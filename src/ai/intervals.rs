@@ -354,6 +354,21 @@ async fn fetch_activity_streams(api_key: &str, activity_id: &str) -> Result<Stre
         .context("failed to read streams response")
 }
 
+/// One activity's streams, for the Garmin comparison harness only.
+///
+/// `None` covers both a ride without streams and one Intervals.icu withholds;
+/// the comparison reports either as "no streams".
+#[cfg(test)]
+pub(super) async fn fetch_streams_for_comparison(
+    api_key: &str,
+    activity_id: &str,
+) -> Result<Option<ActivityStreams>> {
+    Ok(match fetch_activity_streams(api_key, activity_id).await? {
+        StreamFetch::Found(json) => ActivityStreams::from_json(&json),
+        StreamFetch::Missing | StreamFetch::Withheld => None,
+    })
+}
+
 /// Fetch GPS coordinates for a single activity from the map endpoint.
 ///
 /// Returns an empty vec (not an error) when the activity has no GPS track.

@@ -136,6 +136,23 @@ pub fn build(
     resting_hr_row.set_title("Resting HR");
     resting_hr_row.set_subtitle("Resting heart rate (bpm)");
     hr_group.add(&resting_hr_row);
+
+    // Shown at the default until the stored value arrives (connect_lthr).
+    let lthr_adj = gtk::Adjustment::new(
+        settings::default_lthr(athlete.max_hr) as f64,
+        60.0,
+        240.0,
+        1.0,
+        5.0,
+        0.0,
+    );
+    let lthr_row = adw::SpinRow::new(Some(&lthr_adj), 1.0, 0);
+    lthr_row.set_title("Threshold HR");
+    lthr_row.set_subtitle(
+        "Lactate-threshold heart rate (bpm) — synced activities without power are scored \
+         against it",
+    );
+    hr_group.add(&lthr_row);
     page.add(&hr_group);
 
     let coaching_group = adw::PreferencesGroup::builder()
@@ -224,6 +241,7 @@ pub fn build(
         row.connect_value_notify(move |_| apply());
     }
     connect_ftp(&ftp_row, apply, athlete.ftp_watts, &pool, &rt_handle);
+    connect_lthr(&lthr_row, &pool, &rt_handle);
     refresh_ftp_subtitle(&ftp_row, &pool, &rt_handle);
 
     connect_context(&context_row, win, &pool, &rt_handle);
@@ -288,6 +306,48 @@ fn connect_ftp(
             );
         });
     });
+}
+
+/// Show the stored LTHR, then write through every change to it.
+///
+/// The handler is connected only once the stored value is on the row: setting
+/// it fires the same notify a rider's edit does, and must not write back the
+/// default the row was built with. Unset, the row shows 90 % of max heart rate,
+/// which is what loads are scored against until the rider sets their own.
+fn connect_lthr(row: &adw::SpinRow, pool: &SqlitePool, rt_handle: &tokio::runtime::Handle) {
+    let row_weak = row.downgrade();
+    let pool_read = pool.clone();
+    let pool = pool.clone();
+    let rt_write = rt_handle.clone();
+    crate::ui::spawn_to_main(
+        rt_handle,
+        async move { settings::lthr(&pool_read).await },
+        move |stored| {
+            // The window may have closed while the read ran.
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            match stored {
+                Ok(Some(bpm)) => row.set_value(f64::from(bpm)),
+                Ok(None) => {}
+                Err(e) => {
+                    // Writing now could replace a value that is there but
+                    // unreadable; leave the row inert instead.
+                    tracing::error!("Could not read the LTHR: {e}");
+                    return;
+                }
+            }
+            row.connect_value_notify(move |row| {
+                let bpm = row.value() as u32;
+                crate::ui::spawn_write(
+                    &rt_write,
+                    &pool,
+                    "your threshold heart rate",
+                    move |pool| async move { settings::set_lthr(&pool, bpm).await },
+                );
+            });
+        },
+    );
 }
 
 /// Fill the context row's preview, and open the editor when it is activated.

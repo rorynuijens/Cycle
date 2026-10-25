@@ -588,10 +588,6 @@ fn encode_session_at_offset(
     file
 }
 
-/// Parse a FIT file from disk into a `Session`.
-///
-/// Extracts per-second records (power, HR, cadence, speed) and session timestamps.
-/// Returns an error if the file is malformed, too large, or contains no activity data.
 /// Check a FIT file really contains what its header claims, before parsing it.
 ///
 /// `fitparser` 0.6.1 takes the header's declared size on trust: it slices
@@ -630,18 +626,27 @@ fn validate_fit_header(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Parse a FIT file from disk into a `Session`.
+///
+/// Extracts per-second records (power, HR, cadence, speed) and session timestamps.
+/// Returns an error if the file is malformed, too large, or contains no activity data.
 pub fn import_fit_file(path: &Path) -> Result<Session> {
-    let bytes = std::fs::read(path)?;
+    import_fit_bytes(&std::fs::read(path)?)
+}
+
+/// As [`import_fit_file`], for a FIT file already in memory — one downloaded
+/// from Garmin Connect, which never touches the disk.
+pub fn import_fit_bytes(bytes: &[u8]) -> Result<Session> {
     anyhow::ensure!(
         bytes.len() <= 50 * 1024 * 1024,
         "FIT file too large ({} bytes — maximum 50 MB)",
         bytes.len()
     );
 
-    validate_fit_header(&bytes)?;
+    validate_fit_header(bytes)?;
 
     let records =
-        fitparser::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("FIT parse error: {e}"))?;
+        fitparser::from_bytes(bytes).map_err(|e| anyhow::anyhow!("FIT parse error: {e}"))?;
 
     let mut session_start: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut session_end: Option<chrono::DateTime<chrono::Utc>> = None;

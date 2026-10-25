@@ -76,6 +76,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 quick-xml = { version = "0.41", features = ["serialize"] }
 glow = "0.18.0"
 libloading = "0.9.0"
+# Garmin serves activity files zipped (ai/garmin.rs)
+zip = { version = "9.1.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 # Generative tests for every boundary that takes bytes this app did not write:

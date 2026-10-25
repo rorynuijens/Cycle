@@ -297,13 +297,12 @@ impl FormHero {
         }
     }
 
-    /// Note how many of the plotted activities came from Intervals.icu, so the
-    /// numbers are not mistaken for in-app rides alone.
+    /// Note how many of the plotted activities were synced from Garmin Connect
+    /// or Intervals.icu, so the numbers are not mistaken for in-app rides alone.
     pub fn set_synced_count(&self, count: usize) {
         if count > 0 {
-            self.icu_indicator.set_label(&format!(
-                "Includes {count} activities synced from Intervals.icu"
-            ));
+            self.icu_indicator
+                .set_label(&format!("Includes {count} synced activities"));
             self.icu_indicator.set_visible(true);
         } else {
             self.icu_indicator.set_visible(false);

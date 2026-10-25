@@ -148,7 +148,8 @@ pub async fn update_athlete(pool: &SqlitePool, athlete: &AthleteProfile) -> Resu
 /// Wipe athlete profile and, optionally, all training data.
 ///
 /// API keys (`anthropic.api_key`, `intervals.api_key`, `intervals.athlete_id`,
-/// `intervals.upload`, `intervals.sync`) and window geometry are always preserved.
+/// `intervals.upload`, `intervals.sync`, `garmin.key_expires`) and window geometry are
+/// always preserved.
 /// Saved devices, and the radio chosen for them, are always preserved.
 pub async fn reset_athlete_data(pool: &SqlitePool, include_training_data: bool) -> Result<()> {
     // Always: remove the athlete row (will be recreated as default on next load)
@@ -185,6 +186,7 @@ pub async fn reset_athlete_data(pool: &SqlitePool, include_training_data: bool) 
                 'intervals.athlete_id',
                 'intervals.upload',
                 'intervals.sync',
+                'garmin.key_expires',
                 'window.width',
                 'window.height',
                 'devices.radio'
