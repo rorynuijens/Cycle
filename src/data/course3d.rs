@@ -20,7 +20,7 @@ use crate::data::props::Prop;
 use crate::data::roadway;
 use crate::data::route::Route;
 use crate::data::world::{splitmix, AreaKind, World};
-use crate::data::{animals, dressing, encounters, finish, rider, sky, track, trees};
+use crate::data::{animals, cue_signs, dressing, encounters, finish, rider, sky, track, trees};
 
 /// The chase camera: this far behind the rider and this high above the road,
 /// aimed at a point this far ahead of the rider and this high.
@@ -400,6 +400,11 @@ pub struct CourseScene {
 }
 
 impl CourseScene {
+    /// Stand a workout's cue `signs` along the road — see `data/cue_signs.rs`.
+    pub fn add_signs(&mut self, signs: &[cue_signs::Sign]) {
+        self.mesh.extend(cue_signs::signs(&self.road, signs));
+    }
+
     /// Build the world for `route`. `None` for a route too short to draw —
     /// fewer than two points.
     pub fn build(route: &Route, scenery: Scenery) -> Option<Self> {
@@ -647,7 +652,7 @@ pub const CAMERA_LEAD_M: f32 = 4.0;
 /// The road's flat direction at `distance_m`, taken over
 /// [`HEADING_SPAN_M`] either side and kept within the road; north for a road
 /// with no length.
-fn direction_at(road: &[RoadPoint], distance_m: f32) -> Option<[f32; 3]> {
+pub fn direction_at(road: &[RoadPoint], distance_m: f32) -> Option<[f32; 3]> {
     let start = road.first()?.distance_m;
     let end = road.last()?.distance_m;
     let span = HEADING_SPAN_M.min((end - start) / 2.0);

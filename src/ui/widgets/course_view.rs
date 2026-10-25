@@ -25,6 +25,7 @@ use std::sync::OnceLock;
 
 use crate::data::biome;
 use crate::data::course3d::{self, CameraPose, CourseScene, Mat4, Mesh, RiderPose, Sky};
+use crate::data::cue_signs;
 use crate::data::encounters;
 use crate::data::ghost::Ghost;
 use crate::data::palette;
@@ -676,6 +677,8 @@ struct Inner {
     /// "Building the 3D view…", over the top left of the view.
     status: gtk::Label,
     route: RefCell<Option<Route>>,
+    /// A workout's cue signs along the route; none on a route's own ride.
+    signs: RefCell<Vec<cue_signs::Sign>>,
     /// What the world around the route is made of.
     look: Cell<biome::WorldLook>,
     scene: RefCell<Option<CourseScene>>,
@@ -779,6 +782,7 @@ impl CourseView {
             status,
             area: area.clone(),
             route: RefCell::new(None),
+            signs: RefCell::new(Vec::new()),
             look: Cell::new(biome::WorldLook::default()),
             scene: RefCell::new(None),
             director: RefCell::new(None),
@@ -864,7 +868,19 @@ impl CourseView {
     /// Show `route` looking as `look`, with the rider at its start. The world is
     /// built off the main thread; the view says so until it is up.
     pub fn set_route(&self, route: &Route, look: biome::WorldLook) {
+        self.set_workout_route(route, look, Vec::new());
+    }
+
+    /// [`CourseView::set_route`] for a workout's road, with its cue `signs`
+    /// standing where the intervals start.
+    pub fn set_workout_route(
+        &self,
+        route: &Route,
+        look: biome::WorldLook,
+        signs: Vec<cue_signs::Sign>,
+    ) {
         let inner = &self.inner;
+        *inner.signs.borrow_mut() = signs;
         inner.generation.set(inner.generation.get() + 1);
         *inner.scene.borrow_mut() = None;
         *inner.director.borrow_mut() = None;
@@ -993,10 +1009,18 @@ impl Inner {
         };
         let generation = this.generation.get();
         let scenery = this.look.get().scenery;
+        let signs = this.signs.borrow().clone();
         this.update_status();
         let weak = Rc::downgrade(this);
         glib::spawn_future_local(async move {
-            let built = gtk::gio::spawn_blocking(move || CourseScene::build(&route, scenery)).await;
+            let built = gtk::gio::spawn_blocking(move || {
+                let mut scene = CourseScene::build(&route, scenery);
+                if let Some(scene) = scene.as_mut() {
+                    scene.add_signs(&signs);
+                }
+                scene
+            })
+            .await;
             let Some(inner) = weak.upgrade() else {
                 return;
             };
@@ -2463,8 +2487,37 @@ mod offscreen {
             .ok()
             .map(|k| biome::Scenery::from_key(&k).expect("a known scenery"))
             .unwrap_or_default();
-        let scene = CourseScene::build(&route, scenery).expect("a scene");
+        let mut scene = CourseScene::build(&route, scenery).expect("a scene");
         eprintln!("scene built in {:.2} s", started.elapsed().as_secs_f64());
+        // CYCLE_3D_CUES=1: the workout's cue signs.
+        if let (true, Some(w), Some(r)) = (
+            std::env::var("CYCLE_3D_CUES").is_ok_and(|v| v == "1"),
+            workout.as_ref(),
+            road.as_ref(),
+        ) {
+            let signs = crate::training::cues::road_signs(w, r);
+            for s in &signs {
+                eprintln!(
+                    "sign {:?} at {:.0} m, zone {}",
+                    s.label,
+                    s.distance_m,
+                    s.zone + 1
+                );
+            }
+            // CYCLE_3D_SIGN=<k> CYCLE_3D_SIGN_M=<metres>: the rider that far
+            // short of the k-th sign.
+            if let Some(k) = std::env::var("CYCLE_3D_SIGN")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                let short: f32 = std::env::var("CYCLE_3D_SIGN_M")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(120.0);
+                at = signs[k].distance_m - short;
+            }
+            scene.add_signs(&signs);
+        }
         // CYCLE_3D_ENCOUNTER=<n> CYCLE_3D_ENC_S=<seconds>: ride up to the
         // route's n-th encounter at CYCLE_3D_SPEED and show it that many
         // seconds after it began; the rider is wherever that leaves them.

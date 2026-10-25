@@ -6,6 +6,7 @@ pub mod bends;
 pub mod biome;
 pub mod calendar;
 pub mod course3d;
+pub mod cue_signs;
 pub mod db;
 pub mod dedupe;
 pub mod dressing;

@@ -22,7 +22,7 @@ use crate::data::{
     workout::Workout,
 };
 use crate::training::auto_pause::{self, AutoPause, RideState};
-use crate::training::cues::{SegmentCue, CLOSING_SECS};
+use crate::training::cues::{self, SegmentCue, CLOSING_SECS};
 use crate::training::engine::{
     is_pedalling, EngineSnapshot, EngineState, WorkoutEngine, INTENSITY_STEP_PCT, PRE_START_SECS,
 };
@@ -753,7 +753,9 @@ impl PlayerPage {
 
     /// Lay out `road` for the workout just loaded, looking as `look`, and put
     /// the 3D button where the rider last left it (`shown`). With no road the
-    /// button goes and the graph stays.
+    /// button goes and the graph stays. The road has the workout's cue signs
+    /// on it when the page has its cues — not in a test, and not with interval
+    /// cues switched off.
     pub fn set_world(
         &self,
         workout: &Workout,
@@ -762,7 +764,12 @@ impl PlayerPage {
         shown: bool,
     ) {
         if let Some(r) = &road {
-            self.course_view.set_route(&r.route, look);
+            let signs = if self.cues_enabled.get() && !self.test_mode.get() {
+                cues::road_signs(workout, r)
+            } else {
+                Vec::new()
+            };
+            self.course_view.set_workout_route(&r.route, look, signs);
             self.course_view
                 .set_workout_profile(ride_hud::workout_profile(workout));
         }

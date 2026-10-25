@@ -33,7 +33,7 @@ pub fn build(
         .build();
     let cues_row = adw::SwitchRow::builder()
         .title("Interval Cues")
-        .subtitle("Which rep you are on, how many are left, and how to ride it")
+        .subtitle("Which rep you are on, how many are left and how to ride it, on the page and the 3D road")
         .active(settings.interval_cues)
         .build();
     cues_group.add(&cues_row);

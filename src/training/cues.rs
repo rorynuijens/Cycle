@@ -17,7 +17,10 @@
 //! start of the ride would contradict it the moment the rider dials the session
 //! down.
 
+use crate::data::athlete::power_zone_index;
+use crate::data::cue_signs::Sign;
 use crate::data::workout::{Segment, Workout};
+use crate::data::workout_road::WorkoutRoad;
 use crate::training::engine::WorkoutEngine;
 use crate::training::progression::Effort;
 
@@ -137,6 +140,59 @@ pub fn build_cues(workout: &Workout, priors: &[Effort]) -> Vec<SegmentCue> {
 
 /// A segment's power as a single figure — the mid-point, so a ramp is judged on
 /// its average rather than on whichever end happens to be written first.
+/// What the sign at the start of each segment says on a workout's road, one
+/// per segment: a few letters, read from a distance — see `data::cue_signs`.
+/// The same roles as [`build_cues`], so the sign and the page never disagree.
+pub fn sign_labels(workout: &Workout) -> Vec<String> {
+    let roles = roles_of(&workout.segments);
+    let work_total = roles.iter().filter(|r| r.is_effort()).count();
+    let mut work_seen = 0usize;
+    roles
+        .iter()
+        .map(|role| match role {
+            SegmentRole::WarmUp => "WARM-UP".to_string(),
+            SegmentRole::Recovery => "EASY".to_string(),
+            SegmentRole::CoolDown => "COOL-DOWN".to_string(),
+            SegmentRole::Work => {
+                work_seen += 1;
+                match work_total {
+                    1 => "GO".to_string(),
+                    n if work_seen == n => "LAST REP".to_string(),
+                    n => format!("REP {work_seen}/{n}"),
+                }
+            }
+        })
+        .collect()
+}
+
+/// The cue signs along `road`, the workout's own: one where each segment
+/// starts, saying [`sign_labels`] in the segment's zone colour. None for the
+/// first segment — the rider starts on it, and the page has said what it is
+/// — nor for a segment of no length, which has no start of its own.
+pub fn road_signs(workout: &Workout, road: &WorkoutRoad) -> Vec<Sign> {
+    let roles = roles_of(&workout.segments);
+    let mut start_secs = 0u32;
+    let mut signs = Vec::new();
+    for (k, ((segment, label), role)) in workout
+        .segments
+        .iter()
+        .zip(sign_labels(workout))
+        .zip(&roles)
+        .enumerate()
+    {
+        if k > 0 && segment.duration_secs > 0 {
+            signs.push(Sign {
+                distance_m: road.distance_at(start_secs as f32),
+                label,
+                zone: power_zone_index(mid_pct(segment).max(0.0).round() as u32, 100),
+                effort: role.is_effort(),
+            });
+        }
+        start_secs = start_secs.saturating_add(segment.duration_secs);
+    }
+    signs
+}
+
 fn mid_pct(segment: &Segment) -> f32 {
     (segment.power_low_pct + segment.power_high_pct) / 2.0
 }
@@ -148,9 +204,11 @@ fn mid_pct(segment: &Segment) -> f32 {
 /// ride. So an easy segment is a warm-up only while no effort has happened yet,
 /// a cool-down only once none remain, and a recovery in between.
 fn roles_of(segments: &[Segment]) -> Vec<SegmentRole> {
+    // A segment of no length is never ridden, so it is never a rep: counted,
+    // it would make three reps "of 4" and leave the last one never the last.
     let is_work: Vec<bool> = segments
         .iter()
-        .map(|s| mid_pct(s) > RECOVERY_CEILING_PCT)
+        .map(|s| s.duration_secs > 0 && mid_pct(s) > RECOVERY_CEILING_PCT)
         .collect();
 
     // No effort anywhere — a recovery ride. Calling its first half a warm-up for
@@ -622,5 +680,111 @@ mod tests {
             Segment::steady(300, 40.0, "Cool-down"),
         ]);
         assert_eq!(build_cues(&w, &[])[1].detail, None);
+    }
+
+    // ── Signs on the 3D road ────────────────────────────────────────────────
+
+    fn road_for(w: &Workout) -> WorkoutRoad {
+        let rider = crate::data::athlete::AthleteProfile {
+            ftp_watts: 250,
+            ..Default::default()
+        };
+        WorkoutRoad::build(w, &rider).expect("a road")
+    }
+
+    #[test]
+    fn should_label_every_segment_as_the_page_counts_its_reps() {
+        assert_eq!(
+            sign_labels(&intervals()),
+            [
+                "WARM-UP",
+                "REP 1/3",
+                "EASY",
+                "REP 2/3",
+                "EASY",
+                "LAST REP",
+                "COOL-DOWN"
+            ]
+        );
+    }
+
+    #[test]
+    fn should_say_go_for_a_single_effort_and_last_rep_for_the_second_of_two() {
+        let one = workout(vec![
+            Segment::steady(600, 50.0, "Warm-up"),
+            Segment::steady(1200, 95.0, "Threshold block"),
+        ]);
+        assert_eq!(sign_labels(&one), ["WARM-UP", "GO"]);
+        let two = workout(vec![
+            Segment::steady(600, 95.0, "A"),
+            Segment::steady(300, 50.0, "B"),
+            Segment::steady(600, 95.0, "C"),
+        ]);
+        assert_eq!(sign_labels(&two), ["REP 1/2", "EASY", "LAST REP"]);
+    }
+
+    #[test]
+    fn should_stand_a_sign_where_each_segment_after_the_first_starts() {
+        let w = intervals();
+        let road = road_for(&w);
+        let signs = road_signs(&w, &road);
+        assert_eq!(signs.len(), w.segments.len() - 1);
+        let mut start = 0u32;
+        for (k, seg) in w.segments.iter().enumerate() {
+            if k > 0 {
+                assert_eq!(
+                    signs[k - 1].distance_m,
+                    road.distance_at(start as f32),
+                    "sign {k}"
+                );
+            }
+            start += seg.duration_secs;
+        }
+        assert_eq!(signs[0].label, "REP 1/3");
+        assert!(signs[0].effort && !signs[1].effort);
+        // 98 % is threshold (Z4), 50 % recovery (Z1).
+        assert_eq!((signs[0].zone, signs[1].zone), (3, 0));
+    }
+
+    #[test]
+    fn should_board_a_segment_at_exactly_60_percent_and_gantry_one_just_above() {
+        let w = workout(vec![
+            Segment::steady(600, 50.0, "Spin"),
+            Segment::steady(600, 61.0, "Endurance"),
+            Segment::steady(600, 60.0, "Spin"),
+        ]);
+        let signs = road_signs(&w, &road_for(&w));
+        assert!(signs[0].effort, "61 % is an effort");
+        assert!(!signs[1].effort, "60 % is a rest");
+    }
+
+    #[test]
+    fn should_skip_a_segment_of_no_length_without_moving_the_signs_after_it() {
+        let mut segs = intervals().segments;
+        segs.insert(2, Segment::steady(0, 120.0, "Nothing"));
+        let w = workout(segs);
+        let road = road_for(&w);
+        let with_gap = road_signs(&w, &road);
+        let plain = road_signs(&intervals(), &road_for(&intervals()));
+        assert_eq!(with_gap.len(), plain.len());
+        for (a, b) in with_gap.iter().zip(&plain) {
+            assert_eq!((a.distance_m, &a.label), (b.distance_m, &b.label));
+        }
+    }
+
+    #[test]
+    fn should_not_count_an_effort_of_no_length_as_a_rep_on_the_page() {
+        let mut segs = intervals().segments;
+        segs.insert(2, Segment::steady(0, 120.0, "Nothing"));
+        let cues = build_cues(&workout(segs), &[]);
+        assert_eq!(cues[1].headline, "Rep 1 of 3");
+        assert_eq!(cues[6].headline, "Rep 3 of 3");
+        assert_eq!(cues[6].detail.as_deref(), Some("Last one — make it count."));
+    }
+
+    #[test]
+    fn should_stand_no_sign_on_a_one_segment_workout() {
+        let w = workout(vec![Segment::steady(1800, 65.0, "Ride")]);
+        assert!(road_signs(&w, &road_for(&w)).is_empty());
     }
 }
