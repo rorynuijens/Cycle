@@ -90,6 +90,22 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.22.1" date="2026-10-25">
+      <description>
+        <p>A smoother ride in 3D, and cadence you can trust:</p>
+        <ul>
+          <li>The rider's legs turn at the cadence your sensor measures,
+              and stop when you coast.</li>
+          <li>Cadence drops to 0 a few seconds after you stop pedalling.
+              Before, it held your last cadence for ten seconds and then
+              dropped the sensor as lost.</li>
+          <li>Fixed: a small stutter every second while riding in 3D.</li>
+          <li>Fixed: animals by the road, such as a running flock of
+              sheep, vanished in plain view. They now run or fly off out
+              of sight.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.22.0" date="2026-10-25">
       <description>
         <p>Sync straight from Garmin Connect:</p>
