@@ -128,6 +128,44 @@ pub fn build_month_grid(
 
         for (row_widget, item) in item_widgets.iter().zip(items.iter()) {
             let Some(entry) = item.entry.clone() else {
+                // A ride or synced activity opens its own detail, as it does in
+                // the week view.
+                let gesture = gtk::GestureClick::new();
+                match &item.opens {
+                    Opens::Nothing => continue,
+                    Opens::Ride(id) => {
+                        let id = *id;
+                        let open_ride_i = Rc::clone(&open_ride);
+                        gesture.connect_released(move |g, _, _, _| {
+                            if let Some(widget) = g.widget() {
+                                open_ride_i(id, &widget);
+                            }
+                        });
+                    }
+                    Opens::Activity(activity) => {
+                        let activity = (**activity).clone();
+                        let title = item.label.clone();
+                        let pool_a = pool.clone();
+                        let rt_a = rt_handle.clone();
+                        gesture.connect_released(move |g, _, _, _| {
+                            let parent = g
+                                .widget()
+                                .and_then(|w| w.root())
+                                .and_downcast::<gtk::Window>();
+                            super::detail::show_intervals_detail(
+                                &activity,
+                                &title,
+                                ftp,
+                                weight_kg,
+                                &pool_a,
+                                &rt_a,
+                                parent.as_ref(),
+                            );
+                        });
+                    }
+                }
+                row_widget.add_controller(gesture);
+                row_widget.set_tooltip_text(Some(&item.tooltip()));
                 continue;
             };
             let gesture = gtk::GestureClick::new();
@@ -379,6 +417,17 @@ struct MonthCellItem {
     entry: Option<CalendarEntry>,
     /// What the training program has to say about this item.
     mark: EntryMark,
+    /// What clicking an item that is not a plan opens.
+    opens: Opens,
+}
+
+/// The detail view a month-cell item that is not a plan opens.
+enum Opens {
+    Nothing,
+    /// A ride recorded here, by session id.
+    Ride(i64),
+    /// A synced activity.
+    Activity(Box<db::IntervalsActivity>),
 }
 
 impl MonthCellItem {
@@ -431,8 +480,9 @@ impl MonthCellItem {
                 color: category_zone_rgb(&e.category),
                 entry: Some((*e).clone()),
                 mark: overlay.mark(e),
+                opens: Opens::Nothing,
             },
-            CalendarEvent::Session(_, name) => MonthCellItem {
+            CalendarEvent::Session(record, name) => MonthCellItem {
                 label: name
                     .as_deref()
                     .filter(|n| !n.is_empty())
@@ -444,6 +494,7 @@ impl MonthCellItem {
                 color: None,
                 entry: None,
                 mark: EntryMark::default(),
+                opens: Opens::Ride(record.session.id),
             },
             CalendarEvent::IcuActivity(a) => MonthCellItem {
                 label: if a.name.trim().is_empty() {
@@ -457,6 +508,7 @@ impl MonthCellItem {
                 color: None,
                 entry: None,
                 mark: EntryMark::default(),
+                opens: Opens::Activity(Box::new(a.clone())),
             },
             CalendarEvent::TimeOff(_) => MonthCellItem {
                 label: "Time off".to_string(),
@@ -466,6 +518,7 @@ impl MonthCellItem {
                 color: None,
                 entry: None,
                 mark: EntryMark::default(),
+                opens: Opens::Nothing,
             },
         }
     }
@@ -543,6 +596,7 @@ mod tests {
             color: None,
             entry: Some(entry(completed)),
             mark,
+            opens: Opens::Nothing,
         }
     }
 
