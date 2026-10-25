@@ -90,6 +90,26 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.22.0" date="2026-10-25">
+      <description>
+        <p>Sync straight from Garmin Connect:</p>
+        <ul>
+          <li>Add your Garmin Connect API key under Preferences,
+              Integrations, and activities, wellness and ride files come
+              from Garmin itself. Intervals.icu is then only needed for
+              its workout library and uploads.</li>
+          <li>Import History brings in everything Garmin holds. It runs in
+              the background, picks up where it stopped if interrupted,
+              and shows its progress when you reopen Preferences.</li>
+          <li>Training load is worked out by the app from the FTP you had
+              that day, or from heart rate when a ride has no power. A new
+              Threshold HR setting under Athlete sets the heart-rate scale.</li>
+          <li>Activities that were already synced from Intervals.icu are
+              merged with their Garmin copy, so nothing shows twice.</li>
+          <li>The app warns you a week before the Garmin key expires.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.21.0" date="2026-10-25">
       <description>
         <p>Workout cues on the road:</p>
