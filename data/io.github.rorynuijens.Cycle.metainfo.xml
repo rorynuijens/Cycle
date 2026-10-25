@@ -90,6 +90,22 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.21.0" date="2026-10-25">
+      <description>
+        <p>Workout cues on the road:</p>
+        <ul>
+          <li>Riding a workout in 3D, each effort passes under a gantry in
+              the interval's zone colour that reads REP 2/5, LAST REP or
+              GO. Recoveries and the cool-down get a board on the verge.</li>
+          <li>The signs follow the Interval Cues switch and stay out of the
+              ramp test.</li>
+          <li>Fixed: an effort with no length counted as a rep in the
+              interval cues.</li>
+          <li>Fixed: in the month view of the calendar, clicking a ride or
+              a synced activity did nothing.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.20.0" date="2026-10-23">
       <description>
         <p>Ride your workouts in 3D:</p>
