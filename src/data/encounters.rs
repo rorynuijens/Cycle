@@ -37,6 +37,24 @@ const EVERY_MAX_M: f32 = 1_100.0;
 /// None in the first stretch: the rider has only just set off.
 const FIRST_M: f32 = 300.0;
 
+/// Further than this from the rider an animal is a speck in the haze, and
+/// can go without anyone seeing it go.
+pub const OUT_OF_SIGHT_M: f32 = 160.0;
+/// Leaving animals walk out into the fields no further than this from the
+/// road's line: the ground they stand on is the road's, carried out, and
+/// further off the land's own hills would bury or strand them.
+const LEAVE_REACH_M: f32 = 45.0;
+/// How fast a leaving animal goes out from the road, at least, in m/s.
+const LEAVE_OUT_MS: f32 = 3.0;
+/// How fast a dolphin sinks out of sight, in m/s.
+const LEAVE_SINK_MS: f32 = 1.5;
+/// Animals leaving on foot tire, slowing along the road by this time
+/// constant, in seconds, so the rider always comes past them in the end.
+const LEAVE_TIRE_S: f32 = 8.0;
+/// However they are leaving, they are gone after this long, in seconds:
+/// only a rider who has stopped still sees them go.
+const LEAVE_MAX_S: f32 = 180.0;
+
 /// What happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -305,6 +323,12 @@ pub struct Director {
     triggers: Vec<Trigger>,
     next: usize,
     active: Option<Active>,
+    /// The active encounter's animals as last drawn: where they leave from.
+    last_actors: Vec<Actor>,
+    /// The animals of encounters that are over, making their way out of
+    /// sight, and when they set off.
+    leaving: Vec<Actor>,
+    left_s: f32,
     last_m: Option<f32>,
 }
 
@@ -314,6 +338,9 @@ impl Director {
             triggers,
             next: 0,
             active: None,
+            last_actors: Vec::new(),
+            leaving: Vec::new(),
+            left_s: 0.0,
             last_m: None,
         }
     }
@@ -345,6 +372,8 @@ impl Director {
         if let Some(last) = self.last_m {
             if rider_m < last - 5.0 || rider_m > last + 300.0 {
                 self.active = None;
+                self.last_actors.clear();
+                self.leaving.clear();
                 self.next = self.triggers.partition_point(|t| t.at_m <= rider_m);
             }
         }
@@ -352,12 +381,32 @@ impl Director {
         if self.active.is_none() {
             self.start_next(rider_m, speed, now_s);
         }
-        let Some(mut active) = self.active else {
-            return Vec::new();
-        };
-        let (props, over) = actors(&mut active, road, rider_m, speed, now_s);
-        self.active = (!over).then_some(active);
-        props
+        let mut now = Vec::new();
+        if let Some(mut active) = self.active {
+            let over;
+            (now, over) = actors(&mut active, rider_m, speed, now_s);
+            if over {
+                // Over, but its animals do not vanish where they stand: they
+                // go on their way until nobody can see them go.
+                self.active = None;
+                self.leaving = std::mem::take(&mut self.last_actors);
+                self.left_s = now_s;
+                now.clear();
+            } else {
+                self.active = Some(active);
+                self.last_actors.clone_from(&now);
+            }
+        }
+        let since = (now_s - self.left_s).max(0.0);
+        if since > LEAVE_MAX_S {
+            self.leaving.clear();
+        }
+        // Once out of sight, gone for good: a flock outrunning a slow rider
+        // must not run back into the picture from behind the camera.
+        self.leaving
+            .retain(|a| !out_of_sight(&leave(a, since), rider_m));
+        now.extend(self.leaving.iter().map(|a| leave(a, since)));
+        now.iter().filter_map(|a| to_prop(road, a)).collect()
     }
 
     fn start_next(&mut self, rider_m: f32, speed: f32, now_s: f32) {
@@ -390,7 +439,7 @@ impl Director {
 
 /// A place by the road: metres along it and metres to its right, and how
 /// far above the ground there.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Spot {
     along: f32,
     lateral: f32,
@@ -423,6 +472,7 @@ fn colour(name: &str) -> Rgb {
 
 /// One animal of an encounter: where it is now and a moment ago, so it
 /// faces the way it is going.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Actor {
     shape: Shape,
     now: Spot,
@@ -463,14 +513,83 @@ fn to_prop(road: &[RoadPoint], a: &Actor) -> Option<Prop> {
 /// A moment ago, in seconds, for working out which way an animal faces.
 const DT: f32 = 0.1;
 
+/// Whether nobody watching the road can see an animal at `s`, the rider
+/// `rider_m` along: behind the camera, far off in the haze, or gone under
+/// ground or water.
+fn out_of_sight(a: &Actor, rider_m: f32) -> bool {
+    let s = a.now;
+    s.along < rider_m - crate::data::course3d::CAMERA_TRAIL_M - 3.0
+        || (s.along - rider_m).hypot(s.lateral) > OUT_OF_SIGHT_M
+        || s.lift < -0.6 * a.size
+}
+
+/// `a`, `since` seconds after its encounter ended: going on the way it was
+/// going, and out from the road. Birds fly on, and whatever a bird carries;
+/// animals on the ground go no further out than [`LEAVE_REACH_M`], tire,
+/// and stand there; dolphins sink.
+fn leave(a: &Actor, since: f32) -> Actor {
+    let v = |now: f32, before: f32| (now - before) / DT;
+    let (va, vl, vf) = (
+        v(a.now.along, a.before.along),
+        v(a.now.lateral, a.before.lateral),
+        v(a.now.lift, a.before.lift),
+    );
+    let out = if a.now.lateral < 0.0 { -1.0 } else { 1.0 };
+    let vo = (vl * out).max(LEAVE_OUT_MS);
+    let flying = a.motion == Motion::Flap || a.now.lift > 2.0;
+    let at = |t: f32| {
+        if flying {
+            return spot(
+                a.now.along + va * t,
+                a.now.lateral + out * vo * t,
+                a.now.lift + vf.max(0.0) * t,
+            );
+        }
+        if a.shape == Shape::Dolphin {
+            return spot(
+                a.now.along + va * t,
+                a.now.lateral + out * vo * t,
+                a.now.lift - LEAVE_SINK_MS * t,
+            );
+        }
+        let reach = a.now.lateral.abs().max(LEAVE_REACH_M);
+        spot(
+            a.now.along + va * LEAVE_TIRE_S * (1.0 - (-t / LEAVE_TIRE_S).exp()),
+            out * (a.now.lateral.abs() + vo * t).min(reach),
+            a.now.lift,
+        )
+    };
+    let now = at(since);
+    let before = at((since - DT).max(0.0));
+    // Out in the field and tired: it stands there, facing the way it went.
+    let still = !flying
+        && a.shape != Shape::Dolphin
+        && (now.along - before.along).abs() < 0.3 * DT
+        && now.lateral == before.lateral;
+    if still {
+        return Actor {
+            now,
+            before: now,
+            look: Some(spot(now.along + va, now.lateral + out * vo, now.lift)),
+            motion: Motion::Still,
+            ..*a
+        };
+    }
+    // On its way: one that stood or grazed gets up and goes.
+    let motion = match a.motion {
+        Motion::Still | Motion::Graze if !flying && a.shape != Shape::Dolphin => Motion::Run,
+        m => m,
+    };
+    Actor {
+        now,
+        before,
+        motion,
+        ..*a
+    }
+}
+
 /// The animals of `a` now, and whether it is over.
-fn actors(
-    a: &mut Active,
-    road: &[RoadPoint],
-    rider_m: f32,
-    speed: f32,
-    now_s: f32,
-) -> (Vec<Prop>, bool) {
+fn actors(a: &mut Active, rider_m: f32, speed: f32, now_s: f32) -> (Vec<Actor>, bool) {
     let t = a.trigger;
     let elapsed = (now_s - a.started_s).max(0.0);
     let mut out = Vec::new();
@@ -491,11 +610,7 @@ fn actors(
             _ => true,
         },
     };
-    let props = out
-        .iter()
-        .filter_map(|actor| to_prop(road, actor))
-        .collect();
-    (props, over)
+    (out, over)
 }
 
 /// How far over the road a crossing is, 0–1: its own pace, or faster if
@@ -1573,5 +1688,56 @@ mod tests {
         assert!(Director::new(Vec::new())
             .update(&[], 10.0, 8.0, 0.0)
             .is_empty());
+    }
+
+    #[test]
+    fn should_never_end_an_encounter_while_its_animals_are_in_view() {
+        // An encounter is over when its animals are out of the picture —
+        // behind the camera, far off in the haze, or gone under ground or
+        // water — not when a clock says so. A flock running along the field
+        // used to vanish in plain view whenever the rider was too slow to
+        // pass it in half a minute.
+        const FAR_M: f32 = OUT_OF_SIGHT_M;
+        let road = north_road(301);
+        let ground = 10.0;
+        let mut seen = Vec::new();
+        for kind in Kind::ALL {
+            for (seed, side) in [(1u64, 1.0f32), (2, -1.0), (7, 1.0)] {
+                for v in [2.0f32, 4.0, 6.0, 8.0, 10.0, 13.0] {
+                    let mut d = one(kind, 600.0, side, seed);
+                    let mut last: Vec<Prop> = Vec::new();
+                    let mut ended = None;
+                    ride(&mut d, &road, 300.0, 2_800.0, &|_, _| v, &mut |m, props| {
+                        if props.is_empty() && !last.is_empty() && ended.is_none() {
+                            ended = Some(m);
+                            let camera_m = m - crate::data::course3d::CAMERA_TRAIL_M;
+                            for p in &last {
+                                let along = -p.pos[2];
+                                let away = apart(p, rider(m));
+                                let off = p.pos[0].abs();
+                                let ground_y =
+                                    ground - 0.02 - 0.28 * ((off - 4.0) / 26.0).clamp(0.0, 1.0);
+                                // A frame's grace: these are where the
+                                // animals were a frame before they went.
+                                let hidden = along < camera_m + 0.5
+                                    || away > FAR_M - 2.0
+                                    || p.pos[1] < ground_y - 0.6 * p.size + 0.15;
+                                if !hidden {
+                                    seen.push(format!(
+                                        "{kind:?} seed {seed} at {v} m/s: a {:?} vanished \
+                                         {away:.0} m from the rider, {:.0} m along of them",
+                                        p.shape,
+                                        along - m
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        last = props.to_vec();
+                    });
+                }
+            }
+        }
+        assert!(seen.is_empty(), "{}", seen.join("\n"));
     }
 }

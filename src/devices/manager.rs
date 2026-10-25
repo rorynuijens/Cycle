@@ -13,12 +13,12 @@ use futures::StreamExt;
 use crate::data::session::{LiveReadings, ReadingSource};
 use crate::devices::ant::{AntCommand, AntDevice};
 use crate::devices::ftms::{
-    compute_cadence_rpm, parse_csc_measurement, parse_cycling_power_measurement,
-    parse_hr_measurement, parse_indoor_bike_data, request_control_command, set_simulation_command,
-    set_target_power_command, start_resume_command, CONTROL_POINT_UUID, CSC_MEASUREMENT_UUID,
-    CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID, CYCLING_POWER_SERVICE_UUID,
-    FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID, INDOOR_BIKE_DATA_UUID,
-    MAX_ERG_TARGET_W, MAX_PLAUSIBLE_POWER_W,
+    parse_csc_measurement, parse_cycling_power_measurement, parse_hr_measurement,
+    parse_indoor_bike_data, request_control_command, set_simulation_command,
+    set_target_power_command, start_resume_command, CrankCadence, CONTROL_POINT_UUID,
+    CSC_MEASUREMENT_UUID, CSC_SERVICE_UUID, CYCLING_POWER_MEASUREMENT_UUID,
+    CYCLING_POWER_SERVICE_UUID, FTMS_SERVICE_UUID, HR_MEASUREMENT_UUID, HR_SERVICE_UUID,
+    INDOOR_BIKE_DATA_UUID, MAX_ERG_TARGET_W, MAX_PLAUSIBLE_POWER_W,
 };
 use crate::devices::peripheral::Transport;
 
@@ -216,8 +216,7 @@ impl Readers {
 /// Rate characteristics some trainers also expose on the same connection.
 fn spawn_trainer_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_revs: Option<u16> = None;
-        let mut last_time: Option<u16> = None;
+        let mut crank = CrankCadence::default();
         match p.notifications().await {
             Ok(mut stream) => {
                 while let Some(n) = stream.next().await {
@@ -242,19 +241,12 @@ fn spawn_trainer_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> JoinHan
                         }
                     } else if uuid == CYCLING_POWER_MEASUREMENT_UUID {
                         if let Some(cpp) = parse_cycling_power_measurement(&n.value) {
-                            let cadence = match (
-                                last_revs,
-                                last_time,
-                                cpp.crank_revs,
-                                cpp.crank_event_time,
-                            ) {
-                                (Some(pr), Some(pt), Some(cr), Some(ct)) => {
-                                    compute_cadence_rpm(pr, pt, cr, ct)
+                            let cadence = match (cpp.crank_revs, cpp.crank_event_time) {
+                                (Some(revs), Some(time)) => {
+                                    crank.update(revs, time, std::time::Instant::now())
                                 }
                                 _ => None,
                             };
-                            last_revs = cpp.crank_revs;
-                            last_time = cpp.crank_event_time;
                             let readings = LiveReadings {
                                 power_watts: Some(
                                     cpp.power_watts.clamp(0, MAX_PLAUSIBLE_POWER_W as i32) as u32,
@@ -296,8 +288,7 @@ fn spawn_trainer_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> JoinHan
 /// from its crank counters.
 fn spawn_power_meter_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_revs: Option<u16> = None;
-        let mut last_time: Option<u16> = None;
+        let mut crank = CrankCadence::default();
         match p.notifications().await {
             Ok(mut stream) => {
                 while let Some(n) = stream.next().await {
@@ -307,15 +298,12 @@ fn spawn_power_meter_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> Joi
                     let Some(cpp) = parse_cycling_power_measurement(&n.value) else {
                         continue;
                     };
-                    let cadence = match (last_revs, last_time, cpp.crank_revs, cpp.crank_event_time)
-                    {
-                        (Some(pr), Some(pt), Some(cr), Some(ct)) => {
-                            compute_cadence_rpm(pr, pt, cr, ct)
+                    let cadence = match (cpp.crank_revs, cpp.crank_event_time) {
+                        (Some(revs), Some(time)) => {
+                            crank.update(revs, time, std::time::Instant::now())
                         }
                         _ => None,
                     };
-                    last_revs = cpp.crank_revs;
-                    last_time = cpp.crank_event_time;
                     let readings = LiveReadings {
                         power_watts: Some(
                             cpp.power_watts.clamp(0, MAX_PLAUSIBLE_POWER_W as i32) as u32
@@ -396,8 +384,7 @@ fn spawn_cadence_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> JoinHan
     tokio::spawn(async move {
         // Cadence needs two successive crank samples; the
         // counters are cumulative and wrap (see ftms.rs).
-        let mut last_revs: Option<u16> = None;
-        let mut last_time: Option<u16> = None;
+        let mut crank = CrankCadence::default();
         match p.notifications().await {
             Ok(mut stream) => {
                 while let Some(n) = stream.next().await {
@@ -407,17 +394,12 @@ fn spawn_cadence_reader(p: Peripheral, event_tx: Sender<DeviceEvent>) -> JoinHan
                     let Some(csc) = parse_csc_measurement(&n.value) else {
                         continue;
                     };
-                    let cadence = match (last_revs, last_time, csc.crank_revs, csc.crank_event_time)
-                    {
-                        (Some(pr), Some(pt), Some(cr), Some(ct)) => {
-                            compute_cadence_rpm(pr, pt, cr, ct)
+                    let cadence = match (csc.crank_revs, csc.crank_event_time) {
+                        (Some(revs), Some(time)) => {
+                            crank.update(revs, time, std::time::Instant::now())
                         }
                         _ => None,
                     };
-                    if csc.crank_revs.is_some() {
-                        last_revs = csc.crank_revs;
-                        last_time = csc.crank_event_time;
-                    }
                     let Some(rpm) = cadence else { continue };
                     let readings = LiveReadings {
                         cadence_rpm: Some(rpm),

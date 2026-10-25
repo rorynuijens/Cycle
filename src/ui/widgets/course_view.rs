@@ -54,8 +54,12 @@ const PROP_DRAW_M: f32 = 1_300.0;
 const BUILDING: &str = "Building the 3D view…";
 
 /// Longest the view will carry the rider on without a fresh distance, in
-/// seconds. A tick is due every second; past that, the ride has paused.
-const MAX_EXTRAPOLATE_S: f32 = 1.0;
+/// seconds. A tick is due every second, but GLib's timer always fires a
+/// little late — up to a frame or more with the main loop busy — and
+/// stopping at exactly a second stalled the rider for a frame before every
+/// report. Half a second's grace covers a late tick; a pause reports a
+/// standstill itself, so it still stops the rider at once.
+const MAX_EXTRAPOLATE_S: f32 = 1.5;
 
 /// How quickly the drawn rider closes on where the ride says they are, in
 /// seconds: the time to make up two thirds of the gap. A report is due every
@@ -457,6 +461,19 @@ impl Progress {
     }
 }
 
+/// The ride's riding time at `now_us` by `clock` — seconds, when they were
+/// reported, and whether it is running: carried on from the report while it
+/// runs, for a late tick's grace at most. Nought until the clock starts.
+fn ride_secs(clock: Option<(f32, i64, bool)>, now_us: i64) -> f32 {
+    clock.map_or(0.0, |(secs, at, running)| {
+        if running {
+            secs + ((now_us - at) as f32 / 1e6).clamp(0.0, MAX_EXTRAPOLATE_S)
+        } else {
+            secs
+        }
+    })
+}
+
 /// Where the rider is drawn, gliding onto where the ride says they are.
 ///
 /// Between reports the view carries the rider on at the last speed, and the
@@ -691,15 +708,19 @@ struct Inner {
     gl: RefCell<Option<GlState>>,
     progress: Cell<Progress>,
     glide: Cell<Glide>,
+    /// The rider's cadence as last reported, in rpm, and when; and the
+    /// cranks it turns.
+    cadence: Cell<Option<(f32, i64)>>,
+    cranks: Cell<rider::Cranks>,
     hud: RefCell<HudLayer>,
     /// "See Ride Summary", laid over the finished card's button row, and
     /// what it does — once.
     finish_btn: gtk::Button,
     on_finish: RefCell<Option<Box<dyn FnOnce()>>>,
     /// The ride being raced, and the ride's clock of riding time — seconds,
-    /// and when they were reported — that moves it.
+    /// when they were reported, and whether it is running — that moves it.
     ghost: RefCell<Option<Ghost>>,
-    ride_clock: Cell<Option<(f32, i64)>>,
+    ride_clock: Cell<Option<(f32, i64, bool)>>,
     /// The distance last drawn, so an unmoving camera is not redrawn.
     drawn_m: Cell<Option<f32>>,
     /// Bumped for every new route, so a build that finishes after the next
@@ -791,6 +812,8 @@ impl CourseView {
             gl: RefCell::new(None),
             progress: Cell::new(Progress::default()),
             glide: Cell::new(Glide::default()),
+            cadence: Cell::new(None),
+            cranks: Cell::new(rider::Cranks::default()),
             hud: RefCell::new(HudLayer::default()),
             finish_btn: finish_btn.clone(),
             on_finish: RefCell::new(None),
@@ -887,6 +910,8 @@ impl CourseView {
         inner.needs_upload.set(true);
         inner.progress.set(Progress::default());
         inner.glide.set(Glide::default());
+        inner.cadence.set(None);
+        inner.cranks.set(rider::Cranks::default());
         inner.drawn_m.set(None);
         *inner.route.borrow_mut() = Some(route.clone());
         inner.look.set(look);
@@ -913,12 +938,24 @@ impl CourseView {
     }
 
     /// The ride's riding time, in seconds — what the ghost rides by. Called
-    /// once a tick; between ticks the ghost is carried on for at most a
-    /// second, so a pause stops it with the rider.
+    /// once a tick; between ticks the ghost is carried on, for a late tick's
+    /// grace at most.
     pub fn set_ride_clock(&self, secs: u32) {
         self.inner
             .ride_clock
-            .set(Some((secs as f32, glib::monotonic_time())));
+            .set(Some((secs as f32, glib::monotonic_time(), true)));
+    }
+
+    /// The ride is paused: the ghost stops where it is drawn, and goes on
+    /// with the next [`CourseView::set_ride_clock`].
+    pub fn hold_ride_clock(&self) {
+        let now = glib::monotonic_time();
+        let clock = self.inner.ride_clock.get();
+        if let Some((_, _, true)) = clock {
+            self.inner
+                .ride_clock
+                .set(Some((ride_secs(clock, now), now, false)));
+        }
     }
 
     /// The rider is over the line: let them coast to a stop past the arch,
@@ -973,6 +1010,15 @@ impl CourseView {
             at_us: Some(glib::monotonic_time()),
             coast: false,
         });
+    }
+
+    /// The rider's cadence, in rpm — `None` with no cadence sensor, and the
+    /// legs then turn with the road. Called once a tick by the ride loop; a
+    /// cadence not reported again within a late tick's grace is dropped.
+    pub fn set_cadence(&self, cadence_rpm: Option<u32>) {
+        self.inner
+            .cadence
+            .set(cadence_rpm.map(|rpm| (rpm as f32, glib::monotonic_time())));
     }
 
     /// Show or hide the fullscreen ride HUD over the road.
@@ -1128,7 +1174,13 @@ impl Inner {
 
         let scale = area.scale_factor();
         let (w, h) = (area.width() * scale, area.height() * scale);
-        let now = glib::monotonic_time();
+        // The frame's own time, not the moment this callback happens to run:
+        // that wanders by milliseconds from frame to frame, and at riding
+        // speed the road wobbled by as much against the camera every frame.
+        // The frame clock's time steps evenly, in the same time base.
+        let now = area
+            .frame_clock()
+            .map_or_else(glib::monotonic_time, |clock| clock.frame_time());
         let progress = self.progress.get();
         let speed = progress.speed_at(now);
         let mut glide = self.glide.get();
@@ -1145,6 +1197,17 @@ impl Inner {
             ),
             None => (None, Sky::default()),
         };
+        // The legs turn at the cadence the sensor measures, or with the road
+        // without one.
+        let cadence = self
+            .cadence
+            .get()
+            .filter(|&(_, at)| (now - at) as f32 / 1e6 < MAX_EXTRAPOLATE_S)
+            .map(|(rpm, _)| rpm);
+        let mut cranks = self.cranks.get();
+        let crank = cranks.advance(now as f64 / 1e6, distance, cadence);
+        self.cranks.set(cranks);
+        let pose = pose.map(|(camera, rider)| (camera, RiderPose { crank, ..rider }));
         // Seconds, wrapped every hour so the animals' motion keeps its
         // precision.
         let time_s = (now / 1_000 % 3_600_000) as f32 / 1_000.0;
@@ -1161,9 +1224,7 @@ impl Inner {
         let ghost = match (self.ghost.borrow().as_ref(), self.scene.borrow().as_ref()) {
             (Some(g), Some(s)) => {
                 // At the start line until the ride's clock starts.
-                let secs = self.ride_clock.get().map_or(0.0, |(secs, at)| {
-                    secs + ((now - at) as f32 / 1e6).clamp(0.0, MAX_EXTRAPOLATE_S)
-                });
+                let secs = ride_secs(self.ride_clock.get(), now);
                 let d = g.distance_at(secs);
                 let v = g.distance_at(secs + 0.5) - g.distance_at(secs - 0.5);
                 course3d::rider_pose_in_lane(&s.run_out, d, v, course3d::GHOST_OFFSET_M)
@@ -2208,7 +2269,7 @@ mod tests {
     }
 
     #[test]
-    fn should_stop_a_second_after_the_last_report() {
+    fn should_stop_once_the_reports_have_plainly_stopped() {
         // A paused ride stops reporting; the view must not drive on alone.
         let p = Progress {
             distance_m: 100.0,
@@ -2217,7 +2278,8 @@ mod tests {
             coast: false,
         };
         assert_eq!(p.distance_at(2_000_000), 108.0);
-        assert_eq!(p.distance_at(60_000_000), 108.0);
+        assert_eq!(p.distance_at(2_500_000), 112.0);
+        assert_eq!(p.distance_at(60_000_000), 112.0);
     }
 
     #[test]
@@ -2229,8 +2291,10 @@ mod tests {
             coast: false,
         };
         assert_eq!(p.speed_at(1_500_000), 8.0);
+        // A late tick is no pause: still going a frame past the second.
+        assert_eq!(p.speed_at(2_016_000), 8.0);
         // At the very moment the distance stops moving, so does the lean.
-        assert_eq!(p.speed_at(2_000_000), 0.0);
+        assert_eq!(p.speed_at(2_500_000), 0.0);
         assert_eq!(Progress::default().speed_at(5_000_000), 0.0);
         let bad = Progress {
             speed_ms: f32::NAN,
@@ -2316,6 +2380,24 @@ mod tests {
             (3_000_000, 114.5, 8.0),
         ];
         assert_smooth(&drawn(&reports, 1_000_000, 2.5, 60.0), 3.0);
+    }
+
+    #[test]
+    fn should_not_stall_the_rider_when_a_tick_comes_late() {
+        // GLib's one-second timeout counts each second from when the last
+        // one ran, so the ride's ticks come a little over a second apart —
+        // later still with the main loop busy. Stopping the rider at exactly
+        // a second stalled them for a frame or two before every report: a
+        // judder, every second, on a steady ride.
+        let mut reports = Vec::new();
+        let (mut at, mut d) = (1_000_000i64, 100.0f32);
+        for late_us in [4_000, 12_000, 2_000, 40_000, 8_000, 90_000, 3_000] {
+            reports.push((at, d, 8.0));
+            let gap = 1_000_000 + late_us;
+            at += gap;
+            d += 8.0 * gap as f32 / 1e6;
+        }
+        assert_smooth(&drawn(&reports, 1_000_000, 6.5, 60.0), 0.0);
     }
 
     #[test]

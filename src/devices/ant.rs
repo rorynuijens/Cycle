@@ -19,7 +19,7 @@ use async_channel::Sender;
 
 use crate::data::session::{LiveReadings, ReadingSource};
 use crate::devices::ftms::{
-    compute_cadence_rpm, MAX_PLAUSIBLE_CADENCE_RPM, MAX_PLAUSIBLE_HR_BPM, MAX_PLAUSIBLE_POWER_W,
+    CrankCadence, MAX_PLAUSIBLE_CADENCE_RPM, MAX_PLAUSIBLE_HR_BPM, MAX_PLAUSIBLE_POWER_W,
     MAX_PLAUSIBLE_SPEED_KMH,
 };
 use crate::devices::manager::{DeviceEvent, DeviceType};
@@ -290,7 +290,7 @@ fn parse_ant_heart_rate(payload: &[u8]) -> Option<u32> {
 
 /// ANT+ Bike Speed & Cadence page (device type 121). Cadence is bytes 0–3:
 /// event time (1/1024 s) then revolution count, both little-endian. Cadence rpm is
-/// derived from successive samples via [`compute_cadence_rpm`].
+/// derived from successive samples via [`CrankCadence`].
 fn parse_speed_cadence(payload: &[u8]) -> Option<(u16, u16)> {
     if payload.len() < 8 {
         return None;
@@ -605,9 +605,9 @@ struct AntLink {
     cad_discovered: bool,
     cad_connected: bool,
     cad_muted: bool,
-    /// The previous `(revolutions, event_time)` from the cadence sensor. Cleared
+    /// The cadence sensor's crank, as far as its pages have told. Cleared
     /// whenever the sensor may have been away, so no rate spans the gap.
-    last_cadence_page: Option<(u16, u16)>,
+    crank: CrankCadence,
     /// When the FE-C channel last spoke — see `FEC_SILENCE_TIMEOUT`.
     last_fec_seen: Option<Instant>,
 }
@@ -737,7 +737,7 @@ impl AntLink {
             out.push(strap_changed(false));
         }
         self.cad_discovered = false;
-        self.last_cadence_page = None;
+        self.crank = CrankCadence::default();
         if self.cad_connected {
             self.cad_connected = false;
             out.push(cadence_changed(false));
@@ -833,7 +833,7 @@ impl AntLink {
     /// A page arrived on the cadence channel, carrying the sensor's crank
     /// counters. Announced and connected on the first page, as the strap is;
     /// a cadence follows from the second.
-    fn cadence_page(&mut self, revolutions: u16, event_time: u16) -> Vec<Effect> {
+    fn cadence_page(&mut self, revolutions: u16, event_time: u16, now: Instant) -> Vec<Effect> {
         if self.cad_muted {
             return Vec::new(); // rider disconnected it; its channel should be shut
         }
@@ -853,10 +853,7 @@ impl AntLink {
             out.push(cadence_changed(true));
             tracing::info!("ANT+ cadence sensor found");
         }
-        let rpm = self
-            .last_cadence_page
-            .and_then(|(revs, time)| compute_cadence_rpm(revs, time, revolutions, event_time));
-        self.last_cadence_page = Some((revolutions, event_time));
+        let rpm = self.crank.update(revolutions, event_time, now);
         if let Some(rpm) = rpm {
             out.push(Effect::Emit(DeviceEvent::Readings(LiveReadings {
                 cadence_rpm: Some(rpm),
@@ -882,7 +879,7 @@ impl AntLink {
         let mut out = vec![Effect::Close(BC_CHANNEL)];
         self.cad_muted = true;
         self.cad_discovered = false;
-        self.last_cadence_page = None;
+        self.crank = CrankCadence::default();
         if self.cad_connected {
             self.cad_connected = false;
             out.push(cadence_changed(false));
@@ -957,7 +954,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
     // is ignored (some trainers report a bogus 0 there).
     let mut got_ant_cadence = false;
     // Previous (revolutions, event_time) sample from the cadence channel.
-    let mut last_cadence_sample: Option<(u16, u16)> = None;
+    let mut trainer_crank = CrankCadence::default();
     let mut buf = [0u8; 512];
     // Paced retries of a failed channel open — see the loop below.
     let mut last_open_attempt = Instant::now();
@@ -1182,7 +1179,7 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             // whether or not a trainer has been found.
             if channel == BC_CHANNEL {
                 if let Some((revs, time)) = parse_bike_cadence(payload) {
-                    let effects = link.cadence_page(revs, time);
+                    let effects = link.cadence_page(revs, time, Instant::now());
                     apply(Some(s), &event_tx, effects);
                 }
                 return;
@@ -1194,19 +1191,14 @@ pub fn run(event_tx: Sender<DeviceEvent>, cmd_rx: Receiver<AntCommand>) {
             if channel == CADENCE_CHANNEL {
                 if link.connected {
                     if let Some((revs, time)) = parse_speed_cadence(payload) {
-                        if let Some((prev_revs, prev_time)) = last_cadence_sample {
-                            if let Some(rpm) = compute_cadence_rpm(prev_revs, prev_time, revs, time)
-                            {
-                                got_ant_cadence = true;
-                                let _ =
-                                    event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
-                                        cadence_rpm: Some(rpm),
-                                        source: ReadingSource::Ant,
-                                        ..Default::default()
-                                    }));
-                            }
+                        if let Some(rpm) = trainer_crank.update(revs, time, Instant::now()) {
+                            got_ant_cadence = true;
+                            let _ = event_tx.send_blocking(DeviceEvent::Readings(LiveReadings {
+                                cadence_rpm: Some(rpm),
+                                source: ReadingSource::Ant,
+                                ..Default::default()
+                            }));
                         }
-                        last_cadence_sample = Some((revs, time));
                     }
                 }
                 return;
@@ -1554,6 +1546,12 @@ mod tests {
     // A cadence-only sensor, such as the rider's Decathlon one, is not a
     // Speed & Cadence sensor (121): the 121 channel never hears it.
 
+    /// `secs` into a test's own clock.
+    fn t(secs: f32) -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_secs_f32(secs)
+    }
+
     fn cadence_readings(effects: &[Effect]) -> Vec<u32> {
         effects
             .iter()
@@ -1591,7 +1589,7 @@ mod tests {
     #[test]
     fn should_announce_a_cadence_sensor_on_its_first_page() {
         let mut link = AntLink::default();
-        let first = link.cadence_page(10, 0);
+        let first = link.cadence_page(10, 0, t(0.0));
         assert_eq!(discoveries(&first), vec![ANT_CADENCE_ADDRESS]);
         assert_eq!(
             connection_changes(&first),
@@ -1599,7 +1597,7 @@ mod tests {
         );
         // One page is not a rate: there is nothing to compare it with yet.
         assert!(cadence_readings(&first).is_empty());
-        let second = link.cadence_page(11, 1024);
+        let second = link.cadence_page(11, 1024, t(0.0));
         assert!(connection_changes(&second).is_empty());
         assert!(discoveries(&second).is_empty());
     }
@@ -1607,18 +1605,21 @@ mod tests {
     #[test]
     fn should_derive_cadence_from_successive_cadence_pages() {
         let mut link = AntLink::default();
-        link.cadence_page(100, 0x0400);
+        link.cadence_page(100, 0x0400, t(0.0));
         // 3 revs in 2048 ticks (2 s) = 90 rpm.
-        assert_eq!(cadence_readings(&link.cadence_page(103, 0x0C00)), vec![90]);
+        assert_eq!(
+            cadence_readings(&link.cadence_page(103, 0x0C00, t(0.0))),
+            vec![90]
+        );
     }
 
     #[test]
     fn should_derive_cadence_across_the_counter_wrap() {
         let mut link = AntLink::default();
-        link.cadence_page(0xFFFF, 0xFC00);
+        link.cadence_page(0xFFFF, 0xFC00, t(0.0));
         // 1 rev, 1 s later, with both counters wrapping through zero.
         assert_eq!(
-            cadence_readings(&link.cadence_page(0x0000, 0x0000)),
+            cadence_readings(&link.cadence_page(0x0000, 0x0000, t(0.0))),
             vec![60]
         );
     }
@@ -1626,10 +1627,33 @@ mod tests {
     #[test]
     fn should_report_no_cadence_while_the_cranks_are_still() {
         // A sensor repeats its last crank event until the next one, so an
-        // unchanged event time is no new information — not 0 rpm.
+        // unchanged event time is no new information — not 0 rpm, yet.
         let mut link = AntLink::default();
-        link.cadence_page(50, 0x2000);
-        assert!(cadence_readings(&link.cadence_page(50, 0x2000)).is_empty());
+        link.cadence_page(50, 0x2000, t(0.0));
+        assert!(cadence_readings(&link.cadence_page(50, 0x2000, t(0.25))).is_empty());
+    }
+
+    #[test]
+    fn should_report_zero_cadence_when_the_rider_coasts() {
+        // Pedalling at 60, then coasting: the sensor goes on sending the
+        // same crank event four times a second. That is 0 rpm, not a held
+        // 60 for ten seconds and then a sensor taken for lost.
+        let mut link = AntLink::default();
+        link.cadence_page(10, 0, t(0.0));
+        assert_eq!(
+            cadence_readings(&link.cadence_page(11, 1024, t(1.0))),
+            vec![60]
+        );
+        let mut coasting = Vec::new();
+        let mut s = 1.25;
+        while s <= 6.0 {
+            coasting.extend(cadence_readings(&link.cadence_page(11, 1024, t(s))));
+            s += 0.25;
+        }
+        assert_eq!(coasting.first(), Some(&0), "{coasting:?}");
+        assert!(coasting.iter().all(|&rpm| rpm == 0), "{coasting:?}");
+        // From 4 s — three seconds after the last turn — every page says so.
+        assert_eq!(coasting.len(), 9, "{coasting:?}");
     }
 
     #[test]
@@ -1637,15 +1661,18 @@ mod tests {
         // A broadcast sensor of its own, like the strap.
         let mut link = AntLink::default();
         assert!(!link.connected);
-        link.cadence_page(0, 0);
-        assert_eq!(cadence_readings(&link.cadence_page(1, 1024)), vec![60]);
+        link.cadence_page(0, 0, t(0.0));
+        assert_eq!(
+            cadence_readings(&link.cadence_page(1, 1024, t(0.0))),
+            vec![60]
+        );
     }
 
     #[test]
     fn should_leave_the_trainer_and_strap_alone_when_cadence_is_disconnected() {
         let now = Instant::now();
         let mut link = both_live(now);
-        link.cadence_page(0, 0);
+        link.cadence_page(0, 0, t(0.0));
         let effects = link.disconnect_cadence();
         assert_eq!(closed(&effects), vec![BC_CHANNEL]);
         assert_eq!(
@@ -1658,9 +1685,9 @@ mod tests {
     #[test]
     fn should_keep_a_disconnected_cadence_sensor_quiet_and_shut() {
         let mut link = AntLink::default();
-        link.cadence_page(0, 0);
+        link.cadence_page(0, 0, t(0.0));
         link.disconnect_cadence();
-        assert!(link.cadence_page(1, 1024).is_empty());
+        assert!(link.cadence_page(1, 1024, t(0.0)).is_empty());
         assert!(!opened(&link.scan(true)).contains(&BC_CHANNEL));
         assert!(link.muted_channels().contains(&BC_CHANNEL));
         assert!(link.channel_dead(BC_CHANNEL).is_empty());
@@ -1669,12 +1696,12 @@ mod tests {
     #[test]
     fn should_bring_a_disconnected_cadence_sensor_back_without_a_stale_rate() {
         let mut link = AntLink::default();
-        link.cadence_page(0, 0);
+        link.cadence_page(0, 0, t(0.0));
         link.disconnect_cadence();
         assert_eq!(opened(&link.connect_cadence()), vec![BC_CHANNEL]);
         // The first page back pairs with nothing from before the disconnect:
         // 500 revs across the gap is not a cadence.
-        let back = link.cadence_page(500, 2048);
+        let back = link.cadence_page(500, 2048, t(0.0));
         assert_eq!(connection_changes(&back), vec![(ANT_CADENCE_ADDRESS, true)]);
         assert!(cadence_readings(&back).is_empty());
     }
@@ -1682,7 +1709,7 @@ mod tests {
     #[test]
     fn should_not_restart_a_live_cadence_sensor_when_asked_to_connect_it() {
         let mut link = AntLink::default();
-        link.cadence_page(0, 0);
+        link.cadence_page(0, 0, t(0.0));
         assert!(link.connect_cadence().is_empty());
     }
 
@@ -1695,23 +1722,26 @@ mod tests {
     #[test]
     fn should_report_the_cadence_sensor_gone_with_the_stick() {
         let mut link = AntLink::default();
-        link.cadence_page(0, 0);
+        link.cadence_page(0, 0, t(0.0));
         let effects = link.stick_lost();
         assert_eq!(
             connection_changes(&effects),
             vec![(ANT_CADENCE_ADDRESS, false)]
         );
         // And no rate across the gap when it returns.
-        assert!(cadence_readings(&link.cadence_page(400, 4096)).is_empty());
-        assert_eq!(cadence_readings(&link.cadence_page(401, 5120)), vec![60]);
+        assert!(cadence_readings(&link.cadence_page(400, 4096, t(0.0))).is_empty());
+        assert_eq!(
+            cadence_readings(&link.cadence_page(401, 5120, t(0.0))),
+            vec![60]
+        );
     }
 
     #[test]
     fn should_relist_a_live_cadence_sensor_after_a_scan_without_reconnecting_it() {
         let mut link = AntLink::default();
-        link.cadence_page(0, 0);
+        link.cadence_page(0, 0, t(0.0));
         link.scan(true);
-        let heard = link.cadence_page(1, 1024);
+        let heard = link.cadence_page(1, 1024, t(0.0));
         assert_eq!(discoveries(&heard), vec![ANT_CADENCE_ADDRESS]);
         assert!(connection_changes(&heard).is_empty());
     }
@@ -2003,7 +2033,10 @@ mod tests {
         // 1 revolution in 1024 ticks (1 s) → 60 rpm, via compute_cadence_rpm
         let (r0, t0) = parse_speed_cadence(&[0x00, 0x00, 0x63, 0x00, 0, 0, 0, 0]).unwrap();
         let (r1, t1) = parse_speed_cadence(&[0x00, 0x04, 0x64, 0x00, 0, 0, 0, 0]).unwrap();
-        assert_eq!(compute_cadence_rpm(r0, t0, r1, t1), Some(60));
+        assert_eq!(
+            crate::devices::ftms::compute_cadence_rpm(r0, t0, r1, t1),
+            Some(60)
+        );
     }
 
     #[test]

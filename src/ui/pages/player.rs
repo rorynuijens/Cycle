@@ -1388,6 +1388,7 @@ impl PlayerPage {
             0.0
         };
         self.course_view.set_progress(road.distance_at(t), speed);
+        self.course_view.set_cadence(snap.readings.cadence_rpm);
         let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
         let total = snap.elapsed_secs + snap.remaining_secs;
         self.course_view.set_workout_hud(WorkoutHudReadings {

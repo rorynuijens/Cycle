@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 /// Fitness Machine Service (FTMS) — BLE GATT profile for smart trainers.
 pub const FTMS_SERVICE_UUID: &str = "00001826-0000-1000-8000-00805f9b34fb";
 pub const INDOOR_BIKE_DATA_UUID: &str = "00002ad2-0000-1000-8000-00805f9b34fb";
@@ -290,6 +292,66 @@ pub fn compute_cadence_rpm(
     // cadence = (revolutions / time_s) × 60 = (delta_revs × 1024 × 60) / delta_time
     let rpm = (delta_revs * 1024 * 60) / delta_time;
     Some(rpm.min(MAX_PLAUSIBLE_CADENCE_RPM))
+}
+
+/// How long the crank may go without a new revolution, its sensor still
+/// reporting, before the rider has stopped pedalling: one turn in this long
+/// is 20 rpm, and slower is no pedalling.
+pub const CRANK_STOPPED: Duration = Duration::from_secs(3);
+/// A crank's event clock is a uint16 in 1/1024 s: it wraps every 64 s, so a
+/// rest longer than this cannot be told from a short one by it.
+const CRANK_CLOCK_WRAP: Duration = Duration::from_secs(60);
+
+/// Cadence from a crank sensor's successive `(revolutions, event time)`
+/// samples, as ANT+ and BLE sensors both send them.
+///
+/// A sensor whose crank has stopped goes on sending its last revolution
+/// unchanged. That is a rider coasting, not a sensor gone quiet: after
+/// [`CRANK_STOPPED`] of it the cadence is 0 — held at its last value instead,
+/// a coast recorded the last cadence for ten seconds and then dropped the
+/// sensor as lost.
+///
+/// Only a crank seen turning can stop. A speed-only sensor on the ANT+ speed
+/// & cadence channel sends crank fields of zeros for ever, and its zeros
+/// once overwrote the real cadence sensor's reading.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CrankCadence {
+    last: Option<(u16, u16)>,
+    /// When the first sample came.
+    first_at: Option<Instant>,
+    /// When the crank last turned — `None` until it has.
+    turned_at: Option<Instant>,
+}
+
+impl CrankCadence {
+    /// The cadence after a sample of `revolutions` at crank `event_time`,
+    /// arriving at `now`: a rate when the crank has turned since the last
+    /// one, 0 once a crank seen turning has stood still for
+    /// [`CRANK_STOPPED`], and `None` when there is nothing new to say.
+    pub fn update(&mut self, revolutions: u16, event_time: u16, now: Instant) -> Option<u32> {
+        let prev = self.last.replace((revolutions, event_time));
+        let Some((prev_revs, prev_time)) = prev else {
+            self.first_at = Some(now);
+            return None;
+        };
+        let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+        if revolutions == prev_revs {
+            // Not a turn, whatever the event time says.
+            return since(self.turned_at)
+                .is_some_and(|d| d >= CRANK_STOPPED)
+                .then_some(0);
+        }
+        // After a long rest the event clock may have wrapped, and the first
+        // turn's rate spans the rest: say nothing until the next.
+        let rested = since(self.turned_at.or(self.first_at));
+        self.turned_at = Some(now);
+        let rpm = compute_cadence_rpm(prev_revs, prev_time, revolutions, event_time)?;
+        if rested.is_some_and(|d| d >= CRANK_CLOCK_WRAP) {
+            None
+        } else {
+            Some(rpm)
+        }
+    }
 }
 
 /// OpCode 0x05 — Set Target Power (ERG mode), little-endian i16.
@@ -587,6 +649,56 @@ mod tests {
     fn should_return_none_cadence_when_crank_not_moving() {
         // Same event time: no new crank event, cadence unknown
         assert_eq!(compute_cadence_rpm(100, 2048, 100, 2048), None);
+    }
+
+    fn at(secs: f32) -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_secs_f32(secs)
+    }
+
+    #[test]
+    fn should_report_zero_cadence_once_the_crank_stands_still_while_coasting() {
+        // 90 rpm, then the rider stops pedalling: the sensor keeps sending
+        // its last revolution, four times a second, as ANT+ ones do.
+        let mut c = CrankCadence::default();
+        assert_eq!(c.update(100, 0, at(0.0)), None);
+        assert_eq!(c.update(103, 2048, at(2.0)), Some(90));
+        let mut t = 2.25;
+        while t < 5.0 {
+            assert_eq!(c.update(103, 2048, at(t)), None, "at {t} s: holding on");
+            t += 0.25;
+        }
+        assert_eq!(c.update(103, 2048, at(5.0)), Some(0), "3 s still: coasting");
+        assert_eq!(c.update(103, 2048, at(9.0)), Some(0));
+        // Pedalling again within the event clock's wrap: a rate at once.
+        assert_eq!(c.update(104, 2048 + 20 * 1024, at(22.0)), Some(3));
+        assert_eq!(c.update(105, 2048 + 21 * 1024, at(23.0)), Some(60));
+    }
+
+    #[test]
+    fn should_say_nothing_of_the_first_turn_after_a_long_rest() {
+        // 70 s at rest: the 16-bit event clock has wrapped, and the first
+        // turn's rate would be nonsense.
+        let mut c = CrankCadence::default();
+        c.update(10, 0, at(0.0));
+        assert_eq!(c.update(11, 1024, at(1.0)), Some(60));
+        assert_eq!(c.update(11, 1024, at(40.0)), Some(0));
+        assert_eq!(c.update(12, 1024 + 6 * 1024, at(71.0)), None);
+        assert_eq!(c.update(13, 1024 + 7 * 1024, at(72.0)), Some(60));
+    }
+
+    #[test]
+    fn should_never_report_zero_for_a_crank_never_seen_turning() {
+        // The ANT+ speed & cadence channel picks up a speed-only sensor whose
+        // crank fields are zeros on every page, four times a second. Taken
+        // for a stopped crank, its zeros overwrote the real cadence sensor's
+        // 74 rpm two seconds in three.
+        let mut c = CrankCadence::default();
+        let mut t = 0.0;
+        while t < 30.0 {
+            assert_eq!(c.update(0, 0, at(t)), None, "at {t} s");
+            t += 0.25;
+        }
     }
 
     #[test]

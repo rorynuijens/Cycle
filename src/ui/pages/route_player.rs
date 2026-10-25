@@ -1331,6 +1331,12 @@ impl RoutePlayerPage {
             }
 
             if paused.get() {
+                // Stopped: the 3D view would otherwise carry the rider on
+                // for its late-tick grace.
+                page.course_view
+                    .set_progress(engine.borrow().distance_m, 0.0);
+                page.course_view.hold_ride_clock();
+                page.course_view.set_cadence(readings.cadence_rpm);
                 return glib::ControlFlow::Continue;
             }
 
@@ -1532,6 +1538,7 @@ impl RoutePlayerPage {
                 page.route_map.set_position(lat, lng);
             }
             page.course_view.set_progress(distance_m, speed_ms);
+            page.course_view.set_cadence(readings.cadence_rpm);
             page.course_view.set_ride_clock(elapsed);
             // The ghost: where it is after as much riding, and the gap to it.
             let ghost_now = page

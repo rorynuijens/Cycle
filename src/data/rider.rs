@@ -207,6 +207,91 @@ pub fn crank(distance_m: f32) -> f32 {
     (distance_m / METRES_PER_TURN).rem_euclid(1.0) * std::f32::consts::TAU
 }
 
+/// Highest cadence the legs are turned by, in rpm: a sensor claiming more
+/// is not believed (CLAUDE.md §5.1).
+const MAX_CADENCE_RPM: f32 = 250.0;
+/// How quickly the legs take up a new cadence, in seconds: a sensor reports
+/// about once a second, and a step from 70 to 95 rpm in one frame is a
+/// visible lurch of the feet.
+const CADENCE_GLIDE_S: f32 = 0.5;
+
+/// The cranks as drawn, turning at the rider's measured cadence — or, with
+/// no cadence sensor, with the road, as [`crank`] turns them.
+///
+/// The angle is carried on frame by frame rather than worked out afresh,
+/// so a sensor dropping out or coming back changes how fast the legs turn,
+/// never where they are.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Cranks {
+    /// How far round, in radians, in `0..TAU`.
+    angle: f32,
+    /// How fast they turn, in radians a second.
+    rate: f32,
+    /// The distance and time of the last frame, in metres and seconds —
+    /// `None` before the first.
+    last: Option<(f32, f64)>,
+}
+
+impl Cranks {
+    /// Turn the cranks on to `now_s`, the rider `distance_m` along, pedalling
+    /// at `cadence_rpm` — `None` with no cadence to go by; and how far round
+    /// they are.
+    pub fn advance(&mut self, now_s: f64, distance_m: f32, cadence_rpm: Option<f32>) -> f32 {
+        let tau = std::f32::consts::TAU;
+        let distance = if distance_m.is_finite() {
+            distance_m
+        } else {
+            0.0
+        };
+        let Some((last_m, last_s)) = self.last else {
+            self.last = Some((distance, now_s));
+            self.angle = match cadence_rpm {
+                Some(_) => 0.0,
+                None => crank(distance),
+            };
+            self.rate = cadence_rpm.map_or(0.0, rate_of);
+            return self.angle;
+        };
+        let dt = if now_s.is_finite() {
+            (now_s - last_s).max(0.0) as f32
+        } else {
+            0.0
+        };
+        self.last = Some((distance, if now_s.is_finite() { now_s } else { last_s }));
+        if dt <= 0.0 {
+            return self.angle;
+        }
+        let target = match cadence_rpm {
+            Some(c) => rate_of(c),
+            None => {
+                // With the road; a skip along the route is no pedalling.
+                let rolled = distance - last_m;
+                if (0.0..=100.0).contains(&rolled) {
+                    rolled / METRES_PER_TURN * tau / dt
+                } else {
+                    self.rate
+                }
+            }
+        };
+        self.rate += (target - self.rate) * (1.0 - (-dt / CADENCE_GLIDE_S).exp());
+        self.angle = (self.angle + self.rate * dt).rem_euclid(tau);
+        if self.angle >= tau {
+            self.angle = 0.0;
+        }
+        self.angle
+    }
+}
+
+/// `cadence_rpm` as radians a second, within what a rider can turn.
+fn rate_of(cadence_rpm: f32) -> f32 {
+    let rpm = if cadence_rpm.is_finite() {
+        cadence_rpm.clamp(0.0, MAX_CADENCE_RPM)
+    } else {
+        0.0
+    };
+    rpm / 60.0 * std::f32::consts::TAU
+}
+
 /// A leg's swing at the hip (radians, forward positive) and its lift
 /// (metres) at crank angle `crank`; `side` is −1 for the left leg, 1 for the
 /// right, half a turn apart.
@@ -340,5 +425,102 @@ mod tests {
             assert!((l + r).abs() < 1e-5 && (ll + rl).abs() < 1e-5, "at {c}");
             assert!(l.abs() <= SWING_RAD + 1e-6);
         }
+    }
+
+    /// Frames at 60 a second from `cranks`, starting at `from_s`: the angle
+    /// at each, the rider at `distance(k)` pedalling at `cadence(k)`.
+    fn frames(
+        cranks: &mut Cranks,
+        n: usize,
+        distance: &dyn Fn(usize) -> f32,
+        cadence: &dyn Fn(usize) -> Option<f32>,
+    ) -> Vec<f32> {
+        (0..n)
+            .map(|k| cranks.advance(k as f64 / 60.0, distance(k), cadence(k)))
+            .collect()
+    }
+
+    #[test]
+    fn should_turn_the_legs_at_the_measured_cadence() {
+        // 90 rpm is a turn and a half a second: after one second exactly,
+        // half a turn on from where they started.
+        let mut c = Cranks::default();
+        let a = frames(&mut c, 61, &|k| k as f32 * 0.15, &|_| Some(90.0));
+        assert_eq!(a[0], 0.0);
+        assert!((a[60] - std::f32::consts::PI).abs() < 1e-3, "{}", a[60]);
+        // Whatever the speed: the same cadence at a crawl turns them as fast.
+        let mut slow = Cranks::default();
+        let b = frames(&mut slow, 61, &|k| k as f32 * 0.01, &|_| Some(90.0));
+        assert!((b[60] - std::f32::consts::PI).abs() < 1e-3, "{}", b[60]);
+    }
+
+    #[test]
+    fn should_hold_the_legs_still_when_coasting() {
+        // Rolling at 10 m/s with the cadence sensor saying 0: freewheeling.
+        let mut c = Cranks::default();
+        let a = frames(&mut c, 120, &|k| k as f32 / 6.0, &|_| Some(0.0));
+        assert!(a.iter().all(|&x| x == 0.0), "{a:?}");
+    }
+
+    #[test]
+    fn should_turn_the_legs_with_the_road_without_a_cadence_sensor() {
+        // 9 m/s with no cadence sensor: a turn every 6.5 m, as the gear
+        // says — 83.1 rpm — and still once the rider stops.
+        let mut c = Cranks::default();
+        let a = frames(&mut c, 600, &|k| 500.0 + k.min(300) as f32 * 0.15, &|_| {
+            None
+        });
+        let tau = std::f32::consts::TAU;
+        let rpm = (a[241] - a[240]).rem_euclid(tau) * 60.0 / tau * 60.0;
+        let want = 9.0 / METRES_PER_TURN * 60.0;
+        assert!((rpm - want).abs() < 0.1, "{rpm} rpm, not {want}");
+        assert!((a[599] - a[598]).abs() < 1e-4, "still turning once stopped");
+    }
+
+    #[test]
+    fn should_change_cadence_without_a_lurch() {
+        // 70 rpm, then the sensor says 100 and later drops out; at no frame
+        // may the legs jump, only speed up or slow down a little.
+        let mut c = Cranks::default();
+        let a = frames(&mut c, 360, &|k| k as f32 * 0.15, &|k| match k {
+            0..=119 => Some(70.0),
+            120..=239 => Some(100.0),
+            _ => None,
+        });
+        let tau = std::f32::consts::TAU;
+        let steps: Vec<f32> = a
+            .windows(2)
+            .map(|w| (w[1] - w[0]).rem_euclid(tau))
+            .collect();
+        for (k, w) in steps.windows(2).enumerate() {
+            // One frame's turn changes by at most what 6 rpm a frame-step is.
+            let change = (w[1] - w[0]).abs();
+            assert!(change < 0.02, "frame {k}: the turn changed by {change} rad");
+        }
+        // Settled on 100 rpm by the end of the second second.
+        let at_100 = steps[235] * 60.0 / tau * 60.0;
+        assert!((at_100 - 100.0).abs() < 1.0, "turning at {at_100} rpm");
+    }
+
+    #[test]
+    fn should_survive_nonsense_from_a_sensor() {
+        let mut c = Cranks::default();
+        for (t, d, cad) in [
+            (0.0, 0.0, Some(f32::NAN)),
+            (0.1, f32::NAN, Some(90.0)),
+            (f64::NAN, 1.0, Some(f32::INFINITY)),
+            (0.2, 2.0, Some(-40.0)),
+            (0.1, 2.0, Some(90.0)),
+            (0.3, 1e9, None),
+        ] {
+            let a = c.advance(t, d, cad);
+            assert!((0.0..std::f32::consts::TAU).contains(&a), "{a}");
+        }
+        // A rogue 65535 rpm turns the legs no faster than 250.
+        let mut rogue = Cranks::default();
+        let a = frames(&mut rogue, 61, &|_| 0.0, &|_| Some(65_535.0));
+        let mut sane = Cranks::default();
+        let b = frames(&mut sane, 61, &|_| 0.0, &|_| Some(250.0));
+        assert_eq!(a, b);
     }
 }
