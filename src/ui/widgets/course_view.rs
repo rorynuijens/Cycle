@@ -34,9 +34,15 @@ use crate::data::rider;
 use crate::data::route::Route;
 use crate::ui::widgets::ride_hud::{self, FinishedCard, HudReadings, RideHud, WorkoutHudReadings};
 
-/// Vertical field of view, in degrees. Wide enough that a bend does not
-/// leave the frame.
+/// Vertical field of view, in degrees, at the least. Wide enough that a
+/// bend does not leave the frame.
 const FOV_DEG: f32 = 60.0;
+/// The narrowest the view may be across, in degrees. The windowed view is a
+/// wide strip and sees ~114° across at 60° high; fullscreen at 16:9 saw only
+/// ~91°, and with less road streaming past at the sides the same speed felt
+/// slower. A view less wide than this opens up and down until it is this wide:
+/// fullscreen sees what the window does.
+const MIN_HFOV_DEG: f32 = 114.0;
 const NEAR_M: f32 = 0.5;
 /// Past the mountains on the horizon.
 const FAR_M: f32 = 9_000.0;
@@ -62,10 +68,18 @@ const BUILDING: &str = "Building the 3D view…";
 const MAX_EXTRAPOLATE_S: f32 = 1.5;
 
 /// How quickly the drawn rider closes on where the ride says they are, in
-/// seconds: the time to make up two thirds of the gap. A report is due every
-/// second, so the gap is made up at about its own size a second — a metre
-/// short adds a metre a second for a moment, not a lurch.
-const GLIDE_S: f32 = 1.0;
+/// seconds: the time constant of a critically damped follow. Every report
+/// lands a little off where the view carried the rider — the ride moves a
+/// second of riding per tick and the tick comes a few ms late, and the speed
+/// changes in a step — so a report changes how hard the rider speeds up or
+/// slows, never their speed itself in one frame: that was a lurch every second.
+const GLIDE_S: f32 = 0.5;
+/// The longest step the follow is worked in, in seconds: small enough to
+/// stay stable at any frame rate.
+const GLIDE_STEP_S: f32 = 1.0 / 120.0;
+/// A frame gap longer than this, in seconds — the view was off screen — is no
+/// glide: the rider is put where the ride says.
+const GLIDE_GAP_S: f32 = 0.5;
 /// How quickly the speed the rider leans by follows the ride's, in seconds.
 /// The ride's speed changes in a step at each report, and in a hairpin the
 /// lean is so sensitive to speed that each step tipped the rider over by
@@ -85,6 +99,16 @@ const SNAP_M: f32 = 30.0;
 /// A camera that moved less than this since the last frame is not redrawn —
 /// unless something in the world is moving.
 const REDRAW_EPSILON_M: f32 = 0.001;
+
+/// The vertical field of view for a view `aspect` wide to its height, in
+/// degrees: [`FOV_DEG`], or more where that would see less than
+/// [`MIN_HFOV_DEG`] across.
+fn vertical_fov_deg(aspect: f32) -> f32 {
+    let aspect = if aspect > 0.0 { aspect } else { 1.0 };
+    let tan_half_across = (MIN_HFOV_DEG.to_radians() / 2.0).tan();
+    let needed = 2.0 * (tan_half_across / aspect).atan().to_degrees();
+    needed.max(FOV_DEG)
+}
 
 /// The world's vertices, placed by `u_model` (the identity for the land; the
 /// rider's pose for the rider; the eye for the horizon).
@@ -196,7 +220,14 @@ void main() {
     float s = sin(yaw);
     p *= i_size.x * (1.0 - smoothstep(u_reach.x, u_reach.y, length(base - u_eye)));
     vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
-    v_colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
+    vec4 colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
+    if (floor(colour.a + 0.5) == 7.0) {
+        // A window or door: melts into the wall, the prop's own colour,
+        // before it is a flickering pixel. Plainly lit from then on.
+        float fade = smoothstep(150.0, 300.0, length(world - u_eye));
+        colour = vec4(mix(colour.rgb, i_colour, fade), 0.0);
+    }
+    v_colour = colour;
     v_world = world;
     v_rel = world - u_eye;
     v_anchor = world;
@@ -480,12 +511,13 @@ fn ride_secs(clock: Option<(f32, i64, bool)>, now_us: i64) -> f32 {
 /// next report is rarely exactly there: braking into a bend or easing up a
 /// climb, the ride is a metre short of where the view has drawn them. Taken
 /// as it came, every report was a jolt back up the road — in every bend.
-/// So the drawn rider goes on at the ride's speed and makes up the gap
-/// smoothly, and never backwards.
+/// So the drawn rider follows the ride's distance and speed as a critically
+/// damped spring: their speed changes smoothly, and they never go backwards.
 #[derive(Debug, Clone, Copy, Default)]
 struct Glide {
-    /// The distance drawn last frame, and when — `None` before the first.
-    shown: Option<(f32, i64)>,
+    /// The distance drawn last frame, the speed it was drawn going, and when —
+    /// `None` before the first.
+    shown: Option<(f32, f32, i64)>,
     /// The speed the rider is drawn leaning by, in m/s.
     lean_speed: f32,
 }
@@ -499,20 +531,35 @@ impl Glide {
         } else {
             0.0
         };
-        let next = match self.shown {
-            Some((shown, at)) if (target_m - shown).abs() <= SNAP_M => {
+        let (next, moving) = match self.shown {
+            Some((shown, drawn_speed, at)) if (target_m - shown).abs() <= SNAP_M => {
                 let dt = ((now_us - at) as f32 / 1e6).max(0.0);
                 self.lean_speed += (speed - self.lean_speed) * (1.0 - (-dt / LEAN_GLIDE_S).exp());
-                let carried = shown + speed * dt;
-                let closed = carried + (target_m - carried) * (1.0 - (-dt / GLIDE_S).exp());
-                closed.max(shown)
+                if dt > GLIDE_GAP_S {
+                    (target_m.max(shown), speed)
+                } else {
+                    let w = 1.0 / GLIDE_S;
+                    let (mut x, mut u) = (shown, drawn_speed);
+                    let steps = (dt / GLIDE_STEP_S).ceil().max(1.0);
+                    let h = dt / steps;
+                    // The ride's own distance moves on at its speed through
+                    // the frame: each step pulls from where it is at the
+                    // step's start, the same moment as `x`.
+                    for k in 0..steps as i32 {
+                        let goal = target_m - speed * (dt - k as f32 * h);
+                        u += (w * w * (goal - x) + 2.0 * w * (speed - u)) * h;
+                        u = u.max(0.0);
+                        x += u * h;
+                    }
+                    (x.max(shown), u)
+                }
             }
             _ => {
                 self.lean_speed = speed;
-                target_m
+                (target_m, speed)
             }
         };
-        self.shown = Some((next, now_us));
+        self.shown = Some((next, moving, now_us));
         next
     }
 
@@ -742,10 +789,46 @@ struct HudLayer {
     profile: Vec<f32>,
     /// The workout's blocks, for its profile band.
     blocks: Vec<ride_hud::Block>,
-    /// Made on first use: loading the font is for fullscreen, not every view.
-    painter: Option<RideHud>,
     /// What the texture on the GPU shows, and for what size of view.
     painted: Option<(Painted, (i32, i32))>,
+    /// The HUD being painted off the main thread, and the image it made.
+    paints: Rc<RefCell<HudPaints>>,
+}
+
+/// A HUD image painted off the main thread: what it shows, for what size of
+/// view, and its pixels.
+type HudImage = (Painted, (i32, i32), cairo::ImageSurfaceDataOwned);
+
+/// The HUD painted on a worker. A full-screen paint takes 10–16 ms, and
+/// done inside the frame it cost a dropped frame every second the readings
+/// changed — a judder only in fullscreen, where the HUD is.
+#[derive(Default)]
+struct HudPaints {
+    /// A paint is on its way; the next waits for it rather than queueing.
+    busy: bool,
+    /// Painted, waiting to go on the GPU in the next frame.
+    ready: Option<HudImage>,
+}
+
+thread_local! {
+    /// Each worker thread's own painter: the font map is not for sharing
+    /// across threads, and loading the font each second would be waste.
+    static HUD_PAINTER: RideHud = RideHud::new();
+}
+
+/// The HUD showing `want` for a view `w` × `h`, on a worker thread.
+fn paint_hud(
+    want: &Painted,
+    (w, h): (i32, i32),
+    profile: &[f32],
+    blocks: &[ride_hud::Block],
+) -> Option<cairo::ImageSurfaceDataOwned> {
+    let image = HUD_PAINTER.with(|painter| match want {
+        Painted::Readings(r) => painter.render(w, h, r, profile),
+        Painted::Workout(r) => painter.render_workout(w, h, r, blocks),
+        Painted::Finished(card) => painter.render_finished(w, h, card),
+    })?;
+    image.take_data().ok()
 }
 
 /// What the HUD texture was last painted with.
@@ -1242,9 +1325,17 @@ impl Inner {
             finished,
             profile,
             blocks,
-            painter,
             painted,
+            paints,
         } = &mut *hud;
+        // A paint that has landed goes on the GPU — the one cheap step left
+        // in the frame.
+        let ready = paints.borrow_mut().ready.take();
+        if let Some((done, size, pixels)) = ready {
+            let mut image = pixels.into_inner();
+            state.upload_hud(&mut image);
+            *painted = Some((done, size));
+        }
         // The finished card in any layout; else the HUD, when it is shown —
         // a workout's if one is being ridden, else the route's.
         let want = match (
@@ -1262,19 +1353,37 @@ impl Inner {
             let fresh = painted
                 .as_ref()
                 .is_some_and(|(p, size)| *p == want && *size == (w, h));
-            if !fresh {
-                let painter = painter.get_or_insert_with(RideHud::new);
-                let image = match &want {
-                    Painted::Readings(r) => painter.render(w, h, r, profile),
-                    Painted::Workout(r) => painter.render_workout(w, h, r, blocks),
-                    Painted::Finished(card) => painter.render_finished(w, h, card),
-                };
-                if let Some(mut image) = image {
-                    state.upload_hud(&mut image);
-                    *painted = Some((want, (w, h)));
-                }
+            if !fresh && !paints.borrow().busy {
+                paints.borrow_mut().busy = true;
+                let (profile, blocks) = (profile.clone(), blocks.clone());
+                let paints = Rc::clone(paints);
+                let area = area.downgrade();
+                glib::spawn_future_local(async move {
+                    let painted = gtk::gio::spawn_blocking(move || {
+                        let pixels = paint_hud(&want, (w, h), &profile, &blocks);
+                        pixels.map(|p| (want, (w, h), p))
+                    })
+                    .await;
+                    let mut paints = paints.borrow_mut();
+                    paints.busy = false;
+                    match painted {
+                        Ok(Some(image)) => paints.ready = Some(image),
+                        Ok(None) => tracing::warn!("The ride HUD could not be painted"),
+                        Err(_) => tracing::error!("Painting the ride HUD panicked"),
+                    }
+                    drop(paints);
+                    // Drawn in the next frame, even with nothing else moving.
+                    if let Some(area) = area.upgrade() {
+                        area.queue_render();
+                    }
+                });
             }
-            state.draw_hud(w, h);
+            // Only a HUD made for this size of view: stretched, a windowed
+            // one would smear across the screen for the frames it takes the
+            // fullscreen one to arrive.
+            if painted.as_ref().is_some_and(|(_, size)| *size == (w, h)) {
+                state.draw_hud(w, h);
+            }
         }
     }
 }
@@ -1589,8 +1698,9 @@ impl GlState {
 
             if let (Some((camera, rider_pose)), true) = (pose, self.world.index_count > 0) {
                 let aspect = width as f32 / height.max(1) as f32;
+                let fov_deg = vertical_fov_deg(aspect);
                 let mvp = course3d::mul4(
-                    &course3d::perspective(FOV_DEG, aspect, NEAR_M, FAR_M),
+                    &course3d::perspective(fov_deg, aspect, NEAR_M, FAR_M),
                     &course3d::look_at(camera.eye, camera.target),
                 );
                 gl.enable(glow::DEPTH_TEST);
@@ -1639,7 +1749,7 @@ impl GlState {
                 // Which way the camera looks, flat, and how wide: chunks
                 // wholly behind it or off to a side are not drawn. A little
                 // wider than the view, for the camera's pitch.
-                let tan_half = (FOV_DEG.to_radians() / 2.0).tan() * aspect * 1.15;
+                let tan_half = (fov_deg.to_radians() / 2.0).tan() * aspect * 1.15;
                 let forward = {
                     let (fx, fz) = (
                         camera.target[0] - camera.eye[0],
@@ -2400,6 +2510,58 @@ mod tests {
         assert_smooth(&drawn(&reports, 1_000_000, 6.5, 60.0), 0.0);
     }
 
+    /// The drawn rider's speed each frame, in m/s, at 60 frames a second.
+    fn frame_speeds(d: &[f32]) -> Vec<f32> {
+        d.windows(2).map(|w| (w[1] - w[0]) * 60.0).collect()
+    }
+
+    /// The ride's reports as the route player makes them: a tick a little
+    /// over a second apart, each moving the rider on by exactly one second of
+    /// riding at the speed it reports — the engine counts ticks, not time.
+    fn ticked(lateness_us: &[i64], speeds: &[f32]) -> Vec<(i64, f32, f32)> {
+        let (mut at, mut d) = (1_000_000i64, 100.0f32);
+        let mut reports = Vec::new();
+        for (k, &late) in lateness_us.iter().enumerate() {
+            let v = speeds[k % speeds.len()];
+            d += v;
+            reports.push((at, d, v));
+            at += 1_000_000 + late;
+        }
+        reports
+    }
+
+    #[test]
+    fn should_hold_a_steady_speed_on_a_steady_ride_with_late_ticks() {
+        // A steady 8 m/s, ticks late by what GLib really does. The road
+        // should go by at a steady speed: a lurch of 0.15 m/s once a second
+        // is a visible jitter with the camera locked to the rider.
+        let late = [
+            4_000, 12_000, 2_000, 16_000, 8_000, 3_000, 10_000, 5_000, 7_000, 2_000,
+        ];
+        let reports = ticked(&late, &[8.0]);
+        let d = drawn(&reports, 3_000_000, 7.0, 60.0);
+        let speeds = frame_speeds(&d);
+        for (k, w) in speeds.windows(2).enumerate() {
+            let dv = (w[1] - w[0]).abs();
+            assert!(dv <= 0.05, "frame {k}: speed went {} → {} m/s", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn should_change_speed_smoothly_on_rolling_road() {
+        // Speeding up and slowing by 0.3 m/s a tick, as a rider at steady
+        // power does over a rolling road: no frame should change the drawn
+        // speed by more than a few times the ride's own 0.3 m/s² / 60.
+        let speeds = [7.4, 7.7, 8.0, 8.3, 8.0, 7.7, 7.4, 7.7, 8.0, 8.3];
+        let reports = ticked(&[5_000; 10], &speeds);
+        let d = drawn(&reports, 3_000_000, 7.0, 60.0);
+        let speeds = frame_speeds(&d);
+        for (k, w) in speeds.windows(2).enumerate() {
+            let dv = (w[1] - w[0]).abs();
+            assert!(dv <= 0.05, "frame {k}: speed went {} → {} m/s", w[0], w[1]);
+        }
+    }
+
     #[test]
     fn should_glide_onto_where_the_ride_says() {
         let reports = [(1_000_000, 100.0, 9.0), (2_000_000, 107.5, 6.0)];
@@ -2445,6 +2607,41 @@ mod tests {
             last = glide.lean_speed();
         }
         assert!((last - 6.0).abs() < 0.2, "still leaning as at {last} m/s");
+    }
+
+    /// How wide a view sees across, in degrees, at `aspect`.
+    fn across_deg(aspect: f32) -> f32 {
+        let tan_half = (vertical_fov_deg(aspect).to_radians() / 2.0).tan();
+        2.0 * (tan_half * aspect).atan().to_degrees()
+    }
+
+    #[test]
+    fn should_leave_the_wide_windowed_view_as_it_was() {
+        // The windowed road, 900 × 335: 60° high, ~114° across.
+        assert_eq!(vertical_fov_deg(900.0 / 335.0), FOV_DEG);
+        assert!((across_deg(900.0 / 335.0) - 114.2).abs() < 0.2);
+    }
+
+    #[test]
+    fn should_see_as_wide_across_in_fullscreen_as_the_minimum() {
+        // 16:9 at 60° high is ~91° across: opened up to 114°, ~81.8° high.
+        for aspect in [16.0 / 9.0, 16.0 / 10.0, 4.0 / 3.0, 1.0] {
+            assert!(
+                (across_deg(aspect) - MIN_HFOV_DEG).abs() < 0.01,
+                "{aspect}: {}° across",
+                across_deg(aspect)
+            );
+        }
+        assert!((vertical_fov_deg(16.0 / 9.0) - 81.8).abs() < 0.2);
+    }
+
+    #[test]
+    fn should_switch_between_the_two_rules_without_a_jump() {
+        // Where 60° high is exactly 114° across, both rules agree.
+        let edge = (57.0f32.to_radians().tan()) / (30.0f32.to_radians().tan());
+        assert!((vertical_fov_deg(edge * 0.999) - FOV_DEG).abs() < 0.05);
+        assert_eq!(vertical_fov_deg(edge * 1.001), FOV_DEG);
+        assert_eq!(vertical_fov_deg(0.0), vertical_fov_deg(1.0));
     }
 
     #[test]

@@ -13,7 +13,9 @@
 //! Pure: no GTK, no GL.
 
 use crate::data::animals::cuboid;
-use crate::data::course3d::{Mesh, Vertex, MATERIAL_GROUND, MATERIAL_PLAIN, MATERIAL_ROCK};
+use crate::data::course3d::{
+    Mesh, Vertex, MATERIAL_DETAIL, MATERIAL_GROUND, MATERIAL_PLAIN, MATERIAL_ROCK,
+};
 use crate::data::palette::{self, Rgb};
 use crate::data::props::{Shape, OWN_COLOUR};
 
@@ -35,6 +37,12 @@ const STANDS_PROUD: f32 = 0.012;
 /// A plain colour from the base palette.
 fn c(rgb: Rgb) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], MATERIAL_PLAIN]
+}
+
+/// A window or door on a wall in the prop's own colour, which it melts into
+/// with distance.
+fn detail(rgb: Rgb) -> [f32; 4] {
+    [rgb[0], rgb[1], rgb[2], MATERIAL_DETAIL]
 }
 
 /// The prop's own colour, lit plainly.
@@ -506,7 +514,7 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(cuboid(
                 [0.42, 0.0, -0.09],
                 [0.42 + STANDS_PROUD, 0.3, 0.09],
-                c(b.animal_dark),
+                detail(b.animal_dark),
             ));
             for x in [-0.22, 0.18] {
                 for side in [-1.0f32, 1.0] {
@@ -514,7 +522,7 @@ pub fn mesh(shape: Shape) -> Mesh {
                     m.extend(cuboid(
                         [x, 0.24, wall.min(out)],
                         [x + 0.14, 0.38, wall.max(out)],
-                        c(b.animal_dark),
+                        detail(b.animal_dark),
                     ));
                 }
             }
@@ -524,9 +532,17 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(cuboid([-0.45, 0.0, -0.45], [0.45, 0.62, 0.45], OWN));
             m.extend(hipped(-0.52, 0.52, -0.52, 0.52, 0.6, 0.86, c(b.roof_a)));
             let face = 0.45 + STANDS_PROUD;
-            m.extend(cuboid([0.45, 0.0, -0.1], [face, 0.34, 0.1], c(b.boat_b)));
+            m.extend(cuboid(
+                [0.45, 0.0, -0.1],
+                [face, 0.34, 0.1],
+                detail(b.boat_b),
+            ));
             for z in [-0.3, 0.15] {
-                m.extend(cuboid([0.45, 0.4, z], [face, 0.52, z + 0.15], c(b.boat_b)));
+                m.extend(cuboid(
+                    [0.45, 0.4, z],
+                    [face, 0.52, z + 0.15],
+                    detail(b.boat_b),
+                ));
             }
         }
         Shape::Hut => {
@@ -544,7 +560,7 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(cuboid(
                 [0.4, 0.0, -0.08],
                 [0.4 + STANDS_PROUD, 0.3, 0.08],
-                c(b.cattail),
+                detail(b.cattail),
             ));
             m.extend(cuboid([-0.2, 0.6, 0.12], [-0.1, 0.98, 0.22], c(b.rock)));
         }
@@ -990,10 +1006,30 @@ mod tests {
     }
 
     #[test]
+    fn should_melt_the_windows_and_doors_of_every_house_into_its_wall() {
+        // The villa's blue windows flickered in the distance: a pixel each,
+        // and past what the depth buffer tells from the wall. Each detail
+        // fades into the prop's own colour, so the wall must be that colour.
+        for shape in [Shape::House, Shape::Villa, Shape::Hut] {
+            let m = mesh(shape);
+            let details = m
+                .vertices
+                .iter()
+                .filter(|v| v.colour[3] == MATERIAL_DETAIL)
+                .count();
+            assert!(details >= 24, "{shape:?}: {details} detail vertices");
+            assert!(
+                m.vertices.iter().any(|v| v.colour == OWN),
+                "{shape:?} has no wall in its own colour to melt into"
+            );
+        }
+    }
+
+    #[test]
     fn should_stand_house_windows_out_of_the_wall_by_a_depth_step() {
         // Windows 1 mm proud of the wall flickered in town: the wall and the
         // window took turns in front of each other.
-        let dark = c(palette::BASE.animal_dark);
+        let dark = detail(palette::BASE.animal_dark);
         let m = mesh(Shape::House);
         let windows: Vec<f32> = m
             .vertices

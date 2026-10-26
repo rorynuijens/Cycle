@@ -114,6 +114,12 @@ pub const MATERIAL_WATER: f32 = 4.0;
 pub const MATERIAL_BACKDROP: f32 = 5.0;
 /// Clouds: lit white, no haze.
 pub const MATERIAL_CLOUD: f32 = 6.0;
+/// A detail on a prop's wall — a window, a door — drawn in its own colour up
+/// close and melting into the wall's (the prop's own colour) with distance,
+/// then lit plainly. Far off a window is a pixel, and a hand's breadth proud
+/// of the wall is past what the depth buffer can tell apart: either way it
+/// flickered. Props only.
+pub const MATERIAL_DETAIL: f32 = 7.0;
 
 /// Ground steeper than this (rise over run, about 50°) is bare rock;
 /// gentler banks stay green.
