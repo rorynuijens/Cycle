@@ -189,7 +189,8 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
             continue;
         };
         let lift = 25.0 + 20.0 * unit(h.rotate_left(19));
-        let count = 2 + (h.rotate_left(31) % 4) as usize;
+        let [lo, hi] = def.animals.bird_flock;
+        let count = (lo + (h.rotate_left(31) % u64::from(hi - lo + 1)) as u32) as usize;
         for b in 0..count {
             let g = splitmix(h ^ (b as u64 + 7));
             out.push(Prop {

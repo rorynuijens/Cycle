@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::data::biome::{self, Biome, BiomeDef};
 use crate::data::course3d::RoadPoint;
-use crate::data::props::{Motion, Prop, Shape, FLUTTER_M};
+use crate::data::props::{Motion, Prop, Shape, DART_M, FLUTTER_M};
 use crate::data::world::{beside, splitmix, AreaKind};
 
 /// What a prop must stand on.
@@ -50,6 +50,9 @@ pub enum Moves {
     Bob,
     Spin,
     Flutter,
+    Dart,
+    Drift,
+    Leap,
 }
 
 impl Moves {
@@ -60,6 +63,9 @@ impl Moves {
             Moves::Bob => Motion::Bob,
             Moves::Spin => Motion::Spin,
             Moves::Flutter => Motion::Flutter,
+            Moves::Dart => Motion::Dart,
+            Moves::Drift => Motion::Drift,
+            Moves::Leap => Motion::Leap,
         }
     }
 }
@@ -146,6 +152,8 @@ impl PropRule {
             // A butterfly wanders about its spot: set nearer the road than
             // that, it would cross it.
             && (self.motion != Moves::Flutter || self.from_m >= FLUTTER_M)
+            // Nor may a dragonfly dart over it.
+            && (self.motion != Moves::Dart || self.from_m >= DART_M)
     }
 }
 
@@ -435,6 +443,9 @@ mod tests {
             r#"{"shape": "cactus", "per_hectare": 2, "from_m": 10, "to_m": 40, "on": "open", "size": [1, 3], "cluster": [0, 3]}"#,
             r#"{"shape": "cactus", "every_m": 2, "from_m": 10, "to_m": 40, "on": "open", "size": [1, 3]}"#,
             r#"{"shape": "cactus", "every_m": 200, "chance": 1.5, "from_m": 10, "to_m": 40, "on": "open", "size": [1, 3]}"#,
+            // Wandering creatures set close enough to cross the road.
+            r#"{"shape": "butterfly", "every_m": 20, "from_m": 1, "to_m": 8, "on": "grassy", "size": [0.3, 0.4], "motion": "flutter"}"#,
+            r#"{"shape": "dragonfly", "every_m": 20, "from_m": 1, "to_m": 8, "on": "shore", "size": [0.3, 0.4], "motion": "dart"}"#,
         ] {
             assert!(!rule(bad).is_sane(), "{bad}");
         }

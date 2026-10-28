@@ -66,10 +66,22 @@ pub enum Shape {
     Flowers,
     /// A butterfly over the verge's flowers.
     Butterfly,
+    /// A dragonfly over the water's edge.
+    Dragonfly,
+    /// A petal or a leaf blowing on the wind.
+    Petal,
+    /// A fish, leaping now and then from a pool.
+    Fish,
+    /// A white stork standing in a field.
+    Stork,
+    /// A fallen tree trunk.
+    Log,
+    /// A few toadstools together.
+    Mushrooms,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 43] = [
+    pub const ALL: [Shape; 49] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -113,6 +125,12 @@ impl Shape {
         Shape::Tuft,
         Shape::Flowers,
         Shape::Butterfly,
+        Shape::Dragonfly,
+        Shape::Petal,
+        Shape::Fish,
+        Shape::Stork,
+        Shape::Log,
+        Shape::Mushrooms,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -129,7 +147,16 @@ impl Shape {
     /// other prop: there are thousands of verge plants, and past this each
     /// is a pixel or two.
     pub fn reach_m(self) -> Option<f32> {
-        matches!(self, Shape::Tuft | Shape::Flowers | Shape::Butterfly).then_some(VERGE_REACH_M)
+        matches!(
+            self,
+            Shape::Tuft
+                | Shape::Flowers
+                | Shape::Butterfly
+                | Shape::Dragonfly
+                | Shape::Petal
+                | Shape::Mushrooms
+        )
+        .then_some(VERGE_REACH_M)
     }
 
     /// How far the wind bends the top of this shape, as a share of its
@@ -177,6 +204,9 @@ impl Shape {
                 | Shape::Dolphin
                 | Shape::Marmot
                 | Shape::Butterfly
+                | Shape::Dragonfly
+                | Shape::Fish
+                | Shape::Stork
         )
     }
 
@@ -219,6 +249,12 @@ pub enum Motion {
     /// Fluttering about its spot in wandering loops, wings beating fast: a
     /// butterfly.
     Flutter = 9,
+    /// Hanging in the air, then darting to a new spot nearby: a dragonfly.
+    Dart = 10,
+    /// Carried along on the wind, tumbling, rising and sinking: a petal.
+    Drift = 11,
+    /// Under the water, leaping out in an arc now and then: a fish.
+    Leap = 12,
 }
 
 /// How far an orbiting prop strays from its spot, in metres — the view's
@@ -229,6 +265,11 @@ pub const ORBIT_M: f32 = 22.0;
 /// the view's shader loops it up to 1.7 m each way along x and z. A
 /// butterfly set nearer the road's edge than this would cross the road.
 pub const FLUTTER_M: f32 = 2.41;
+
+/// How far a darting dragonfly strays from its spot, in metres, at most: the
+/// view's shader darts it up to 1.6 m each way along x and z. A dragonfly set
+/// nearer the road's edge than this would cross the road.
+pub const DART_M: f32 = 2.27;
 
 /// Mesh vertices marked with this colour take the prop's own colour instead:
 /// a tree's crown, a sheep's fleece. Negative, so no real colour can be taken
@@ -463,6 +504,80 @@ mod tests {
         assert_eq!(Shape::Butterfly.reach_m(), Shape::Flowers.reach_m());
     }
 
+    #[test]
+    fn should_keep_dragonflies_to_the_wet_lands_and_off_the_road() {
+        // Ditches and pools lie 30 m and more from the road, where a
+        // dragonfly is a pixel: they patrol the verge, as real ones do, but
+        // only where the land is wet.
+        let mut seen = Vec::new();
+        for biome in Biome::ALL {
+            for rule in biome
+                .def()
+                .props
+                .iter()
+                .filter(|r| r.shape == Shape::Dragonfly)
+            {
+                seen.push(biome);
+                assert_eq!(rule.motion, Moves::Dart, "{biome:?}");
+                assert!(
+                    rule.from_m >= DART_M,
+                    "{biome:?}: dragonflies {} m from the road dart {DART_M} m",
+                    rule.from_m
+                );
+            }
+        }
+        assert_eq!(seen, [Biome::Polder, Biome::Wetland]);
+        assert!(Shape::Dragonfly.is_animal());
+    }
+
+    #[test]
+    fn should_lay_logs_and_toadstools_in_the_forest_and_storks_in_the_polder() {
+        let has = |b: Biome, s: Shape| b.def().props.iter().any(|r| r.shape == s);
+        assert!(has(Biome::Forest, Shape::Log) && has(Biome::Forest, Shape::Mushrooms));
+        assert!(has(Biome::Polder, Shape::Stork));
+        for biome in Biome::ALL {
+            for rule in biome.def().props.iter().filter(|r| r.shape == Shape::Stork) {
+                // A stork grazes: as far from the road as any herd.
+                assert!(
+                    rule.from_m >= crate::data::animals::CLEAR_OF_ROAD_M,
+                    "{biome:?}"
+                );
+            }
+            // Trees grow round a log, not through it.
+            for rule in biome.def().props.iter().filter(|r| r.shape == Shape::Log) {
+                assert!(rule.claims_m * 2.0 >= rule.size[1] * 4.0, "{biome:?}");
+            }
+        }
+        assert!(Shape::Stork.is_animal());
+        assert!(!Shape::Log.is_animal() && !Shape::Mushrooms.is_animal());
+    }
+
+    #[test]
+    fn should_leap_fish_only_from_water_and_blow_petals_on_the_wind() {
+        use crate::data::dressing::Ground;
+        let (mut fish, mut petals) = (0, 0);
+        for biome in Biome::ALL {
+            for rule in &biome.def().props {
+                match rule.shape {
+                    Shape::Fish => {
+                        fish += 1;
+                        assert_eq!(rule.on, Ground::Water, "{biome:?}");
+                        assert_eq!(rule.motion, Moves::Leap, "{biome:?}");
+                    }
+                    Shape::Petal => {
+                        petals += 1;
+                        assert_eq!(rule.motion, Moves::Drift, "{biome:?}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(fish > 0 && petals > 0);
+        // A fish is an animal; a petal is not, and stays when they go.
+        assert!(Shape::Fish.is_animal());
+        assert!(!Shape::Petal.is_animal());
+    }
+
     fn prop_at(shape: Shape, x: f32, z: f32) -> Prop {
         Prop {
             shape,
@@ -563,10 +678,18 @@ mod tests {
 
     #[test]
     fn should_draw_only_the_verge_plants_near_the_eye() {
-        // And the butterflies over them: a third of a metre across, a pixel
-        // past this.
+        // And the butterflies, dragonflies and petals among them: a third
+        // of a metre across or less, a pixel past this.
         for shape in Shape::ALL {
-            let small = matches!(shape, Shape::Tuft | Shape::Flowers | Shape::Butterfly);
+            let small = matches!(
+                shape,
+                Shape::Tuft
+                    | Shape::Flowers
+                    | Shape::Butterfly
+                    | Shape::Dragonfly
+                    | Shape::Petal
+                    | Shape::Mushrooms
+            );
             assert_eq!(shape.reach_m(), small.then_some(VERGE_REACH_M), "{shape:?}");
         }
     }

@@ -89,6 +89,9 @@ pub const TREE_LINE_SPREAD_M: f32 = 25.0;
 fn thin_from() -> f32 {
     350.0
 }
+fn flock() -> [u32; 2] {
+    [2, 5]
+}
 
 /// The herd that grazes beside the road, and the birds overhead.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -108,6 +111,10 @@ pub struct AnimalRules {
     /// Birds circling overhead, and how big — in the palette's `bird`.
     pub birds: bool,
     pub bird_size_m: f32,
+    /// How many circle together, fewest and most: a flock, or an eagle
+    /// alone.
+    #[serde(default = "flock")]
+    pub bird_flock: [u32; 2],
 }
 
 /// The shape of a biome's land (the stylized-route skill, §7.4). Every one
@@ -287,6 +294,8 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             && a.herd_count[1] <= 20
             && a.bird_size_m.is_finite()
             && a.bird_size_m > 0.0
+            && (1..=a.bird_flock[1].max(1)).contains(&a.bird_flock[0])
+            && a.bird_flock[1] <= 8
             && !a.coats.is_empty()
             && a.coats.iter().all(|n| p.named(n).is_some());
         if !in_range || !animals_sane {
@@ -785,6 +794,15 @@ mod tests {
             let bare = matches!(b, Biome::Desert | Biome::Urban);
             assert_eq!(flowers == 0, bare, "{b:?}: {flowers} flower rules");
         }
+    }
+
+    #[test]
+    fn should_circle_a_lone_eagle_over_the_mountains_and_flocks_elsewhere() {
+        let m = Biome::Mountain.def();
+        assert_eq!(m.animals.bird_flock, [1, 1]);
+        assert_eq!(m.palette.bird, crate::data::palette::BASE.eagle);
+        // Unset, a biome keeps the flocks it always had.
+        assert_eq!(Biome::Temperate.def().animals.bird_flock, [2, 5]);
     }
 
     #[test]

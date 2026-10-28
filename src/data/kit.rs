@@ -321,6 +321,33 @@ fn legs(x: f32, z: f32, w: f32, h: f32, colour: [f32; 4]) -> Mesh {
 }
 
 /// A shape's mesh. Shapes that are not in the kit have none here.
+/// A long-legged wading bird, one unit tall: legs and bill in `bill`, the
+/// body in the prop's own colour, a short tail in `tail`.
+fn wader(bill: [f32; 4], tail: [f32; 4]) -> Mesh {
+    let mut m = Mesh::default();
+    for z in [-0.05, 0.05] {
+        m.extend(beam([0.0, 0.0, z], [0.0, 0.58, z], 0.025, 0.025, bill));
+    }
+    m.extend(ball([-0.02, 0.68, 0.0], [0.26, 0.12, 0.12], OWN));
+    m.extend(beam([0.18, 0.72, 0.0], [0.45, 0.96, 0.0], 0.05, 0.05, OWN));
+    m.extend(ball([0.5, 0.98, 0.0], [0.07, 0.05, 0.05], OWN));
+    m.extend(beam(
+        [0.54, 0.98, 0.0],
+        [0.7, 0.95, 0.0],
+        0.025,
+        0.025,
+        bill,
+    ));
+    m.extend(beam(
+        [-0.24, 0.68, 0.0],
+        [-0.36, 0.62, 0.0],
+        0.06,
+        0.03,
+        tail,
+    ));
+    m
+}
+
 pub fn mesh(shape: Shape) -> Mesh {
     let b = palette::BASE;
     let mut m = Mesh::default();
@@ -483,6 +510,44 @@ pub fn mesh(shape: Shape) -> Mesh {
                     OWN,
                 );
             }
+        }
+        Shape::Dragonfly => {
+            // A long thin body with a round head, and two pairs of narrow
+            // wings held out flat, the span along z.
+            m.extend(cuboid([-0.5, -0.025, -0.025], [0.26, 0.025, 0.025], OWN));
+            m.extend(ball([0.32, 0.0, 0.0], [0.07, 0.06, 0.07], c(b.animal_dark)));
+            let wing = c(b.dragonfly_wing);
+            for side in [-1.0f32, 1.0] {
+                let w = |x: f32, z: f32| [x, 0.0, z * side];
+                for (x0, x1) in [(0.06, 0.18), (-0.1, 0.02)] {
+                    quad(
+                        &mut m,
+                        [w(x1, 0.03), w(x1 - 0.02, 0.5), w(x0, 0.5), w(x0, 0.03)],
+                        wing,
+                    );
+                }
+            }
+        }
+        Shape::Petal => {
+            // A small cupped leaf, folded along its length, centred on the
+            // origin: the shader tumbles it about there.
+            let (tip, tail) = ([0.5, 0.0, 0.0], [-0.5, 0.0, 0.0]);
+            tri(&mut m, [tip, [0.0, 0.1, 0.32], tail], OWN);
+            tri(&mut m, [tip, tail, [0.0, 0.1, -0.32]], OWN);
+        }
+        Shape::Fish => {
+            // A slim body and a forked tail, nose along +x.
+            m.extend(ball([0.05, 0.12, 0.0], [0.38, 0.12, 0.08], OWN));
+            tri(
+                &mut m,
+                [[-0.3, 0.12, 0.0], [-0.5, 0.26, 0.0], [-0.5, -0.02, 0.0]],
+                OWN,
+            );
+            tri(
+                &mut m,
+                [[-0.05, 0.22, 0.0], [0.15, 0.22, 0.0], [-0.08, 0.32, 0.0]],
+                OWN,
+            );
         }
         Shape::Flowers => {
             // A few stems with a head each, and blades of leaf at their feet.
@@ -753,27 +818,52 @@ pub fn mesh(shape: Shape) -> Mesh {
             m.extend(cuboid([0.44, 0.44, -0.04], [0.6, 0.49, 0.04], c(b.beak)));
             m.extend(cuboid([-0.42, 0.28, -0.08], [-0.3, 0.36, 0.08], OWN));
         }
-        Shape::Heron => {
-            for z in [-0.05, 0.05] {
-                m.extend(beam([0.0, 0.0, z], [0.0, 0.58, z], 0.025, 0.025, c(b.beak)));
-            }
-            m.extend(ball([-0.02, 0.68, 0.0], [0.26, 0.12, 0.12], OWN));
-            m.extend(beam([0.18, 0.72, 0.0], [0.45, 0.96, 0.0], 0.05, 0.05, OWN));
-            m.extend(ball([0.5, 0.98, 0.0], [0.07, 0.05, 0.05], OWN));
-            m.extend(beam(
-                [0.54, 0.98, 0.0],
-                [0.7, 0.95, 0.0],
-                0.025,
-                0.025,
-                c(b.beak),
-            ));
-            m.extend(beam(
-                [-0.24, 0.68, 0.0],
-                [-0.36, 0.62, 0.0],
-                0.06,
-                0.03,
+        Shape::Heron => m.extend(wader(c(b.beak), c(b.animal_dark))),
+        Shape::Stork => {
+            // A heron's build in white, on red legs and bill, black down the
+            // back of its wings.
+            m.extend(wader(c(b.stork_bill), c(b.animal_dark)));
+            m.extend(cuboid(
+                [-0.3, 0.64, -0.125],
+                [0.05, 0.74, 0.125],
                 c(b.animal_dark),
             ));
+        }
+        Shape::Log => {
+            // A fallen trunk on its side, along x, its cut ends pale.
+            const SIDES: usize = 7;
+            let r = 0.5;
+            let ring = |x: f32| -> Vec<[f32; 3]> {
+                (0..SIDES)
+                    .map(|k| {
+                        let a = k as f32 / SIDES as f32 * std::f32::consts::TAU;
+                        [x, r + r * a.sin(), r * a.cos()]
+                    })
+                    .collect()
+            };
+            let (near, far) = (ring(-2.0), ring(2.0));
+            for k in 0..SIDES {
+                let j = (k + 1) % SIDES;
+                quad(&mut m, [near[k], far[k], far[j], near[j]], c(b.trunk));
+            }
+            for end in [&near, &far] {
+                for k in 1..SIDES - 1 {
+                    tri(&mut m, [end[0], end[k], end[k + 1]], c(b.log_end));
+                }
+            }
+        }
+        Shape::Mushrooms => {
+            // Three toadstools, a tall one and two small, caps in the
+            // prop's own colour.
+            const CAPS: [(f32, f32, f32, f32); 3] = [
+                (0.0, 0.0, 0.62, 0.32),
+                (0.36, 0.22, 0.38, 0.22),
+                (-0.3, 0.3, 0.3, 0.18),
+            ];
+            for (x, z, h, r) in CAPS {
+                m.extend(tube(x, z, 0.3 * r, 0.25 * r, 0.0, h, 6, c(b.mushroom_stem)));
+                m.extend(spike(x, z, r, h - 0.02, h + 0.55 * r, 7, OWN));
+            }
         }
         Shape::Dog => {
             m.extend(cuboid([-0.38, 0.3, -0.11], [0.3, 0.55, 0.11], OWN));

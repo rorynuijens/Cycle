@@ -150,6 +150,27 @@ pub struct Palette {
     pub butterfly_a: Rgb,
     pub butterfly_b: Rgb,
     pub butterfly_c: Rgb,
+    /// Dragonflies by the water, blue or green, on pale wings.
+    pub dragonfly_a: Rgb,
+    pub dragonfly_b: Rgb,
+    pub dragonfly_wing: Rgb,
+    /// Blossom blowing across the road, pink and white.
+    pub blossom_a: Rgb,
+    pub blossom_b: Rgb,
+    /// Leaves blowing across the road: a birch's gold, an oak's rust.
+    pub leaf_gold: Rgb,
+    pub leaf_rust: Rgb,
+    /// A fish leaping from a pool.
+    pub fish: Rgb,
+    /// A white stork, on red legs and bill.
+    pub stork: Rgb,
+    pub stork_bill: Rgb,
+    /// The pale cut end of a fallen log.
+    pub log_end: Rgb,
+    /// Toadstools: pale stems, red or brown caps.
+    pub mushroom_stem: Rgb,
+    pub mushroom_red: Rgb,
+    pub mushroom_brown: Rgb,
     /// The finish: the arch, its banner, and the chequers on the banner and
     /// across the road.
     pub arch: Rgb,
@@ -263,6 +284,20 @@ pub const BASE: Palette = Palette {
     butterfly_a: hex(0xF2902E),
     butterfly_b: hex(0xF5F2E8),
     butterfly_c: hex(0x7AA7EE),
+    dragonfly_a: hex(0x2E8FC4),
+    dragonfly_b: hex(0x3DAA6E),
+    dragonfly_wing: hex(0xE2F0F4),
+    blossom_a: hex(0xF6C3D3),
+    blossom_b: hex(0xFFF4F0),
+    leaf_gold: hex(0xE6BF3E),
+    leaf_rust: hex(0xC9772F),
+    fish: hex(0xA9B8BF),
+    stork: hex(0xF4F2EC),
+    stork_bill: hex(0xD9452B),
+    log_end: hex(0xD9B583),
+    mushroom_stem: hex(0xF1E9D8),
+    mushroom_red: hex(0xD2392B),
+    mushroom_brown: hex(0xA0673A),
     arch: hex(0xD63333),
     banner: hex(0xFFFFFF),
     chequer: hex(0x1E2430),
@@ -472,6 +507,20 @@ impl Palette {
             "butterfly_a" => &mut self.butterfly_a,
             "butterfly_b" => &mut self.butterfly_b,
             "butterfly_c" => &mut self.butterfly_c,
+            "dragonfly_a" => &mut self.dragonfly_a,
+            "dragonfly_b" => &mut self.dragonfly_b,
+            "dragonfly_wing" => &mut self.dragonfly_wing,
+            "blossom_a" => &mut self.blossom_a,
+            "blossom_b" => &mut self.blossom_b,
+            "leaf_gold" => &mut self.leaf_gold,
+            "leaf_rust" => &mut self.leaf_rust,
+            "fish" => &mut self.fish,
+            "stork" => &mut self.stork,
+            "stork_bill" => &mut self.stork_bill,
+            "log_end" => &mut self.log_end,
+            "mushroom_stem" => &mut self.mushroom_stem,
+            "mushroom_red" => &mut self.mushroom_red,
+            "mushroom_brown" => &mut self.mushroom_brown,
             "arch" => &mut self.arch,
             "banner" => &mut self.banner,
             "chequer" => &mut self.chequer,
@@ -545,7 +594,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 104] = [
+        const NAMES: [&str; 118] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -645,6 +694,20 @@ mod tests {
             "butterfly_a",
             "butterfly_b",
             "butterfly_c",
+            "dragonfly_a",
+            "dragonfly_b",
+            "dragonfly_wing",
+            "blossom_a",
+            "blossom_b",
+            "leaf_gold",
+            "leaf_rust",
+            "fish",
+            "stork",
+            "stork_bill",
+            "log_end",
+            "mushroom_stem",
+            "mushroom_red",
+            "mushroom_brown",
             "arch",
             "banner",
             "chequer",
@@ -656,7 +719,7 @@ mod tests {
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 104] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 118] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

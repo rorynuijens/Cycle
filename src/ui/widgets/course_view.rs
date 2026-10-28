@@ -226,6 +226,48 @@ void main() {
         yaw = atan(vz, vx);
         float beat = 0.9 * sin(u_time * 22.0 + phase * 7.0);
         p = vec3(p.x, abs(p.z) * sin(beat) + p.y, p.z * cos(beat));
+    } else if (motion == 10.0) {
+        // A dragonfly: hangs in the air a moment, then darts to a new spot
+        // near its own, nose the way it went, and hangs there. Each spot is
+        // the next one's start, so it never jumps; wings a shimmer.
+        float k = u_time * 0.45 + phase;
+        float n = floor(k);
+        float go = smoothstep(0.0, 0.12, fract(k));
+        vec2 seed = vec2(12.9898, 78.233);
+        vec2 was = 2.0 * fract(sin(vec2(n, n + 0.5) * seed + phase * 17.3) * 43758.5453) - 1.0;
+        vec2 next = 2.0 * fract(sin(vec2(n + 1.0, n + 1.5) * seed + phase * 17.3) * 43758.5453)
+            - 1.0;
+        vec2 at = 1.6 * mix(was, next, go);
+        base += vec3(at.x, 0.8 + 0.12 * (at.x - at.y) + 0.04 * sin(u_time * 3.0 + phase), at.y);
+        yaw = atan(next.y - was.y, next.x - was.x);
+        p.y += 0.12 * abs(p.z) * sin(u_time * 40.0 + phase * 9.0);
+    } else if (motion == 11.0) {
+        // A petal or a leaf on the wind: carried downwind across 20 m in
+        // 10 s, swaying, rising and sinking, tumbling over and over. It grows
+        // out of nothing at the start of its run and shrinks away at the
+        // end, then starts it again.
+        float run = fract(u_time * 0.1 + phase * 0.15915494);
+        float t = u_time + phase * 3.0;
+        vec2 across = vec2(-u_wind.y, u_wind.x);
+        base.xz += u_wind * (run - 0.5) * 20.0 + across * 0.8 * sin(t * 0.7);
+        base.y += 0.3 + 0.5 * (0.5 + 0.5 * sin(t * 0.9)) + 0.12 * sin(t * 2.3);
+        float a = t * 3.1;
+        float b = t * 2.3;
+        p = vec3(p.x, p.y * cos(a) - p.z * sin(a), p.y * sin(a) + p.z * cos(a));
+        p = vec3(p.x * cos(b) - p.y * sin(b), p.x * sin(b) + p.y * cos(b), p.z);
+        p *= smoothstep(0.0, 0.08, run) * (1.0 - smoothstep(0.92, 1.0, run));
+    } else if (motion == 12.0) {
+        // A fish: under the water, out of sight, but for a leap every 7 s,
+        // out and over in an arc along the way it faces, nose up then down.
+        float s = fract(u_time / 7.0 + phase * 0.15915494) * 7.0 / 0.9;
+        if (s < 1.0) {
+            base += vec3(cos(yaw), 0.0, sin(yaw)) * (s - 0.5) * 1.6;
+            base.y += -0.2 + 4.4 * s * (1.0 - s);
+            float pitch = 0.8 * atan(4.4 * (1.0 - 2.0 * s), 1.6);
+            p = vec3(p.x * cos(pitch) - p.y * sin(pitch), p.x * sin(pitch) + p.y * cos(pitch), p.z);
+        } else {
+            p = vec3(0.0);
+        }
     } else if (motion == 8.0) {
         // Rolling forward about its centre, half a unit up.
         float a = -(u_time * 5.0 + phase);
