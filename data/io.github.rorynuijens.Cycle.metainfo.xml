@@ -90,6 +90,28 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.22.2" date="2026-10-28">
+      <description>
+        <p>More nature along the 3D road, and smoother full-screen riding:</p>
+        <ul>
+          <li>Wind sways the trees and the grass, and blows petals and
+              leaves across the road.</li>
+          <li>Butterflies by the flowers, dragonflies over the wet
+              verges, fish leaping from pools, storks in the polder and
+              an eagle circling over the mountains.</li>
+          <li>Fallen logs and toadstools in the forest.</li>
+          <li>Fields of lavender, sunflowers and poppies, stone walls and
+              wooden fences, village fountains and mountain
+              waterfalls.</li>
+          <li>Full screen now shows the same wide view as the window, so
+              the ride feels as fast.</li>
+          <li>Fixed: a slight lurch every second and dropped frames in
+              full screen.</li>
+          <li>Fixed: blue windows on Mediterranean houses flickered in
+              the distance.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.22.1" date="2026-10-25">
       <description>
         <p>A smoother ride in 3D, and cadence you can trust:</p>
