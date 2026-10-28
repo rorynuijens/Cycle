@@ -16,7 +16,7 @@
 
 use crate::data::biome::{self, BiomeDef, BiomeMap, Scenery};
 use crate::data::palette::Palette;
-use crate::data::props::Prop;
+use crate::data::props::{Prop, Shape};
 use crate::data::roadway;
 use crate::data::route::Route;
 use crate::data::world::{splitmix, AreaKind, World};
@@ -120,13 +120,15 @@ pub const MATERIAL_CLOUD: f32 = 6.0;
 /// of the wall is past what the depth buffer can tell apart: either way it
 /// flickered. Props only.
 pub const MATERIAL_DETAIL: f32 = 7.0;
+/// Falling water: white streaks run down it. Props only.
+pub const MATERIAL_FALLS: f32 = 8.0;
 
 /// Ground steeper than this (rise over run, about 50°) is bare rock;
 /// gentler banks stay green.
 const ROCK_SLOPE: f32 = 1.2;
 
 /// Fields where the map has farmland: patches about this far across.
-const FIELD_M: f32 = 80.0;
+pub const FIELD_M: f32 = 80.0;
 
 /// How far the ground may stand above or below the road `t` metres beyond
 /// its edge (the stylized-route skill, §4.2): nothing within 10 m, then
@@ -164,6 +166,7 @@ fn ground_colour(def: &BiomeDef, area: Option<AreaKind>, x: f32, z: f32, rise: f
     let p = &def.palette;
     let rgb = match area {
         Some(AreaKind::Water) => return [p.water[0], p.water[1], p.water[2], MATERIAL_WATER],
+        Some(AreaKind::Farmland) if in_bloom(def, x, z) => p.field_bloom,
         Some(AreaKind::Farmland) => field(p, def.land.crops, x, z),
         Some(AreaKind::Wood) => p.grass_high,
         Some(AreaKind::Sand) => p.sand,
@@ -173,24 +176,72 @@ fn ground_colour(def: &BiomeDef, area: Option<AreaKind>, x: f32, z: f32, rise: f
     [rgb[0], rgb[1], rgb[2], MATERIAL_GROUND]
 }
 
+/// One field: the cell of the land round a seeded point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Field {
+    /// The field's own seed: the same field, the same seed, every ride.
+    pub seed: u64,
+    /// The seeded point it is the cell round.
+    pub centre: (f32, f32),
+}
+
+/// The field the land at `(x, z)` would be, if it is farmland: the cells
+/// round seeded points about [`FIELD_M`] apart.
+pub fn field_at(x: f32, z: f32) -> Field {
+    let (ci, cj) = ((x / FIELD_M).floor() as i64, (z / FIELD_M).floor() as i64);
+    let mut best = (
+        f32::MAX,
+        Field {
+            seed: 0,
+            centre: (x, z),
+        },
+    );
+    for di in -1..=1 {
+        for dj in -1..=1 {
+            let f = field_cell(ci + di, cj + dj);
+            let d = (x - f.centre.0).powi(2) + (z - f.centre.1).powi(2);
+            if d < best.0 {
+                best = (d, f);
+            }
+        }
+    }
+    best.1
+}
+
+/// The field round the seeded point in grid cell `(i, j)`, [`FIELD_M`]
+/// wide.
+pub fn field_cell(i: i64, j: i64) -> Field {
+    let h = splitmix(splitmix(i as u64 ^ 0xF1E1D).wrapping_add(j as u64));
+    Field {
+        seed: h,
+        centre: (
+            (i as f32 + 0.15 + 0.7 * biome::unit(h)) * FIELD_M,
+            (j as f32 + 0.15 + 0.7 * biome::unit(splitmix(h))) * FIELD_M,
+        ),
+    }
+}
+
+/// Whether farmland at `(x, z)` is a field in bloom in a biome like `def`.
+pub fn in_bloom(def: &BiomeDef, x: f32, z: f32) -> bool {
+    def.land.bloom > 0.0 && field_blooms(def, field_at(x, z))
+}
+
+/// Whether `field` is one in bloom in a biome like `def`.
+pub fn field_blooms(def: &BiomeDef, field: Field) -> bool {
+    biome::unit(splitmix(field.seed ^ 0xB100_5EED)) < def.land.bloom
+}
+
+/// The way a field's rows run, as a yaw: its own, so neighbouring fields
+/// are ploughed different ways.
+pub fn field_rows_yaw(field: Field) -> f32 {
+    biome::unit(splitmix(field.seed ^ 0x0505)) * std::f32::consts::PI
+}
+
 /// The crop in the field at `(x, z)`: fields are the cells round seeded
 /// points about [`FIELD_M`] apart, each sown at random from the palette's
 /// field colours — the same field every ride.
 fn field(p: &Palette, crops: f32, x: f32, z: f32) -> [f32; 3] {
-    let (ci, cj) = ((x / FIELD_M).floor() as i64, (z / FIELD_M).floor() as i64);
-    let mut best = (f32::MAX, 0u64);
-    for di in -1..=1 {
-        for dj in -1..=1 {
-            let (i, j) = (ci + di, cj + dj);
-            let h = splitmix(splitmix(i as u64 ^ 0xF1E1D).wrapping_add(j as u64));
-            let cx = (i as f32 + 0.15 + 0.7 * biome::unit(h)) * FIELD_M;
-            let cz = (j as f32 + 0.15 + 0.7 * biome::unit(splitmix(h))) * FIELD_M;
-            let d = (x - cx).powi(2) + (z - cz).powi(2);
-            if d < best.0 {
-                best = (d, h);
-            }
-        }
-    }
+    let best = (0.0, field_at(x, z).seed);
     // Crops scattered through meadows: half the fields are grass in the
     // countryside, and a biome with more or fewer crops turns some over.
     let pick = (best.1 % 8) as usize;
@@ -473,6 +524,7 @@ impl CourseScene {
             &|x, z| world.land(x, z) == Some(AreaKind::Water),
             world.seed(),
         );
+        clear_paths(&mut props, &encounters::footprints(&road, &encounters));
         let start = road[0].distance_m;
         let run_out = drawn
             .iter()
@@ -505,6 +557,42 @@ impl CourseScene {
         let j = (i + 1).min(self.skies.len() - 1);
         self.skies[i].mix(&self.skies[j], k - k.floor())
     }
+}
+
+/// Clears every solid prop off the ground the encounters' animals cross:
+/// a flock goes through a gap in the wall, not through the wall.
+fn clear_paths(props: &mut Vec<Prop>, steps: &[(f32, f32)]) {
+    /// The animals' own half-width, and the cells their steps are kept in.
+    const BODY_M: f32 = 1.2;
+    const CELL_M: f32 = 4.0;
+    let cell = |x: f32, z: f32| ((x / CELL_M).floor() as i64, (z / CELL_M).floor() as i64);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<(f32, f32)>> = Default::default();
+    for &(x, z) in steps {
+        if x.is_finite() && z.is_finite() {
+            grid.entry(cell(x, z)).or_default().push((x, z));
+        }
+    }
+    if grid.is_empty() {
+        return;
+    }
+    let reach: Vec<f32> = Shape::ALL.iter().map(|s| s.footprint()).collect();
+    props.retain(|p| {
+        if !p.shape.is_solid() {
+            return true;
+        }
+        let r = reach[p.shape as usize] * p.size + BODY_M;
+        let n = (r / CELL_M).ceil() as i64;
+        let (ci, cj) = cell(p.pos[0], p.pos[2]);
+        !(-n..=n).any(|di| {
+            (-n..=n).any(|dj| {
+                grid.get(&(ci + di, cj + dj)).is_some_and(|spots| {
+                    spots
+                        .iter()
+                        .any(|&(x, z)| (x - p.pos[0]).hypot(z - p.pos[2]) < r)
+                })
+            })
+        })
+    });
 }
 
 /// Sky and haze, as the view clears and fogs with them.
@@ -1879,6 +1967,82 @@ fn normalise_xz(v: [f32; 3]) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_clear_what_a_flock_would_run_through_off_its_path() {
+        // The flock crossing the farm ran straight through a log.
+        let prop = |shape, x: f32, z: f32, size: f32| Prop {
+            shape,
+            pos: [x, 0.0, z],
+            size,
+            yaw: 0.0,
+            colour: [1.0; 3],
+            motion: crate::data::props::Motion::Still,
+            phase: 0.0,
+        };
+        let mut all = vec![
+            prop(Shape::Log, 2.0, 0.0, 1.0),
+            // A wall's length reaches the path from its middle 2.5 m off.
+            Prop {
+                yaw: std::f32::consts::FRAC_PI_2,
+                ..prop(Shape::Wall, 0.0, 2.5, 0.9)
+            },
+            prop(Shape::HayBale, 0.0, -1.5, 2.0),
+            // Beside the path but clear of it, a wall stays.
+            prop(Shape::Wall, 0.0, 6.0, 0.9),
+            prop(Shape::Log, 30.0, 0.0, 1.0),
+            prop(Shape::Tuft, 0.5, 0.0, 0.4),
+            prop(Shape::Sunflowers, 0.0, 1.0, 4.0),
+            prop(Shape::Cow, 1.0, 1.0, 2.0),
+        ];
+        let path: Vec<(f32, f32)> = (0..20).map(|k| (k as f32 * 0.5 - 5.0, 0.0)).collect();
+        clear_paths(&mut all, &path);
+        let left: Vec<(Shape, f32)> = all.iter().map(|p| (p.shape, p.pos[0])).collect();
+        assert_eq!(
+            left,
+            [
+                (Shape::Wall, 0.0),
+                (Shape::Log, 30.0),
+                (Shape::Tuft, 0.5),
+                (Shape::Sunflowers, 0.0),
+                (Shape::Cow, 1.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn should_index_every_shape_by_its_place_in_all() {
+        // clear_paths looks a shape's reach up by `shape as usize`.
+        for (k, shape) in Shape::ALL.iter().enumerate() {
+            assert_eq!(*shape as usize, k, "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn should_colour_a_field_in_bloom_its_bloom_and_no_other() {
+        // Past its rows a lavender field must still read purple, and a
+        // field not in bloom keeps the crop it always had.
+        let def = biome::Biome::Mediterranean.def();
+        let (mut bloom, mut other) = (0, 0);
+        for i in 0..60 {
+            for j in 0..60 {
+                let (x, z) = (i as f32 * 23.0, j as f32 * 23.0);
+                let rgb = ground_colour(def, Some(AreaKind::Farmland), x, z, 0.0);
+                let rgb = [rgb[0], rgb[1], rgb[2]];
+                if in_bloom(def, x, z) {
+                    bloom += 1;
+                    assert_eq!(rgb, def.palette.field_bloom);
+                } else {
+                    other += 1;
+                    assert_eq!(rgb, field(&def.palette, def.land.crops, x, z));
+                }
+            }
+        }
+        assert!(bloom > 300 && other > 300, "{bloom} in bloom, {other} not");
+        // Where the biome has none, no field blooms.
+        let plain = biome::Biome::Desert.def();
+        assert!((0..400).all(|k| !in_bloom(plain, k as f32 * 31.0, k as f32 * 17.0)));
+    }
     use crate::data::route::RoutePoint;
 
     /// A straight road due north from (52.0, 6.0), one point every `step` m,

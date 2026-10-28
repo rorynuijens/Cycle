@@ -78,10 +78,24 @@ pub enum Shape {
     Log,
     /// A few toadstools together.
     Mushrooms,
+    /// A short run of a lavender row: bushes in a line along x.
+    Lavender,
+    /// A short run of a sunflower row, heads turned to the sun.
+    Sunflowers,
+    /// A patch of poppies in a field.
+    Poppies,
+    /// A length of dry-stone wall along x.
+    Wall,
+    /// A length of post-and-rail fence along x.
+    Fence,
+    /// A village fountain: a basin, a column and a spout.
+    Fountain,
+    /// A cliff with water falling down the face it turns to +x.
+    Waterfall,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 49] = [
+    pub const ALL: [Shape; 56] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -131,6 +145,13 @@ impl Shape {
         Shape::Stork,
         Shape::Log,
         Shape::Mushrooms,
+        Shape::Lavender,
+        Shape::Sunflowers,
+        Shape::Poppies,
+        Shape::Wall,
+        Shape::Fence,
+        Shape::Fountain,
+        Shape::Waterfall,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -155,6 +176,11 @@ impl Shape {
                 | Shape::Dragonfly
                 | Shape::Petal
                 | Shape::Mushrooms
+                | Shape::Lavender
+                | Shape::Sunflowers
+                | Shape::Poppies
+                | Shape::Wall
+                | Shape::Fence
         )
         .then_some(VERGE_REACH_M)
     }
@@ -167,7 +193,9 @@ impl Shape {
         match self {
             Shape::Tuft => 0.15,
             Shape::Reeds => 0.13,
-            Shape::Flowers => 0.12,
+            Shape::Flowers | Shape::Poppies => 0.12,
+            Shape::Lavender => 0.08,
+            Shape::Sunflowers => 0.05,
             // Tall and slender, the trees seen sway: a poplar's crown moves
             // most of a metre.
             Shape::Palm | Shape::Cypress => 0.06,
@@ -177,6 +205,26 @@ impl Shape {
             Shape::Olive | Shape::Cone => 0.035,
             _ => 0.0,
         }
+    }
+
+    /// Something an animal must go round, not through: everything but the
+    /// animals and the small plants a flock runs through — the verge's
+    /// tufts and flowers, a field's rows. A wall and a fence are low but
+    /// solid.
+    pub fn is_solid(self) -> bool {
+        !self.is_animal()
+            && (self.reach_m().is_none() || matches!(self, Shape::Wall | Shape::Fence))
+            && self != Shape::Petal
+    }
+
+    /// How far the shape reaches from its middle across the ground, in
+    /// mesh units.
+    pub fn footprint(self) -> f32 {
+        self.mesh()
+            .vertices
+            .iter()
+            .map(|v| v.pos[0].hypot(v.pos[2]))
+            .fold(0.0, f32::max)
     }
 
     /// An animal: hidden, with the encounters, when the rider turns animals
@@ -429,7 +477,13 @@ mod tests {
             let plant = shape.is_tree()
                 || matches!(
                     shape,
-                    Shape::Tuft | Shape::Flowers | Shape::Reeds | Shape::Bush
+                    Shape::Tuft
+                        | Shape::Flowers
+                        | Shape::Reeds
+                        | Shape::Bush
+                        | Shape::Lavender
+                        | Shape::Sunflowers
+                        | Shape::Poppies
                 );
             assert_eq!(
                 shape.sway() > 0.0,
@@ -550,6 +604,63 @@ mod tests {
         }
         assert!(Shape::Stork.is_animal());
         assert!(!Shape::Log.is_animal() && !Shape::Mushrooms.is_animal());
+    }
+
+    #[test]
+    fn should_set_walls_and_fences_end_to_end_along_the_road() {
+        let mut lengths = 0;
+        for biome in Biome::ALL {
+            for rule in &biome.def().props {
+                let length = match rule.shape {
+                    Shape::Wall => crate::data::kit::WALL_LENGTH,
+                    Shape::Fence => crate::data::kit::FENCE_LENGTH,
+                    _ => continue,
+                };
+                lengths += 1;
+                // Each length reaches the next, with no gap between.
+                assert!(
+                    rule.along_road && rule.run_m > 0.0,
+                    "{biome:?} {:?}",
+                    rule.shape
+                );
+                assert!(
+                    rule.every_m <= length * rule.size[0],
+                    "{biome:?} {:?}",
+                    rule.shape
+                );
+                // On a bend the next length turns: they overlap, never part.
+                assert!(rule.every_m >= 0.9 * length * rule.size[1], "{biome:?}");
+            }
+        }
+        assert!(lengths >= 4);
+    }
+
+    #[test]
+    fn should_lay_lavender_sunflowers_and_poppies_only_in_fields_in_bloom() {
+        use crate::data::dressing::Ground;
+        for (shape, home) in [
+            (Shape::Lavender, Biome::Mediterranean),
+            (Shape::Sunflowers, Biome::Farmland),
+            (Shape::Poppies, Biome::Temperate),
+        ] {
+            for biome in Biome::ALL {
+                let def = biome.def();
+                let rules: Vec<_> = def.props.iter().filter(|r| r.shape == shape).collect();
+                assert_eq!(!rules.is_empty(), biome == home, "{shape:?} in {biome:?}");
+                for rule in rules {
+                    assert_eq!(rule.on, Ground::Bloom);
+                    assert!(rule.rows_m[0] > 0.0 && def.land.bloom > 0.0);
+                    // Runs of a row meet end to end along it.
+                    if shape != Shape::Poppies {
+                        assert!(rule.rows_m[1] <= rule.size[0], "{shape:?}");
+                    }
+                    // Past the rows, the field's own colour is the bloom's.
+                    let bloom = def.palette.field_bloom;
+                    assert_ne!(bloom, def.palette.field_wheat);
+                    assert_ne!(bloom, def.palette.grass_low);
+                }
+            }
+        }
     }
 
     #[test]
@@ -679,7 +790,9 @@ mod tests {
     #[test]
     fn should_draw_only_the_verge_plants_near_the_eye() {
         // And the butterflies, dragonflies and petals among them: a third
-        // of a metre across or less, a pixel past this.
+        // of a metre across or less, a pixel past this. The rows of a field
+        // in bloom and the walls and fences are low and many: past this the
+        // field's own colour and the verge carry them.
         for shape in Shape::ALL {
             let small = matches!(
                 shape,
@@ -689,6 +802,11 @@ mod tests {
                     | Shape::Dragonfly
                     | Shape::Petal
                     | Shape::Mushrooms
+                    | Shape::Lavender
+                    | Shape::Sunflowers
+                    | Shape::Poppies
+                    | Shape::Wall
+                    | Shape::Fence
             );
             assert_eq!(shape.reach_m(), small.then_some(VERGE_REACH_M), "{shape:?}");
         }

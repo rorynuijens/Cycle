@@ -171,6 +171,24 @@ pub struct Palette {
     pub mushroom_stem: Rgb,
     pub mushroom_red: Rgb,
     pub mushroom_brown: Rgb,
+    /// The ground of a field in bloom, under and past its rows: a poppy
+    /// meadow green (the red is the flowers), lavender purple, sunflower gold.
+    pub field_bloom: Rgb,
+    /// Lavender bushes.
+    pub lavender: Rgb,
+    /// Sunflowers: gold petals round a dark eye, on green stems and leaves.
+    pub sunflower: Rgb,
+    pub sunflower_eye: Rgb,
+    pub sunflower_leaf: Rgb,
+    /// A poppy's red head.
+    pub poppy: Rgb,
+    /// A dry-stone wall, and a post-and-rail fence.
+    pub wall_stone: Rgb,
+    pub fence_wood: Rgb,
+    /// A village fountain's pale stone.
+    pub fountain_stone: Rgb,
+    /// Water falling down a cliff, white where it lands.
+    pub falls: Rgb,
     /// The finish: the arch, its banner, and the chequers on the banner and
     /// across the road.
     pub arch: Rgb,
@@ -298,6 +316,16 @@ pub const BASE: Palette = Palette {
     mushroom_stem: hex(0xF1E9D8),
     mushroom_red: hex(0xD2392B),
     mushroom_brown: hex(0xA0673A),
+    field_bloom: hex(0x8CBF4C),
+    lavender: hex(0x8A66C2),
+    sunflower: hex(0xF5C232),
+    sunflower_eye: hex(0x5A3A1E),
+    sunflower_leaf: hex(0x5E8F32),
+    poppy: hex(0xD8302A),
+    wall_stone: hex(0xB3A994),
+    fence_wood: hex(0x9A7550),
+    fountain_stone: hex(0xE6DCC6),
+    falls: hex(0xDDF2FB),
     arch: hex(0xD63333),
     banner: hex(0xFFFFFF),
     chequer: hex(0x1E2430),
@@ -521,6 +549,16 @@ impl Palette {
             "mushroom_stem" => &mut self.mushroom_stem,
             "mushroom_red" => &mut self.mushroom_red,
             "mushroom_brown" => &mut self.mushroom_brown,
+            "field_bloom" => &mut self.field_bloom,
+            "lavender" => &mut self.lavender,
+            "sunflower" => &mut self.sunflower,
+            "sunflower_eye" => &mut self.sunflower_eye,
+            "sunflower_leaf" => &mut self.sunflower_leaf,
+            "poppy" => &mut self.poppy,
+            "wall_stone" => &mut self.wall_stone,
+            "fence_wood" => &mut self.fence_wood,
+            "fountain_stone" => &mut self.fountain_stone,
+            "falls" => &mut self.falls,
             "arch" => &mut self.arch,
             "banner" => &mut self.banner,
             "chequer" => &mut self.chequer,
@@ -594,7 +632,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 118] = [
+        const NAMES: [&str; 128] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -708,6 +746,16 @@ mod tests {
             "mushroom_stem",
             "mushroom_red",
             "mushroom_brown",
+            "field_bloom",
+            "lavender",
+            "sunflower",
+            "sunflower_eye",
+            "sunflower_leaf",
+            "poppy",
+            "wall_stone",
+            "fence_wood",
+            "fountain_stone",
+            "falls",
             "arch",
             "banner",
             "chequer",
@@ -719,7 +767,7 @@ mod tests {
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 118] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 128] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

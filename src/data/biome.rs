@@ -193,6 +193,10 @@ pub struct LandRules {
     pub fields: f32,
     /// Share of fields under a crop rather than grass, 0–1.
     pub crops: f32,
+    /// Share of fields in bloom, 0–1: their ground is `field_bloom`, and
+    /// the biome's rows on `bloom` ground are laid across them.
+    #[serde(default)]
+    pub bloom: f32,
     /// Ground within this far of the road's line is paved, in metres.
     pub paving_m: f32,
     pub water: WaterKind,
@@ -275,6 +279,7 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             && (0.0..=1_000.0).contains(&def.land.wood_from_m)
             && (-1.0..=1.0).contains(&def.land.fields)
             && (0.0..=1.0).contains(&def.land.crops)
+            && (0.0..=1.0).contains(&def.land.bloom)
             && (0.0..=500.0).contains(&def.land.paving_m)
             && def
                 .trees

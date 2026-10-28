@@ -14,7 +14,8 @@
 
 use crate::data::animals::cuboid;
 use crate::data::course3d::{
-    Mesh, Vertex, MATERIAL_DETAIL, MATERIAL_GROUND, MATERIAL_PLAIN, MATERIAL_ROCK,
+    Mesh, Vertex, MATERIAL_DETAIL, MATERIAL_FALLS, MATERIAL_GROUND, MATERIAL_PLAIN, MATERIAL_ROCK,
+    MATERIAL_WATER,
 };
 use crate::data::palette::{self, Rgb};
 use crate::data::props::{Shape, OWN_COLOUR};
@@ -24,6 +25,13 @@ use crate::data::props::{Shape, OWN_COLOUR};
 pub const SAIL_FROM: f32 = 0.21;
 /// The height of a windmill's hub, in mesh units.
 pub const HUB_Y: f32 = 0.78;
+/// A length of wall, and of fence, in mesh units: each is one unit tall,
+/// and this long along x, so lengths set end to end along the road meet.
+pub const WALL_LENGTH: f32 = 6.0;
+pub const FENCE_LENGTH: f32 = 5.0;
+/// A run of a row in bloom is one unit long along x; its plants stand
+/// this many to the run.
+const ROW_PLANTS: usize = 5;
 /// A running animal's legs are every vertex below this, in mesh units: the
 /// view's shader swings them.
 pub const LEGS_TOP: f32 = 0.3;
@@ -865,6 +873,189 @@ pub fn mesh(shape: Shape) -> Mesh {
                 m.extend(spike(x, z, r, h - 0.02, h + 0.55 * r, 7, OWN));
             }
         }
+        Shape::Lavender => {
+            // Round bushes nose to tail along the row: one ball each, as
+            // there are thousands of them.
+            let s = 1.0 / ROW_PLANTS as f32;
+            for k in 0..ROW_PLANTS {
+                let x = (k as f32 + 0.5) * s - 0.5;
+                m.extend(ball([x, 0.3 * s, 0.0], [0.52 * s, 0.3 * s, 0.42 * s], LEAF));
+            }
+        }
+        Shape::Sunflowers => {
+            // Tall stems, two leaves each, and a head turned square to the
+            // row: gold petals round a dark eye.
+            let s = 1.0 / ROW_PLANTS as f32;
+            let leaf = c(b.sunflower_leaf);
+            for k in 0..ROW_PLANTS {
+                let x = (k as f32 + 0.5) * s - 0.5;
+                let (hy, hz) = (1.8 * s, 0.06 * s);
+                m.extend(tube(x, 0.0, 0.05 * s, 0.035 * s, 0.0, hy, 4, leaf));
+                for (y, side) in [(0.8 * s, 1.0), (1.2 * s, -1.0)] {
+                    m.extend(blade(
+                        [x, y, 0.0],
+                        [x + 0.08 * s, y + 0.14 * s, side * 0.4 * s],
+                        0.22 * s,
+                        leaf,
+                    ));
+                }
+                // The head tipped back to the sky, so it shows gold from
+                // every side of the field and from the saddle, not edge on.
+                const PETALS: usize = 8;
+                const TILT: f32 = 0.95;
+                let (inner, outer) = (0.11 * s, 0.4 * s);
+                let normal = [0.0, TILT.sin(), TILT.cos()];
+                let at = |a: f32, r: f32, out: f32| {
+                    let (u, w) = (r * a.cos(), r * a.sin());
+                    [
+                        x + u,
+                        hy + w * TILT.cos() + out * normal[1],
+                        hz - w * TILT.sin() + out * normal[2],
+                    ]
+                };
+                for p in 0..PETALS {
+                    let turn = |q: f32| q / PETALS as f32 * std::f32::consts::TAU;
+                    let (a0, a1, a2) = (turn(p as f32), turn(p as f32 + 0.5), turn(p as f32 + 1.0));
+                    tri(
+                        &mut m,
+                        [at(a0, inner, 0.0), at(a1, outer, 0.0), at(a2, inner, 0.0)],
+                        OWN,
+                    );
+                    // The eye, a depth step proud of the petals on both
+                    // sides: a field is seen from either.
+                    for side in [1.0, -1.0] {
+                        let eye = side * STANDS_PROUD;
+                        tri(
+                            &mut m,
+                            [
+                                at(a0, inner, eye),
+                                at(a2, inner, eye),
+                                at(0.0, 0.0, eye + side * 0.01 * s),
+                            ],
+                            c(b.sunflower_eye),
+                        );
+                    }
+                }
+            }
+        }
+        Shape::Poppies => {
+            // Red heads at knee height on thin stems, scattered over a
+            // patch a unit across, with a blade of leaf at each foot.
+            const HEADS: [(f32, f32, f32); 12] = [
+                (0.0, 0.04, 0.2),
+                (0.22, 0.1, 0.16),
+                (-0.2, 0.16, 0.18),
+                (0.12, -0.24, 0.22),
+                (-0.16, -0.2, 0.15),
+                (0.34, -0.06, 0.19),
+                (-0.36, -0.02, 0.21),
+                (0.06, 0.36, 0.17),
+                (-0.08, -0.4, 0.2),
+                (0.3, 0.3, 0.14),
+                (-0.32, 0.32, 0.19),
+                (0.4, -0.34, 0.16),
+            ];
+            let stem = c(b.verge_grass);
+            for (x, z, h) in HEADS {
+                m.extend(blade([x - 0.006, 0.0, z], [x, h, z], 0.012, stem));
+                m.extend(gem([x, h, z], 0.055, 0.02, OWN));
+                m.extend(blade([x, 0.0, z], [x + 0.05, 0.08, z + 0.03], 0.03, stem));
+            }
+        }
+        Shape::Wall => {
+            // A low wall of stacked stone, its coping ragged: stones of
+            // seeded heights along the top.
+            let half = WALL_LENGTH / 2.0;
+            m.extend(cuboid([-half, 0.0, -0.32], [half, 0.78, 0.32], ROCK));
+            let stones = (WALL_LENGTH / 0.5) as usize;
+            for k in 0..stones {
+                let x0 = -half + k as f32 * 0.5;
+                let h = 0.86 + 0.1 * ((k * 7 + 3) % 5) as f32 / 4.0;
+                let w = 0.26 + 0.04 * ((k * 3 + 1) % 3) as f32;
+                m.extend(cuboid([x0, 0.7, -w], [x0 + 0.5, h, w], ROCK));
+            }
+        }
+        Shape::Fence => {
+            // Posts and two rails.
+            let half = FENCE_LENGTH / 2.0;
+            for x in [-half, 0.0, half] {
+                m.extend(cuboid([x - 0.05, 0.0, -0.05], [x + 0.05, 1.0, 0.05], OWN));
+            }
+            for y in [0.42, 0.78] {
+                m.extend(cuboid([-half, y, -0.025], [half, y + 0.09, 0.025], OWN));
+            }
+        }
+        Shape::Fountain => {
+            // An eight-sided basin of still water, a column rising from it
+            // to a bowl, and four jets falling from the bowl to the basin.
+            let stone = c(b.fountain_stone);
+            let falls = c(b.falls);
+            m.extend(tube(0.0, 0.0, 0.8, 0.8, 0.0, 0.22, 8, stone));
+            m.extend(tube(0.0, 0.0, 0.72, 0.72, 0.2, 0.234, 8, c(b.water)));
+            m.extend(tube(0.0, 0.0, 0.1, 0.08, 0.2, 0.62, 8, stone));
+            m.extend(tube(0.0, 0.0, 0.08, 0.32, 0.6, 0.7, 8, stone));
+            m.extend(tube(0.0, 0.0, 0.29, 0.29, 0.68, 0.714, 8, c(b.water)));
+            m.extend(spike(0.0, 0.0, 0.05, 0.714, 0.95, 6, falls));
+            for k in 0..4 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_4;
+                let (ca, sa) = (a.cos(), a.sin());
+                m.extend(beam(
+                    [0.3 * ca, 0.7, 0.3 * sa],
+                    [0.55 * ca, 0.235, 0.55 * sa],
+                    0.04,
+                    0.02,
+                    falls,
+                ));
+            }
+        }
+        Shape::Waterfall => {
+            // A crag of worn rock, its face toward +x, rising to a notch
+            // between two boulders, with a pine or two on its shoulders.
+            // From the notch a sheet of water falls clear of the face into
+            // a pool, white where it lands.
+            m.extend(lump([-0.35, 0.3, 0.0], [0.5, 0.7, 0.75], ROCK));
+            m.extend(lump([-0.12, 0.24, 0.5], [0.36, 0.34, 0.3], ROCK));
+            m.extend(lump([-0.14, 0.2, -0.52], [0.34, 0.3, 0.28], ROCK));
+            m.extend(lump([-0.08, 0.86, 0.26], [0.2, 0.14, 0.15], ROCK));
+            m.extend(lump([-0.1, 0.84, -0.27], [0.22, 0.15, 0.16], ROCK));
+            m.extend(lump([0.3, 0.06, 0.34], [0.14, 0.1, 0.12], ROCK));
+            m.extend(lump([0.26, 0.05, -0.36], [0.12, 0.08, 0.1], ROCK));
+            let pine = [b.tree_b[0], b.tree_b[1], b.tree_b[2], MATERIAL_GROUND];
+            for (x, z, y, h) in [(-0.45, 0.42, 0.62, 0.3), (-0.55, -0.4, 0.66, 0.24)] {
+                m.extend(tube(x, z, 0.012, 0.01, y - 0.04, y + 0.04, 5, c(b.trunk)));
+                m.extend(spike(x, z, 0.07, y + 0.02, y + h, 7, pine));
+                m.extend(spike(x, z, 0.05, y + 0.45 * h, y + h * 1.12, 7, pine));
+            }
+            let falls = [b.falls[0], b.falls[1], b.falls[2], MATERIAL_FALLS];
+            // Out from the notch in a curve, then straight down, a little
+            // wider as it falls, in steps so the curve shows.
+            const STEPS: usize = 10;
+            let at = |k: usize| {
+                let t = k as f32 / STEPS as f32;
+                let y = 0.9 - 0.88 * t;
+                let x = 0.2 - 0.18 * (1.0 - (t / 0.25).min(1.0)).powi(2);
+                (x, y, 0.1 + 0.05 * t)
+            };
+            for k in 0..STEPS {
+                let ((x0, y0, w0), (x1, y1, w1)) = (at(k), at(k + 1));
+                quad(
+                    &mut m,
+                    [[x0, y0, -w0], [x0, y0, w0], [x1, y1, w1], [x1, y1, -w1]],
+                    falls,
+                );
+            }
+            m.extend(tube(
+                0.46,
+                0.0,
+                0.3,
+                0.3,
+                0.0,
+                0.02,
+                9,
+                [b.water[0], b.water[1], b.water[2], MATERIAL_WATER],
+            ));
+            m.extend(ball([0.24, 0.04, 0.0], [0.1, 0.06, 0.2], c(b.foam)));
+        }
         Shape::Dog => {
             m.extend(cuboid([-0.38, 0.3, -0.11], [0.3, 0.55, 0.11], OWN));
             m.extend(legs(0.26, 0.07, 0.07, 0.32, OWN));
@@ -1120,6 +1311,44 @@ mod tests {
             "faces too close to tell apart:\n{}",
             close.join("\n")
         );
+    }
+
+    #[test]
+    fn should_keep_the_rows_of_a_field_in_bloom_cheap_to_draw() {
+        // A field in bloom is thousands of runs of a row, and every run near
+        // the eye is drawn: a lavender run's bushes on worn-stone feet came
+        // to 710 triangles, and a chunk of them millions.
+        for shape in [Shape::Lavender, Shape::Sunflowers, Shape::Poppies] {
+            let tris = mesh(shape).indices.len() / 3;
+            assert!(tris <= 220, "{shape:?}: {tris} triangles");
+        }
+    }
+
+    #[test]
+    fn should_fall_a_waterfall_clear_of_its_own_rock() {
+        // The water falls in front of the crag: no rock stands out through
+        // the sheet, and the sheet hangs from the top to the pool.
+        let m = mesh(Shape::Waterfall);
+        let water: Vec<&Vertex> = m
+            .vertices
+            .iter()
+            .filter(|v| v.colour[3] == MATERIAL_FALLS)
+            .collect();
+        assert!(water.len() >= 40);
+        let top = water.iter().map(|v| v.pos[1]).fold(0.0, f32::max);
+        let bottom = water.iter().map(|v| v.pos[1]).fold(1.0, f32::min);
+        assert!(top > 0.85 && bottom < 0.05, "{bottom}–{top}");
+        // The crag's face, from its biggest lump: in front of it at every
+        // height the sheet falls past.
+        for v in water.iter().filter(|v| v.pos[1] > 0.05) {
+            let (y, z) = (v.pos[1] - 0.3, v.pos[2]);
+            let inside = 1.0 - (y / 0.7).powi(2) - (z / 0.75).powi(2);
+            let face = -0.35 + 0.5 * inside.max(0.0).sqrt();
+            assert!(v.pos[0] > face + 0.02, "{:?} inside the rock", v.pos);
+        }
+        // Rock, and not one box of it: a crag, not a building.
+        let rock = m.vertices.iter().filter(|v| v.colour == ROCK).count();
+        assert!(rock > 200, "{rock} rock vertices");
     }
 
     #[test]

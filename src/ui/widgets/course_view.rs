@@ -424,6 +424,12 @@ void main() {
         float crack = 1.0 - smoothstep(0.05, 0.05 + 1.5 * fwidth(st.x), st.x);
         c *= mix(1.0, 0.86 + 0.24 * st.y, near);
         c *= mix(vec3(1.0), u_crack, crack * near);
+    } else if (material == 8.0) {
+        // Falling water: white streaks of their own lengths running down
+        // it, a column at a time, too fast to follow one.
+        float column = floor((v_world.x + v_world.z) * 1.6);
+        float run = fract(v_world.y * 0.22 + u_time * 1.4 + 0.37 * hash(vec3(column, 3.0, 0.0)));
+        c = mix(c, u_foam, 0.7 * step(0.55 + 0.3 * hash(vec3(column, 7.0, 0.0)), run));
     } else if (material == 4.0) {
         // Water lies flat, with lighter stripes drifting along it.
         n = vec3(0.0, 1.0, 0.0);

@@ -302,6 +302,34 @@ pub fn triggers(
     out
 }
 
+/// Where the animals of `triggers` set foot along `road`, as scene `(x, z)`
+/// spots: each encounter played through once for a slow rider and once
+/// for a fast one, from long before it to long after its animals have gone.
+/// Nothing solid may stand on these — a flock does not run through a log.
+/// Birds in the air leave no footprint.
+pub fn footprints(road: &[RoadPoint], triggers: &[Trigger]) -> Vec<(f32, f32)> {
+    const STEP_S: f32 = 0.25;
+    let mut out = Vec::new();
+    for t in triggers {
+        for speed in [4.0f32, 11.0] {
+            let mut d = Director::new(vec![*t]);
+            let (mut rider, mut clock) = (t.at_m - 300.0, 0.0f32);
+            while rider < t.at_m + 600.0 && clock < LEAVE_MAX_S + 120.0 {
+                for p in d.update(road, rider, speed, clock) {
+                    let flying =
+                        p.shape == Shape::Bird || matches!(p.motion, Motion::Flap | Motion::Orbit);
+                    if !flying {
+                        out.push((p.pos[0], p.pos[2]));
+                    }
+                }
+                rider += speed * STEP_S;
+                clock += STEP_S;
+            }
+        }
+    }
+    out
+}
+
 /// An encounter under way.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Active {
@@ -1306,6 +1334,42 @@ mod tests {
                 distance_m: i as f32 * 10.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn should_trace_a_flock_across_the_road_and_a_run_along_it() {
+        let road = north_road(300);
+        let flock = Trigger {
+            at_m: 1_000.0,
+            kind: Kind::Flock,
+            side: 1.0,
+            seed: 3,
+        };
+        let steps = footprints(&road, &[flock]);
+        assert!(!steps.is_empty());
+        // Right across: from well out one side to well out the other.
+        let xs = |lo: f32, hi: f32| steps.iter().any(|&(x, _)| (lo..hi).contains(&x));
+        assert!(xs(15.0, 40.0) && xs(-40.0, -15.0) && xs(-1.0, 1.0));
+        // And near where it was set, not all along the road.
+        assert!(steps.iter().all(|&(_, z)| (-z - 1_000.0).abs() < 300.0));
+        let run = Trigger {
+            at_m: 1_000.0,
+            kind: Kind::FlockRun,
+            side: -1.0,
+            seed: 3,
+        };
+        let steps = footprints(&road, &[run]);
+        assert!(steps
+            .iter()
+            .any(|&(x, z)| (-20.0..-10.0).contains(&x) && -z > 1_080.0));
+        // Birds in the air leave none.
+        let geese = Trigger {
+            at_m: 1_000.0,
+            kind: Kind::Geese,
+            side: 1.0,
+            seed: 3,
+        };
+        assert!(footprints(&road, &[geese]).is_empty());
     }
 
     fn one(kind: Kind, at_m: f32, side: f32, seed: u64) -> Director {

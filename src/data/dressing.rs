@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::data::biome::{self, Biome, BiomeDef};
-use crate::data::course3d::RoadPoint;
+use crate::data::course3d::{self, RoadPoint, FIELD_M};
 use crate::data::props::{Motion, Prop, Shape, DART_M, FLUTTER_M};
 use crate::data::world::{beside, splitmix, AreaKind};
 
@@ -39,6 +39,8 @@ pub enum Ground {
     Shore,
     /// Anywhere that is not water.
     Dry,
+    /// A field in bloom: the biome's `land.bloom` share of its fields.
+    Bloom,
 }
 
 /// How a prop moves, as the data file names it.
@@ -94,6 +96,15 @@ pub struct PropRule {
     /// Or set along the road: a group every this many metres of it …
     #[serde(default)]
     pub every_m: f32,
+    /// … the chance and the side drawn once for each run this long, not
+    /// for each spot: a wall lines a stretch of road, then stops.
+    #[serde(default)]
+    pub run_m: f32,
+    /// Or laid in rows across every field it may stand in: this far apart
+    /// across the rows, then this far along them. The rows of one field
+    /// run its own way; the props stand along them.
+    #[serde(default)]
+    pub rows_m: [f32; 2],
     /// … that many times in one.
     #[serde(default = "one")]
     pub chance: f32,
@@ -116,6 +127,13 @@ pub struct PropRule {
     /// Turned to face the road, as a house is.
     #[serde(default)]
     pub face_road: bool,
+    /// Turned to run along the road, as a wall is.
+    #[serde(default)]
+    pub along_road: bool,
+    /// Set down as low as the ground round its claim, so on a slope it
+    /// stands in the hill rather than proud of it: a cliff.
+    #[serde(default)]
+    pub sunk: bool,
     /// The ground it takes for itself, as a radius in metres: nothing else
     /// that takes ground, no tree and no animal stands within it.
     #[serde(default)]
@@ -128,6 +146,9 @@ impl PropRule {
         let finite = [
             self.per_hectare,
             self.every_m,
+            self.run_m,
+            self.rows_m[0],
+            self.rows_m[1],
             self.chance,
             self.from_m,
             self.to_m,
@@ -139,8 +160,16 @@ impl PropRule {
         .iter()
         .all(|v| v.is_finite() && *v >= 0.0);
         finite
-            && (self.per_hectare > 0.0) != (self.every_m > 0.0)
+            // One way of placing, and only one.
+            && [self.per_hectare > 0.0, self.every_m > 0.0, self.rows_m[0] > 0.0]
+                .iter()
+                .filter(|&&b| b)
+                .count()
+                == 1
             && (self.every_m == 0.0 || self.every_m >= 5.0)
+            && (self.run_m == 0.0 || (self.every_m > 0.0 && self.run_m >= self.every_m))
+            && (self.rows_m == [0.0, 0.0] || self.rows_m.iter().all(|&m| m >= 0.5))
+            && !(self.face_road && self.along_road)
             && self.per_hectare <= 50.0
             && self.chance <= 1.0
             && self.from_m <= self.to_m
@@ -226,7 +255,12 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Dressed {
             let mut k = 0u64;
             let mut along = first.distance_m + rule.every_m / 2.0;
             while along < last.distance_m {
-                let h = splitmix(salt ^ k);
+                // A run draws once for all its spots.
+                let h = if rule.run_m > 0.0 {
+                    splitmix(salt ^ (along / rule.run_m).floor() as u64 ^ 0x5E6)
+                } else {
+                    splitmix(salt ^ k)
+                };
                 k += 1;
                 let here = along;
                 along += rule.every_m;
@@ -258,11 +292,18 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Dressed {
             }
         }
     }
-    // Then scattered over the land, cell by cell.
     let ((x_lo, x_hi), (z_lo, z_hi)) = land.bounds;
     if !(x_lo.is_finite() && x_hi.is_finite() && z_lo.is_finite() && z_hi.is_finite()) {
         return out;
     }
+    // Then the rows across the fields, field by field.
+    for b in Biome::ALL {
+        let def = b.def();
+        for rule in def.props.iter().filter(|r| r.rows_m[0] > 0.0) {
+            rows(land, b, rule, &mut out);
+        }
+    }
+    // Then scattered over the land, cell by cell.
     let (i_lo, i_hi) = (
         (x_lo / CELL_M).floor() as i64,
         (x_hi / CELL_M).ceil() as i64,
@@ -298,6 +339,54 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Dressed {
     out
 }
 
+/// `rule`'s rows across every field of biome `b` they may stand in.
+fn rows(land: &Land, b: Biome, rule: &PropRule, out: &mut Dressed) {
+    let def = b.def();
+    let ((x_lo, x_hi), (z_lo, z_hi)) = land.bounds;
+    let [across, along] = rule.rows_m;
+    // No field reaches further than this from its seeded point.
+    let reach = 1.2 * FIELD_M;
+    let (i_lo, i_hi) = (
+        (x_lo / FIELD_M).floor() as i64,
+        (x_hi / FIELD_M).ceil() as i64,
+    );
+    let (j_lo, j_hi) = (
+        (z_lo / FIELD_M).floor() as i64,
+        (z_hi / FIELD_M).ceil() as i64,
+    );
+    for i in i_lo..i_hi {
+        for j in j_lo..j_hi {
+            let field = course3d::field_cell(i, j);
+            let (cx, cz) = field.centre;
+            if (land.from_road)(cx, cz) > rule.to_m + reach
+                || (land.biome)(cx, cz) != b
+                || !course3d::field_blooms(def, field)
+            {
+                continue;
+            }
+            let yaw = course3d::field_rows_yaw(field);
+            let (dx, dz) = (yaw.cos(), yaw.sin());
+            let (nu, nv) = ((reach / along) as i32, (reach / across) as i32);
+            for v in -nv..=nv {
+                for u in -nu..=nu {
+                    let (a, c) = (u as f32 * along, v as f32 * across);
+                    let g = splitmix(field.seed ^ (u as u64) << 20 ^ v as u64 ^ 0x2085);
+                    let jitter = rule.spread_m * biome::unit(g);
+                    let turn = biome::unit(g.rotate_left(13)) * std::f32::consts::TAU;
+                    let x = cx + a * dx - c * dz + jitter * turn.cos();
+                    let z = cz + a * dz + c * dx + jitter * turn.sin();
+                    if course3d::field_at(x, z).seed != field.seed {
+                        continue;
+                    }
+                    if let Some(p) = one_prop(land, rule, def, x, z, g, Some(yaw), out) {
+                        out.props.push(p);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A group of `rule`'s props round `(cx, cz)`.
 fn group(
     land: &Land,
@@ -319,13 +408,15 @@ fn group(
             let a = biome::unit(g.rotate_left(13)) * std::f32::consts::TAU;
             (cx + r * a.cos(), cz + r * a.sin())
         };
-        if let Some(p) = one_prop(land, rule, def, x, z, g, out) {
+        if let Some(p) = one_prop(land, rule, def, x, z, g, None, out) {
             out.props.push(p);
         }
     }
 }
 
-/// One of `rule`'s props at `(x, z)`, if the place allows it.
+/// One of `rule`'s props at `(x, z)`, if the place allows it: turned to
+/// `yaw` if given, else as the rule says.
+#[allow(clippy::too_many_arguments)]
 fn one_prop(
     land: &Land,
     rule: &PropRule,
@@ -333,6 +424,7 @@ fn one_prop(
     x: f32,
     z: f32,
     g: u64,
+    yaw: Option<f32>,
     out: &mut Dressed,
 ) -> Option<Prop> {
     if !(x.is_finite() && z.is_finite()) {
@@ -361,6 +453,7 @@ fn one_prop(
                     }))
         }
         Ground::Dry => area != Some(AreaKind::Water),
+        Ground::Bloom => area == Some(AreaKind::Farmland) && course3d::in_bloom(def, x, z),
     };
     if !fits {
         return None;
@@ -393,9 +486,22 @@ fn one_prop(
             }
         }
     }
-    let y = (land.ground)(x, z)?;
-    let yaw = if rule.face_road {
+    let mut y = (land.ground)(x, z)?;
+    if rule.sunk {
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let r = rule.claims_m;
+            if let Some(g) = (land.ground)(x + r * a.cos(), z + r * a.sin()) {
+                y = y.min(g);
+            }
+        }
+    }
+    let yaw = if let Some(yaw) = yaw {
+        yaw
+    } else if rule.face_road {
         (land.toward_road)(x, z)
+    } else if rule.along_road {
+        (land.toward_road)(x, z) + std::f32::consts::FRAC_PI_2
     } else {
         biome::unit(g.rotate_left(37)) * std::f32::consts::TAU
     };
@@ -424,6 +530,139 @@ mod tests {
         serde_json::from_str(json).expect("a rule")
     }
 
+    fn north_road() -> Vec<RoadPoint> {
+        (0..400)
+            .map(|i| RoadPoint {
+                pos: [0.0, 10.0, -(i as f32) * 10.0],
+                distance_m: i as f32 * 10.0,
+            })
+            .collect()
+    }
+
+    fn from_road(x: f32, _: f32) -> f32 {
+        (x.abs() - crate::data::roadway::TRACK_HALF_WIDTH_M).max(0.0)
+    }
+
+    fn dress(
+        biome: Biome,
+        area: Option<AreaKind>,
+        ground: &dyn Fn(f32, f32) -> Option<f32>,
+    ) -> Vec<Prop> {
+        let area = move |_: f32, _: f32| area;
+        place(
+            &north_road(),
+            &Land {
+                seed: 7,
+                bounds: ((-300.0, 300.0), (-4_000.0, 0.0)),
+                from_road: &from_road,
+                area: &area,
+                ground,
+                taken: &|_, _| false,
+                biome: &|_, _| biome,
+                toward_road: &|x, _| if x > 0.0 { std::f32::consts::PI } else { 0.0 },
+            },
+        )
+        .props
+    }
+
+    #[test]
+    fn should_lay_the_rows_of_a_field_in_bloom_its_own_way_and_only_in_it() {
+        let def = Biome::Farmland.def();
+        let props = dress(Biome::Farmland, Some(AreaKind::Farmland), &|_, _| {
+            Some(10.0)
+        });
+        let rows: Vec<&Prop> = props
+            .iter()
+            .filter(|p| p.shape == Shape::Sunflowers)
+            .collect();
+        assert!(rows.len() > 200, "{} runs", rows.len());
+        let mut yaws = Vec::new();
+        for p in &rows {
+            let [x, _, z] = p.pos;
+            assert!(
+                course3d::in_bloom(def, x, z),
+                "a run at {x}, {z} outside a bloom"
+            );
+            let field = course3d::field_at(x, z);
+            assert_eq!(
+                p.yaw,
+                course3d::field_rows_yaw(field),
+                "a run across its field's rows"
+            );
+            assert!(from_road(x, z) <= 70.0);
+            yaws.push(field.seed);
+        }
+        yaws.sort();
+        yaws.dedup();
+        assert!(yaws.len() >= 3, "only {} fields in bloom", yaws.len());
+        // Not on grass: a field in bloom is a field.
+        assert!(dress(Biome::Farmland, None, &|_, _| Some(10.0))
+            .iter()
+            .all(|p| p.shape != Shape::Sunflowers));
+    }
+
+    #[test]
+    fn should_line_a_stretch_of_road_with_one_wall_then_stop() {
+        let rule = Biome::Mountain
+            .def()
+            .props
+            .iter()
+            .find(|r| r.shape == Shape::Wall)
+            .expect("a wall")
+            .clone();
+        let props = dress(Biome::Mountain, None, &|_, _| Some(10.0));
+        let walls: Vec<&Prop> = props.iter().filter(|p| p.shape == Shape::Wall).collect();
+        let mut runs: std::collections::BTreeMap<i64, Vec<&Prop>> = Default::default();
+        for p in &walls {
+            // The road runs north, so along it is straight up z.
+            assert!(p.yaw.cos().abs() < 1e-4, "a wall turned across the road");
+            let along = -p.pos[2];
+            runs.entry((along / rule.run_m).floor() as i64)
+                .or_default()
+                .push(p);
+        }
+        let stretches = 4_000.0 / rule.run_m;
+        assert!(runs.len() >= 3, "{} walled stretches", runs.len());
+        assert!((runs.len() as f32) < stretches * 0.8, "walls everywhere");
+        // The last stretch runs off the end of the road.
+        let whole = (3_990.0 / rule.run_m).floor() as i64;
+        for (k, run) in &runs {
+            // One side, one distance out, one length after another.
+            let x = run[0].pos[0];
+            assert!(run.iter().all(|p| p.pos[0] == x), "{run:?}");
+            if *k < whole {
+                assert!(
+                    run.len() as f32 >= rule.run_m / rule.every_m - 1.0,
+                    "{k}: {}",
+                    run.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_sink_a_waterfall_into_its_hill_and_turn_it_to_the_road() {
+        let slope = |x: f32, z: f32| Some(10.0 + 0.3 * x + 0.1 * z);
+        let props = dress(Biome::Mountain, None, &slope);
+        let falls: Vec<&Prop> = props
+            .iter()
+            .filter(|p| p.shape == Shape::Waterfall)
+            .collect();
+        assert!(!falls.is_empty());
+        for p in falls {
+            let [x, y, z] = p.pos;
+            let lowest = (0..8)
+                .map(|k| {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    slope(x + 12.0 * a.cos(), z + 12.0 * a.sin()).unwrap_or(f32::MAX)
+                })
+                .fold(f32::MAX, f32::min);
+            assert!(y <= lowest + 1e-3, "stands {} proud", y - lowest);
+            assert!(y < slope(x, z).unwrap_or(0.0) - 3.0);
+            assert_eq!(p.yaw, if x > 0.0 { std::f32::consts::PI } else { 0.0 });
+        }
+    }
+
     #[test]
     fn should_read_a_rule_and_refuse_nonsense() {
         let r = rule(
@@ -446,6 +685,14 @@ mod tests {
             // Wandering creatures set close enough to cross the road.
             r#"{"shape": "butterfly", "every_m": 20, "from_m": 1, "to_m": 8, "on": "grassy", "size": [0.3, 0.4], "motion": "flutter"}"#,
             r#"{"shape": "dragonfly", "every_m": 20, "from_m": 1, "to_m": 8, "on": "shore", "size": [0.3, 0.4], "motion": "dart"}"#,
+            // Rows and a spacing along the road; rows packed too tight.
+            r#"{"shape": "lavender", "every_m": 20, "rows_m": [2, 4], "from_m": 4, "to_m": 80, "on": "bloom", "size": [4, 4]}"#,
+            r#"{"shape": "lavender", "rows_m": [0.1, 4], "from_m": 4, "to_m": 80, "on": "bloom", "size": [4, 4]}"#,
+            // A run shorter than a spot, or with nothing set along the road.
+            r#"{"shape": "wall", "every_m": 5, "run_m": 3, "from_m": 4, "to_m": 5, "on": "dry", "size": [1, 1]}"#,
+            r#"{"shape": "wall", "per_hectare": 1, "run_m": 30, "from_m": 4, "to_m": 5, "on": "dry", "size": [1, 1]}"#,
+            // Facing the road and running along it at once.
+            r#"{"shape": "wall", "every_m": 5, "face_road": true, "along_road": true, "from_m": 4, "to_m": 5, "on": "dry", "size": [1, 1]}"#,
         ] {
             assert!(!rule(bad).is_sane(), "{bad}");
         }
