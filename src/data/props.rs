@@ -64,10 +64,12 @@ pub enum Shape {
     Tuft,
     /// A clump of wild flowers on the verge.
     Flowers,
+    /// A butterfly over the verge's flowers.
+    Butterfly,
 }
 
 impl Shape {
-    pub const ALL: [Shape; 42] = [
+    pub const ALL: [Shape; 43] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -110,6 +112,7 @@ impl Shape {
         Shape::Marmot,
         Shape::Tuft,
         Shape::Flowers,
+        Shape::Butterfly,
     ];
 
     /// The shape's mesh, one unit in size, standing on the origin and
@@ -126,7 +129,27 @@ impl Shape {
     /// other prop: there are thousands of verge plants, and past this each
     /// is a pixel or two.
     pub fn reach_m(self) -> Option<f32> {
-        matches!(self, Shape::Tuft | Shape::Flowers).then_some(VERGE_REACH_M)
+        matches!(self, Shape::Tuft | Shape::Flowers | Shape::Butterfly).then_some(VERGE_REACH_M)
+    }
+
+    /// How far the wind bends the top of this shape, as a share of its
+    /// size: the grass a lot, a tree's crown a little, a house not at all.
+    /// The view's shader bends a shape more the higher up it, so a trunk
+    /// stays put and only the crown moves.
+    pub fn sway(self) -> f32 {
+        match self {
+            Shape::Tuft => 0.15,
+            Shape::Reeds => 0.13,
+            Shape::Flowers => 0.12,
+            // Tall and slender, the trees seen sway: a poplar's crown moves
+            // most of a metre.
+            Shape::Palm | Shape::Cypress => 0.06,
+            Shape::Poplar => 0.055,
+            Shape::Birch => 0.05,
+            Shape::Round | Shape::Bush => 0.04,
+            Shape::Olive | Shape::Cone => 0.035,
+            _ => 0.0,
+        }
     }
 
     /// An animal: hidden, with the encounters, when the rider turns animals
@@ -153,6 +176,7 @@ impl Shape {
                 | Shape::Chicken
                 | Shape::Dolphin
                 | Shape::Marmot
+                | Shape::Butterfly
         )
     }
 
@@ -192,11 +216,19 @@ pub enum Motion {
     Flap = 7,
     /// Rolling over and over along the way it faces: tumbleweed.
     Roll = 8,
+    /// Fluttering about its spot in wandering loops, wings beating fast: a
+    /// butterfly.
+    Flutter = 9,
 }
 
 /// How far an orbiting prop strays from its spot, in metres — the view's
 /// shader circles at this radius.
 pub const ORBIT_M: f32 = 22.0;
+
+/// How far a fluttering butterfly wanders from its spot, in metres, at most:
+/// the view's shader loops it up to 1.7 m each way along x and z. A
+/// butterfly set nearer the road's edge than this would cross the road.
+pub const FLUTTER_M: f32 = 2.41;
 
 /// Mesh vertices marked with this colour take the prop's own colour instead:
 /// a tree's crown, a sheep's fleece. Negative, so no real colour can be taken
@@ -347,6 +379,89 @@ pub fn in_reach(chunk: &Chunk, x: f32, z: f32, reach: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::biome::Biome;
+    use crate::data::dressing::Moves;
+
+    #[test]
+    fn should_sway_every_tree_and_verge_plant_and_nothing_else() {
+        for shape in Shape::ALL {
+            let plant = shape.is_tree()
+                || matches!(
+                    shape,
+                    Shape::Tuft | Shape::Flowers | Shape::Reeds | Shape::Bush
+                );
+            assert_eq!(
+                shape.sway() > 0.0,
+                plant,
+                "{shape:?} sways {}",
+                shape.sway()
+            );
+            if shape.is_animal() {
+                assert_eq!(shape.sway(), 0.0, "{shape:?} is an animal");
+            }
+        }
+        // Grass bends further than any tree.
+        let trees = Shape::ALL.iter().filter(|s| s.is_tree()).map(|s| s.sway());
+        assert!(trees.fold(0.0, f32::max) < Shape::Flowers.sway());
+    }
+
+    #[test]
+    fn should_sway_a_tall_tree_enough_to_see_from_the_saddle() {
+        // At 2 % of its height a 10 m tree moved 20 cm at the very top, and
+        // the rider saw no wind at all. The poplars and cypresses lining a
+        // road are the trees the rider watches.
+        for (shape, smallest_m) in [(Shape::Poplar, 13.0 * 0.8), (Shape::Cypress, 11.0 * 0.8)] {
+            let top = shape.sway() * smallest_m;
+            assert!(top >= 0.5, "{shape:?}: top moves {top} m");
+        }
+        // And a tree, 8 m clear of the road at least, never reaches it.
+        let most = Shape::ALL
+            .iter()
+            .filter(|s| s.is_tree())
+            .map(|s| 1.25 * s.sway() * 17.0);
+        assert!(most.fold(0.0, f32::max) < 2.0);
+    }
+
+    #[test]
+    fn should_never_sway_a_verge_plant_over_the_road() {
+        // The shader leans a plant's top by up to its sway, plus a quarter
+        // more across the wind.
+        for biome in Biome::ALL {
+            for rule in &biome.def().props {
+                let reach = 1.25 * rule.shape.sway() * rule.size[1];
+                assert!(
+                    reach < rule.from_m.max(0.01) || reach == 0.0,
+                    "{biome:?} {:?}: leans {reach} m, set {} m from the road",
+                    rule.shape,
+                    rule.from_m
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_keep_butterflies_off_the_road_and_by_the_flowers() {
+        for biome in Biome::ALL {
+            let props = &biome.def().props;
+            let flowers = props.iter().any(|r| r.shape == Shape::Flowers);
+            let butterflies: Vec<_> = props
+                .iter()
+                .filter(|r| r.shape == Shape::Butterfly)
+                .collect();
+            assert_eq!(!butterflies.is_empty(), flowers, "{biome:?}");
+            for rule in butterflies {
+                assert_eq!(rule.motion, Moves::Flutter, "{biome:?}");
+                assert!(
+                    rule.from_m >= FLUTTER_M,
+                    "{biome:?}: butterflies {} m from the road wander {FLUTTER_M} m",
+                    rule.from_m
+                );
+            }
+        }
+        // Hidden with the animals, and drawn only near, as the flowers are.
+        assert!(Shape::Butterfly.is_animal());
+        assert_eq!(Shape::Butterfly.reach_m(), Shape::Flowers.reach_m());
+    }
 
     fn prop_at(shape: Shape, x: f32, z: f32) -> Prop {
         Prop {
@@ -448,8 +563,10 @@ mod tests {
 
     #[test]
     fn should_draw_only_the_verge_plants_near_the_eye() {
+        // And the butterflies over them: a third of a metre across, a pixel
+        // past this.
         for shape in Shape::ALL {
-            let small = matches!(shape, Shape::Tuft | Shape::Flowers);
+            let small = matches!(shape, Shape::Tuft | Shape::Flowers | Shape::Butterfly);
             assert_eq!(shape.reach_m(), small.then_some(VERGE_REACH_M), "{shape:?}");
         }
     }

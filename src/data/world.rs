@@ -240,6 +240,18 @@ impl World {
         self.seed
     }
 
+    /// The angle the dunes' crests run along, in radians: across the wind.
+    fn crest_angle(&self) -> f32 {
+        unit(splitmix(self.seed ^ 0x3171D)) * std::f32::consts::PI
+    }
+
+    /// Which way the wind blows over the whole world, as a unit `(x, z)`:
+    /// across the dunes' crests, and the way the grass and the trees lean.
+    pub fn wind(&self) -> [f32; 2] {
+        let a = self.crest_angle();
+        [-a.sin(), a.cos()]
+    }
+
     /// Base height and distance to the road, bilinear on the grid.
     fn base_at(&self, x: f32, z: f32) -> (f32, f32) {
         let fx = ((x - self.x0) / BASE_CELL_M).clamp(0.0, (self.cols - 1) as f32);
@@ -350,7 +362,7 @@ impl World {
             Relief::Dunes => {
                 // Crests across a wind that blows one way over the whole
                 // world: noise stretched along the crest.
-                let a = unit(splitmix(self.seed ^ 0x3171D)) * std::f32::consts::PI;
+                let a = self.crest_angle();
                 let (c, s) = (a.cos(), a.sin());
                 let (u, v) = (x * c + z * s, z * c - x * s);
                 let n = fbm(self.seed ^ 0xD0E, u * 0.3, v, 150.0, 3);
@@ -706,6 +718,23 @@ mod tests {
                 distance_m: i as f32 * 10.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn should_blow_the_wind_one_way_across_the_dunes_crests() {
+        let road = north_road(50, |_| 10.0);
+        let w = World::new(&road);
+        let [x, z] = w.wind();
+        assert!(
+            (x.hypot(z) - 1.0).abs() < 1e-5,
+            "wind {x}, {z} is not a unit"
+        );
+        let a = w.crest_angle();
+        assert!(
+            (x * a.cos() + z * a.sin()).abs() < 1e-5,
+            "wind along the crests"
+        );
+        assert_eq!(World::new(&road).wind(), w.wind());
     }
 
     #[test]

@@ -457,6 +457,33 @@ pub fn mesh(shape: Shape) -> Mesh {
                 ));
             }
         }
+        Shape::Butterfly => {
+            // Flat wings either side of a thin body, the span along z: the
+            // view's shader beats them about the body.
+            m.extend(cuboid(
+                [-0.22, -0.03, -0.03],
+                [0.18, 0.03, 0.03],
+                c(b.animal_dark),
+            ));
+            for side in [-1.0f32, 1.0] {
+                let w = |x: f32, z: f32| [x, 0.0, z * side];
+                quad(
+                    &mut m,
+                    [w(0.12, 0.04), w(0.28, 0.46), w(-0.02, 0.5), w(-0.04, 0.04)],
+                    OWN,
+                );
+                quad(
+                    &mut m,
+                    [
+                        w(-0.04, 0.04),
+                        w(-0.06, 0.36),
+                        w(-0.3, 0.28),
+                        w(-0.18, 0.04),
+                    ],
+                    OWN,
+                );
+            }
+        }
         Shape::Flowers => {
             // A few stems with a head each, and blades of leaf at their feet.
             const STEMS: [(f32, f32, f32); 5] = [

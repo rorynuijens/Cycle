@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::data::biome::{self, Biome, BiomeDef};
 use crate::data::course3d::RoadPoint;
-use crate::data::props::{Motion, Prop, Shape};
+use crate::data::props::{Motion, Prop, Shape, FLUTTER_M};
 use crate::data::world::{beside, splitmix, AreaKind};
 
 /// What a prop must stand on.
@@ -49,6 +49,7 @@ pub enum Moves {
     Graze,
     Bob,
     Spin,
+    Flutter,
 }
 
 impl Moves {
@@ -58,6 +59,7 @@ impl Moves {
             Moves::Graze => Motion::Graze,
             Moves::Bob => Motion::Bob,
             Moves::Spin => Motion::Spin,
+            Moves::Flutter => Motion::Flutter,
         }
     }
 }
@@ -141,6 +143,9 @@ impl PropRule {
             && self.size[0] <= self.size[1]
             && (1..=self.cluster[1].max(1)).contains(&self.cluster[0])
             && self.cluster[1] <= 20
+            // A butterfly wanders about its spot: set nearer the road than
+            // that, it would cross it.
+            && (self.motion != Moves::Flutter || self.from_m >= FLUTTER_M)
     }
 }
 

@@ -146,6 +146,10 @@ pub struct Palette {
     pub flower_a: Rgb,
     pub flower_b: Rgb,
     pub flower_c: Rgb,
+    /// Butterflies over the verge: orange, white and blue.
+    pub butterfly_a: Rgb,
+    pub butterfly_b: Rgb,
+    pub butterfly_c: Rgb,
     /// The finish: the arch, its banner, and the chequers on the banner and
     /// across the road.
     pub arch: Rgb,
@@ -256,6 +260,9 @@ pub const BASE: Palette = Palette {
     flower_a: hex(0xF5D547),
     flower_b: hex(0xF27A9C),
     flower_c: hex(0xF7F5EE),
+    butterfly_a: hex(0xF2902E),
+    butterfly_b: hex(0xF5F2E8),
+    butterfly_c: hex(0x7AA7EE),
     arch: hex(0xD63333),
     banner: hex(0xFFFFFF),
     chequer: hex(0x1E2430),
@@ -462,6 +469,9 @@ impl Palette {
             "flower_a" => &mut self.flower_a,
             "flower_b" => &mut self.flower_b,
             "flower_c" => &mut self.flower_c,
+            "butterfly_a" => &mut self.butterfly_a,
+            "butterfly_b" => &mut self.butterfly_b,
+            "butterfly_c" => &mut self.butterfly_c,
             "arch" => &mut self.arch,
             "banner" => &mut self.banner,
             "chequer" => &mut self.chequer,
@@ -535,7 +545,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 101] = [
+        const NAMES: [&str; 104] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -632,6 +642,9 @@ mod tests {
             "flower_a",
             "flower_b",
             "flower_c",
+            "butterfly_a",
+            "butterfly_b",
+            "butterfly_c",
             "arch",
             "banner",
             "chequer",
@@ -643,7 +656,7 @@ mod tests {
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 101] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 104] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

@@ -401,6 +401,9 @@ pub struct CourseScene {
     /// Where along the route each animal encounter happens — see
     /// `data/encounters.rs`.
     pub encounters: Vec<encounters::Trigger>,
+    /// Which way the wind blows, as a unit `(x, z)`: the grass and the trees
+    /// sway with it — see `World::wind`.
+    pub wind: [f32; 2],
     /// The sky every [`SKY_STEP_M`] along the road — see [`CourseScene::sky_at`].
     skies: Vec<Sky>,
 }
@@ -485,6 +488,7 @@ impl CourseScene {
             clouds: sky::clouds(world.seed()),
             skies,
             encounters,
+            wind: world.wind(),
         })
     }
 

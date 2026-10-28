@@ -155,6 +155,10 @@ uniform float u_time;
 // Small props shrink away between these distances from the eye, in metres,
 // rather than blinking out where they stop being drawn.
 uniform vec2 u_reach;
+// How far the wind bends this shape's top, as a share of its size, and which
+// way it blows, as a unit (x, z).
+uniform float u_sway;
+uniform vec2 u_wind;
 uniform float u_orbit;
 uniform float u_head;
 uniform vec2 u_hub;
@@ -209,6 +213,19 @@ void main() {
     } else if (motion == 7.0) {
         // Wings beating, the bird flown along by the encounter.
         p.y += sin(u_time * 7.0 + phase * 5.0) * 0.5 * abs(p.z);
+    } else if (motion == 9.0) {
+        // A butterfly: wandering loops about its flowers, bobbing, wings
+        // beating about the body, nose along the way it is going.
+        float t = u_time + phase;
+        base += vec3(
+            1.2 * sin(t * 0.7) + 0.5 * sin(t * 1.9),
+            0.7 + 0.3 * sin(t * 2.3) + 0.12 * sin(t * 5.1),
+            1.2 * cos(t * 0.9) + 0.5 * sin(t * 1.3));
+        float vx = 0.84 * cos(t * 0.7) + 0.95 * cos(t * 1.9);
+        float vz = -1.08 * sin(t * 0.9) + 0.65 * cos(t * 1.3);
+        yaw = atan(vz, vx);
+        float beat = 0.9 * sin(u_time * 22.0 + phase * 7.0);
+        p = vec3(p.x, abs(p.z) * sin(beat) + p.y, p.z * cos(beat));
     } else if (motion == 8.0) {
         // Rolling forward about its centre, half a unit up.
         float a = -(u_time * 5.0 + phase);
@@ -220,6 +237,23 @@ void main() {
     float s = sin(yaw);
     p *= i_size.x * (1.0 - smoothstep(u_reach.x, u_reach.y, length(base - u_eye)));
     vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+    if (u_sway > 0.0 && motion == 0.0) {
+        // Wind: the top bends most and the foot not at all. Gusts roll
+        // across the land downwind as broad bands; in them each plant rocks
+        // to and fro at its own pace, a tall tree slowly and grass quickly.
+        // The rocking is what the eye sees: a steady lean reads as still.
+        float up = clamp(a_pos.y, 0.0, 1.0);
+        float bend = up * up;
+        float down = dot(base.xz, u_wind);
+        float across = dot(base.xz, vec2(-u_wind.y, u_wind.x));
+        float gust = 0.5 + 0.5 * sin(down * 0.08 - u_time * 0.5)
+            * (0.6 + 0.4 * sin(across * 0.023 + u_time * 0.13));
+        float rate = 4.0 / sqrt(max(i_size.x, 0.2));
+        float own = sin(u_time * rate + phase + down * 0.3);
+        float lean = u_sway * i_size.x * bend * (0.15 + 0.45 * gust + 0.4 * own);
+        float flutter = 0.25 * u_sway * i_size.x * bend * sin(u_time * rate * 1.7 + phase * 3.0);
+        world.xz += u_wind * lean + vec2(-u_wind.y, u_wind.x) * flutter;
+    }
     vec4 colour = a_colour.r < 0.0 ? vec4(i_colour, a_colour.a) : a_colour;
     if (floor(colour.a + 0.5) == 7.0) {
         // A window or door: melts into the wall, the prop's own colour,
@@ -603,6 +637,8 @@ struct GlState {
     /// Whether the GL state GTK handed over has been logged — once per
     /// context, for the day a rider's screen shows only sky.
     reported: Cell<bool>,
+    /// Which way the wind blows over the scene uploaded, as a unit `(x, z)`.
+    wind: [f32; 2],
 }
 
 /// A mesh on the GPU.
@@ -730,6 +766,8 @@ struct Uniforms {
     sky_zenith: Uniform,
     sky_glow: Uniform,
     p_reach: Uniform,
+    p_sway: Uniform,
+    p_wind: Uniform,
     finish_colour: Uniform,
     finish_corner: Uniform,
     hud_image: Uniform,
@@ -1522,6 +1560,8 @@ impl GlState {
                 sky_zenith: at(sky_program, "u_zenith"),
                 sky_glow: at(sky_program, "u_glow"),
                 p_reach: at(prop_program, "u_reach"),
+                p_sway: at(prop_program, "u_sway"),
+                p_wind: at(prop_program, "u_wind"),
                 finish_colour: at(finish_program, "u_colour"),
                 finish_corner: at(finish_program, "u_corner"),
                 hud_image: at(hud_program, "u_hud"),
@@ -1546,6 +1586,7 @@ impl GlState {
                 target: None,
                 u,
                 reported: Cell::new(false),
+                wind: [1.0, 0.0],
             })
         }
     }
@@ -1553,6 +1594,7 @@ impl GlState {
     /// Replace what is on the GPU with `scene`, or with nothing.
     /// `animals` false leaves every animal out: herds and birds.
     fn upload(&mut self, scene: Option<&CourseScene>, animals: bool) {
+        self.wind = scene.map_or([1.0, 0.0], |s| s.wind);
         let batches = scene
             .map(|s| {
                 let kept: Vec<Prop> = s
@@ -1746,6 +1788,7 @@ impl GlState {
 
                 gl.use_program(Some(self.prop_program));
                 u.props.set(gl, &mvp, &camera.eye, &sky, time_s);
+                gl.uniform_2_f32(u.p_wind.as_ref(), self.wind[0], self.wind[1]);
                 // Which way the camera looks, flat, and how wide: chunks
                 // wholly behind it or off to a side are not drawn. A little
                 // wider than the view, for the camera's pitch.
@@ -1769,6 +1812,7 @@ impl GlState {
                         None => (f32::MAX / 2.0, f32::MAX),
                     };
                     gl.uniform_2_f32(u.p_reach.as_ref(), gone_from, gone);
+                    gl.uniform_1_f32(u.p_sway.as_ref(), shape.shape.sway());
                     shape.draw(
                         gl,
                         camera.eye,
