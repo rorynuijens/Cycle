@@ -302,7 +302,7 @@ impl Ambience {
             }
             scratch.resize(frames * CHANNELS, 0.0);
             lock(&mixer).fill(&mut scratch);
-            for (bytes, s) in buf.chunks_exact_mut(4).zip(&scratch) {
+            for (bytes, s) in buf.as_chunks_mut::<4>().0.iter_mut().zip(&scratch) {
                 bytes.copy_from_slice(&s.to_le_bytes());
             }
             frames * frame_bytes as usize

@@ -184,7 +184,7 @@ impl Mixer {
                 continue;
             }
             let whole = pcm.len() - pcm.len() % CHANNELS;
-            for frame in out.chunks_exact_mut(CHANNELS) {
+            for frame in out.as_chunks_mut::<CHANNELS>().0 {
                 v.gain = glide(v.gain, v.target, step);
                 if v.pos + CHANNELS > whole {
                     v.pos = 0;
@@ -199,7 +199,7 @@ impl Mixer {
             let Some(shot) = slot else {
                 continue;
             };
-            for frame in out.chunks_exact_mut(CHANNELS) {
+            for frame in out.as_chunks_mut::<CHANNELS>().0 {
                 let Some(&s) = shot.pcm.get(shot.pos) else {
                     break;
                 };
@@ -212,7 +212,7 @@ impl Mixer {
                 *slot = None;
             }
         }
-        for frame in out.chunks_exact_mut(CHANNELS) {
+        for frame in out.as_chunks_mut::<CHANNELS>().0 {
             self.master = glide(self.master, self.master_target, master_step);
             if self.master > 0.0 && frame.iter().any(|&o| o != 0.0) {
                 self.heard_frames += 1;
@@ -292,7 +292,7 @@ mod tests {
         m.master_target = 1.0;
         let mut out = vec![0.0; 20 * CHANNELS];
         m.fill(&mut out);
-        for (f, frame) in out.chunks_exact(CHANNELS).enumerate() {
+        for (f, frame) in out.as_chunks::<CHANNELS>().0.iter().enumerate() {
             let want = (f % 7) as f32 * 1_000.0 / 32_768.0;
             assert!((frame[0] - want).abs() < 1e-6, "frame {f}");
             assert!((frame[1] + want).abs() < 1e-6, "frame {f}");

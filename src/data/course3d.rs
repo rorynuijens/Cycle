@@ -415,7 +415,7 @@ impl Mesh {
     /// "work it out from the pixels".
     pub fn faceted(&self) -> Vec<FacetVertex> {
         let mut out = Vec::with_capacity(self.indices.len());
-        for tri in self.indices.chunks_exact(3) {
+        for tri in self.indices.as_chunks::<3>().0 {
             let Some(v) = tri
                 .iter()
                 .map(|&i| self.vertices.get(i as usize).copied())
