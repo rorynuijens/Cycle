@@ -104,7 +104,7 @@ Run this whenever you like. It updates Tour du Salon along with everything else 
 Every [release](https://github.com/rorynuijens/Cycle/releases) also has a `.flatpak` file attached. Download it and run:
 
 ```bash
-flatpak install ./cycle-0.23.0.flatpak
+flatpak install ./cycle-0.23.1.flatpak
 ```
 
 This is handy for a machine that cannot reach the repository, but it is a one-off: `flatpak update` will not find new versions, so you have to repeat the download for each release. The repository in step 1 is the better option if it works for you.
@@ -253,4 +253,4 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 - Session data is stored in a local SQLite database (`~/.var/app/io.github.rorynuijens.Cycle/data/cycle/cycle.db` in the Flatpak sandbox). A snapshot is taken automatically before a schema upgrade, but there is no scheduled backup or cloud sync. Copies outside your computer are made by hand, from Preferences → Data: **Export History** saves everything to one file, and **Export Every Ride** writes one FIT file per ride.
 
-<!-- readme-reviewed-for: 0.23.0 -->
+<!-- readme-reviewed-for: 0.23.1 -->
