@@ -28,6 +28,30 @@ const CLOSE_AFTER: Duration = Duration::from_secs(300);
 /// After a failed connection, the next try waits this long.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// How long a sound server's cookie is, in bytes.
+const COOKIE_LEN: usize = 256;
+
+/// The cookie to log in with: the one read, or all zeros without a good one.
+///
+/// `Client::from_env` sends an empty cookie when it finds no file, and
+/// PipeWire refuses any but a full-length one. The Flatpak sandbox has no
+/// cookie file, so that silenced every Flatpak install while builds outside
+/// the sandbox played. PipeWire does not check what the cookie holds, and
+/// zeros are what libpulse itself sends without one.
+fn cookie_to_send(read: Option<Vec<u8>>) -> Vec<u8> {
+    read.filter(|c| c.len() == COOKIE_LEN)
+        .unwrap_or_else(|| vec![0; COOKIE_LEN])
+}
+
+/// Connects to the sound server the environment names.
+fn connect() -> Result<Client, pulseaudio::ClientError> {
+    let path =
+        pulseaudio::socket_path_from_env().ok_or(pulseaudio::ClientError::ServerUnavailable)?;
+    let cookie = pulseaudio::cookie_path_from_env().and_then(|p| std::fs::read(p).ok());
+    let socket = std::os::unix::net::UnixStream::connect(path)?;
+    Client::new_unix(c"Tour du Salon", socket, Some(cookie_to_send(cookie)))
+}
+
 /// Who is asking for sound — each 3D view has its own, so one closing does
 /// not silence another that took over.
 pub type Owner = u64;
@@ -261,7 +285,7 @@ impl Ambience {
     /// long enough to close; errs when the server cannot be reached or the
     /// connection breaks.
     async fn stream_while_wanted(&'static self) -> Result<(), pulseaudio::ClientError> {
-        let client = tokio::task::spawn_blocking(|| Client::from_env(c"Tour du Salon"))
+        let client = tokio::task::spawn_blocking(connect)
             .await
             .map_err(|e| pulseaudio::ClientError::Io(std::io::Error::other(e)))??;
         let mut props = protocol::Props::new();
@@ -361,9 +385,29 @@ mod tests {
     use super::*;
     use crate::data::ambience::{Bed, Call};
 
+    #[test]
+    fn should_send_zeros_of_the_full_length_when_there_is_no_cookie_file() {
+        // What the Flatpak sandbox gets: PipeWire refuses an empty cookie.
+        assert_eq!(cookie_to_send(None), vec![0; 256]);
+    }
+
+    #[test]
+    fn should_send_zeros_rather_than_a_cookie_of_the_wrong_length() {
+        for len in [0, 1, 255, 257] {
+            assert_eq!(cookie_to_send(Some(vec![7; len])), vec![0; 256], "{len}");
+        }
+    }
+
+    #[test]
+    fn should_send_a_full_length_cookie_as_it_was_read() {
+        assert_eq!(cookie_to_send(Some(vec![7; 256])), vec![7; 256]);
+    }
+
     /// Plays, falls quiet long enough for the stream to cork, and plays
     /// again — against the real sound server, at a volume nobody hears.
     /// Needs one: `cargo test -- --ignored should_play_again_after_resting`.
+    /// Run it with `HOME` at an empty directory too: that is how the Flatpak
+    /// sandbox connects, with no cookie file.
     #[test]
     #[ignore]
     fn should_play_again_after_resting() {
