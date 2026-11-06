@@ -1134,6 +1134,7 @@ impl PlayerPage {
         glib::timeout_add_local(Duration::from_secs(1), move || {
             if !timer_alive_in_timer.get() {
                 page_clone.borrow().close_overlay();
+                page_clone.borrow().course_view.set_riding(false);
                 return glib::ControlFlow::Break;
             }
             // Only sensors still transmitting contribute — a strap that has gone
@@ -1390,6 +1391,7 @@ impl PlayerPage {
         self.course_view.set_progress(road.distance_at(t), speed);
         self.course_view.set_cadence(snap.readings.cadence_rpm);
         let is_active = matches!(snap.state, EngineState::Running | EngineState::Paused);
+        self.course_view.set_riding(is_active);
         let total = snap.elapsed_secs + snap.remaining_secs;
         self.course_view.set_workout_hud(WorkoutHudReadings {
             workout_name: self.workout_name_label.label().to_string(),

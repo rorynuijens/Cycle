@@ -42,6 +42,9 @@ pub mod keys {
     pub const WORKOUT_SCENERY: &str = "view3d.workout_scenery";
     /// Whether the workout page last showed the 3D road in place of its graph.
     pub const WORKOUT_ROAD: &str = "view3d.workout_road";
+    /// The sound of the land the 3D road passes through, and how loud.
+    pub const AMBIENT_SOUND: &str = "sound.ambient";
+    pub const AMBIENT_VOLUME: &str = "sound.ambient_volume";
 
     pub const INTERVALS_ATHLETE_ID: &str = "intervals.athlete_id";
     pub const INTERVALS_UPLOAD: &str = "intervals.upload";
@@ -217,6 +220,61 @@ pub async fn workout_road(pool: &SqlitePool) -> Result<bool> {
 
 pub async fn set_workout_road(pool: &SqlitePool, on: bool) -> Result<()> {
     db::set_setting(pool, keys::WORKOUT_ROAD, flag_value(on)).await
+}
+
+// ── Sound ────────────────────────────────────────────────────────────────────
+
+/// The ambient sound of the 3D world: on until the rider turns it off, at a
+/// volume in percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmbientSound {
+    pub on: bool,
+    pub volume_pct: u32,
+}
+
+impl Default for AmbientSound {
+    fn default() -> Self {
+        Self {
+            on: true,
+            volume_pct: 70,
+        }
+    }
+}
+
+impl AmbientSound {
+    /// What the player plays at: the volume from 0 to 1, or 0 when off.
+    pub fn level(self) -> f32 {
+        if self.on {
+            self.volume_pct.min(100) as f32 / 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// The ambient sound setting. A stored volume that is no percentage reads as
+/// the default, not as silence or as a blare.
+pub async fn ambient_sound(pool: &SqlitePool) -> Result<AmbientSound> {
+    let default = AmbientSound::default();
+    Ok(AmbientSound {
+        on: flag(
+            db::get_setting(pool, keys::AMBIENT_SOUND).await?,
+            default.on,
+        ),
+        volume_pct: db::get_setting(pool, keys::AMBIENT_VOLUME)
+            .await?
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v <= 100)
+            .unwrap_or(default.volume_pct),
+    })
+}
+
+pub async fn set_ambient_on(pool: &SqlitePool, on: bool) -> Result<()> {
+    db::set_setting(pool, keys::AMBIENT_SOUND, flag_value(on)).await
+}
+
+pub async fn set_ambient_volume(pool: &SqlitePool, percent: u32) -> Result<()> {
+    db::set_setting(pool, keys::AMBIENT_VOLUME, &percent.min(100).to_string()).await
 }
 
 // ── Intervals.icu ────────────────────────────────────────────────────────────
@@ -588,6 +646,55 @@ mod tests {
         }
         set_lthr(&pool, 168).await.unwrap();
         assert_eq!(lthr(&pool).await.unwrap(), Some(168));
+    }
+
+    #[tokio::test]
+    async fn should_play_ambient_sound_by_default_and_remember_the_rider_s_choice() {
+        let pool = test_pool().await;
+        let fresh = ambient_sound(&pool).await.unwrap();
+        assert_eq!(
+            fresh,
+            AmbientSound {
+                on: true,
+                volume_pct: 70
+            }
+        );
+        assert_eq!(fresh.level(), 0.7);
+        set_ambient_on(&pool, false).await.unwrap();
+        set_ambient_volume(&pool, 35).await.unwrap();
+        let set = ambient_sound(&pool).await.unwrap();
+        assert_eq!(
+            set,
+            AmbientSound {
+                on: false,
+                volume_pct: 35
+            }
+        );
+        assert_eq!(set.level(), 0.0);
+        set_ambient_volume(&pool, 400).await.unwrap();
+        assert_eq!(ambient_sound(&pool).await.unwrap().volume_pct, 100);
+    }
+
+    #[tokio::test]
+    async fn should_read_a_nonsense_ambient_volume_as_the_default() {
+        let pool = test_pool().await;
+        for (raw, read) in [
+            ("0", 0),
+            ("100", 100),
+            ("101", 70),
+            ("-5", 70),
+            ("loud", 70),
+            ("", 70),
+        ] {
+            db::set_setting(&pool, keys::AMBIENT_VOLUME, raw)
+                .await
+                .unwrap();
+            assert_eq!(
+                ambient_sound(&pool).await.unwrap().volume_pct,
+                read,
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

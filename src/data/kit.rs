@@ -709,17 +709,6 @@ pub fn mesh(shape: Shape) -> Mesh {
                 c(b.patch),
             ));
         }
-        Shape::LampPost => {
-            m.extend(tube(0.0, 0.0, 0.03, 0.022, 0.0, 0.95, 6, c(b.lamp)));
-            m.extend(beam(
-                [0.0, 0.93, 0.0],
-                [0.24, 0.95, 0.0],
-                0.03,
-                0.03,
-                c(b.lamp),
-            ));
-            m.extend(cuboid([0.18, 0.86, -0.05], [0.3, 0.93, 0.05], c(b.cloud)));
-        }
         Shape::Boat => {
             m.extend(cuboid([-0.5, 0.0, -0.18], [0.36, 0.18, 0.18], OWN));
             let (bow, s, t) = ([0.56, 0.18, 0.0], [0.36, 0.0, 0.0], 0.18);
@@ -1073,25 +1062,6 @@ pub fn mesh(shape: Shape) -> Mesh {
                 ));
             }
             m.extend(beam([-0.36, 0.5, 0.0], [-0.52, 0.68, 0.0], 0.05, 0.05, OWN));
-        }
-        Shape::Cat => {
-            m.extend(cuboid([-0.32, 0.25, -0.08], [0.25, 0.45, 0.08], OWN));
-            m.extend(legs(0.22, 0.05, 0.05, 0.27, OWN));
-            m.extend(cuboid([0.25, 0.36, -0.08], [0.42, 0.53, 0.08], OWN));
-            for z in [-0.07, 0.04] {
-                tri(
-                    &mut m,
-                    [[0.28, 0.53, z], [0.36, 0.53, z], [0.31, 0.62, z + 0.015]],
-                    OWN,
-                );
-            }
-            m.extend(beam(
-                [-0.3, 0.42, 0.0],
-                [-0.42, 0.76, 0.0],
-                0.035,
-                0.035,
-                OWN,
-            ));
         }
         Shape::Snake => {
             // A low flat body in segments, the shader waving it; dark bands.
@@ -1476,7 +1446,6 @@ mod tests {
             Shape::Villa,
             Shape::Hut,
             Shape::Lighthouse,
-            Shape::LampPost,
         ] {
             let m = mesh(shape);
             let top = m.vertices.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);

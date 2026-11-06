@@ -203,7 +203,14 @@ mod tests {
     async fn should_read_a_tampered_scenery_as_the_countryside() {
         let pool = test_pool().await;
         let id = save_route(&pool, "r", "r.gpx", 1.0, 1.0).await.unwrap();
-        for bad in ["volcano", "", "DESERT", "mixed'; DROP TABLE routes; --"] {
+        // "urban" was a biome until 0.23.0: a route may still have it stored.
+        for bad in [
+            "volcano",
+            "",
+            "DESERT",
+            "mixed'; DROP TABLE routes; --",
+            "urban",
+        ] {
             sqlx::query("UPDATE routes SET scenery = ? WHERE id = ?")
                 .bind(bad)
                 .bind(id)

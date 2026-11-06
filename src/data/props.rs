@@ -12,7 +12,7 @@
 use crate::data::course3d::Mesh;
 
 /// The shapes a prop can take. The biome data file names them in lower
-/// case, words joined: `haybale`, `lamppost`.
+/// case, words joined: `haybale`, `windmill`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shape {
@@ -39,7 +39,6 @@ pub enum Shape {
     Hut,
     Windmill,
     Lighthouse,
-    LampPost,
     Boat,
     Cow,
     Deer,
@@ -48,7 +47,6 @@ pub enum Shape {
     Duck,
     Heron,
     Dog,
-    Cat,
     Snake,
     Rat,
     /// A shepherd with a crook.
@@ -95,7 +93,7 @@ pub enum Shape {
 }
 
 impl Shape {
-    pub const ALL: [Shape; 56] = [
+    pub const ALL: [Shape; 54] = [
         Shape::Round,
         Shape::Cone,
         Shape::Poplar,
@@ -116,7 +114,6 @@ impl Shape {
         Shape::Hut,
         Shape::Windmill,
         Shape::Lighthouse,
-        Shape::LampPost,
         Shape::Boat,
         Shape::Cow,
         Shape::Deer,
@@ -125,7 +122,6 @@ impl Shape {
         Shape::Duck,
         Shape::Heron,
         Shape::Dog,
-        Shape::Cat,
         Shape::Snake,
         Shape::Rat,
         Shape::Person,
@@ -241,7 +237,6 @@ impl Shape {
                 | Shape::Duck
                 | Shape::Heron
                 | Shape::Dog
-                | Shape::Cat
                 | Shape::Snake
                 | Shape::Rat
                 | Shape::Person

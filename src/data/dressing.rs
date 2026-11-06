@@ -24,7 +24,7 @@ use crate::data::world::{beside, splitmix, AreaKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ground {
-    /// Grass: not a field, a wood, sand, paving or water.
+    /// Grass: not a field, a wood, sand or water.
     Open,
     /// A field.
     Field,
@@ -32,7 +32,6 @@ pub enum Ground {
     Grassy,
     Wood,
     Sand,
-    Paving,
     /// On open water.
     Water,
     /// Dry land at the water's edge: a pool's, the sea's, a ditch's.
@@ -442,7 +441,6 @@ fn one_prop(
         Ground::Grassy => matches!(area, None | Some(AreaKind::Farmland)),
         Ground::Wood => area == Some(AreaKind::Wood),
         Ground::Sand => area == Some(AreaKind::Sand),
-        Ground::Paving => area == Some(AreaKind::Paving),
         Ground::Water => area == Some(AreaKind::Water),
         Ground::Shore => {
             area != Some(AreaKind::Water)

@@ -94,6 +94,9 @@ pub fn install(
             .version(env!("CARGO_PKG_VERSION"))
             .developer_name("Rory Nuijens")
             .build();
+        let sounds = crate::audio::beds::credits();
+        let sounds: Vec<&str> = sounds.iter().map(String::as_str).collect();
+        dialog.add_credit_section(Some("Sounds"), &sounds);
         dialog.present(Some(&window_for_about));
     });
     app.add_action(&about_action);

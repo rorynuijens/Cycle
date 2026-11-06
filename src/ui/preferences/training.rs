@@ -4,11 +4,12 @@
 //! stored, so a change can be felt without restarting the ride.
 
 use adw::prelude::*;
+use gtk::glib;
 use sqlx::SqlitePool;
 use std::rc::Rc;
 
 use crate::data::biome::{Scenery, WorldLook};
-use crate::data::settings::{self, TrainingSettings};
+use crate::data::settings::{self, AmbientSound, TrainingSettings};
 use crate::ui::spawn_write;
 
 /// Build the Training page.
@@ -16,6 +17,7 @@ use crate::ui::spawn_write;
 pub fn build(
     settings: &TrainingSettings,
     workout_look: WorldLook,
+    ambient: AmbientSound,
     pool: SqlitePool,
     rt_handle: tokio::runtime::Handle,
     on_erg_rate_changed: impl Fn(u32) + 'static,
@@ -125,6 +127,98 @@ pub fn build(
         .build();
     world_group.add(&animals_row);
     page.add(&world_group);
+
+    // Heard at once: the player is told as the row changes, and the value is
+    // stored after the slider settles.
+    let sound_group = adw::PreferencesGroup::builder().title("Sound").build();
+    let ambient_row = adw::SwitchRow::builder()
+        .title("Ambient Sound")
+        .subtitle("Birds, wind and animals of the land the 3D road passes through")
+        .active(ambient.on)
+        .build();
+    sound_group.add(&ambient_row);
+    let volume_scale = gtk::Scale::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .adjustment(&gtk::Adjustment::new(
+            ambient.volume_pct.min(100) as f64,
+            0.0,
+            100.0,
+            5.0,
+            10.0,
+            0.0,
+        ))
+        .draw_value(false)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .tooltip_text("Ambient sound volume")
+        .build();
+    volume_scale.update_property(&[gtk::accessible::Property::Label("Ambient sound volume")]);
+    let volume_row = adw::ActionRow::builder()
+        .title("Volume")
+        .sensitive(ambient.on)
+        .build();
+    volume_row.add_suffix(&volume_scale);
+    sound_group.add(&volume_row);
+    page.add(&sound_group);
+
+    let ambient_now = Rc::new(std::cell::Cell::new(ambient));
+    let tell_player = |a: AmbientSound| {
+        if let Some(player) = crate::audio::get() {
+            player.set_volume(a.level());
+        }
+    };
+    {
+        let pool = pool.clone();
+        let rt_handle = rt_handle.clone();
+        let ambient_now = Rc::clone(&ambient_now);
+        let volume_row = volume_row.clone();
+        ambient_row.connect_active_notify(move |row| {
+            let on = row.is_active();
+            volume_row.set_sensitive(on);
+            let a = AmbientSound {
+                on,
+                ..ambient_now.get()
+            };
+            ambient_now.set(a);
+            tell_player(a);
+            spawn_write(
+                &rt_handle,
+                &pool,
+                "the ambient sound setting",
+                move |pool| async move { settings::set_ambient_on(&pool, on).await },
+            );
+        });
+    }
+    {
+        let pool = pool.clone();
+        let rt_handle = rt_handle.clone();
+        let pending: Rc<std::cell::Cell<Option<glib::SourceId>>> = Rc::default();
+        volume_scale.connect_value_changed(move |scale| {
+            let percent = scale.value().round().clamp(0.0, 100.0) as u32;
+            let a = AmbientSound { volume_pct: percent, ..ambient_now.get() };
+            ambient_now.set(a);
+            tell_player(a);
+            // One write once the slider rests, not one per step of a drag.
+            if let Some(id) = pending.take() {
+                id.remove();
+            }
+            let pool = pool.clone();
+            let rt_handle = rt_handle.clone();
+            let pending_done = Rc::clone(&pending);
+            pending.set(Some(glib::timeout_add_local_once(
+                std::time::Duration::from_millis(400),
+                move || {
+                    pending_done.set(None);
+                    spawn_write(
+                        &rt_handle,
+                        &pool,
+                        "the ambient sound volume",
+                        move |pool| async move { settings::set_ambient_volume(&pool, percent).await },
+                    );
+                },
+            )));
+        });
+    }
 
     {
         let pool = pool.clone();

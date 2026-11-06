@@ -1,6 +1,6 @@
 //! Encounters: short animal moments by the road, one biome's at a time
 //! (the stylized-route skill, §7.9) — street dogs chasing the rider by the
-//! Mediterranean, a cat crossing the street in town, a snake across the
+//! Mediterranean, a snake across the
 //! desert road, deer leaping over it in the forest, a flock with its dog and
 //! shepherd crossing far ahead on the farm, gulls flying alongside on the
 //! coast, an eagle taking a rat in the mountains.
@@ -62,10 +62,6 @@ pub enum Kind {
     Dogs,
     /// A goat stands on the verge and watches the rider go by.
     Goat,
-    /// A cat or two cross the street ahead.
-    Cats,
-    /// Pigeons on the pavement burst up as the rider passes.
-    Pigeons,
     /// A snake slides across the road ahead.
     Snake,
     /// Tumbleweed rolls across the road ahead.
@@ -107,11 +103,9 @@ pub enum Kind {
 impl Kind {
     /// Every kind.
     #[cfg(test)]
-    pub const ALL: [Kind; 22] = [
+    pub const ALL: [Kind; 20] = [
         Kind::Dogs,
         Kind::Goat,
-        Kind::Cats,
-        Kind::Pigeons,
         Kind::Snake,
         Kind::Tumbleweed,
         Kind::Camels,
@@ -144,7 +138,6 @@ impl Kind {
             Biome::Coast => &[Kind::Gulls, Kind::Dolphins],
             Biome::Mountain => &[Kind::Eagle, Kind::Marmots],
             Biome::Wetland => &[Kind::Frogs, Kind::Ducks],
-            Biome::Urban => &[Kind::Cats, Kind::Pigeons],
         }
     }
 
@@ -159,7 +152,6 @@ impl Kind {
             })
         };
         match self {
-            Kind::Cats => c(3.0, 30.0, 10.0, CROSSING_CLEAR_M),
             Kind::Snake => c(4.0, 30.0, 6.0, CROSSING_CLEAR_M),
             Kind::Deer => c(2.4, 30.0, 18.0, CROSSING_CLEAR_M),
             Kind::Flock => c(12.0, 110.0, 28.0, FLOCK_CLEAR_M),
@@ -179,7 +171,6 @@ impl Kind {
             Kind::Gulls => (20.0, -30.0),
             Kind::Eagle => (95.0, 35.0),
             Kind::Goat | Kind::Marmots => (60.0, 5.0),
-            Kind::Pigeons => (60.0, 25.0),
             Kind::Chickens => (50.0, 21.0),
             Kind::Heron | Kind::Ducks => (70.0, 31.0),
             Kind::FlockRun => (70.0, 10.0),
@@ -629,9 +620,7 @@ fn actors(a: &mut Active, rider_m: f32, speed: f32, now_s: f32) -> (Vec<Actor>, 
             Kind::Eagle => eagle(&t, elapsed, &mut out),
             Kind::FlockRun | Kind::Camels => alongside(&t, rider_m, elapsed, &mut out),
             Kind::Goat | Kind::Marmots => watchers(a, rider_m, now_s, &mut out),
-            Kind::Pigeons | Kind::Chickens | Kind::Heron | Kind::Ducks => {
-                take_off(a, rider_m, now_s, &mut out)
-            }
+            Kind::Chickens | Kind::Heron | Kind::Ducks => take_off(a, rider_m, now_s, &mut out),
             Kind::Geese => geese(&t, elapsed, &mut out),
             Kind::Owl => owl(&t, elapsed, &mut out),
             Kind::Dolphins => dolphins(&t, rider_m, speed, elapsed, &mut out),
@@ -727,25 +716,6 @@ fn members(t: &Trigger) -> Vec<Member> {
         phase: u(k + 900) * std::f32::consts::TAU,
     };
     match t.kind {
-        Kind::Cats => {
-            let n = 1 + (t.seed % 2);
-            (0..n)
-                .map(|k| {
-                    let coat = ["cat_a", "animal_dark", "patch", "cat_a"]
-                        [(splitmix(t.seed ^ k) % 4) as usize];
-                    member(
-                        Shape::Cat,
-                        k as f32 * 1.5,
-                        0.0,
-                        k as f32 * 0.15,
-                        1.5,
-                        colour(coat),
-                        Motion::Run,
-                        k,
-                    )
-                })
-                .collect()
-        }
         Kind::Snake => vec![member(
             Shape::Snake,
             0.0,
@@ -1153,7 +1123,7 @@ fn watchers(a: &mut Active, rider_m: f32, now_s: f32, out: &mut Vec<Actor>) -> b
 }
 
 /// Birds on the ground beside the road take off as the rider comes — the
-/// pigeons, a heron, ducks — flying up and away from the road; chickens
+/// a heron, ducks — flying up and away from the road; chickens
 /// scatter away from it on foot.
 fn take_off(a: &mut Active, rider_m: f32, now_s: f32, out: &mut Vec<Actor>) -> bool {
     let t = a.trigger;
@@ -1168,7 +1138,6 @@ fn take_off(a: &mut Active, rider_m: f32, now_s: f32, out: &mut Vec<Actor>) -> b
         &str,
         f32,
     ) = match t.kind {
-        Kind::Pigeons => (8, 5.0, 9.0, 22.0, Shape::Bird, 0.6, "pigeon", 0.6),
         Kind::Chickens => (6, 4.5, 8.0, 18.0, Shape::Chicken, 0.8, "chicken", 0.8),
         Kind::Heron => (1, 16.0, 18.0, 28.0, Shape::Heron, 1.8, "heron", 2.2),
         _ => (4, 22.0, 26.0, 30.0, Shape::Duck, 0.9, "duck", 1.0),
@@ -1556,7 +1525,7 @@ mod tests {
     #[test]
     fn should_have_every_crossing_over_before_the_rider_reaches_it() {
         let road = north_road(201);
-        for kind in [Kind::Cats, Kind::Snake, Kind::Deer, Kind::Flock] {
+        for kind in [Kind::Snake, Kind::Deer, Kind::Flock] {
             // Crawling up to it, then sprinting the moment it begins: the
             // crossing must hurry, not stand in the rider's way.
             let begins = 900.0 - kind.crossing().expect("a crossing").start_gap(4.0);

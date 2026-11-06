@@ -51,23 +51,27 @@ pub fn show(
                 settings::load_training(&pool_load).await?,
                 settings::load_intervals(&pool_load).await?,
                 settings::workout_look(&pool_load).await?,
+                settings::ambient_sound(&pool_load).await?,
             ))
         },
         move |result| match result {
-            Ok((training_settings, intervals_settings, workout_look)) => build_and_present(
-                &parent,
-                athlete,
-                pool,
-                rt_build,
-                training_settings,
-                intervals_settings,
-                workout_look,
-                on_saved,
-                on_erg_rate_changed,
-                on_sim_changed,
-                on_cues_changed,
-                on_auto_pause_changed,
-            ),
+            Ok((training_settings, intervals_settings, workout_look, ambient)) => {
+                build_and_present(
+                    &parent,
+                    athlete,
+                    pool,
+                    rt_build,
+                    training_settings,
+                    intervals_settings,
+                    workout_look,
+                    ambient,
+                    on_saved,
+                    on_erg_rate_changed,
+                    on_sim_changed,
+                    on_cues_changed,
+                    on_auto_pause_changed,
+                )
+            }
             Err(e) => {
                 tracing::error!("Could not read your settings: {e}");
                 let dialog = adw::AlertDialog::builder()
@@ -94,6 +98,7 @@ fn build_and_present(
     training_settings: TrainingSettings,
     intervals_settings: IntervalsSettings,
     workout_look: WorldLook,
+    ambient: settings::AmbientSound,
     on_saved: impl Fn(AthleteProfile) + 'static,
     on_erg_rate_changed: impl Fn(u32) + 'static,
     on_sim_changed: impl Fn(u32, u32) + 'static,
@@ -117,6 +122,7 @@ fn build_and_present(
     win.add(&training::build(
         &training_settings,
         workout_look,
+        ambient,
         pool.clone(),
         rt_handle.clone(),
         on_erg_rate_changed,

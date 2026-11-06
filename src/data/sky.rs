@@ -222,7 +222,6 @@ mod tests {
             Biome::Mediterranean,
             Biome::Farmland,
             Biome::Coast,
-            Biome::Urban,
             Biome::Desert,
         ] {
             let t = top(&of(b, 4));

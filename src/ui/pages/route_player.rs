@@ -1257,8 +1257,12 @@ impl RoutePlayerPage {
                 // Ended, or replaced by another ride: the overlay has nothing
                 // left to say about this one.
                 page.close_overlay();
+                page.course_view.set_riding(false);
                 return glib::ControlFlow::Break;
             }
+            // However the ride started — pedalling or "Start Now" — the land
+            // is heard from then on.
+            page.course_view.set_riding(started_tick.get());
 
             // Only sensors that are still transmitting contribute; a strap that
             // has gone quiet must not have its last value recorded all ride.
@@ -1598,9 +1602,10 @@ impl RoutePlayerPage {
                     ghost::new_best(page.ghost.borrow().as_ref(), elapsed, sess.rider_driven)
                         .filter(|_| sess.route_id.is_some());
                 page.new_best.set(best);
-                // Nothing left to pause or end.
+                // Nothing left to pause or end, and the land falls quiet.
                 page.pause_btn.set_sensitive(false);
                 page.end_btn.set_sensitive(false);
+                page.course_view.set_riding(false);
                 if page.course_view.is_showing() {
                     // Watching the road: roll through the arch to the
                     // finished card, and on to the summary when asked.

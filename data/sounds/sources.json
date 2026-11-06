@@ -1,0 +1,35 @@
+{
+  "beds": {
+    "cicadas": {"file": "082526-cicadasounds2_0.ogg", "start_s": 0, "length_s": 30, "trim_db": -8, "title": "Cicada sounds", "author": "syncopika", "licence": "CC0", "page": "https://opengameart.org/content/cicada-sounds"},
+    "wind": {"file": "wind_background_noise_2.wav", "start_s": 4, "length_s": 36, "title": "Mild wind background noise", "author": "bashar3a", "licence": "CC0", "page": "https://opengameart.org/content/mild-wind-background-noise"},
+    "alpine": {"file": "yell-040201LowerGeyserBasinWindInTreesBinaural01011.mp3", "start_s": 60, "length_s": 90, "highpass_hz": 100, "trim_db": -8, "title": "Soundscapes: wind in the trees", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-soundscapes.htm"}
+  },
+  "calls": {
+    "goat": {"title": "Herd of goats bleating", "author": "stephan", "licence": "Public domain", "page": "https://commons.wikimedia.org/wiki/File:Herd_of_goats_bleating.ogg",
+      "takes": [["Herd_of_goats_bleating.ogg", 12.10, 2.65], ["Herd_of_goats_bleating.ogg", 16.30, 1.15], ["Herd_of_goats_bleating.ogg", 29.80, 1.15], ["Herd_of_goats_bleating.ogg", 36.80, 0.90], ["Herd_of_goats_bleating.ogg", 14.75, 1.50], ["Herd_of_goats_bleating.ogg", 18.10, 1.95]]},
+    "gull": {"title": "Solo seagull sound effects", "author": "rango-mango", "licence": "CC0", "page": "https://opengameart.org/content/solo-seagull-sound-effects",
+      "takes": [["Seagull_Ambient_1.wav", 0, 3.75], ["Seagull_Ambient_2.wav", 0, 1.15], ["Seagull_Ambient_3.wav", 0, 1.1], ["Seagull_Ambient_4.wav", 0, 1.1], ["Seagull_Ambient_5.wav", 0, 1.35], ["Seagull_Ambient_6.wav", 0.1, 0.95], ["Seagull_Ambient_7.wav", 0, 0.9]]},
+    "eagle": {"title": "Bald eagle", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-goldeneagle.htm",
+      "takes": [["yell-YELLBAEA20160914T12ms.mp3", 0.45, 2.9], ["yell-YELLBAEA20160914T12ms.mp3", 3.2, 3.8], ["yell-YELLBAEA20160912T07ms.mp3", 47.85, 2.5], ["yell-YELLBAEA20160912T07ms.mp3", 24.75, 3.0]]},
+    "elk": {"title": "Elk", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-elk.htm",
+      "takes": [["yell-ElkBugle2.mp3", 1.8, 3.95], ["yell-ElkBugle2.mp3", 12.55, 4.05], ["yell-ElkBugle1.mp3", 2.15, 3.95]]},
+    "raven": {"title": "Common raven", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-raven.htm",
+      "takes": [["yell-RavenBlackSandBasin.mp3", 3.6, 1.9], ["yell-RavenBlackSandBasin.mp3", 5.4, 1.85], ["yell-RavenBlackSandBasin.mp3", 7.1, 2.0]]},
+    "songbird": {"title": "Dawn chorus", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-dawnchorus.htm", "fade_s": 0.6,
+      "takes": [["yell-YELLDawnChorus.mp3", 4, 4.5], ["yell-YELLDawnChorus.mp3", 14, 4.5], ["yell-YELLDawnChorus.mp3", 24, 4.5], ["yell-YELLDawnChorus.mp3", 34, 4.5], ["yell-YELLDawnChorus.mp3", 44, 4.5], ["yell-YELLDawnChorus.mp3", 54, 4.5]]},
+    "blackbird": {"title": "Red-winged blackbird", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-redwingedblackbird.htm",
+      "takes": [["yell-YELLredwingedblackbird20150427.mp3", 14.7, 3.0], ["yell-YELLredwingedblackbird20150427.mp3", 8.8, 2.15], ["yell-YELLredwingedblackbird20150427.mp3", 4.7, 1.25]]},
+    "rail": {"title": "Bird chorus: sora and Virginia rail", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-birdchorus.htm",
+      "takes": [["yell-YELLSORAVIRAWISN20150617T42.mp3", 11.5, 1.1], ["yell-YELLSORAVIRAWISN20150617T42.mp3", 2.5, 1.0], ["yell-YELLSORAVIRAWISN20150617T42.mp3", 19.75, 1.0], ["yell-YELLSORAVIRAWISN20150617T42.mp3", 26.65, 1.05]]},
+    "hawk": {"title": "Red-shouldered hawk", "author": "G. McGrane", "licence": "Public domain", "page": "https://commons.wikimedia.org/wiki/File:Red-shouldered_Hawk.ogg",
+      "takes": [["Red-shouldered_Hawk.ogg", 3.45, 0.85], ["Red-shouldered_Hawk.ogg", 10.1, 1.7], ["Red-shouldered_Hawk.ogg", 12.85, 0.9], ["Red-shouldered_Hawk.ogg", 14.5, 1.4], ["Red-shouldered_Hawk.ogg", 18.05, 1.1]]},
+    "frog": {"title": "Chorus frogs", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-chorusfrogs.htm", "fade_s": 0.5,
+      "takes": [["yell-ChorusFrogs.mp3", 5, 3.0], ["yell-ChorusFrogs.mp3", 15, 3.0], ["yell-ChorusFrogs.mp3", 25, 3.0], ["yell-ChorusFrogs.mp3", 34, 3.0]]},
+    "crane": {"title": "Chorus frogs, snipe and sandhill cranes", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-chorusfrogs.htm",
+      "takes": [["yell-20150427T13BorealfrogSACRWISN.mp3", 125.95, 2.15], ["yell-20150427T13BorealfrogSACRWISN.mp3", 133.15, 2.3], ["yell-20150427T13BorealfrogSACRWISN.mp3", 107.5, 3.15]]},
+    "goose": {"title": "Canada geese", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-canadagoose.htm",
+      "takes": [["yell-YELLCAGE20160914T04ms.mp3", 1.75, 3.1], ["yell-YELLCAGE20160914T04ms.mp3", 36.2, 4.2], ["yell-YELLCAGE20160914T04ms.mp3", 40.9, 1.1]]},
+    "loon": {"title": "Common loon", "author": "U.S. National Park Service, Yellowstone", "licence": "Public domain", "page": "https://www.nps.gov/yell/learn/photosmultimedia/sounds-commonloon.htm",
+      "takes": [["yell-YELLCOLO20160913T18ms.mp3", 62.9, 4.55], ["yell-YELLCOLO20160913T18ms.mp3", 89.15, 3.75], ["yell-YELLCOLO20160913T18ms.mp3", 69.45, 3.85], ["yell-YELLCOLO20160913T18ms.mp3", 110.45, 3.15]]}
+  }
+}

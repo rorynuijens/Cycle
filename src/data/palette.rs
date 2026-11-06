@@ -65,7 +65,6 @@ pub struct Palette {
     /// The HUD's ink. The world itself draws no lines.
     pub outline: Rgb,
     /// Squares, car parks and the ground in towns.
-    pub paving: Rgb,
     pub sand: Rgb,
     pub wet_sand: Rgb,
     pub field_wheat: Rgb,
@@ -114,15 +113,12 @@ pub struct Palette {
     pub boat_b: Rgb,
     pub sail: Rgb,
     pub birch_bark: Rgb,
-    pub lamp: Rgb,
     pub hut: Rgb,
     pub lighthouse: Rgb,
     pub windmill: Rgb,
     pub dog_a: Rgb,
     pub dog_b: Rgb,
     pub dog_c: Rgb,
-    pub cat_a: Rgb,
-    pub cat_b: Rgb,
     pub snake: Rgb,
     pub rat: Rgb,
     pub eagle: Rgb,
@@ -137,7 +133,6 @@ pub struct Palette {
     pub marmot: Rgb,
     pub goose: Rgb,
     pub owl: Rgb,
-    pub pigeon: Rgb,
     /// Tufts of grass along the verge, a shade deeper than the grass round
     /// them so they read; dry ones where the land is dry.
     pub verge_grass: Rgb,
@@ -226,7 +221,6 @@ pub const BASE: Palette = Palette {
     sky_top: hex(0x8DBDE8),
     sky_horizon: hex(0xD8ECF7),
     outline: hex(0x1E2430),
-    paving: hex(0xD6D0C4),
     sand: hex(0xF3DFA8),
     wet_sand: hex(0xD9C089),
     field_wheat: hex(0xF1DE8C),
@@ -270,15 +264,12 @@ pub const BASE: Palette = Palette {
     boat_b: hex(0x3F7FBF),
     sail: hex(0xF7F5EE),
     birch_bark: hex(0xF2F0E8),
-    lamp: hex(0x3A3F4A),
     hut: hex(0x8B5A3A),
     lighthouse: hex(0xD8432F),
     windmill: hex(0x4A5A4E),
     dog_a: hex(0xC9A66B),
     dog_b: hex(0xEFE3C8),
     dog_c: hex(0x7A5230),
-    cat_a: hex(0xE08A3C),
-    cat_b: hex(0x6E6E74),
     snake: hex(0x9A8A3E),
     rat: hex(0x7D746A),
     eagle: hex(0x5A4030),
@@ -293,7 +284,6 @@ pub const BASE: Palette = Palette {
     marmot: hex(0x9A7350),
     goose: hex(0xE9E6DF),
     owl: hex(0x8C6B4A),
-    pigeon: hex(0x8A8F99),
     verge_grass: hex(0x6FBF4A),
     dry_grass: hex(0xC9B46A),
     flower_a: hex(0xF5D547),
@@ -459,7 +449,6 @@ impl Palette {
             "sky_top" => &mut self.sky_top,
             "sky_horizon" => &mut self.sky_horizon,
             "outline" => &mut self.outline,
-            "paving" => &mut self.paving,
             "sand" => &mut self.sand,
             "wet_sand" => &mut self.wet_sand,
             "field_wheat" => &mut self.field_wheat,
@@ -503,15 +492,12 @@ impl Palette {
             "boat_b" => &mut self.boat_b,
             "sail" => &mut self.sail,
             "birch_bark" => &mut self.birch_bark,
-            "lamp" => &mut self.lamp,
             "hut" => &mut self.hut,
             "lighthouse" => &mut self.lighthouse,
             "windmill" => &mut self.windmill,
             "dog_a" => &mut self.dog_a,
             "dog_b" => &mut self.dog_b,
             "dog_c" => &mut self.dog_c,
-            "cat_a" => &mut self.cat_a,
-            "cat_b" => &mut self.cat_b,
             "snake" => &mut self.snake,
             "rat" => &mut self.rat,
             "eagle" => &mut self.eagle,
@@ -526,7 +512,6 @@ impl Palette {
             "marmot" => &mut self.marmot,
             "goose" => &mut self.goose,
             "owl" => &mut self.owl,
-            "pigeon" => &mut self.pigeon,
             "verge_grass" => &mut self.verge_grass,
             "dry_grass" => &mut self.dry_grass,
             "flower_a" => &mut self.flower_a,
@@ -632,7 +617,7 @@ mod tests {
     fn should_reach_every_colour_by_its_name() {
         // Every field, each with a different value, set by name: a field the
         // name table forgot keeps the base value and shows here.
-        const NAMES: [&str; 128] = [
+        const NAMES: [&str; 123] = [
             "grass_low",
             "grass_high",
             "rock",
@@ -656,7 +641,6 @@ mod tests {
             "sky_top",
             "sky_horizon",
             "outline",
-            "paving",
             "sand",
             "wet_sand",
             "field_wheat",
@@ -700,15 +684,12 @@ mod tests {
             "boat_b",
             "sail",
             "birch_bark",
-            "lamp",
             "hut",
             "lighthouse",
             "windmill",
             "dog_a",
             "dog_b",
             "dog_c",
-            "cat_a",
-            "cat_b",
             "snake",
             "rat",
             "eagle",
@@ -723,7 +704,6 @@ mod tests {
             "marmot",
             "goose",
             "owl",
-            "pigeon",
             "verge_grass",
             "dry_grass",
             "flower_a",
@@ -767,7 +747,7 @@ mod tests {
         for (k, name) in NAMES.iter().enumerate() {
             *p.slot(name).unwrap_or_else(|| panic!("{name} has no slot")) = [k as f32; 3];
         }
-        let flat: [Rgb; 128] = unsafe { std::mem::transmute(p) };
+        let flat: [Rgb; 123] = unsafe { std::mem::transmute(p) };
         for (k, rgb) in flat.iter().enumerate() {
             assert_eq!(*rgb, [k as f32; 3], "field {k} is not reached by its name");
         }

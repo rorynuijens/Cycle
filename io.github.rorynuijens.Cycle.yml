@@ -20,6 +20,8 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
   # Network: Anthropic API, Intervals.icu, OpenStreetMap map tiles
   - --share=network
+  # Sound: the 3D world's ambient beds. Playback only — the app never records.
+  - --socket=pulseaudio
   # No --filesystem= entry of any kind, deliberately. This once carried
   # --filesystem=xdg-run/gvfsd, purely to silence a "peer-to-peer connection
   # failed, falling back to the session bus" log line from GIO once per mount.

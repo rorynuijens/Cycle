@@ -20,8 +20,6 @@ pub enum AreaKind {
     Farmland,
     /// A beach, or the sand round an oasis.
     Sand,
-    /// Squares and pavements in town.
-    Paving,
 }
 
 /// A well-mixed hash, for every seeded choice.
@@ -87,6 +85,12 @@ const BEACH_DROP_M: f32 = 1.2;
 /// below the road beside them.
 const POOL_FROM_M: f32 = 45.0;
 const OASIS_FROM_M: f32 = 80.0;
+/// Where the oasis noise rises above this the sand holds a pool — about
+/// one part in seventy of the desert: a desert is dry, and a pool in it is
+/// a find, not the view.
+const OASIS_WATER: f32 = 0.66;
+/// And above this, the pale sand that rings it.
+const OASIS_SAND: f32 = 0.58;
 const POOL_DROP_M: f32 = 0.7;
 /// Ditches are laid in steps this long, and one runs away from the road
 /// every this many metres of it.
@@ -440,7 +444,8 @@ impl World {
                 Some((base - POOL_DROP_M, AreaKind::Water))
             }
             WaterKind::Oasis
-                if from_road > OASIS_FROM_M && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > 0.46 =>
+                if from_road > OASIS_FROM_M
+                    && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > OASIS_WATER =>
             {
                 Some((base - POOL_DROP_M, AreaKind::Water))
             }
@@ -453,7 +458,8 @@ impl World {
         match rules.water {
             WaterKind::Sea => from_road > SEA_FROM_M - 40.0 && self.sea_side(x, z),
             WaterKind::Oasis => {
-                from_road > OASIS_FROM_M - 20.0 && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > 0.38
+                from_road > OASIS_FROM_M - 20.0
+                    && fbm(self.seed ^ 0x0A51, x, z, 160.0, 2) > OASIS_SAND
             }
             _ => false,
         }
@@ -476,9 +482,6 @@ impl World {
         }
         if self.sand_at(x, z, rules, coarse.min(from_road)) {
             return Some(AreaKind::Sand);
-        }
-        if from_road < rules.paving_m {
-            return Some(AreaKind::Paving);
         }
         let wood = fbm(self.seed ^ 0x3009, x, z, 320.0, 3);
         // Woods keep back from the road, and gather on the far hills.
@@ -855,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn should_grow_no_woods_or_fields_in_the_desert_and_pave_the_town() {
+    fn should_grow_no_woods_or_fields_in_the_desert() {
         let (desert, _) = world_of(Biome::Desert);
         for (x, z) in beside_road(10.0, 1_500.0) {
             let kind = desert.land_at(x, z, x.abs());
@@ -864,10 +867,6 @@ mod tests {
                 "{kind:?} at {x}, {z}"
             );
         }
-        let (town, _) = world_of(Biome::Urban);
-        assert_eq!(town.land_at(30.0, -500.0, 30.0), Some(AreaKind::Paving));
-        assert_eq!(town.land_at(-89.0, -500.0, 89.0), Some(AreaKind::Paving));
-        assert_ne!(town.land_at(-91.0, -500.0, 91.0), Some(AreaKind::Paving));
     }
 
     #[test]

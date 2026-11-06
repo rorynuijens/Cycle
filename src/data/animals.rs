@@ -147,7 +147,7 @@ pub fn place(road: &[RoadPoint], land: &Land) -> Vec<Prop> {
                 continue;
             }
             match (land.area)(x, z) {
-                Some(AreaKind::Water | AreaKind::Sand | AreaKind::Paving) => continue,
+                Some(AreaKind::Water | AreaKind::Sand) => continue,
                 Some(AreaKind::Wood) if !rules.herd_in_woods => continue,
                 _ => {}
             }

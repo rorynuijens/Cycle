@@ -1,4 +1,5 @@
 pub mod ai_cache;
+pub mod ambience;
 pub mod animals;
 pub mod athlete;
 pub mod backup;

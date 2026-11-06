@@ -170,7 +170,6 @@ fn ground_colour(def: &BiomeDef, area: Option<AreaKind>, x: f32, z: f32, rise: f
         Some(AreaKind::Farmland) => field(p, def.land.crops, x, z),
         Some(AreaKind::Wood) => p.grass_high,
         Some(AreaKind::Sand) => p.sand,
-        Some(AreaKind::Paving) => p.paving,
         None => lerp3(p.grass_low, p.grass_high, smoothstep(0.0, 40.0, rise)),
     };
     [rgb[0], rgb[1], rgb[2], MATERIAL_GROUND]
@@ -390,6 +389,15 @@ pub struct Vertex {
     pub colour: [f32; 4],
 }
 
+/// A vertex of a [`Mesh::faceted`] mesh: its triangle's own way out with it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FacetVertex {
+    pub pos: [f32; 3],
+    pub colour: [f32; 4],
+    pub normal: [f32; 3],
+}
+
 /// Triangles ready to upload.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mesh {
@@ -398,6 +406,48 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    /// Every triangle on its own three vertices, each carrying the
+    /// triangle's unit normal. The shader otherwise takes a face's way out
+    /// from how the position changes across a pixel, and on a face a few
+    /// pixels across — a cow's patch seen from the road — almost every pixel
+    /// borders another face, so its light flickered as the view moved. A
+    /// degenerate triangle gets a zero normal, which the shader reads as
+    /// "work it out from the pixels".
+    pub fn faceted(&self) -> Vec<FacetVertex> {
+        let mut out = Vec::with_capacity(self.indices.len());
+        for tri in self.indices.chunks_exact(3) {
+            let Some(v) = tri
+                .iter()
+                .map(|&i| self.vertices.get(i as usize).copied())
+                .collect::<Option<Vec<Vertex>>>()
+            else {
+                continue;
+            };
+            let (a, b, c) = (v[0].pos, v[1].pos, v[2].pos);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            let normal = if len > 1e-12 {
+                [n[0] / len, n[1] / len, n[2] / len]
+            } else {
+                [0.0; 3]
+            };
+            for vertex in v {
+                out.push(FacetVertex {
+                    pos: vertex.pos,
+                    colour: vertex.colour,
+                    normal,
+                });
+            }
+        }
+        out
+    }
+
     /// Append `other`, shifting its indices past this mesh's vertices.
     pub fn extend(&mut self, other: Mesh) {
         let base = self.vertices.len() as u32;
@@ -457,6 +507,9 @@ pub struct CourseScene {
     pub wind: [f32; 2],
     /// The sky every [`SKY_STEP_M`] along the road — see [`CourseScene::sky_at`].
     skies: Vec<Sky>,
+    /// The biomes round the rider every [`SKY_STEP_M`] along the road — see
+    /// [`CourseScene::land_at`].
+    lands: Vec<biome::Weights>,
 }
 
 impl CourseScene {
@@ -505,6 +558,7 @@ impl CourseScene {
         };
         let backdrop = |d: f32| biome::backdrop(scenery, &segments, d);
         let skies = skies_along(&road, &look.biomes, &backdrop);
+        let lands = steps_along(&road, |_, p| look.biomes.weights_at(p[0], p[2]));
         // A horizon for every biome that stands round the rider anywhere.
         let horizons = biome::Biome::ALL
             .into_iter()
@@ -539,6 +593,7 @@ impl CourseScene {
             horizons,
             clouds: sky::clouds(world.seed()),
             skies,
+            lands,
             encounters,
             wind: world.wind(),
         })
@@ -556,6 +611,22 @@ impl CourseScene {
         let i = (k.floor() as usize).min(self.skies.len() - 1);
         let j = (i + 1).min(self.skies.len() - 1);
         self.skies[i].mix(&self.skies[j], k - k.floor())
+    }
+
+    /// How much of each biome the land holds round a rider at `distance_m`:
+    /// what the ride sounds like there.
+    pub fn land_at(&self, distance_m: f32) -> biome::Weights {
+        let Some(first) = self.lands.first() else {
+            return [0.0; biome::COUNT];
+        };
+        let k = ((distance_m - self.road[0].distance_m) / SKY_STEP_M).max(0.0);
+        if !k.is_finite() {
+            return *first;
+        }
+        let i = (k.floor() as usize).min(self.lands.len() - 1);
+        let j = (i + 1).min(self.lands.len() - 1);
+        let t = k - k.floor();
+        std::array::from_fn(|b| lerp(self.lands[i][b], self.lands[j][b], t))
     }
 }
 
@@ -649,6 +720,36 @@ fn skies_along(
     biomes: &BiomeMap,
     backdrop: &dyn Fn(f32) -> biome::Weights,
 ) -> Vec<Sky> {
+    steps_along(road, |d, p| {
+        Sky::of(&biomes.weights_at(p[0], p[2]), backdrop(d))
+    })
+}
+
+/// Streams keep clear of the road's line by this much: [`STREAM_CLEAR_M`]
+/// from its edge, by the stream's own width too, and by half a step of its
+/// line, which may cut a corner between two of its points.
+const STREAM_CLEAR: f32 = STREAM_CLEAR_M + DEFAULT_EXTENT_M + STREAM_HALF_M + 6.0;
+
+/// The brooks the world runs beside `road` (the road as drawn, with its
+/// leads), as lines: only where the biome has them, by where each starts.
+/// `from_line(x, z)` says how far a place is from the road's line.
+fn brooks(
+    road: &[RoadPoint],
+    world: &World,
+    from_line: impl Fn(f32, f32) -> f32,
+) -> Vec<Vec<(f32, f32)>> {
+    let mut streams = world.streams(road, STREAM_EVERY_M, STREAM_CLEAR, from_line);
+    streams.retain(|s| {
+        s.first().is_some_and(|&(x, z)| {
+            world.biome_at(x, z).def().land.water == biome::WaterKind::Streams
+        })
+    });
+    streams
+}
+
+/// `at(distance, position)` every [`SKY_STEP_M`] along the road, from its
+/// start.
+fn steps_along<T>(road: &[RoadPoint], at: impl Fn(f32, [f32; 3]) -> T) -> Vec<T> {
     let (Some(first), Some(last)) = (road.first(), road.last()) else {
         return Vec::new();
     };
@@ -658,7 +759,7 @@ fn skies_along(
     (0..=steps)
         .filter_map(|k| {
             let d = first.distance_m + k as f32 * SKY_STEP_M;
-            position_at(road, d).map(|p| Sky::of(&biomes.weights_at(p[0], p[2]), backdrop(d)))
+            position_at(road, d).map(|p| at(d, p))
         })
         .collect()
 }
@@ -1130,19 +1231,10 @@ pub fn world_mesh(
         let (d2, _) = index.nearest(x, z)?;
         Some((d2.sqrt() - reach).max(0.0))
     };
-    // Clear by the stream's own width too, and by half a step of its line,
-    // which may cut a corner between two of its points.
-    let stream_clear = STREAM_CLEAR_M + reach + STREAM_HALF_M + 6.0;
     let from_line = |x: f32, z: f32| index.nearest(x, z).map_or(f32::MAX, |(d2, _)| d2.sqrt());
-    // Brooks only where the biome has them, by where each starts; ditches
-    // wherever it digs them.
-    let mut streams = world.streams(road, STREAM_EVERY_M, stream_clear, from_line);
-    streams.retain(|s| {
-        s.first().is_some_and(|&(x, z)| {
-            world.biome_at(x, z).def().land.water == biome::WaterKind::Streams
-        })
-    });
-    streams.extend(world.ditches(road, stream_clear, from_line));
+    // Brooks, and ditches wherever the biome digs them.
+    let mut streams = brooks(road, world, from_line);
+    streams.extend(world.ditches(road, STREAM_CLEAR, from_line));
     let ground = surface;
     for s in &streams {
         mesh.extend(stream_mesh(s, &ground, &look_at));
@@ -3246,7 +3338,7 @@ mod tests {
     #[test]
     fn should_keep_every_prop_off_the_track_and_every_animal_well_clear() {
         // Rule 5 and the skill's encounters rule: nothing stands on the
-        // asphalt — not a house, not a lamp post, not a tuft — and nothing
+        // asphalt — not a house, not a tuft — and nothing
         // that moves comes within the animals' clearance of the edge.
         let route = straight_route(400, 10.0, 0.0);
         for scenery in Scenery::CHOICES {
@@ -3282,15 +3374,16 @@ mod tests {
 
     #[test]
     fn should_keep_trees_and_herds_off_the_ground_a_house_takes() {
-        let route = straight_route(400, 10.0, 0.0);
+        // Farmland has trees and houses both, the houses seldom: a long road.
+        let route = straight_route(2_000, 10.0, 0.0);
         let scene =
-            CourseScene::build(&route, Scenery::Only(biome::Biome::Urban)).expect("a scene");
+            CourseScene::build(&route, Scenery::Only(biome::Biome::Farmland)).expect("a scene");
         let houses: Vec<&Prop> = scene
             .props
             .iter()
             .filter(|p| p.shape == crate::data::props::Shape::House)
             .collect();
-        assert!(houses.len() > 100, "{} houses in a 4 km town", houses.len());
+        assert!(houses.len() >= 10, "{} houses in 20 km", houses.len());
         for t in scene.props.iter().filter(|p| p.shape.is_tree()) {
             for h in &houses {
                 let d = (t.pos[0] - h.pos[0]).hypot(t.pos[2] - h.pos[2]);
@@ -3311,6 +3404,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn should_give_every_facet_its_own_unit_normal_and_keep_its_colour() {
+        let red = [1.0, 0.0, 0.0, 0.0];
+        let blue = [0.0, 0.0, 1.0, 0.0];
+        let v = |pos: [f32; 3], colour| Vertex { pos, colour };
+        // Two triangles sharing an edge, one flat on the ground and one
+        // standing up: the shared vertices are split, each with its own way.
+        let mesh = Mesh {
+            vertices: vec![
+                v([0.0, 0.0, 0.0], red),
+                v([0.0, 0.0, 1.0], red),
+                v([1.0, 0.0, 0.0], red),
+                v([0.0, 1.0, 0.0], blue),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3, 0, 0, 0, 9, 1, 2],
+        };
+        let f = mesh.faceted();
+        // The degenerate one is kept with no normal; the one with an index
+        // past the end is dropped.
+        assert_eq!(f.len(), 9);
+        assert!(f[..3].iter().all(|x| x.normal == [0.0, 1.0, 0.0]));
+        assert!(f[3..6].iter().all(|x| x.normal == [0.0, 0.0, 1.0]));
+        assert!(f[6..].iter().all(|x| x.normal == [0.0; 3]));
+        assert_eq!(f[5].colour, blue);
+        assert_eq!(f[3].colour, red);
+        for shape in crate::data::props::Shape::ALL {
+            let m = shape.mesh();
+            for x in m.faceted() {
+                let len = x.normal.iter().map(|c| c * c).sum::<f32>().sqrt();
+                assert!(len == 0.0 || (len - 1.0).abs() < 1e-4, "{shape:?}");
+            }
+        }
+    }
+
     // ── Scenery ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -3326,6 +3453,44 @@ mod tests {
             let scene = CourseScene::build(&route, s).expect("a scene");
             assert!(scene.road == base.road, "{s:?} moved the road");
         }
+    }
+
+    #[test]
+    fn should_sound_like_the_one_chosen_biome_the_whole_ride() {
+        let route = straight_route(150, 10.0, 0.0);
+        let coast =
+            CourseScene::build(&route, Scenery::Only(biome::Biome::Coast)).expect("a scene");
+        for d in [0.0, 25.0, 700.0, 1_490.0, 9_999.0, f32::NAN] {
+            let w = coast.land_at(d);
+            assert_eq!(w[biome::Biome::Coast as usize], 1.0, "at {d} m");
+            assert_eq!(w.iter().sum::<f32>(), 1.0, "at {d} m");
+        }
+    }
+
+    #[test]
+    fn should_cross_from_one_biome_to_the_next_along_a_mixed_ride() {
+        // A mixed ride long enough for two stretches: somewhere along it the
+        // land changes, and it changes through a blend, not a step.
+        let route = straight_route(3_000, 10.0, 0.0);
+        let scene = CourseScene::build(&route, Scenery::Mixed).expect("a scene");
+        let dominant = |d: f32| {
+            let w = scene.land_at(d);
+            (0..biome::COUNT)
+                .max_by(|&a, &b| w[a].total_cmp(&w[b]))
+                .unwrap_or(0)
+        };
+        let first = dominant(0.0);
+        let change = (0..3_000)
+            .map(|k| k as f32 * 10.0)
+            .find(|&d| dominant(d) != first)
+            .expect("a second biome along 30 km");
+        let blended = (0..40)
+            .map(|k| scene.land_at(change - 200.0 + k as f32 * 10.0))
+            .any(|w| w.iter().filter(|&&x| x > 0.1).count() >= 2);
+        assert!(
+            blended,
+            "the land jumps from one biome to the next at {change} m"
+        );
     }
 
     #[test]

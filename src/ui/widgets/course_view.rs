@@ -23,6 +23,8 @@ use std::ffi::{c_char, c_void, CString};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use crate::audio;
+use crate::data::ambience;
 use crate::data::biome;
 use crate::data::course3d::{self, CameraPose, CourseScene, Mat4, Mesh, RiderPose, Sky};
 use crate::data::cue_signs;
@@ -115,6 +117,9 @@ fn vertical_fov_deg(aspect: f32) -> f32 {
 const VERTEX_SHADER: &str = r#"
 in vec3 a_pos;
 in vec4 a_colour;
+// The facet's way out, on a faceted mesh; zero on the land, whose faces are
+// big enough to take it from the pixels.
+in vec3 a_normal;
 uniform mat4 u_mvp;
 uniform mat4 u_model;
 uniform vec3 u_eye;
@@ -124,7 +129,9 @@ out vec3 v_rel;
 // facets, not gradients.
 flat out vec4 v_colour;
 flat out vec3 v_anchor;
+flat out vec3 v_normal;
 void main() {
+    v_normal = mat3(u_model) * a_normal;
     vec3 world = (u_model * vec4(a_pos, 1.0)).xyz;
     v_world = world;
     // Relative to the eye, the numbers are small. Interpolated across a pixel
@@ -145,6 +152,7 @@ void main() {
 const PROP_VERTEX_SHADER: &str = r#"
 in vec3 a_pos;
 in vec4 a_colour;
+in vec3 a_normal;
 in vec3 i_pos;
 in vec2 i_size;
 in vec3 i_colour;
@@ -167,6 +175,7 @@ out vec3 v_world;
 out vec3 v_rel;
 flat out vec4 v_colour;
 flat out vec3 v_anchor;
+flat out vec3 v_normal;
 void main() {
     vec3 base = i_pos;
     vec3 p = a_pos;
@@ -279,6 +288,11 @@ void main() {
     float s = sin(yaw);
     p *= i_size.x * (1.0 - smoothstep(u_reach.x, u_reach.y, length(base - u_eye)));
     vec3 world = base + vec3(c * p.x - s * p.z, p.y, s * p.x + c * p.z);
+    // Turned with the shape; the bends of a gait or a wingbeat are left out,
+    // and a facet the motion folds over takes its way from the pixels.
+    bool folded = motion == 2.0 || motion == 4.0 || motion >= 7.0;
+    v_normal = folded ? vec3(0.0) : vec3(c * a_normal.x - s * a_normal.z, a_normal.y,
+        s * a_normal.x + c * a_normal.z);
     if (u_sway > 0.0 && motion == 0.0) {
         // Wind: the top bends most and the foot not at all. Gusts roll
         // across the land downwind as broad bands; in them each plant rocks
@@ -323,6 +337,7 @@ in vec3 v_world;
 in vec3 v_rel;
 flat in vec4 v_colour;
 flat in vec3 v_anchor;
+flat in vec3 v_normal;
 uniform vec3 u_horizon;
 uniform vec3 u_zenith;
 uniform vec3 u_sun;
@@ -394,9 +409,13 @@ vec2 stone(vec3 p) {
 void main() {
     vec3 c = v_colour.rgb;
     float material = floor(v_colour.a + 0.5);
-    // The face normal comes from how the position changes across the pixel,
-    // so no normals are stored and every face is flat.
-    vec3 n = normalize(cross(dFdx(v_rel), dFdy(v_rel)));
+    // A faceted mesh brings its facet's way out. The land does not: there
+    // it comes from how the position changes across the pixel, which is
+    // flat and cheap but guesses wrong where a face is only a few pixels
+    // across, so a small prop's details flickered light and dark.
+    vec3 n = dot(v_normal, v_normal) > 0.25
+        ? normalize(v_normal)
+        : normalize(cross(dFdx(v_rel), dFdy(v_rel)));
     // Face the viewer. Flipping to face *up* instead decides a wall's side by
     // the sign of a vertical component that is noise, and the wall comes out
     // speckled light and dark pixel by pixel.
@@ -859,6 +878,22 @@ struct Inner {
     /// Bumped for every new route, so a build that finishes after the next
     /// route has been set is thrown away rather than shown.
     generation: Cell<u64>,
+    /// Who this view is to the ambient player, and when it last told it
+    /// what the land sounds like.
+    sound: audio::Owner,
+    heard_us: Cell<i64>,
+    /// When each biome's calls are heard.
+    caller: RefCell<ambience::Caller>,
+    /// Whether a ride is on along this road: the land is heard only then.
+    riding: Cell<bool>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(player) = audio::get() {
+            player.release(self.sound);
+        }
+    }
 }
 
 /// The fullscreen ride HUD, while the view carries one, and the finished
@@ -990,6 +1025,12 @@ impl CourseView {
             ride_clock: Cell::new(None),
             drawn_m: Cell::new(None),
             generation: Cell::new(0),
+            sound: audio::next_owner(),
+            heard_us: Cell::new(0),
+            caller: RefCell::new(ambience::Caller::new(
+                glib::monotonic_time() as u64 ^ 0xCA11,
+            )),
+            riding: Cell::new(false),
         });
 
         // Handlers hold the inner state weakly: the area owns these closures,
@@ -1017,6 +1058,14 @@ impl CourseView {
                 inner.realize(area);
             }
         });
+        // Off the screen — another page, the window hidden — the land
+        // falls quiet; the tick below brings it back.
+        let weak = Rc::downgrade(&inner);
+        area.connect_unmap(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.fall_quiet();
+            }
+        });
         let weak = Rc::downgrade(&inner);
         area.connect_unrealize(move |area| {
             if let Some(inner) = weak.upgrade() {
@@ -1040,6 +1089,7 @@ impl CourseView {
             };
             let now = glib::monotonic_time();
             let d = inner.progress.get().distance_at(now);
+            inner.hear(d, now);
             let moved = inner
                 .drawn_m
                 .get()
@@ -1072,6 +1122,9 @@ impl CourseView {
         signs: Vec<cue_signs::Sign>,
     ) {
         let inner = &self.inner;
+        // The last route's land is not this one's, and no ride is on it yet.
+        inner.riding.set(false);
+        inner.fall_quiet();
         *inner.signs.borrow_mut() = signs;
         inner.generation.set(inner.generation.get() + 1);
         *inner.scene.borrow_mut() = None;
@@ -1190,6 +1243,19 @@ impl CourseView {
             .set(cadence_rpm.map(|rpm| (rpm as f32, glib::monotonic_time())));
     }
 
+    /// Whether a ride is on — from its start to its end, paused or not. The
+    /// land is heard only while one is: not before it, nor over the
+    /// finished card after.
+    pub fn set_riding(&self, riding: bool) {
+        let was = self.inner.riding.replace(riding);
+        if was != riding {
+            tracing::debug!("3D ride sound: riding {riding}");
+        }
+        if was && !riding {
+            self.inner.fall_quiet();
+        }
+    }
+
     /// Show or hide the fullscreen ride HUD over the road.
     pub fn set_hud_shown(&self, shown: bool) {
         self.inner.hud.borrow_mut().shown = shown;
@@ -1216,6 +1282,53 @@ impl CourseView {
 }
 
 impl Inner {
+    /// How often the ambient player is told where the rider is, in µs: the
+    /// land changes over tens of metres, and the player fades over seconds.
+    const HEAR_EVERY_US: i64 = 250_000;
+
+    /// Tells the ambient player what the land sounds like `distance_m` along
+    /// the road — every [`Self::HEAR_EVERY_US`] while a ride is on, once the
+    /// world is built.
+    fn hear(&self, distance_m: f32, now_us: i64) {
+        if !self.riding.get() || now_us - self.heard_us.get() < Self::HEAR_EVERY_US {
+            return;
+        }
+        let Some(player) = audio::get() else {
+            return;
+        };
+        let Some(land) = self
+            .scene
+            .borrow()
+            .as_ref()
+            .map(|scene| scene.land_at(distance_m))
+        else {
+            return;
+        };
+        let last = self.heard_us.replace(now_us);
+        if last == 0 {
+            tracing::debug!("3D ride sound: heard from {distance_m:.0} m");
+        }
+        player.play(self.sound, &ambience::gains(&land));
+        // Calls wait out their gaps only while the ride is heard.
+        let dt = if last == 0 {
+            0.0
+        } else {
+            (now_us - last) as f32 / 1e6
+        };
+        let cries = self.caller.borrow_mut().tick(dt, &land);
+        for cry in &cries {
+            player.cry(self.sound, cry);
+        }
+    }
+
+    /// The land this view shows is no longer heard.
+    fn fall_quiet(&self) {
+        self.heard_us.set(0);
+        if let Some(player) = audio::get() {
+            player.release(self.sound);
+        }
+    }
+
     /// Build the world from the route, off the main thread — a long route
     /// takes long enough to stall a frame.
     fn rebuild(this: &Rc<Self>) {
@@ -1499,6 +1612,44 @@ impl MeshGl {
         Ok(this)
     }
 
+    /// `mesh` on the GPU as facets, each vertex with its triangle's normal
+    /// (slot 2) — for props and riders, whose faces can be a few pixels
+    /// across. Drawn the same way; the land's meshes leave slot 2 off and
+    /// read it as zero.
+    unsafe fn faceted(gl: &glow::Context, mesh: &Mesh) -> Result<Self, String> {
+        let facets = mesh.faceted();
+        let vao = gl.create_vertex_array()?;
+        let vbo = gl.create_buffer()?;
+        let ebo = gl.create_buffer()?;
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes: Vec<u8> = facets
+            .iter()
+            .flat_map(|v| v.pos.iter().chain(&v.colour).chain(&v.normal))
+            .flat_map(|f| f.to_ne_bytes())
+            .collect();
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &bytes, glow::STATIC_DRAW);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+        let indices: Vec<u8> = (0..facets.len() as u32)
+            .flat_map(|i| i.to_ne_bytes())
+            .collect();
+        gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, &indices, glow::STATIC_DRAW);
+        let stride = std::mem::size_of::<course3d::FacetVertex>() as i32;
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 12);
+        gl.enable_vertex_attrib_array(2);
+        gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, stride, 28);
+        gl.bind_vertex_array(None);
+        Ok(Self {
+            vao,
+            vbo,
+            ebo,
+            index_count: facets.len() as i32,
+        })
+    }
+
     /// Replace what is on the GPU with `mesh`, or with nothing.
     fn replace(&mut self, gl: &glow::Context, mesh: Option<&Mesh>) {
         let (vertices, indices) = match mesh {
@@ -1547,7 +1698,7 @@ impl GlState {
                 header,
                 VERTEX_SHADER,
                 FRAGMENT_SHADER,
-                &[(0, "a_pos"), (1, "a_colour")],
+                &[(0, "a_pos"), (1, "a_colour"), (2, "a_normal")],
             )?;
             let sky_program = link(
                 &gl,
@@ -1578,6 +1729,7 @@ impl GlState {
                 &[
                     (0, "a_pos"),
                     (1, "a_colour"),
+                    (2, "a_normal"),
                     (3, "i_pos"),
                     (4, "i_size"),
                     (5, "i_colour"),
@@ -1591,10 +1743,10 @@ impl GlState {
                 .map(|_| MeshGl::new(&gl, &empty))
                 .collect::<Result<Vec<_>, _>>()?;
             let clouds = MeshGl::new(&gl, &empty)?;
-            let rider_body = MeshGl::new(&gl, &rider::body(&rider::Avatar::default()))?;
-            let rider_leg = MeshGl::new(&gl, &rider::leg(&rider::Avatar::default()))?;
-            let ghost_body = MeshGl::new(&gl, &rider::body(&rider::Avatar::ghost()))?;
-            let ghost_leg = MeshGl::new(&gl, &rider::leg(&rider::Avatar::ghost()))?;
+            let rider_body = MeshGl::faceted(&gl, &rider::body(&rider::Avatar::default()))?;
+            let rider_leg = MeshGl::faceted(&gl, &rider::leg(&rider::Avatar::default()))?;
+            let ghost_body = MeshGl::faceted(&gl, &rider::body(&rider::Avatar::ghost()))?;
+            let ghost_leg = MeshGl::faceted(&gl, &rider::leg(&rider::Avatar::ghost()))?;
             let props = Shape::ALL
                 .iter()
                 .map(|&shape| PropShape::new(&gl, shape))
@@ -2091,7 +2243,7 @@ impl GlState {
 impl PropShape {
     /// The shape's mesh on the GPU, with an empty buffer for its props.
     unsafe fn new(gl: &glow::Context, shape: Shape) -> Result<Self, String> {
-        let mesh = MeshGl::new(gl, &shape.mesh())?;
+        let mesh = MeshGl::faceted(gl, &shape.mesh())?;
         let instances = gl.create_buffer()?;
         let live = gl.create_buffer()?;
         gl.bind_vertex_array(Some(mesh.vao));

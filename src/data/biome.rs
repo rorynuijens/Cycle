@@ -10,6 +10,7 @@
 
 use std::sync::OnceLock;
 
+use super::ambience::Ambience;
 use serde::Deserialize;
 
 use crate::data::dressing::PropRule;
@@ -30,10 +31,9 @@ pub enum Biome {
     Coast,
     Mountain,
     Wetland,
-    Urban,
 }
 
-pub const COUNT: usize = 10;
+pub const COUNT: usize = 9;
 
 impl Biome {
     pub const ALL: [Biome; COUNT] = [
@@ -46,7 +46,6 @@ impl Biome {
         Biome::Coast,
         Biome::Mountain,
         Biome::Wetland,
-        Biome::Urban,
     ];
 
     /// This biome's look, from the bundled data file.
@@ -197,8 +196,6 @@ pub struct LandRules {
     /// the biome's rows on `bloom` ground are laid across them.
     #[serde(default)]
     pub bloom: f32,
-    /// Ground within this far of the road's line is paved, in metres.
-    pub paving_m: f32,
     pub water: WaterKind,
     /// Rows of poplars along the road.
     pub poplar_rows: bool,
@@ -220,6 +217,8 @@ pub struct BiomeDef {
     /// Everything else it sets about its land.
     pub props: Vec<PropRule>,
     pub horizon: HorizonRules,
+    /// What the land sounds like — see [`super::ambience`].
+    pub ambience: Ambience,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +232,7 @@ struct RawDef {
     #[serde(default)]
     props: Vec<PropRule>,
     horizon: HorizonRules,
+    ambience: Ambience,
 }
 
 /// The haze starts this far from the eye; nearer, the scene is clear.
@@ -280,7 +280,6 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             && (-1.0..=1.0).contains(&def.land.fields)
             && (0.0..=1.0).contains(&def.land.crops)
             && (0.0..=1.0).contains(&def.land.bloom)
-            && (0.0..=500.0).contains(&def.land.paving_m)
             && def
                 .trees
                 .tree_line_m
@@ -306,6 +305,9 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
         if !in_range || !animals_sane {
             return Err(format!("{biome:?}: a number is out of range"));
         }
+        if let Some(bad) = def.ambience.calls.iter().find(|r| !r.is_sane()) {
+            return Err(format!("{biome:?}: the {:?} call makes no sense", bad.call));
+        }
         if let Some(bad) = def.props.iter().find(|r| !r.is_sane()) {
             return Err(format!(
                 "{biome:?}: the {:?} rule makes no sense",
@@ -328,6 +330,7 @@ fn parse(text: &str) -> Result<[BiomeDef; COUNT], String> {
             animals: def.animals.clone(),
             props: def.props.clone(),
             horizon: def.horizon,
+            ambience: def.ambience.clone(),
         });
     }
     out.try_into().map_err(|_| "wrong count".to_owned())
@@ -561,7 +564,7 @@ impl Default for WorldLook {
 
 impl Scenery {
     /// Every choice, in the order the picker lists them.
-    pub const CHOICES: [Scenery; 11] = [
+    pub const CHOICES: [Scenery; 10] = [
         Scenery::Countryside,
         Scenery::Only(Biome::Forest),
         Scenery::Only(Biome::Farmland),
@@ -571,7 +574,6 @@ impl Scenery {
         Scenery::Only(Biome::Coast),
         Scenery::Only(Biome::Mountain),
         Scenery::Only(Biome::Wetland),
-        Scenery::Only(Biome::Urban),
         Scenery::Mixed,
     ];
 
@@ -605,7 +607,6 @@ impl Scenery {
                 Biome::Coast => "Coast",
                 Biome::Mountain => "Mountain",
                 Biome::Wetland => "Wetland",
-                Biome::Urban => "Urban",
             },
         }
     }
@@ -624,7 +625,6 @@ impl Biome {
             Biome::Coast => "coast",
             Biome::Mountain => "mountain",
             Biome::Wetland => "wetland",
-            Biome::Urban => "urban",
         }
     }
 }
@@ -793,10 +793,10 @@ mod tests {
     }
 
     #[test]
-    fn should_set_flowers_on_every_verge_but_the_desert_and_the_town() {
+    fn should_set_flowers_on_every_verge_but_the_desert() {
         for b in Biome::ALL {
             let (_, flowers) = verge_rules(b);
-            let bare = matches!(b, Biome::Desert | Biome::Urban);
+            let bare = b == Biome::Desert;
             assert_eq!(flowers == 0, bare, "{b:?}: {flowers} flower rules");
         }
     }
@@ -1024,7 +1024,16 @@ mod tests {
 
     #[test]
     fn should_refuse_a_stored_scenery_it_does_not_know() {
-        for bad in ["", "Desert", "desert ", "temperate", "mixed;", "\u{0}"] {
+        // "urban" was a biome until 0.23.0: a route may still have it stored.
+        for bad in [
+            "",
+            "Desert",
+            "desert ",
+            "temperate",
+            "mixed;",
+            "\u{0}",
+            "urban",
+        ] {
             assert_eq!(Scenery::from_key(bad), None, "{bad:?}");
         }
         assert_eq!(Scenery::default(), Scenery::Countryside);

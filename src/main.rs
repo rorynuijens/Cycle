@@ -1,4 +1,5 @@
 mod ai;
+mod audio;
 mod data;
 mod devices;
 mod training;
@@ -103,6 +104,14 @@ fn main() -> glib::ExitCode {
     // Sent before the window exists, so the manager is on the right radio
     // before the Devices page asks it to scan.
     let _ = cmd_tx.try_send(devices::manager::DeviceCommand::SetRadio(device_radio));
+    // Nothing connects to the sound server until a 3D ride is on screen.
+    let ambient = rt
+        .block_on(data::settings::ambient_sound(&pool))
+        .unwrap_or_else(|e| {
+            tracing::warn!("Could not read the ambient sound setting, using the default: {e}");
+            data::settings::AmbientSound::default()
+        });
+    audio::init(rt_handle.clone(), ambient.level());
 
     let app = adw::Application::builder()
         .application_id(APP_ID)
