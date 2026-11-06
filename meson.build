@@ -1,5 +1,5 @@
 project('cycle',
-  version: '0.22.2',
+  version: '0.23.0',
   meson_version: '>= 1.0',
   license: 'MIT',
 )

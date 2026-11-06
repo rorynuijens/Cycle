@@ -90,6 +90,26 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.23.0" date="2026-11-06">
+      <description>
+        <p>The 3D road now has sound:</p>
+        <ul>
+          <li>Each kind of scenery has its own ambient sound, with birds and
+              animals calling over wind, cicadas or wind in the trees. It
+              is on by default, with a volume under Preferences, Training,
+              Sound.</li>
+          <li>The Urban scenery is gone. A route set to it now opens in the
+              Countryside, and Mixed rides run through their scenery in a
+              new order. Your rides and their numbers do not change.</li>
+          <li>Less water at desert oases, and no more flickering cow
+              patches.</li>
+          <li>First-time setup now asks for an Anthropic key, the only AI
+              provider the app uses.</li>
+          <li>The README is up to date again, with the correct install
+              commands and limitations.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.22.2" date="2026-10-28">
       <description>
         <p>More nature along the 3D road, and smoother full-screen riding:</p>

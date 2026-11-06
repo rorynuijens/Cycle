@@ -4,7 +4,7 @@ This is my hobby project. I am not a coder, so all the code is written by Claude
 
 ---
 
-Tour du Salon is a native GNOME application for indoor cycling training, built in Rust with GTK4 and libadwaita. It connects to smart trainers and sensors over Bluetooth LE and ANT+, executes structured workouts with automatic resistance control (ERG), records sessions, and integrates with Intervals.icu and the Anthropic Claude API for training analysis and AI-assisted coaching.
+Tour du Salon is a native GNOME application for indoor cycling training, built in Rust with GTK4 and libadwaita. It connects to smart trainers and sensors over Bluetooth LE and ANT+, executes structured workouts with automatic resistance control (ERG), records sessions, and integrates with Intervals.icu, Garmin Connect and the Anthropic Claude API for training analysis and AI-assisted coaching.
 
 The application targets GNOME desktop environments and is distributed as a Flatpak.
 
@@ -104,7 +104,7 @@ Run this whenever you like. It updates Tour du Salon along with everything else 
 Every [release](https://github.com/rorynuijens/Cycle/releases) also has a `.flatpak` file attached. Download it and run:
 
 ```bash
-flatpak install ./cycle-0.1.0.flatpak
+flatpak install ./cycle-0.23.0.flatpak
 ```
 
 This is handy for a machine that cannot reach the repository, but it is a one-off: `flatpak update` will not find new versions, so you have to repeat the download for each release. The repository in step 1 is the better option if it works for you.
@@ -151,9 +151,15 @@ Workouts can be paused and resumed. Ending a workout early saves the recorded po
 
 GPX routes can be ridden in simulation mode: the trainer's resistance follows the route's gradient, and the rider's measured power is converted to a virtual speed through a road-cycling physics model — ease off on a climb and the climb takes longer. The route player shows live gradient, virtual speed, position on the elevation profile, and distance remaining. Without a controllable trainer, route rides fall back to ERG emulation: power targets computed from the gradient at a fixed assumed speed.
 
+### 3D view and ambient sound
+
+Rides can be shown in a stylised 3D world built around the road, with a choice of scenery from countryside to desert, coast and mountains, or a mix of them. The road follows the route's real elevation, while everything beside it is made up and never affects the ride's numbers. A ghost can ride the same route alongside you, based on an earlier ride.
+
+Each kind of scenery has its own ambient sound: wind, cicadas or wind in the trees, with birds and animals calling over it. It is on by default and can be turned down or off in Preferences → Training → Sound. The recordings are public domain or CC0, and are credited in the About dialog.
+
 ### Workout library
 
-The library holds structured workouts across eight training categories: Recovery, Endurance, Tempo, Sweet Spot, Threshold, VO₂ Max, Anaerobic, and Custom. A built-in workout creator edits workouts segment by segment — steady blocks and ramps with FTP-percentage targets, reorderable by drag and drop — and existing workouts can be opened in the same editor. Workouts can also be imported from `.zwo` files (Zwift XML format) or `.erg` files, scheduled to a calendar date, or deleted. GPX files can be loaded to preview a route's elevation profile and ride it in the route player.
+The library holds structured workouts across eight training categories: Recovery, Endurance, Tempo, Sweet Spot, Threshold, VO₂ Max, Anaerobic, and Custom. A built-in workout creator edits workouts segment by segment — steady blocks and ramps with FTP-percentage targets, reorderable by drag and drop — and existing workouts can be opened in the same editor. Workouts can also be imported from `.zwo` files (Zwift XML format) or `.erg` and `.mrc` files, scheduled to a calendar date, or deleted. GPX files can be loaded to preview a route's elevation profile and ride it in the route player.
 
 ### Training calendar
 
@@ -177,6 +183,10 @@ These metrics are derived from both locally recorded sessions and activities syn
 ### Intervals.icu integration
 
 Connecting an Intervals.icu account enables syncing activity history (training load, power, HR, cadence, distance), syncing wellness data (HRV, resting HR, sleep, steps, calories), uploading locally recorded sessions as FIT files, and importing structured workouts from the Intervals.icu workout library. Credentials are stored in the GNOME Secret Service keyring.
+
+### Garmin Connect integration
+
+Connecting a Garmin account brings activities, activity files and wellness data in through Garmin's Personal API. It is read-only: rides do not go back out to Garmin (see [Current limitations](#current-limitations)).
 
 ### AI coaching
 
@@ -205,6 +215,7 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 - Bluetooth adapter supporting Bluetooth LE (4.0 or later)
 - Optional: a USB ANT+ stick for ANT+ FE-C trainers and sensors
 - BlueZ accessible via D-Bus (standard on Fedora, Ubuntu, Arch, and most common distributions)
+- Optional: PipeWire or PulseAudio for the ambient sound; the app records nothing
 - GNOME Secret Service daemon (gnome-keyring or equivalent) for credential storage
 - Network access for Garmin Connect and Intervals.icu sync, AI features, and map tile rendering
 
@@ -241,3 +252,5 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 ### Data portability
 
 - Session data is stored in a local SQLite database (`~/.var/app/io.github.rorynuijens.Cycle/data/cycle/cycle.db` in the Flatpak sandbox). A snapshot is taken automatically before a schema upgrade, but there is no scheduled backup or cloud sync. Copies outside your computer are made by hand, from Preferences → Data: **Export History** saves everything to one file, and **Export Every Ride** writes one FIT file per ride.
+
+<!-- readme-reviewed-for: 0.23.0 -->
