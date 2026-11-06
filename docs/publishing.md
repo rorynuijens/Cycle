@@ -103,7 +103,10 @@ For every release after that:
    </release>
    ```
    GNOME Software shows this text verbatim. The workflow refuses to publish without it.
-3. Commit, then tag and push:
+3. Read `README.md` against what the release changes (`CLAUDE.md` §4.5), fix what is out of date,
+   and set its last line to `<!-- readme-reviewed-for: 0.2.0 -->`. `scripts/preflight.sh` refuses
+   the release without it.
+4. Commit, then tag and push:
    ```bash
    git tag v0.2.0
    git push origin main v0.2.0

@@ -85,6 +85,29 @@ else
     echo "the <release> entry is dated today"
 fi
 
+# The README goes stale without failing anything: the rename left install commands
+# that could not work, and "Current limitations" denied features that had shipped.
+# A script cannot tell whether prose is still true, so this checks that someone
+# read it for this release (CLAUDE.md §4.5) and stamped it, not that it is right.
+readme_stamp=$(sed -n 's/^<!-- readme-reviewed-for: \([^ ]*\) -->$/\1/p' README.md | tail -n 1 || true)
+if [ "$readme_stamp" != "$version" ]; then
+    fail "README.md is stamped as reviewed for '${readme_stamp:-nothing}', not $version.
+      Read it against 'git log <previous tag>..HEAD' (CLAUDE.md §4.5), fix what is out
+      of date, then set its last line to: <!-- readme-reviewed-for: $version -->"
+else
+    echo "README.md is stamped as reviewed for $version"
+fi
+
+# The one README error a script can catch outright, and the rename's actual bug.
+wrong_ids=$(grep -n 'io\.github\.rorynuijens\.' README.md |
+    grep -v "$APP_ID\([^A-Za-z]\|\$\)" || true)
+if [ -n "$wrong_ids" ]; then
+    fail "README.md names an app ID other than $APP_ID:
+$wrong_ids"
+else
+    echo "README.md uses the right app ID throughout"
+fi
+
 # The flatpak build runs with CARGO_NET_OFFLINE=true and fails on a stale vendor
 # list — 15 to 30 minutes in. Compare the sets, never the mtimes: Cargo.lock is
 # routinely newer than the JSON purely from the local package's own version bump,

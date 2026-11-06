@@ -86,7 +86,7 @@ Nothing is installed yet — this only saves the address.
 ### Step 2 — install the app
 
 ```bash
-flatpak install cycle io.github.rorynuijens.Tour du Salon
+flatpak install cycle io.github.rorynuijens.Cycle
 ```
 
 The first install also downloads the GNOME runtime (the shared set of libraries every GNOME Flatpak uses), so it may take a few minutes and a few hundred megabytes. Later updates are much smaller. Tour du Salon then appears in your applications menu like any other app.
@@ -112,11 +112,11 @@ This is handy for a machine that cannot reach the repository, but it is a one-of
 ### Uninstalling
 
 ```bash
-flatpak uninstall io.github.rorynuijens.Tour du Salon
+flatpak uninstall io.github.rorynuijens.Cycle
 flatpak remote-delete cycle
 ```
 
-Your training data lives outside the app and is not deleted by this. To remove that too, delete `~/.var/app/io.github.rorynuijens.Tour du Salon`.
+Your training data lives outside the app and is not deleted by this. To remove that too, delete `~/.var/app/io.github.rorynuijens.Cycle`.
 
 ### If something goes wrong
 
@@ -203,10 +203,10 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 - Linux with a GNOME desktop environment
 - Bluetooth adapter supporting Bluetooth LE (4.0 or later)
-- Optional: a USB ANT+ stick for ANT+ FE-C trainers
+- Optional: a USB ANT+ stick for ANT+ FE-C trainers and sensors
 - BlueZ accessible via D-Bus (standard on Fedora, Ubuntu, Arch, and most common distributions)
 - GNOME Secret Service daemon (gnome-keyring or equivalent) for credential storage
-- Network access for Intervals.icu sync, AI features, and map tile rendering
+- Network access for Garmin Connect and Intervals.icu sync, AI features, and map tile rendering
 
 ---
 
@@ -214,7 +214,8 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 ### Device connectivity
 
-- **ANT+ covers FE-C trainers only.** ANT+ heart rate straps and cadence sensors are not supported; use their BLE mode instead. Running the ANT+ stick outside Flatpak may require a udev rule granting USB access.
+- **One radio at a time.** The app connects over either Bluetooth or ANT+, chosen on the Devices page, never both at once.
+- ANT+ covers FE-C trainers, heart rate straps, speed and cadence sensors, and cadence sensors. ANT+ power meters are not supported; use their BLE mode instead. Running the ANT+ stick outside Flatpak may require a udev rule granting USB access.
 
 ### Simulation
 
@@ -222,14 +223,14 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 ### AI integration
 
-- The Anthropic Claude API is the only supported AI provider. The API endpoint is hardcoded to `api.anthropic.com`. Despite a reference to OpenAI and compatible APIs in the setup wizard, only the Anthropic API is implemented.
-- AI features require a paid Anthropic API account. There is no offline fallback.
-- The AI has no write access to the workout schedule; recommendations are displayed as text and must be acted on manually.
+- The Anthropic Claude API is the only supported AI provider. The API endpoint is hardcoded to `api.anthropic.com`.
+- Coaching suggestions, the morning brief and AI-built programs require a paid Anthropic API account. Interval cues and the local plan adjustments work without one.
 
 ### External platform integrations
 
-- Intervals.icu is the only supported external training platform. There is no Strava, TrainingPeaks, Garmin Connect, or Wahoo integration.
-- FIT files from Garmin or other devices must be transferred manually and imported via the calendar or history view.
+- Intervals.icu and Garmin Connect are the only supported external training platforms. There is no Strava, TrainingPeaks, or Wahoo integration.
+- Garmin Connect is read-only, through its Personal API: activities, activity files and wellness come in, but rides do not go out. To put a ride on Garmin Connect or Strava, export its FIT file and upload it by hand.
+- FIT files from other sources must be transferred manually and imported via the calendar.
 
 ### Platform
 
@@ -239,5 +240,4 @@ The application assumes familiarity with power-based training concepts: FTP, TSS
 
 ### Data portability
 
-- Session data is stored in a local SQLite database (`~/.var/app/io.github.rorynuijens.Cycle/data/cycle/cycle.db` in the Flatpak sandbox). There is no automatic backup or cloud sync of the local database.
-- FIT export is available per session. There is no bulk export of the full session history.
+- Session data is stored in a local SQLite database (`~/.var/app/io.github.rorynuijens.Cycle/data/cycle/cycle.db` in the Flatpak sandbox). A snapshot is taken automatically before a schema upgrade, but there is no scheduled backup or cloud sync. Copies outside your computer are made by hand, from Preferences → Data: **Export History** saves everything to one file, and **Export Every Ride** writes one FIT file per ride.

@@ -619,6 +619,21 @@ Apply this checklist when reviewing any PR or generated code.
 - [ ] Are async database operations tested against `:memory:` (not the real XDG path)?
 - [ ] Does `cargo test` pass cleanly?
 
+### 4.5 README, before every release
+
+A proposed release is not ready until `README.md` has been read against it.
+`scripts/preflight.sh` blocks the tag until the stamp matches the version, but the
+stamp only records that the reading happened, so do the reading first.
+
+- [ ] Read all of `README.md` against `git log <previous tag>..HEAD`, not only the sections the release seems to touch
+- [ ] Do the features and integrations it describes match what this release ships?
+- [ ] Is every "Current limitations" bullet still true, checked against the code rather than from memory?
+- [ ] Are the requirements, permissions and install commands still right?
+- [ ] Does anything new in this release need a mention?
+- [ ] Fix what is out of date, then set the file's last line to `<!-- readme-reviewed-for: X.Y.Z -->`
+
+If you could not check a claim, say so to the rider rather than stamping over it.
+
 ---
 
 ## 5. Security review checklist

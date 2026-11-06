@@ -247,9 +247,8 @@ pub fn show(
 
     let ai_desc = gtk::Label::builder()
         .label(
-            "Add an AI provider API key to get personalised coaching suggestions and \
-             morning briefings. Supports Claude (Anthropic), OpenAI, and compatible APIs. \
-             Your key is stored only on this device. This step is optional.",
+            "Add an Anthropic API key to get personalised coaching suggestions and \
+             morning briefings. Your key is stored only on this device. This step is optional.",
         )
         .halign(gtk::Align::Start)
         .wrap(true)
