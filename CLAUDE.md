@@ -823,3 +823,21 @@ When asking Claude to write code for this project:
 | `.unwrap()` in GTK callbacks | Match on Result, log errors, show `adw::Toast` |
 | Raw SQL string interpolation | `sqlx::query(...).bind(value)` |
 | Storing OAuth tokens in SQLite | GNOME Keyring via `libsecret` |
+
+---
+
+## 8. Agents
+
+Five Claude Code agents live in `.claude/agents/`. The reviewers are read-only: they report,
+the main session fixes. Use them without being asked:
+
+| When | Agent |
+|---|---|
+| After every code change, and before any PR | `code-reviewer` |
+| Changes to `devices/`, file import, `data/db/`, integrations, logging, or `Cargo.toml`/`Cargo.lock` | `security-reviewer` |
+| Any change under `src/ui/` | `ui-reviewer` (renders real screens to PNG, light and dark) |
+| The rider wants to release | `release-manager` (stops before the tag) |
+| Any work on the 3D world, its HUD or ambient sound | `world-builder` |
+
+A change isn't done until the reviewers that apply have reported **Ready** (or their
+findings are fixed), and anything they couldn't check has been told to the rider.
